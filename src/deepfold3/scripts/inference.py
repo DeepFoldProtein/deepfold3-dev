@@ -6,7 +6,6 @@ uv run python -m deepfold3.scripts.inference \\
     --msa      path/to/query.a3m \\
     --output   output/prediction.cif \\
     --params   resources/deepfold3.safetensors \\
-    --num-recycles 3 \\
     --num-samples  5 \\
     --seed     42
 
@@ -64,7 +63,7 @@ import torch
     show_default=True,
     help="Molecule type",
 )
-@click.option("--num-recycles", default=3, show_default=True, help="Evoformer recycling iterations")
+@click.option("--num-recycles", default=10, show_default=True, help="Evoformer recycling iterations")
 @click.option("--num-samples", default=1, show_default=True, help="Number of diffusion samples")
 @click.option("--seed", default=42, show_default=True, help="Random seed for diffusion sampling")
 @click.option("--device", default=None, help="Torch device (e.g. 'cuda', 'cpu'). Auto-detected if omitted.")
