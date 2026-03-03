@@ -35,16 +35,6 @@ class GridAttentionConfig:
 
 
 @dataclass
-class TransitionConfig:
-    num_intermediate_factor: int = 4
-
-
-@dataclass
-class TriMulConfig:
-    equation: str = "ikc,jkc->ijc"  # outgoing
-
-
-@dataclass
 class EvoformerConfig:
     num_layer: int = 4
     msa_channel: int = 64
