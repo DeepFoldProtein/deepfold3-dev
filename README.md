@@ -28,7 +28,7 @@ uv sync --dev
 
 ### 1. Convert weights
 
-Convert official AF3 parameters to safetensors format:
+Convert official AF3 parameters to safetensors format. `--af3-ref` should point to a local clone of [google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3) (used to read Haiku scope names):
 
 ```bash
 deepfold3 convert \
