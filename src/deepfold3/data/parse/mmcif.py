@@ -96,15 +96,6 @@ def parse_mmcif(path: Path) -> Structure:
         entity_name_to_id[entity_name] = entity_seq_to_id[seq_key]
         return entity_seq_to_id[seq_key]
 
-    # First pass: assign entity IDs by residue-name sequence
-    for chain in model:
-        subchain = chain.subchains()
-        for sc_label, _residues in subchain.items():
-            # Get entity for this subchain
-            entity_name = structure.find_chain(sc_label).entity_name if False else None
-            # Use chain entity name
-            pass  # deferred to second pass
-
     # Collect chains, residues, atoms, bonds
     all_atoms: list[tuple] = []
     all_bonds: list[tuple] = []
@@ -117,10 +108,6 @@ def parse_mmcif(path: Path) -> Structure:
 
     # Track entity copy counts for sym_id
     entity_sym_counter: dict[int, int] = {}
-
-    # atom global index map: (chain_idx, gemmi atom address) → global idx
-    # We'll use position-based indexing
-    atom_global_map: dict[int, int] = {}  # gemmi atom serial → global idx
 
     for chain in model:
         # Process each subchain (= unique chain instance in mmCIF)
@@ -193,7 +180,6 @@ def parse_mmcif(path: Path) -> Structure:
                             is_present,
                         )
                     )
-                    atom_global_map[atom_idx_global] = atom_idx_global
                     atom_idx_global += 1
                     res_atom_count += 1
 

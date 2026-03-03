@@ -1,4 +1,4 @@
-"""Inference script: run DeepFold3 from an A3M MSA file.
+"""Inference script: run DeepFold3 from an A3M MSA file or JSON input.
 
 Usage
 -----
@@ -9,6 +9,13 @@ uv run python -m deepfold3.scripts.inference \\
     --num-recycles 3 \\
     --num-samples  5 \\
     --seed     42
+
+# Or from a Protenix-format JSON input:
+uv run python -m deepfold3.scripts.inference \\
+    --json     path/to/input.json \\
+    --output   output/prediction.cif \\
+    --params   resources/deepfold3.safetensors \\
+    --template-cache /tmp/template_cache
 
 Supported parameter formats:
   - ``.safetensors`` — native format produced by ``convert_weights.py``
@@ -21,6 +28,7 @@ diffusion samples.  Per-atom pLDDT is stored in the B-factor column.
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -31,9 +39,16 @@ import torch
 @click.command("inference")
 @click.option(
     "--msa",
-    required=True,
+    default=None,
     type=click.Path(exists=True, path_type=Path),
     help="Input A3M file (first sequence is query)",
+)
+@click.option(
+    "--json",
+    "json_input",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Protenix-format JSON input file (alternative to --msa)",
 )
 @click.option("--output", required=True, type=click.Path(path_type=Path), help="Output mmCIF file path")
 @click.option(
@@ -53,8 +68,21 @@ import torch
 @click.option("--num-samples", default=1, show_default=True, help="Number of diffusion samples")
 @click.option("--seed", default=42, show_default=True, help="Random seed for diffusion sampling")
 @click.option("--device", default=None, help="Torch device (e.g. 'cuda', 'cpu'). Auto-detected if omitted.")
+@click.option(
+    "--templates",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Directory of template mmCIF files (optional, used with --msa)",
+)
+@click.option(
+    "--template-cache",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Directory to cache downloaded template mmCIF files (used with --json)",
+)
 def inference(
-    msa: Path,
+    msa: Path | None,
+    json_input: Path | None,
     output: Path,
     params: Path,
     mol_type: str,
@@ -62,20 +90,27 @@ def inference(
     num_samples: int,
     seed: int,
     device: str | None,
+    templates: Path | None,
+    template_cache: Path | None,
 ) -> None:
-    """Run structure prediction from an A3M MSA file."""
-    # ------------------------------------------------------------------ #
+    """Run structure prediction from an A3M MSA file or JSON input."""
+    # Validate input: exactly one of --msa or --json
+    if msa is None and json_input is None:
+        raise click.UsageError("Provide either --msa or --json")
+    if msa is not None and json_input is not None:
+        raise click.UsageError("Provide only one of --msa or --json, not both")
+    # ------------------------------------------------------------------
     # Device
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     if device is None:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         dev = torch.device(device)
     click.echo(f"[inference] device: {dev}")
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Load model weights
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     click.echo(f"[inference] loading parameters from {params} …")
     t0 = time.perf_counter()
     from deepfold3.model.model import DeepFold3
@@ -107,25 +142,55 @@ def inference(
     model.to(dev).eval()
     click.echo(f"  loaded in {time.perf_counter() - t0:.1f}s")
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Featurize
-    # ------------------------------------------------------------------ #
-    click.echo(f"[inference] featurizing {msa} …")
+    # ------------------------------------------------------------------
     t0 = time.perf_counter()
     from deepfold3.data.module.dataset import InferenceInput
 
-    a3m_text = msa.read_text()
-    feats = InferenceInput.from_a3m(a3m_text, mol_type=mol_type)
+    if json_input is not None:
+        click.echo(f"[inference] featurizing {json_input} …")
+        feats = InferenceInput.from_json(
+            json_input,
+            template_cache_dir=template_cache,
+        )
+    else:
+        click.echo(f"[inference] featurizing {msa} …")
+        a3m_text = msa.read_text()
+
+        # Parse templates if directory provided
+        template_feats = None
+        if templates is not None:
+            import numpy as np
+
+            from deepfold3.data import const as data_const
+            from deepfold3.data.parse.a3m import parse_a3m
+            from deepfold3.data.parse.templates import parse_template_mmcifs
+
+            mt = data_const.MOL_TYPE_IDS.get(mol_type.upper(), data_const.MOL_PROTEIN)
+            msa_obj = parse_a3m(a3m_text, mt)
+            n_tokens = msa_obj.sequences.shape[1]
+            query_residue_index = np.arange(n_tokens, dtype=np.int64) + 1  # 1-based
+            template_feats = parse_template_mmcifs(templates, query_residue_index)
+            if template_feats:
+                click.echo(f"  loaded {len(template_feats)} template(s) from {templates}")
+            else:
+                click.echo("  no valid templates found")
+                template_feats = None
+
+        feats = InferenceInput.from_a3m(a3m_text, mol_type=mol_type, templates=template_feats)
+
     N = feats["res_type"].shape[0]
     S = feats["msa"].shape[0]
-    click.echo(f"  {N} tokens, {S} MSA sequences  ({time.perf_counter() - t0:.1f}s)")
+    T = feats.get("template_aatype", torch.zeros(0)).shape[0]
+    click.echo(f"  {N} tokens, {S} MSA sequences, {T} templates  ({time.perf_counter() - t0:.1f}s)")
 
     # Move to device
     feats = {k: v.to(dev) for k, v in feats.items()}
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Inference
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     click.echo(f"[inference] running model  (recycles={num_recycles}, samples={num_samples}, seed={seed}) …")
     t0 = time.perf_counter()
     with torch.no_grad():
@@ -138,9 +203,9 @@ def inference(
     elapsed = time.perf_counter() - t0
     click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
 
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     # Confidence metrics + save
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
     from deepfold3.io.confidences import (
         compute_iptm,
         compute_pde,
@@ -154,16 +219,19 @@ def inference(
     seq_mask = feats["seq_mask"].float().to(dev)
     pair_mask = feats["pair_mask"].float().to(dev)
     asym_id = feats["asym_id"].to(dev)
+    seq_mask_cpu = feats["seq_mask"].float().cpu()
+    seq_mask_sum = seq_mask_cpu.sum().clamp(min=1)
+
+    # Compute pLDDT once for all samples
+    per_token_plddt = None
+    if model_output.plddt is not None:
+        _, per_token_plddt = compute_plddt(model_output.plddt, atom_mask)
 
     for s in range(num_samples):
         metrics = []
 
-        if model_output.plddt is not None:
-            _, per_token = compute_plddt(model_output.plddt, atom_mask)
-            mean_plddt = float(
-                (per_token[s].cpu() * feats["seq_mask"].float().cpu()).sum()
-                / feats["seq_mask"].float().cpu().sum().clamp(min=1)
-            )
+        if per_token_plddt is not None:
+            mean_plddt = float((per_token_plddt[s].cpu() * seq_mask_cpu).sum() / seq_mask_sum)
             metrics.append(f"pLDDT={mean_plddt:.1f}")
 
         if model_output.pae is not None:
@@ -171,7 +239,7 @@ def inference(
             iptm = compute_iptm(model_output.pae[s], seq_mask, pair_mask, asym_id)
             ranking = compute_ranking_score(ptm, iptm)
             metrics.append(f"pTM={ptm:.3f}")
-            if iptm == iptm:  # not NaN
+            if not math.isnan(iptm):
                 metrics.append(f"ipTM={iptm:.3f}")
             metrics.append(f"ranking={ranking:.3f}")
 
@@ -194,7 +262,7 @@ def inference(
             json_path = output.with_name(output.stem + "_confidences.json")
         else:
             json_path = output.with_name(output.stem + f"_sample{s}_confidences.json")
-        save_confidences_json(json_path, model_output, feats, sample_idx=s)
+        save_confidences_json(json_path, model_output, feats, sample_idx=s, seed=seed)
         click.echo(f"  saved  {json_path.resolve()}")
 
 

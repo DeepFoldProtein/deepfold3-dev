@@ -6,12 +6,17 @@ Feature specifications follow AlphaFold3 exactly.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
 from deepfold3.data import const
-from deepfold3.data.feature.ref_atoms import get_ref_atoms
+from deepfold3.data.feature.ref_atoms import _encode_atom_name, get_ref_atoms
 from deepfold3.data.types import Tokenized
+
+if TYPE_CHECKING:
+    from deepfold3.data.parse.templates import TemplateFeatures
 
 
 def _random_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
@@ -32,9 +37,11 @@ class Featurizer:
         self,
         max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
         max_msa_seqs: int = 2048,
+        max_templates: int = 4,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
+        self.max_templates = max_templates
 
     def process(
         self,
@@ -42,6 +49,7 @@ class Featurizer:
         training: bool = True,
         random_rot: bool = True,
         seed: int | None = None,
+        templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Process tokenized data into a feature dictionary.
 
@@ -65,6 +73,11 @@ class Featurizer:
             deletion_matrix   [S, N]      int64
             profile           [N, 31]     float32
             deletion_mean     [N]         float32
+            template_aatype            [T, N]         int64    (if templates provided)
+            template_pseudo_beta       [T, N, 3]      float32
+            template_pseudo_beta_mask  [T, N]         bool
+            template_backbone_frame    [T, N, 3, 3]   float32
+            template_backbone_mask     [T, N]         bool
         """
         rng = np.random.default_rng(seed)
         tokens = data.tokens
@@ -137,8 +150,6 @@ class Featurizer:
                             ref_atom_data.element[j] = int(np.clip(atom["element"], 0, 127))
                             ref_atom_data.charge[j] = float(atom["charge"])
                             aname = atom["name"].decode("ascii", errors="replace").strip()
-                            from deepfold3.data.feature.ref_atoms import _encode_atom_name
-
                             ref_atom_data.atom_name_chars[j] = _encode_atom_name(aname)
 
             # Apply random augmentation (center → rotate → translate) per token.
@@ -172,7 +183,7 @@ class Featurizer:
 
         pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)  # [N, N]
 
-        return {
+        result = {
             "res_type": res_type,
             "residue_index": residue_index,
             "token_index": token_index,
@@ -192,6 +203,13 @@ class Featurizer:
             "profile": profile,
             "deletion_mean": deletion_mean,
         }
+
+        # ------------------------------------------------------------------
+        # Template features
+        # ------------------------------------------------------------------
+        result.update(self._build_template_features(templates, N))
+
+        return result
 
     def _build_msa_features(
         self,
@@ -302,6 +320,87 @@ class Featurizer:
         profile = weighted.sum(0) / denom  # [N, 31]
         return profile
 
+    def _build_template_features(
+        self,
+        templates: list[TemplateFeatures] | None,
+        N: int,
+    ) -> dict[str, torch.Tensor]:
+        """Build template feature tensors from TemplateFeatures list.
+
+        Computes pseudo-beta positions/mask and backbone frames from dense atom
+        positions for each template.  When no templates are provided, returns
+        T=0 empty tensors (backward compatible).
+
+        Returns dict with keys:
+            template_aatype            [T, N]         int64
+            template_pseudo_beta       [T, N, 3]      float32
+            template_pseudo_beta_mask  [T, N]         bool
+            template_backbone_frame    [T, N, 3, 3]   float32
+            template_backbone_mask     [T, N]         bool
+        """
+        if not templates:
+            return {
+                "template_aatype": torch.zeros(0, N, dtype=torch.int64),
+                "template_pseudo_beta": torch.zeros(0, N, 3),
+                "template_pseudo_beta_mask": torch.zeros(0, N, dtype=torch.bool),
+                "template_backbone_frame": torch.zeros(0, N, 3, 3),
+                "template_backbone_mask": torch.zeros(0, N, dtype=torch.bool),
+            }
+
+        T = len(templates)
+        t_aatype = np.zeros((T, N), dtype=np.int64)
+        t_pb = np.zeros((T, N, 3), dtype=np.float32)
+        t_pb_mask = np.zeros((T, N), dtype=bool)
+        t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)
+        t_frame_mask = np.zeros((T, N), dtype=bool)
+
+        for t, tmpl in enumerate(templates):
+            t_aatype[t] = tmpl.aatype
+            pos = tmpl.atom_positions  # [N, M, 3]
+            mask = tmpl.atom_mask  # [N, M]
+
+            # Pseudo-beta: CB (index 3) for all, CA (index 1) for GLY (type 7)
+            is_gly = tmpl.aatype == 7
+            cb_pos = pos[:, 3, :]  # [N, 3]
+            ca_pos = pos[:, 1, :]  # [N, 3]
+            t_pb[t] = np.where(is_gly[:, None], ca_pos, cb_pos)
+            cb_mask = mask[:, 3]
+            ca_mask = mask[:, 1]
+            t_pb_mask[t] = np.where(is_gly, ca_mask, cb_mask)
+
+            # Backbone frames from N(0), CA(1), C(2) via Gram-Schmidt
+            n_pos = pos[:, 0, :]  # [N, 3]
+            ca = pos[:, 1, :]  # [N, 3]
+            c_pos = pos[:, 2, :]  # [N, 3]
+
+            # Frame mask: all three backbone atoms must be present
+            frame_mask = mask[:, 0] & mask[:, 1] & mask[:, 2]
+            t_frame_mask[t] = frame_mask
+
+            eps = 1e-8
+            v1 = c_pos - ca  # C - CA
+            v2 = n_pos - ca  # N - CA
+
+            v1_norm = np.linalg.norm(v1, axis=-1, keepdims=True) + eps
+            e1 = v1 / v1_norm
+            # Orthogonalize v2 against e1
+            proj = np.sum(v2 * e1, axis=-1, keepdims=True) * e1
+            u2 = v2 - proj
+            u2_norm = np.linalg.norm(u2, axis=-1, keepdims=True) + eps
+            e2 = u2 / u2_norm
+            e3 = np.cross(e1, e2)
+
+            # Stack as rotation matrix [N, 3, 3]
+            t_frame[t] = np.stack([e1, e2, e3], axis=1)
+
+        return {
+            "template_aatype": torch.from_numpy(t_aatype),
+            "template_pseudo_beta": torch.from_numpy(t_pb),
+            "template_pseudo_beta_mask": torch.from_numpy(t_pb_mask),
+            "template_backbone_frame": torch.from_numpy(t_frame),
+            "template_backbone_mask": torch.from_numpy(t_frame_mask),
+        }
+
     def _empty_features(self) -> dict[str, torch.Tensor]:
         M = self.max_atoms
         return {
@@ -322,6 +421,11 @@ class Featurizer:
             "deletion_matrix": torch.zeros(1, 0, dtype=torch.int64),
             "profile": torch.zeros(0, const.RES_TYPE_COUNT),
             "deletion_mean": torch.zeros(0),
+            "template_aatype": torch.zeros(0, 0, dtype=torch.int64),
+            "template_pseudo_beta": torch.zeros(0, 0, 3),
+            "template_pseudo_beta_mask": torch.zeros(0, 0, dtype=torch.bool),
+            "template_backbone_frame": torch.zeros(0, 0, 3, 3),
+            "template_backbone_mask": torch.zeros(0, 0, dtype=torch.bool),
         }
 
 

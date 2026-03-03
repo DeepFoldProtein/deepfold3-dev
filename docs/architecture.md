@@ -4,44 +4,48 @@ DeepFold3 is a diffusion-based generative model for biomolecular structure predi
 
 ## Forward Pass Overview
 
-```
+```text
 Features dict (featurizer output)
   │
-  ├─ create_relative_encoding()        → rel_feat    [N, N, 139]
-  ├─ one_hot(res_type) + profile       → raw_feat    [N,  63]
+  ├─ create_relative_encoding()        -> rel_feat    [N, N, 139]
+  ├─ one_hot(res_type) + profile       -> raw_feat    [N,  63]
   │    + deletion_mean
-  ├─ EvoformerConditioningEncoder()     → evo_cond    [N, 384]
-  │    (ref atoms → atom transformer
-  │     → masked mean pool to tokens)
+  ├─ EvoformerConditioningEncoder()     -> evo_cond    [N, 384]
+  │    (ref atoms -> atom transformer
+  │     -> masked mean pool to tokens)
   │
-  ├─ concat [raw_feat, evo_cond]       → target_feat [N, 447]
-  ├─ MSA feat (one_hot + has_deletion  → msa_feat    [S, N,  34]
+  ├─ concat [raw_feat, evo_cond]       -> target_feat [N, 447]
+  ├─ MSA feat (one_hot + has_deletion  -> msa_feat    [S, N,  34]
   │    + deletion_value)
   │
   ╰─ Evoformer trunk (10 recycles)
        ├─ Input projections
        │    single = proj(target_feat)               [N, 384]
-       │    pair   = left(tf)⊗right(tf) + rel_feat   [N, N, 128]
+       │    pair   = outer_sum(left(tf), right(tf)) + rel_feat   [N, N, 128]
        │    msa    = proj(msa_feat) + proj(tf)        [S, N,  64]
        ├─ + recycled prev_single, prev_pair (.detach())
-       ├─ MSA stack:       4 × EvoformerBlock
-       ╰─ PairFormer stack: 48 × PairFormerBlock
-              → single [N, 384]  +  pair [N, N, 128]
+       ├─ + bond embedding (optional)
+       ├─ + template embedding (optional, T templates)
+       │    T x SingleTemplateEmbedding -> avg -> ReLU -> proj  [N, N, 128]
+       ├─ MSA stack:       4 x EvoformerBlock
+       ╰─ PairFormer stack: 48 x PairFormerBlock
+              -> single [N, 384]  +  pair [N, N, 128]
 
   DiffusionHead.sample()
        200-step denoising with random augmentation
-       → atom_positions [S, N, M, 3]     (S=num_samples, M=24)
+       -> atom_positions [S, N, M, 3]     (S=num_samples, M=24)
 
   ConfidenceHead (per sample)
        4-layer PairFormer on embeddings + dgram from predicted positions
-       → pLDDT [S, N, M*50],  PAE [S, N, N, 64]
+       -> pLDDT [S, N, M*50],  PAE [S, N, N, 64]
          PDE   [S, N, N, 64], exp_resolved [S, N, M*2]
 
   DistogramHead
-       half_logits(pair) + transpose  →  [N, N, 64]
+       half_logits(pair) + transpose  ->  [N, N, 64]
 ```
 
 Key constants (`model/model.py`):
+
 - `_RAW_TARGET_FEAT_DIM = 63` (31 one-hot + 31 profile + 1 deletion_mean)
 - `_AATYPE_NUM_CLASSES = 31`
 - `_MSA_FEAT_DIM = 34` (32 one-hot + 1 has_deletion + 1 deletion_value)
@@ -49,18 +53,18 @@ Key constants (`model/model.py`):
 
 ## Module-by-Module Breakdown
 
-### `primitives.py` — Building Blocks
+### `primitives.py` -- Building Blocks
 
 | Class | Description |
 |---|---|
-| `LinearNoBias` | `nn.Linear(bias=False)` — matches AF3's `hm.Linear` default (`use_bias=False`) |
-| `LayerNorm` | `nn.LayerNorm(elementwise_affine=True)` — always has learnable scale+offset |
-| `AdaLayerNorm` | Adaptive LN: base LN (no learnable params) + conditioning → sigmoid(scale) * x + bias |
+| `LinearNoBias` | `nn.Linear(bias=False)` -- matches AF3's `hm.Linear` default (`use_bias=False`) |
+| `LayerNorm` | `nn.LayerNorm(elementwise_affine=True)` -- always has learnable scale+offset |
+| `AdaLayerNorm` | Adaptive LN: base LN (no learnable params) + conditioning -> sigmoid(scale) * x + bias |
 | `SwiGLU` | `swish(a) * b` where `[a, b] = linear(x).chunk(2)` |
-| `TransitionBlock` | LN → SwiGLU feed-forward; `linear1: [c → 2*c*factor]`, `linear2: [c*factor → c]`; default factor=4 |
+| `TransitionBlock` | LN -> SwiGLU feed-forward; `linear1: [c -> 2*c*factor]`, `linear2: [c*factor -> c]`; default factor=4 |
 | `AdaTransitionBlock` | AdaLN-zero conditioned FF for diffusion; `zero_cond` gate init at bias=-2; default factor=2 |
 
-### `config.py` — Configuration Hierarchy
+### `config.py` -- Configuration Hierarchy
 
 `ModelConfig` is the top-level config, containing nested dataclasses:
 
@@ -73,108 +77,155 @@ Key constants (`model/model.py`):
 | `AtomTransformerConfig` | `num_blocks=3`, `num_head=4`, `key_dim=128`, `value_dim=128` |
 | `DiffusionTransformerConfig` | `num_blocks=24`, `num_head=16`, `super_block_size=4`, `num_intermediate_factor=2` |
 | `DiffusionConfig` | `steps=200`, `num_samples=5`, `sigma_data=16.0`, `smin=0.0004`, `smax=160.0`, `noise_p=7.0`, `gamma_0=0.8`, `gamma_min=1.0`, `noise_scale=1.003`, `step_scale=1.5` |
+| `TemplateEmbeddingConfig` | `num_channels=64`, `pair_channel=128`, `dgram_num_bins=39`, `dgram_min_bin=3.25`, `dgram_max_bin=50.75`, `aatype_num_classes=31` |
+| `TemplatePairFormerConfig` | `num_layer=2`, `num_channels=64`, `num_heads=4`, `num_intermediate_factor=2` |
 | `ConfidenceConfig` | `num_layer=4`, `num_plddt_bins=50`, `num_distogram_bins=64`, `max_error_bin=31.0`, `max_atoms_per_token=24` |
 
-### `embedders.py` — Relative Encoding
+### `embedders.py` -- Relative Encoding
 
-`create_relative_encoding(token_index, residue_index, asym_id, entity_id, sym_id)` → `[N, N, 139]`
+`create_relative_encoding(token_index, residue_index, asym_id, entity_id, sym_id)` -> `[N, N, 139]`
 
 Components:
-- **rel_pos** (66 dims): residue_index diff, clamped to `±max_relative_idx=32`, one-hot + extra bin for cross-chain
+
+- **rel_pos** (66 dims): residue_index diff, clamped to `+/-max_relative_idx=32`, one-hot + extra bin for cross-chain
 - **rel_token** (66 dims): token_index diff within same residue, same encoding
 - **entity_same** (1 dim): `entity_id[i] == entity_id[j]` as float
-- **rel_chain** (6 dims): sym_id diff, clamped to `±max_relative_chain=2`, one-hot + extra bin for cross-entity
+- **rel_chain** (6 dims): sym_id diff, clamped to `+/-max_relative_chain=2`, one-hot + extra bin for cross-entity
 
-### `attention.py` — Three Attention Variants
+### `attention.py` -- Three Attention Variants
 
-**`GridSelfAttention`** — Row/column attention on pair representation `[N, N, C]`
+**`GridSelfAttention`** -- Row/column attention on pair representation `[N, N, C]`
+
 - `transpose=False` for row-wise, `transpose=True` for column-wise
 - 4 heads, `head_dim = max(c // num_heads, 16)`
-- Pair bias: `pair → LinearNoBias → [H, N, N]` broadcast over all rows (`pb.unsqueeze(0)`)
+- Pair bias: `pair -> LinearNoBias -> [H, N, N]` broadcast over all rows (`pb.unsqueeze(0)`)
 - Gated output: `out * sigmoid(to_g(x))`
 
-**`MSAAttention`** — Row-wise MSA attention `[S, N, msa_channel]`
-- 8 heads; **no Q/K projections** — attention weights derived from pair activations
-- `pair_logits(pair_norm(pair))` → shared attention weights `[H, N, N]` across all S sequences
-- `einsum("bhqk,bskhc→bsqhc", w, v)` applies shared weights to per-sequence values
+**`MSAAttention`** -- Row-wise MSA attention `[S, N, msa_channel]`
 
-**`SingleAttention`** — Self-attention on single representation `[N, 384]`
+- 8 heads; **no Q/K projections** -- attention weights derived from pair activations
+- `pair_logits(pair_norm(pair))` -> shared attention weights `[H, N, N]` across all S sequences
+- `einsum("bhqk,bskhc->bsqhc", w, v)` applies shared weights to per-sequence values
+
+**`SingleAttention`** -- Self-attention on single representation `[N, 384]`
+
 - 16 heads, `key_dim=384`, `value_dim=384`
 - Receives **pre-computed** `pair_logits [H, N, N]` from `PairFormerBlock.single_to_pair`
 - Note: `to_q` uses `nn.Linear` (with bias); all other projections use `LinearNoBias`
 
-### `ops.py` — Triangle Operations
+### `ops.py` -- Triangle Operations
 
-**`TriangleMul`** — Triangle multiplicative update
+**`TriangleMul`** -- Triangle multiplicative update
+
 - Outgoing: `equation="ikc,jkc->ijc"` (default); Incoming: `equation="kic,kjc->ijc"`
-- LayerNorm → project to 2×channels → sigmoid gate → einsum → LayerNorm → project back + sigmoid gate
+- LayerNorm -> project to 2xchannels -> sigmoid gate -> einsum -> LayerNorm -> project back + sigmoid gate
 
-**`OuterProductMean`** — MSA-to-pair information flow
-- MSA `[S, N, c_msa]` → two projections `[S, N, 32]` → outer product → mean over S → pair `[N, N, c_pair]`
+**`OuterProductMean`** -- MSA-to-pair information flow
 
-### `evoformer.py` — Trunk
+- MSA `[S, N, c_msa]` -> two projections `[S, N, 32]` -> outer product -> mean over S -> pair `[N, N, c_pair]`
 
-**`EvoformerBlock`** (×4): MSA column attention → MSA row attention (pair-biased) → MSA transition → OuterProductMean → pair TriangleMul (out+in) → pair GridSelfAttention (row+col) → pair transition
+### `evoformer.py` -- Trunk
 
-**`PairFormerBlock`** (×48): pair TriangleMul (out+in) → pair GridSelfAttention (row+col) → pair transition → SingleAttention (pair-biased) → single transition
+**`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition
+
+**`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition
 
 **`Evoformer`** input projections:
-- `target_feat [N, 447]` → single `[N, 384]`, pair `[N, N, 128]` (outer sum of left/right projections)
-- `msa_feat [S, N, 34]` → msa `[S, N, 64]` (+ broadcast target_feat projection)
-- `rel_feat [N, N, 139]` → pair (additive)
+
+- `target_feat [N, 447]` -> single `[N, 384]`, pair `[N, N, 128]` (outer sum of left/right projections)
+- `msa_feat [S, N, 34]` -> msa `[S, N, 64]` (+ broadcast target_feat projection)
+- `rel_feat [N, N, 139]` -> pair (additive)
 - Recycled `prev_pair` and `prev_single` added through LayerNorm + projection
+- Template embedding (optional): `pair += template_embedding(pair, template_feats)` -- after bonds, before MSA stack
 
-### `atom_cross_attn.py` — Atom-Level Processing
+### `template_embedding.py` -- Template Embedding
 
-**`AtomSubsets`** — Flat atom layout with rectangular block attention:
+Processes structural templates (known PDB structures similar to the query) into pair-space embeddings.
+
+**`TemplateEmbedding`** -- Top-level module:
+
+- Loops over T templates, each processed by `SingleTemplateEmbedding`
+- Averages over T, applies ReLU, projects `LinearNoBias(64, 128)` -> `[N, N, 128]`
+- Haiku scope: `diffuser/evoformer/template_embedding/`
+
+**`SingleTemplateEmbedding`** -- Processes one template:
+
+- 9 input projections (all `LinearNoBias -> 64`, summed):
+  - Distance histogram `[N, N, 39]`, pseudo-beta mask `[N, N, 1]`
+  - Aatype one-hot (row and column) `[N, 31]`
+  - Unit vectors (x, y, z) from backbone frames `[N, N, 1]`
+  - Backbone mask `[N, N, 1]`, query pair `[N, N, 128]`
+- 2-layer `TemplatePairFormerBlock` stack + output LayerNorm
+
+**`TemplatePairFormerBlock`** -- Simplified PairFormer (no single track):
+
+- tri_mul_out, tri_mul_in, pair_attn_row, pair_attn_col, pair_transition (factor=2)
+
+**Helper functions**:
+
+- `pseudo_beta_from_positions()` -- CB for all residues, CA for GLY
+- `backbone_frames_from_positions()` -- Gram-Schmidt from N/CA/C atoms
+- `dgram_from_positions()` -- Squared-distance binning into 39 bins (3.25-50.75 Å)
+
+### `atom_cross_attn.py` -- Atom-Level Processing
+
+**`AtomSubsets`** -- Flat atom layout with rectangular block attention:
+
 - Packs real atoms from `[N, M=24]` grid into flat array, padded to multiple of Q=32
 - Non-overlapping **query subsets** of Q=32 atoms (~6 residues each)
 - Overlapping **key windows** of K=128 atoms centered on each query subset
 - Fields: `ta_to_q_idx [S,Q]`, `q_to_k_idx [S,K]`, `token_for_query [S,Q]`, `token_for_key [S,K]`, etc.
 
 **`EvoformerConditioningEncoder`**:
-- Ref atom features (element, charge, name_chars, mask) → per-atom embeddings
+
+- Ref atom features (element, charge, name_chars, mask) -> per-atom embeddings
 - 3-block atom transformer with pair conditioning
-- Masked mean pool over atoms per token → `[N, per_token_channels=384]`
+- Masked mean pool over atoms per token -> `[N, per_token_channels=384]`
 - This becomes `evo_cond`, concatenated with `raw_feat` to form `target_feat [N, 447]`
 
 **`AtomCrossAttEncoder`** / **`AtomCrossAttDecoder`**:
+
 - Encoder: maps noisy atom positions to flat subset space, conditions with trunk single/pair
 - Decoder: maps denoised subset features back to `[N, M, 3]` atom positions
-- Trunk pair broadcast: `pair[token_for_query, token_for_key]` → `[S, Q, K, pair_channels]`
+- Trunk pair broadcast: `pair[token_for_query, token_for_key]` -> `[S, Q, K, pair_channels]`
 
-### `diffusion.py` — Denoising
+### `diffusion.py` -- Denoising
 
-**`DiffusionTransformer`** — 24 blocks, organized in super-blocks of 4:
-- Each block: AdaLN → self-attention (pair-biased) → AdaTransitionBlock → atom cross-att encode/decode
+**`DiffusionTransformer`** -- 24 blocks, organized in super-blocks of 4:
+
+- Each block: AdaLN -> self-attention (pair-biased) -> AdaTransitionBlock -> atom cross-att encode/decode
 - Conditioning: `single_cond [N, 384+447=831]`, `pair_cond [N, N, 128+139=267]`, noise embedding (Fourier, 256-dim)
 - EDM-style skip/output scaling: `result = skip_scaling * noisy_pos + out_scaling * pos_update`
 
-**`DiffusionHead.sample()`** — 200-step reverse process:
-1. `t = linspace(0, 1, 201)` → `sigma = noise_schedule(t)` (cosine schedule with `sigma_data=16.0`)
+**`DiffusionHead.sample()`** -- 200-step reverse process:
+
+1. `t = linspace(0, 1, 201)` -> `sigma = noise_schedule(t)` (cosine schedule with `sigma_data=16.0`)
 2. Initial noise: `x ~ N(0, smax^2) * atom_mask`, shape `[S, N, M, 3]`
-3. Each step: `_random_augmentation()` → denoise → Euler update with stochastic gamma injection
+3. Each step: `_random_augmentation()` -> denoise -> Euler update with stochastic gamma injection
 4. Gamma: `gamma_0=0.8` if `sigma_next > gamma_min=1.0`, else 0 (no stochasticity near convergence)
 
-### `confidence.py` — Confidence Head
+### `confidence.py` -- Confidence Head
 
 4-layer PairFormer operating on:
+
 - **Pair input**: target_feat outer-sum `[N,N,128]` + distogram from predicted positions (39 bins, 3.25-50.75 Å range)
 - **Single input**: single representation `[N, 384]`
 
 Output projections (each preceded by LayerNorm):
-- **pLDDT**: `LinearNoBias(384, M*50=1200)` → `[S, N, 1200]`
-- **PAE**: `LinearNoBias(128, 64)` → `[S, N, N, 64]`
-- **PDE**: `LinearNoBias(128, 64)` → symmetrized → `[S, N, N, 64]`
-- **exp_resolved**: `LinearNoBias(384, M*2=48)` → `[S, N, 48]`
 
-Confidence is computed **per diffusion sample** — the head runs S times.
+- **pLDDT**: `LinearNoBias(384, M*50=1200)` -> `[S, N, 1200]`
+- **PAE**: `LinearNoBias(128, 64)` -> `[S, N, N, 64]`
+- **PDE**: `LinearNoBias(128, 64)` -> symmetrized -> `[S, N, N, 64]`
+- **exp_resolved**: `LinearNoBias(384, M*2=48)` -> `[S, N, 48]`
 
-### `model.py` — Top-Level Orchestrator
+Confidence is computed **per diffusion sample** -- the head runs S times.
+
+### `model.py` -- Top-Level Orchestrator
 
 **`DeepFold3`**: wires all modules together in `forward()`. Orchestrates recycling, calls evoformer, diffusion, confidence, and distogram heads.
 
-**`DeepFold3Output`** — 7 fields:
+**`DeepFold3Output`** -- 7 fields:
+
 - `atom_positions [S, N, M, 3]`, `atom_mask [N, M]`
 - `plddt [S, N, M*50]`, `pae [S, N, N, 64]`, `pde [S, N, N, 64]`, `exp_resolved [S, N, M*2]`
 - `distogram [N, N, 64]`
@@ -187,17 +238,20 @@ Also exposes `compute_distogram(features, num_recycles)` which runs only the evo
 
 Two parallel layouts coexist throughout the model:
 
-**Token-level** `[N]` — One representative atom per token:
+**Token-level** `[N]` -- One representative atom per token:
+
 - Protein: Cα (one token per residue)
 - Nucleic acid: C1' (one token per residue)
 - Ligand: the single atom itself (one token per atom)
 
-**Token-atoms** `[N, M=24]` — All heavy atoms per token, padded to `MAX_ATOMS_PER_TOKEN=24`:
+**Token-atoms** `[N, M=24]` -- All heavy atoms per token, padded to `MAX_ATOMS_PER_TOKEN=24`:
+
 - `ref_pos [N, M, 3]`: ideal CCD coordinates, randomly rotated during training
 - `ref_mask [N, M]`: which atom slots are occupied
 - `ref_element [N, M]`, `ref_charge [N, M]`, `ref_atom_name_chars [N, M, 4]`
 
 **Flat subset mapping** (`AtomSubsets`):
+
 - The `[N, M]` grid is flattened to a 1D array of real atoms (mask=True), padded to a multiple of Q=32
 - Partitioned into non-overlapping query subsets of Q=32 atoms
 - Each query subset gets an overlapping key window of K=128 atoms (centered on the query)
@@ -216,17 +270,20 @@ Two parallel layouts coexist throughout the model:
 The diffusion head implements a 200-step reverse denoising process:
 
 **Noise schedule**: `sigma(t) = sigma_data * (smax^(1/p) + t * (smin^(1/p) - smax^(1/p)))^p`
+
 - `sigma_data=16.0`, `smin=0.0004`, `smax=160.0`, `p=7.0`
 
-**Random augmentation** (critical — applied at every denoising step):
+**Random augmentation** (critical -- applied at every denoising step):
+
 1. Center: subtract masked center of mass
-2. Rotate: Gram-Schmidt orthogonalization from two random N(0,1) vectors → SO(3)
+2. Rotate: Gram-Schmidt orthogonalization from two random N(0,1) vectors -> SO(3)
 3. Translate: add random N(0,1) vector
 4. Zero out masked atoms
 
 **Stochastic sampling**:
+
 - `gamma = gamma_0 (0.8)` when `sigma_next > gamma_min (1.0)`, else 0
-- `sigma_hat = sigma * (1 + gamma)` — inflated noise level
+- `sigma_hat = sigma * (1 + gamma)` -- inflated noise level
 - Inject noise: `x_hat = x + noise_scale * sqrt(sigma_hat^2 - sigma^2) * noise`
 - Euler step: `x_next = x_hat + step_scale * (sigma_next - sigma_hat) * (x_hat - denoised) / sigma_hat`
 
@@ -235,14 +292,16 @@ The diffusion head implements a 200-step reverse denoising process:
 ## Batch Dimension Support
 
 All core model modules support both unbatched and batched (leading B dim) inputs:
-- Pattern: `has_batch = x.dim() == expected_batched_dim; if not: unsqueeze(0) → compute → squeeze(0)`
+
+- Pattern: `has_batch = x.dim() == expected_batched_dim; if not: unsqueeze(0) -> compute -> squeeze(0)`
 - Supported: attention, ops, evoformer, diffusion, confidence, embedders
 - **Not yet batched**: `atom_cross_attn.py` (subset building is per-sample)
 
 ## Weight Compatibility
 
-- All weights load from AF3 Haiku params via `convert/af3.py` (Haiku scope → PyTorch state_dict)
+- All weights load from AF3 Haiku params via `convert/af3.py` (Haiku scope -> PyTorch state_dict)
 - Zero missing / zero unexpected keys (validated in `test_weight_loading.py`)
-- Only skipped: **template embedding** (not yet implemented, listed in `skip_prefixes`)
+- All AF3 scopes converted, including template embedding
 - Haiku `[in, out]` transposed to PyTorch `[out, in]` during conversion
+- Template embedding scalar projections (`num_input_dims=0` in Haiku) require special handling: weight shape `(C,)` -> `(C, 1)` via `_linear_scalar()`
 - Each module's docstring documents its corresponding Haiku scope hierarchy

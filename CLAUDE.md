@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline — model, data, I/O, and scripts are implemented in `src/`.
 
-**Not yet implemented:** template embedding, structured inputs (mmCIF/JSON input, multi-chain complexes, ligands), full data pipeline (PDB preprocessing, clustering, dataset generation), training pipeline.
+**Not yet implemented:** multi-chain complexes, ligands, full data pipeline (PDB preprocessing, clustering, dataset generation), training pipeline.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.12 (pinned in `.python-version`)
@@ -33,6 +33,7 @@ uv run ruff format src/
 
 # CLI (unified entry point via click — registered in pyproject.toml as deepfold3)
 deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensors
+deepfold3 inference --json input.json --output out.cif --params weights.safetensors --template-cache /tmp/cache
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 plot      --input out_confidences.json --output confidences.png
 ```
@@ -60,6 +61,7 @@ The model is a **diffusion-based generative model** with three major heads and a
 Input features (tokens + atoms)
     → Per-atom conditioning (AtomCrossAttEncoder)
     → Evoformer trunk  [10 recycles]
+        ├─ Template embedding (optional, T templates → pair)
         ├─ MSA processing (EvoformerBlock × 4)
         └─ PairFormer stack (48 layers)
                → single [N, 384]  +  pair [N, N, 128]
@@ -84,6 +86,7 @@ src/deepfold3/
 │   ├── attention.py      # GridSelfAttention, MSAAttention, SingleAttention
 │   ├── ops.py            # TriangleMul, OuterProductMean
 │   ├── evoformer.py      # EvoformerBlock, PairFormerBlock, Evoformer
+│   ├── template_embedding.py  # TemplateEmbedding, SingleTemplateEmbedding, TemplatePairFormerBlock
 │   ├── atom_cross_attn.py # AtomCrossAttEncoder/Decoder, EvoformerConditioningEncoder
 │   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training)
 │   ├── confidence.py     # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
@@ -91,7 +94,7 @@ src/deepfold3/
 ├── data/            # Data pipeline
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
-│   ├── parse/            # mmcif.py (gemmi), a3m.py (MSA)
+│   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)

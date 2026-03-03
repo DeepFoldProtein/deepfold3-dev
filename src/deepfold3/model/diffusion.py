@@ -276,9 +276,11 @@ class DiffusionTransformer(nn.Module):
         sbs = self.super_block_size
         num_super = self.num_blocks // sbs
 
+        # Compute pair norm once (pair_cond is constant across super-blocks)
+        pair_norm = F.layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+
         for super_idx in range(num_super):
             # Per-super-block pair logit projection
-            pair_norm = F.layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
             pair_logits_all = self.pair_logits_proj[super_idx](pair_norm)  # [..., N, N, sbs*H]
             # Move last dim (sbs*H) before the two N dims: [..., sbs*H, N, N]
             pair_logits_all = pair_logits_all.movedim(-1, -3)

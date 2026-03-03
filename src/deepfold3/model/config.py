@@ -111,9 +111,48 @@ class ConfidenceConfig:
 
 
 @dataclass
+class TemplatePairFormerConfig:
+    """Config for the simplified PairFormer stack inside template embedding.
+
+    Uses pair-only layers (no single track) with a smaller transition factor.
+    """
+
+    num_layer: int = 2
+    num_channels: int = 64
+    num_heads: int = 4
+    num_intermediate_factor: int = 2
+
+
+@dataclass
+class TemplateEmbeddingConfig:
+    """Config for template embedding (structural templates → pair embedding).
+
+    Haiku scope: diffuser/evoformer/template_embedding/
+
+    Attributes:
+        num_channels: Hidden dimension for template pair features.
+        pair_channel: Pair channel from the Evoformer (query embedding dim).
+        dgram_num_bins: Number of distance histogram bins.
+        dgram_min_bin: Left edge of the first distance bin (Angstroms).
+        dgram_max_bin: Left edge of the last distance bin (Angstroms).
+        aatype_num_classes: Number of amino acid type classes for one-hot encoding.
+        pairformer: Config for the template PairFormer stack.
+    """
+
+    num_channels: int = 64
+    pair_channel: int = 128
+    dgram_num_bins: int = 39
+    dgram_min_bin: float = 3.25
+    dgram_max_bin: float = 50.75
+    aatype_num_classes: int = 31
+    pairformer: TemplatePairFormerConfig = field(default_factory=TemplatePairFormerConfig)
+
+
+@dataclass
 class ModelConfig:
     evoformer: EvoformerConfig = field(default_factory=EvoformerConfig)
     pairformer: PairFormerConfig = field(default_factory=PairFormerConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    template: TemplateEmbeddingConfig = field(default_factory=TemplateEmbeddingConfig)
     num_recycles: int = 10

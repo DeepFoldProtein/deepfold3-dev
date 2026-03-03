@@ -60,6 +60,8 @@ class TriangleMulOutgoing(nn.Module):
         z0 = self.norm_left(z)
         proj = self.proj(z0)  # [B, N, N, 2*c_z]
         gate = torch.sigmoid(self.gate(z0))  # [B, N, N, 2*c_z]
+        out_gate = torch.sigmoid(self.out_gate(z0))  # compute early to free z0
+        del z0
         proj = proj * gate
         # INTERLEAVED split (AF3: reshape [2c]->[c,2] then split axis=1)
         # a gets even channels (0,2,4,...), b gets odd channels (1,3,5,...)
@@ -73,7 +75,6 @@ class TriangleMulOutgoing(nn.Module):
         act = torch.einsum("bikc,bjkc->bijc", a, b)
         act = self.norm_center(act)
         act = self.out_proj(act)
-        out_gate = torch.sigmoid(self.out_gate(z0))
         result = act * out_gate
 
         if not has_batch:
@@ -112,6 +113,8 @@ class TriangleMulIncoming(nn.Module):
         z0 = self.norm_left(z)
         proj = self.proj(z0)
         gate = torch.sigmoid(self.gate(z0))
+        out_gate = torch.sigmoid(self.out_gate(z0))  # compute early to free z0
+        del z0
         proj = proj * gate
         # INTERLEAVED split (AF3: reshape [2c]->[c,2] then split axis=1)
         a = proj[..., 0::2]  # [B, N, N, c_z]
@@ -123,7 +126,6 @@ class TriangleMulIncoming(nn.Module):
         act = torch.einsum("bkjc,bkic->bijc", a, b)
         act = self.norm_center(act)
         act = self.out_proj(act)
-        out_gate = torch.sigmoid(self.out_gate(z0))
         result = act * out_gate
 
         if not has_batch:

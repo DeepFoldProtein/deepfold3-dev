@@ -35,9 +35,10 @@ import torch
 import torch.nn as nn
 
 from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
-from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+from deepfold3.model.config import EvoformerConfig, PairFormerConfig, TemplateEmbeddingConfig
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, TransitionBlock
+from deepfold3.model.template_embedding import TemplateEmbedding
 
 # Full target_feat dimension fed into the Evoformer (raw_feat + evo_cond_token_act)
 _TARGET_FEAT_DIM = 447
@@ -151,11 +152,22 @@ class Evoformer(nn.Module):
         msa_feat input: 34-dim (one_hot(32) + has_deletion + deletion_value)
     """
 
-    def __init__(self, cfg: EvoformerConfig, pf_cfg: PairFormerConfig):
+    def __init__(
+        self,
+        cfg: EvoformerConfig,
+        pf_cfg: PairFormerConfig,
+        template_cfg: TemplateEmbeddingConfig | None = None,
+    ):
         super().__init__()
         c_msa = cfg.msa_channel
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
+
+        # Template embedding (optional — None if not using templates)
+        if template_cfg is not None:
+            self.template_embedding: TemplateEmbedding | None = TemplateEmbedding(template_cfg)
+        else:
+            self.template_embedding = None
 
         # Input embeddings for single and MSA — dimensions from AF3 weight file
         self.msa_activations = LinearNoBias(_MSA_FEAT_DIM, c_msa)
@@ -213,6 +225,12 @@ class Evoformer(nn.Module):
         prev_pair: torch.Tensor,  # [B?, N, N, c_pair]
         prev_single: torch.Tensor,  # [B?, N, c_single]
         bond_matrix: torch.Tensor | None = None,  # [B?, N, N, 1]
+        template_aatype: torch.Tensor | None = None,  # [T, N]
+        template_pseudo_beta: torch.Tensor | None = None,  # [T, N, 3]
+        template_pseudo_beta_mask: torch.Tensor | None = None,  # [T, N]
+        template_backbone_frame: torch.Tensor | None = None,  # [T, N, 3, 3]
+        template_backbone_mask: torch.Tensor | None = None,  # [T, N]
+        multichain_mask: torch.Tensor | None = None,  # [N, N]
     ) -> dict[str, torch.Tensor]:
         # Build initial pair activations (negative indices work for both batched/unbatched)
         left = self.left_single(target_feat).unsqueeze(-2)  # [..., N, 1, c_pair]
@@ -228,6 +246,22 @@ class Evoformer(nn.Module):
         # Add bond embedding
         if bond_matrix is not None:
             pair = pair + self.bond_embedding(bond_matrix)
+
+        # Template embedding (after bonds, before MSA stack — matches AF3 pipeline)
+        if self.template_embedding is not None and template_aatype is not None and template_aatype.shape[0] > 0:
+            if multichain_mask is None:
+                N = pair.shape[-2]
+                multichain_mask = torch.ones(N, N, device=pair.device, dtype=pair.dtype)
+            pair = pair + self.template_embedding(
+                query_pair=pair,
+                template_aatype=template_aatype,
+                template_pseudo_beta=template_pseudo_beta,
+                template_pseudo_beta_mask=template_pseudo_beta_mask,
+                template_backbone_frame=template_backbone_frame,
+                template_backbone_mask=template_backbone_mask,
+                pair_mask=pair_mask,
+                multichain_mask=multichain_mask,
+            )
 
         # Initial single activations
         single = self.single_activations(target_feat)

@@ -4,16 +4,16 @@ This document traces a biomolecular input through every stage of the DeepFold3 d
 
 ## Pipeline Overview
 
-```
-Raw input (mmCIF / A3M / sequence string)
-  → Parse     →  Structure + MSA objects
-  → Tokenize  →  Tokenized (tokens[], bonds[], structure, msa)
-  → Crop      →  Tokenized (≤ max_tokens, ≤ max_atoms)
-  → Featurize →  dict[str, Tensor]
-  → Collate   →  padded batch tensors [B, ...]
+```text
+Raw input (mmCIF / A3M / sequence string / JSON)
+  -> Parse     ->  Structure + MSA objects
+  -> Tokenize  ->  Tokenized (tokens[], bonds[], structure, msa)
+  -> Crop      ->  Tokenized (<= max_tokens, <= max_atoms)
+  -> Featurize ->  dict[str, Tensor]
+  -> Collate   ->  padded batch tensors [B, ...]
 ```
 
-During **inference**, cropping and random rotation are skipped. The `InferenceInput` static methods (`from_sequence`, `from_a3m`) handle the full pipeline in one call.
+During **inference**, cropping and random rotation are skipped. The `InferenceInput` static methods (`from_sequence`, `from_a3m`, `from_json`) handle the full pipeline in one call.
 
 During **training**, all stages run: `TrainingDataset.__getitem__()` loads a Structure + MSA from disk, tokenizes, crops, and featurizes with random augmentation.
 
@@ -24,7 +24,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `ATOM_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `x` | float32 | x coordinate (Å) |
 | `y` | float32 | y coordinate |
 | `z` | float32 | z coordinate |
@@ -36,7 +36,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `BOND_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `atom_1` | int32 | Global atom index |
 | `atom_2` | int32 | Global atom index |
 | `type` | int8 | Bond order: 1=single, 2=double, 3=triple, 4=aromatic |
@@ -44,7 +44,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `RESIDUE_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `name` | S5 | Residue name (3-letter code, e.g. "ALA", "DA") |
 | `res_type` | int16 | Index in `RES_TYPE_ORDER` (0-30) |
 | `mol_type` | int8 | `MOL_PROTEIN=0`, `MOL_DNA=1`, `MOL_RNA=2`, `MOL_NONPOLYMER=3` |
@@ -57,10 +57,10 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `CHAIN_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `name` | S4 | PDB chain ID |
 | `mol_type` | int8 | Molecule type |
-| `entity_id` | int32 | Entity group (same sequence → same entity) |
+| `entity_id` | int32 | Entity group (same sequence -> same entity) |
 | `sym_id` | int32 | 0-based copy index within entity |
 | `asym_id` | int32 | Unique sequential chain index |
 | `res_idx` | int32 | Index of first residue |
@@ -71,7 +71,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `TOKEN_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `token_idx` | int32 | Sequential token index |
 | `residue_index` | int32 | PDB residue number (polymer) or atom index (ligand) |
 | `res_type` | int16 | Index in `RES_TYPE_ORDER` |
@@ -86,7 +86,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 ### `TOKEN_BOND_DTYPE`
 
 | Field | Type | Description |
-|---|---|---|
+| ----- | ---- | ----------- |
 | `token_1` | int32 | Source token index |
 | `token_2` | int32 | Target token index |
 
@@ -100,7 +100,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 **`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `msa: dict[int, MSA]`.
 
-**`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]` — metadata for training dataset indexing.
+**`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]` -- metadata for training dataset indexing.
 
 ## Parsing Stage
 
@@ -125,8 +125,49 @@ def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
 - Lowercase characters increment a deletion counter but are not added as match states
 - Returns:
   - `sequences [S, N]`: int8, using `PROTEIN_MSA_ID` / `RNA_MSA_ID` / `DNA_MSA_ID` mapping
-  - `mask [S, N]`: bool, **always True at valid positions** — gaps (idx 21) are valid aligned positions, only padding beyond sequence length is False
+  - `mask [S, N]`: bool, **always True at valid positions** -- gaps (idx 21) are valid aligned positions, only padding beyond sequence length is False
   - `deletion_matrix [S, N]`: int8, raw insertion counts per position
+
+### Templates (`data/parse/templates.py`)
+
+```python
+def extract_template_features(mmcif_text, query_residue_index, ...) -> TemplateFeatures:
+def extract_template_features_from_hhr(mmcif_text, hit, query_length, ...) -> TemplateFeatures:
+def parse_template_mmcifs(template_dir, query_residue_index, max_templates=4) -> list[TemplateFeatures]:
+def parse_hhr_templates(hhr_path, query_length, max_templates=4, cache_dir=None) -> list[TemplateFeatures]:
+def fetch_pdb_mmcif(pdb_id, cache_dir=None) -> str:
+```
+
+- `TemplateFeatures` dataclass: `aatype [N]` int64, `atom_positions [N, 24, 3]` float32, `atom_mask [N, 24]` bool
+- Two alignment modes:
+  - **Residue-index matching**: `extract_template_features()` aligns template to query by residue_index values (for mmCIF directory input)
+  - **HHR alignment**: `extract_template_features_from_hhr()` uses HHR query-to-hit mapping for alignment (for HHsearch output)
+- `parse_hhr_templates()` reads an HHR file, selects top hits by `sum_probs`, downloads structures from RCSB, and extracts features
+- Unaligned positions are filled with zeros and aatype=20 (UNK)
+- `fetch_pdb_mmcif()` downloads from RCSB (`https://files.rcsb.org/download/{pdb_id}.cif`) with optional caching
+- Template features are converted to pseudo-beta positions, backbone frames, and masks in the featurizer
+
+### HHR (`data/parse/hhr.py`)
+
+```python
+def parse_hhr(hhr_text: str) -> list[TemplateHit]:
+```
+
+- `TemplateHit` frozen dataclass: `pdb_id`, `chain_id`, `aligned_cols`, `sum_probs`, `e_value`, `query_sequence`, `hit_sequence`, `indices_query`, `indices_hit`
+- `query_to_hit_mapping` property: `{query_0based: hit_0based}` for non-gap aligned columns
+- Parses HHsearch `.hhr` output: splits on `"No "` blocks, extracts Q/T alignment lines, builds 0-based index arrays
+
+### JSON Input (`data/parse/json_input.py`)
+
+```python
+def parse_json_input(json_path: Path) -> list[JobInput]:
+```
+
+- Parses Protenix-format JSON specifying protein chains with MSA and template paths
+- `ProteinChainInput`: `sequence`, `count`, `paired_msa_path`, `unpaired_msa_path`, `templates_path`
+- `JobInput`: `name`, `protein_chains`, `model_seeds`
+- Resolves relative paths against the JSON file's directory
+- Currently supports single-chain protein only (`count=1`)
 
 ## Tokenization (`data/tokenize/tokenizer.py`)
 
@@ -136,12 +177,14 @@ class Tokenizer:
 ```
 
 **Polymer tokens** (protein, RNA, DNA): One token per residue.
+
 - `residue_index` = PDB sequence number (`res_id`)
 - `atom_num` = number of heavy atoms in that residue
 - Center coordinates from representative atom: `CA` for protein, `C1'` for nucleic acids
 - Consecutive residues in the same chain get a backbone bond
 
 **Ligand tokens**: One token per heavy atom.
+
 - `residue_index` = atom index within the ligand (0-based)
 - `res_type` = 20 (UNK)
 - `atom_num` = 1
@@ -177,7 +220,7 @@ class Featurizer:
 N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 
 | Feature | Shape | Dtype | Description |
-|---|---|---|---|
+| ------- | ----- | ----- | ----------- |
 | `res_type` | `[N]` | int64 | Token type (0-19=AA, 20=UNK, 21=gap, 22-25=RNA, 26-29=DNA, 30=N) |
 | `residue_index` | `[N]` | int64 | Residue number (1-based for polymer) |
 | `token_index` | `[N]` | int64 | Sequential token index (0-based) |
@@ -195,11 +238,17 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `msa_mask` | `[S, N]` | bool | MSA validity mask (gaps are valid; only padding is False) |
 | `deletion_matrix` | `[S, N]` | int64 | Raw deletion counts (number of insertions before each match state) |
 | `profile` | `[N, 31]` | float32 | Per-position residue frequency (includes gap class at idx 21) |
-| `deletion_mean` | `[N]` | float32 | `mean(deletion_matrix, dim=0)` — raw mean, arctan applied later in model |
+| `deletion_mean` | `[N]` | float32 | `mean(deletion_matrix, dim=0)` -- raw mean, arctan applied later in model |
+| `template_aatype` | `[T, N]` | int64 | Template residue types (same vocab as `res_type`) |
+| `template_pseudo_beta` | `[T, N, 3]` | float32 | Template CB positions (CA for GLY) |
+| `template_pseudo_beta_mask` | `[T, N]` | bool | Valid pseudo-beta mask |
+| `template_backbone_frame` | `[T, N, 3, 3]` | float32 | Template backbone frames (Gram-Schmidt from N/CA/C) |
+| `template_backbone_mask` | `[T, N]` | bool | Valid backbone frame mask |
 
 ### Reference Atom Augmentation
 
 When `random_rot=True` (training), each token's `ref_pos` is:
+
 1. Centered on the mean of valid atoms
 2. Rotated by a uniformly random SO(3) rotation (QR decomposition of N(0,1) matrix)
 3. Translated by a random N(0,1) vector
@@ -213,7 +262,8 @@ def get_ref_atoms(res_name: str, mol_type: int, max_atoms: int = 24, ...) -> Ref
 ```
 
 CCD lookup flow:
-1. Try `_load_ccd_entry_gemmi(res_name)` — downloads from RCSB, parses ideal coordinates, skips H atoms and OXT
+
+1. Try `_load_ccd_entry_gemmi(res_name)` -- downloads from RCSB, parses ideal coordinates, skips H atoms and OXT
 2. If unavailable, fall back to hardcoded `const.REF_ATOMS[res_name]` + `const.REF_ATOM_POSITIONS[res_name]`
 3. Pad/truncate to `max_atoms`, encode atom names as `[ord(c)-32 for c in name.ljust(4)[:4]]`
 
@@ -227,14 +277,23 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 - Creates a single-row MSA `[1, N]` with all-True mask
 - Tokenizes and featurizes with `training=False, random_rot=False`
 
-### `InferenceInput.from_a3m(a3m_text, mol_type="protein", max_msa_seqs=2048)`
+### `InferenceInput.from_a3m(a3m_text, mol_type="protein", max_msa_seqs=2048, templates=None)`
 
 - Parses full A3M text via `parse_a3m()`
 - Reconstructs query sequence from MSA row 0 (skipping gap indices)
 - Builds a `Structure` from the query using CCD ideal coordinates
 - Tokenizes and featurizes with `training=False, random_rot=False`
+- Optional `templates: list[TemplateFeatures]` -- if provided, template features (aatype, pseudo-beta, backbone frames) are computed and included in output
 
-Both methods accept `mol_type` as `"protein"`, `"rna"`, or `"dna"` (case-insensitive).
+### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=2048, max_templates=4, template_cache_dir=None)`
+
+- Parses Protenix-format JSON via `parse_json_input()`
+- Loads unpaired MSA (preferred) or paired MSA via `parse_a3m()`; falls back to single-sequence MSA
+- If templates path is `.hhr`: calls `parse_hhr_templates()` to download and extract template features
+- Builds Structure from query sequence, tokenizes and featurizes
+- Currently supports single-chain protein only
+
+All methods accept `mol_type` as `"protein"`, `"rna"`, or `"dna"` (case-insensitive).
 
 ### `TrainingDataset`
 
@@ -244,7 +303,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 ```
 
 - Loads `{data_dir}/structures/{record.id}.npz` and `{data_dir}/msa/{chain.msa_id}.npz`
-- Runs the full pipeline: tokenize → crop → featurize (with random rotation)
+- Runs the full pipeline: tokenize -> crop -> featurize (with random rotation)
 
 ## Batch Collation (`data/module/collate.py`)
 
@@ -262,7 +321,7 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 **Residue type vocabulary** (`RES_TYPE_ORDER`, 31 classes):
 
 | Index | Type |
-|---|---|
+| ----- | ---- |
 | 0-19 | 20 standard amino acids (ALA, ARG, ASN, ..., VAL) |
 | 20 | UNK (unknown protein) |
 | 21 | `-` (gap) |
@@ -270,6 +329,6 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 | 26-29 | DNA (DA, DG, DC, DT) |
 | 30 | N (unknown nucleic) |
 
-**MSA vocabulary** (`MSA_VOCAB_SIZE = 32`): Same indices as `RES_TYPE_ORDER` for overlapping types. Ambiguous amino acid codes mapped to nearest standard (e.g., B→ASP, Z→GLU, U→CYS).
+**MSA vocabulary** (`MSA_VOCAB_SIZE = 32`): Same indices as `RES_TYPE_ORDER` for overlapping types. Ambiguous amino acid codes mapped to nearest standard (e.g., B->ASP, Z->GLU, U->CYS).
 
 **Other constants**: `MAX_ATOMS_PER_TOKEN = 24`, `NUM_ELEMENTS = 128`, `MOL_PROTEIN = 0`, `MOL_DNA = 1`, `MOL_RNA = 2`, `MOL_NONPOLYMER = 3`.

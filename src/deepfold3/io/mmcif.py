@@ -18,36 +18,13 @@ try:
 except ImportError as e:
     raise ImportError("gemmi is required for mmCIF output: pip install gemmi") from e
 
-from deepfold3.data.const import ELEMENT_TO_INT, RES_TYPE_INDEX_TO_NAME
+from deepfold3.data.const import ELEMENT_TO_INT, RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
+from deepfold3.io.confidences import compute_plddt
 from deepfold3.model.model import DeepFold3Output
 
 # Reverse element map: atomic number -> symbol
 _INT_TO_ELEMENT: dict[int, str] = {v: k for k, v in ELEMENT_TO_INT.items()}
 _INT_TO_ELEMENT[0] = "X"  # unknown / padding
-
-# 3-letter code -> 1-letter code (standard amino acids)
-_THREE_TO_ONE: dict[str, str] = {
-    "ALA": "A",
-    "ARG": "R",
-    "ASN": "N",
-    "ASP": "D",
-    "CYS": "C",
-    "GLN": "Q",
-    "GLU": "E",
-    "GLY": "G",
-    "HIS": "H",
-    "ILE": "I",
-    "LEU": "L",
-    "LYS": "K",
-    "MET": "M",
-    "PHE": "F",
-    "PRO": "P",
-    "SER": "S",
-    "THR": "T",
-    "TRP": "W",
-    "TYR": "Y",
-    "VAL": "V",
-}
 
 # chem_comp type for standard residues
 _CHEM_COMP_TYPE: dict[str, str] = {
@@ -83,7 +60,7 @@ _CHEM_COMP_TYPE: dict[str, str] = {
 }
 
 
-def _asym_id_to_chain_name(asym_id: int) -> str:
+def asym_id_to_chain_name(asym_id: int) -> str:
     """Map 0-based asym_id to a PDB chain name (A, B, ..., Z, AA, ...)."""
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     n = len(letters)
@@ -95,19 +72,6 @@ def _asym_id_to_chain_name(asym_id: int) -> str:
 def _decode_atom_name(chars: torch.Tensor) -> str:
     """Decode 4-int atom name tensor (ord(c)-32 encoding) to string."""
     return "".join(chr(int(c) + 32) for c in chars).strip()
-
-
-def _compute_plddt_per_atom(
-    plddt_raw: torch.Tensor,
-    N: int,
-    M: int,
-    num_bins: int = 50,
-) -> torch.Tensor:
-    """Compute per-atom pLDDT scores in [0, 100]. Returns [N, M] float tensor."""
-    logits = plddt_raw.reshape(N, M, num_bins)
-    probs = logits.softmax(dim=-1)
-    bin_centers = (torch.arange(num_bins, device=probs.device).float() + 0.5) / num_bins
-    return (probs * bin_centers).sum(-1) * 100.0
 
 
 def _cif_quote(value: str) -> str:
@@ -266,13 +230,9 @@ def save_mmcif(
     # Per-atom pLDDT in [0, 100]
     if output.plddt is not None:
         plddt_cpu = output.plddt.cpu()
-        if plddt_cpu.dim() == 3:
-            plddt_per_sample = torch.stack(
-                [_compute_plddt_per_atom(plddt_cpu[s], N, M, num_plddt_bins) for s in range(num_samples)]
-            )
-        else:
-            plddt_one = _compute_plddt_per_atom(plddt_cpu, N, M, num_plddt_bins)
-            plddt_per_sample = plddt_one.unsqueeze(0).expand(num_samples, -1, -1)
+        if plddt_cpu.dim() == 2:
+            plddt_cpu = plddt_cpu.unsqueeze(0)
+        plddt_per_sample, _ = compute_plddt(plddt_cpu, ref_mask.float(), num_plddt_bins)
     else:
         plddt_per_sample = torch.zeros(num_samples, N, M)
 
@@ -289,7 +249,7 @@ def save_mmcif(
         model = gemmi.Model(str(sample_idx + 1))
 
         for asym in unique_asym_ids:
-            chain_name = _asym_id_to_chain_name(int(asym))
+            chain_name = asym_id_to_chain_name(int(asym))
             chain = gemmi.Chain(chain_name)
 
             token_indices = (asym_id == asym).nonzero(as_tuple=True)[0]
@@ -374,7 +334,7 @@ def save_mmcif(
     # Build per-residue pLDDT for metric table (average over atoms, first sample).
     plddt_per_residue: dict[tuple[str, str, int], float] = {}
     for asym in unique_asym_ids:
-        chain_name = _asym_id_to_chain_name(int(asym))
+        chain_name = asym_id_to_chain_name(int(asym))
         token_indices = (asym_id == asym).nonzero(as_tuple=True)[0]
         for token_i in token_indices.tolist():
             mask_i = ref_mask[token_i]  # [M]
@@ -401,7 +361,7 @@ def save_mmcif(
         if entity.entity_type == gemmi.EntityType.Polymer and entity.subchains:
             chain_name = entity.subchains[0]
             seq = chain_sequences.get(chain_name, [])
-            one_letter = "".join(_THREE_TO_ONE.get(r, "X") for r in seq)
+            one_letter = "".join(THREE_LETTER_TO_ONE.get(r, "X") for r in seq)
             entity_sequences[entity.name] = one_letter
     base_text = _fix_seq_one_letter_code(base_text, entity_sequences)
 

@@ -29,8 +29,6 @@ from deepfold3.model.primitives import LinearNoBias
 _RAW_TARGET_FEAT_DIM = 63
 # aatype token classes (31 polymer types including unknown and gap)
 _AATYPE_NUM_CLASSES = 31
-# MSA feat dim: one_hot(32) + has_deletion(1) + deletion_value(1)
-_MSA_FEAT_DIM = 34
 _MSA_NUM_CLASSES = 32  # POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP + 1 (gap)
 
 
@@ -107,8 +105,8 @@ class DeepFold3(nn.Module):
             K=dc.atom_cross_att.keys_subset_size,
         )
 
-        # Evoformer trunk
-        self.evoformer = Evoformer(ec, pfc)
+        # Evoformer trunk (with optional template embedding)
+        self.evoformer = Evoformer(ec, pfc, template_cfg=cfg.template)
 
         # Diffusion head
         # rel_feat_dim = rel_pos(66) + rel_token(66) + entity_same(1) + rel_chain(6) = 139
@@ -123,30 +121,16 @@ class DeepFold3(nn.Module):
         # Distogram head
         self.distogram_head = DistogramHead(ec.pair_channel)
 
-    def forward(
+    def _run_evoformer(
         self,
         features: dict[str, torch.Tensor],
-        seed: int = 0,
-        num_recycles: int | None = None,
-        num_samples: int | None = None,
-    ) -> DeepFold3Output:
-        """Run full forward pass.
+        num_recycles: int,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run feature building + evoformer trunk with recycling.
 
-        Args:
-            features: dict from featurizer with keys:
-                token_index, residue_index, asym_id, entity_id, sym_id,
-                mol_type, res_type, ref_pos, ref_mask, ref_element, ref_charge,
-                ref_atom_name_chars, atom_to_token, token_to_rep_atom,
-                msa, msa_mask, profile, deletion_mean, pair_mask, seq_mask
-            seed: random seed for diffusion sampling
-            num_recycles: override default number of recycles
-            num_samples: override default number of diffusion samples
+        Returns:
+            (embeddings, rel_feat, target_feat, seq_mask, pair_mask)
         """
-        if num_recycles is None:
-            num_recycles = self.cfg.num_recycles
-        if num_samples is not None:
-            self.diffusion_head.cfg.num_samples = num_samples
-
         device = features["res_type"].device
         N = features["res_type"].shape[0]
 
@@ -189,6 +173,15 @@ class DeepFold3(nn.Module):
         prev_pair = torch.zeros(N, N, c_pair, device=device)
         prev_single = torch.zeros(N, c_single, device=device)
 
+        # Extract template features (optional — T=0 tensors when no templates)
+        template_kwargs: dict[str, torch.Tensor] = {}
+        if "template_aatype" in features:
+            template_kwargs["template_aatype"] = features["template_aatype"]
+            template_kwargs["template_pseudo_beta"] = features["template_pseudo_beta"].float()
+            template_kwargs["template_pseudo_beta_mask"] = features["template_pseudo_beta_mask"].float()
+            template_kwargs["template_backbone_frame"] = features["template_backbone_frame"].float()
+            template_kwargs["template_backbone_mask"] = features["template_backbone_mask"].float()
+
         # Recycle
         for recycle_idx in range(num_recycles + 1):
             embeddings = self.evoformer(
@@ -200,48 +193,84 @@ class DeepFold3(nn.Module):
                 msa_mask=msa_mask,
                 prev_pair=prev_pair,
                 prev_single=prev_single,
+                **template_kwargs,
             )
             if recycle_idx < num_recycles:
                 prev_pair = embeddings["pair"].detach()
                 prev_single = embeddings["single"].detach()
 
-        # Diffusion sampling
-        generator = torch.Generator(device=device).manual_seed(seed)
+        return embeddings, rel_feat, target_feat, seq_mask, pair_mask
 
-        sample_result = self.diffusion_head.sample(
-            embeddings=embeddings,
-            ref_pos=features["ref_pos"],
-            ref_mask=features["ref_mask"].float(),
-            ref_element=features["ref_element"],
-            ref_charge=features["ref_charge"].float(),
-            ref_atom_name_chars=features["ref_atom_name_chars"],
-            seq_mask=seq_mask,
-            rel_feat=rel_feat,
-            generator=generator,
-        )
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        seed: int = 0,
+        num_recycles: int | None = None,
+        num_samples: int | None = None,
+    ) -> DeepFold3Output:
+        """Run full forward pass.
 
-        # Confidence estimates (per-sample, matching AF3)
-        conf_out = self.confidence_head(
-            pair=embeddings["pair"],
-            single=embeddings["single"],
-            pair_mask=pair_mask,
-            seq_mask=seq_mask,
-            target_feat=target_feat,
-            atom_positions=sample_result["atom_positions"],
-            rep_atom_index=features.get("token_to_rep_atom"),
-        )
+        Args:
+            features: dict from featurizer with keys:
+                token_index, residue_index, asym_id, entity_id, sym_id,
+                mol_type, res_type, ref_pos, ref_mask, ref_element, ref_charge,
+                ref_atom_name_chars, atom_to_token, token_to_rep_atom,
+                msa, msa_mask, profile, deletion_mean, pair_mask, seq_mask
+            seed: random seed for diffusion sampling
+            num_recycles: override default number of recycles
+            num_samples: override default number of diffusion samples
+        """
+        if num_recycles is None:
+            num_recycles = self.cfg.num_recycles
 
-        disto_logits = self.distogram_head(embeddings["pair"])
+        # Temporarily override num_samples if provided, restoring after
+        orig_num_samples = self.diffusion_head.cfg.num_samples
+        if num_samples is not None:
+            self.diffusion_head.cfg.num_samples = num_samples
 
-        return DeepFold3Output(
-            atom_positions=sample_result["atom_positions"],
-            atom_mask=sample_result["mask"],
-            plddt=conf_out["plddt_logits"],
-            pae=conf_out["pae_logits"],
-            pde=conf_out["pde_logits"],
-            exp_resolved=conf_out["exp_resolved_logits"],
-            distogram=disto_logits,
-        )
+        try:
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = self._run_evoformer(features, num_recycles)
+
+            # Diffusion sampling
+            device = features["res_type"].device
+            generator = torch.Generator(device=device).manual_seed(seed)
+
+            sample_result = self.diffusion_head.sample(
+                embeddings=embeddings,
+                ref_pos=features["ref_pos"],
+                ref_mask=features["ref_mask"].float(),
+                ref_element=features["ref_element"],
+                ref_charge=features["ref_charge"].float(),
+                ref_atom_name_chars=features["ref_atom_name_chars"],
+                seq_mask=seq_mask,
+                rel_feat=rel_feat,
+                generator=generator,
+            )
+
+            # Confidence estimates (per-sample, matching AF3)
+            conf_out = self.confidence_head(
+                pair=embeddings["pair"],
+                single=embeddings["single"],
+                pair_mask=pair_mask,
+                seq_mask=seq_mask,
+                target_feat=target_feat,
+                atom_positions=sample_result["atom_positions"],
+                rep_atom_index=features.get("token_to_rep_atom"),
+            )
+
+            disto_logits = self.distogram_head(embeddings["pair"])
+
+            return DeepFold3Output(
+                atom_positions=sample_result["atom_positions"],
+                atom_mask=sample_result["mask"],
+                plddt=conf_out["plddt_logits"],
+                pae=conf_out["pae_logits"],
+                pde=conf_out["pde_logits"],
+                exp_resolved=conf_out["exp_resolved_logits"],
+                distogram=disto_logits,
+            )
+        finally:
+            self.diffusion_head.cfg.num_samples = orig_num_samples
 
     def _build_raw_target_feat(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
         """Build raw token feature vector [N, 63].
@@ -315,52 +344,5 @@ class DeepFold3(nn.Module):
         if num_recycles is None:
             num_recycles = self.cfg.num_recycles
 
-        device = features["res_type"].device
-        N = features["res_type"].shape[0]
-
-        rel_feat = create_relative_encoding(
-            token_index=features.get("token_index", torch.arange(N, dtype=torch.long, device=device)),
-            residue_index=features["residue_index"],
-            asym_id=features["asym_id"],
-            entity_id=features["entity_id"],
-            sym_id=features.get("sym_id", torch.zeros(N, dtype=torch.long, device=device)),
-            max_relative_idx=self.cfg.evoformer.max_relative_idx,
-            max_relative_chain=self.cfg.evoformer.max_relative_chain,
-        )
-
-        raw_feat = self._build_raw_target_feat(features)
-        evo_cond_act = self.evo_cond_encoder(
-            ref_pos=features["ref_pos"],
-            ref_mask=features["ref_mask"].float(),
-            ref_element=features["ref_element"],
-            ref_charge=features["ref_charge"].float(),
-            ref_atom_name_chars=features["ref_atom_name_chars"],
-        )
-        target_feat = torch.cat([raw_feat, evo_cond_act], dim=-1)
-        msa_feat = self._build_msa_feat(features)
-
-        seq_mask = features["seq_mask"].float()
-        pair_mask = features["pair_mask"].float()
-        msa_mask = features["msa_mask"].float()
-
-        c_pair = self.cfg.evoformer.pair_channel
-        c_single = self.cfg.evoformer.seq_channel
-        prev_pair = torch.zeros(N, N, c_pair, device=device)
-        prev_single = torch.zeros(N, c_single, device=device)
-
-        for recycle_idx in range(num_recycles + 1):
-            embeddings = self.evoformer(
-                target_feat=target_feat,
-                msa_feat=msa_feat,
-                rel_feat=rel_feat,
-                pair_mask=pair_mask,
-                seq_mask=seq_mask,
-                msa_mask=msa_mask,
-                prev_pair=prev_pair,
-                prev_single=prev_single,
-            )
-            if recycle_idx < num_recycles:
-                prev_pair = embeddings["pair"].detach()
-                prev_single = embeddings["single"].detach()
-
+        embeddings, _, _, _, _ = self._run_evoformer(features, num_recycles)
         return self.distogram_head(embeddings["pair"])  # [N, N, 64]

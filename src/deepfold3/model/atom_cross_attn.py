@@ -721,10 +721,11 @@ class AtomEncoder(nn.Module):
         atom_pair = self.per_atom.apply_pair_mlp(atom_pair)
 
         # --- queries_act: start from queries_single, add projected noisy positions ---
-        queries_act = queries_single.clone()
         if noisy_atom_pos is not None:
             noisy_q = _gather_to_subsets(noisy_atom_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, 3]
-            queries_act = queries_act + self._pos_proj(noisy_q) * queries_mask.unsqueeze(-1)
+            queries_act = queries_single + self._pos_proj(noisy_q) * queries_mask.unsqueeze(-1)
+        else:
+            queries_act = queries_single
 
         # --- Cross-attention transformer ---
         queries_act = self.atom_transformer(

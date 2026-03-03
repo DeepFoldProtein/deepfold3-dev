@@ -38,7 +38,7 @@ def _sanitize_for_json(obj: object) -> object:
     return obj
 
 
-def _pae_bin_centers(
+def _error_bin_centers(
     max_error_bin: float = _DEFAULT_CFG.max_error_bin, num_bins: int = _DEFAULT_CFG.num_distogram_bins
 ) -> torch.Tensor:
     """Compute PAE/PDE bin centers following AF3 convention.
@@ -101,7 +101,7 @@ def compute_pae(
     Returns:
         pae: [S, N, N] expected error in Angstroms.
     """
-    centers = _pae_bin_centers(max_error_bin, num_bins).to(pae_logits.device)
+    centers = _error_bin_centers(max_error_bin, num_bins).to(pae_logits.device)
     probs = pae_logits.softmax(dim=-1)
     pae = (probs * centers).sum(-1)  # [S, N, N]
     return pae * pair_mask.unsqueeze(0)
@@ -123,7 +123,7 @@ def compute_pde(
         pde: [S, N, N] expected distance error in Angstroms.
         average_pde: [S] global average PDE (scalar per sample).
     """
-    centers = _pae_bin_centers(max_error_bin, num_bins).to(pde_logits.device)
+    centers = _error_bin_centers(max_error_bin, num_bins).to(pde_logits.device)
     probs = pde_logits.softmax(dim=-1)
     pde = (probs * centers).sum(-1)  # [S, N, N]
     pde = pde * pair_mask.unsqueeze(0)
@@ -170,7 +170,7 @@ def _compute_tm_adjusted_pae(
     Returns:
         [N, N] TM-adjusted PAE values.
     """
-    centers = _pae_bin_centers(max_error_bin, num_bins).to(pae_logits.device)
+    centers = _error_bin_centers(max_error_bin, num_bins).to(pae_logits.device)
 
     # d0 from TM-score formula: Yang & Skolnick 2004
     clipped_num_res = max(num_tokens, 19)
@@ -253,7 +253,7 @@ def compute_iptm(
 
 def compute_ranking_score(ptm: float, iptm: float) -> float:
     """Compute AF3 ranking score: 0.8*ipTM + 0.2*pTM (or just pTM if single-chain)."""
-    if iptm != iptm:  # NaN check
+    if math.isnan(iptm):
         return ptm
     return 0.8 * iptm + 0.2 * ptm
 
@@ -292,6 +292,7 @@ def save_confidences_json(
     features: dict[str, torch.Tensor],
     sample_idx: int = 0,
     cfg: ConfidenceConfig | None = None,
+    seed: int | None = None,
 ) -> dict:
     """Compute all confidence metrics and save as JSON.
 
@@ -301,6 +302,7 @@ def save_confidences_json(
         features: Feature dict from featurizer.
         sample_idx: Which diffusion sample to export (default 0).
         cfg: ConfidenceConfig (uses defaults if None).
+        seed: Random seed used for diffusion sampling (saved in summary).
 
     Returns:
         The summary dict (subset of the full JSON).
@@ -324,10 +326,10 @@ def save_confidences_json(
     result: dict = {}
 
     # Chain IDs per token
-    from deepfold3.io.mmcif import _asym_id_to_chain_name
+    from deepfold3.io.mmcif import asym_id_to_chain_name
 
     asym_cpu = asym_id.cpu()
-    token_chain_ids = [_asym_id_to_chain_name(int(a)) for a in asym_cpu]
+    token_chain_ids = [asym_id_to_chain_name(int(a)) for a in asym_cpu]
     result["token_chain_ids"] = token_chain_ids
     result["token_res_ids"] = residue_index.cpu().tolist()
 
@@ -405,12 +407,13 @@ def save_confidences_json(
 
     summary = {
         "ptm": round(ptm, 4),
-        "iptm": round(iptm, 4) if iptm == iptm else None,
+        "iptm": round(iptm, 4) if not math.isnan(iptm) else None,
         "ranking_score": round(ranking_score, 4),
         "mean_plddt": round(mean_plddt, 2),
         "average_pde": round(average_pde, 2),
         "num_tokens": N,
         "num_chains": num_chains,
+        "seed": seed,
     }
     result["summary"] = summary
 

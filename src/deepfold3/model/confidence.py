@@ -126,7 +126,6 @@ class ConfidenceHead(nn.Module):
 
     def _embed_features(
         self,
-        pair_act: torch.Tensor,  # [N, N, c_pair]
         target_feat: torch.Tensor,  # [N, target_feat_dim]
         positions: torch.Tensor,  # [N, 3] representative atom positions
         pair_mask: torch.Tensor,  # [N, N]
@@ -186,7 +185,7 @@ class ConfidenceHead(nn.Module):
             single_act = single.clone()
 
             # Add position-dependent features
-            pair_act = pair_act + self._embed_features(pair_act, target_feat, positions, pair_mask)
+            pair_act = pair_act + self._embed_features(target_feat, positions, pair_mask)
 
             # Run confidence PairFormer
             for layer in self.layers:

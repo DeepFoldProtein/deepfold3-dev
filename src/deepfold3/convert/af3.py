@@ -67,6 +67,18 @@ def _linear(params: dict, pt_prefix: str, transposed: bool = False):
         yield f"{pt_prefix}.bias", _b(params["bias"])
 
 
+def _linear_scalar(params: dict, pt_prefix: str):
+    """Yield (key, tensor) for a Haiku Linear with num_input_dims=0.
+
+    AF3 stores these weights as shape (num_output,) — a point-wise scale.
+    We map to a LinearNoBias(1, num_output) with weight [num_output, 1].
+    """
+    if "weights" in params:
+        w = params["weights"]  # shape (num_output,)
+        t = torch.from_numpy(w.reshape(-1, 1).copy()).float()  # [num_output, 1]
+        yield f"{pt_prefix}.weight", t
+
+
 def _layernorm(params: dict, pt_prefix: str):
     """Yield (key, tensor) for a Haiku LayerNorm (scale=weight, offset=bias)."""
     if "scale" in params:
@@ -750,11 +762,108 @@ def haiku_to_torch(
     ):
         put(k, v)
 
-    # Report unmapped scopes (skip template/meta)
-    skip_prefixes = (
-        "__meta__",
-        "diffuser/evoformer/template_embedding/",
-    )
+    # Template embedding
+    # Haiku scope: diffuser/evoformer/template_embedding/
+    #   output_linear                         → evoformer.template_embedding.output_proj
+    #   single_template_embedding/
+    #     query_embedding_norm                → ...single_template_emb.query_norm
+    #     template_pair_embedding_0..8        → ...single_template_emb.embed_{dgram,...,query}
+    #     output_layer_norm                   → ...single_template_emb.output_norm
+    #     __layer_stack_no_per_layer/template_embedding_iteration/
+    #       (2-layer PairFormer, no single track)
+    te = "diffuser/evoformer/template_embedding/"
+    ste = te + "single_template_embedding/"
+    te_pt = "evoformer.template_embedding"
+    ste_pt = f"{te_pt}.single_template_emb"
+
+    # Output projection (TemplateEmbedding.output_proj)
+    emit(_linear(get(te + "output_linear"), f"{te_pt}.output_proj"))
+
+    # SingleTemplateEmbedding: query_norm, 9 embedding projections, output_norm
+    emit(_layernorm(get(ste + "query_embedding_norm"), f"{ste_pt}.query_norm"))
+
+    # 9 template pair embedding projections.
+    # Indices 1, 4, 5, 6, 7 use num_input_dims=0 in AF3 (scalar inputs:
+    # pseudo_beta_mask, unit_vec x/y/z, backbone_mask). Their Haiku weights
+    # have shape (num_channels,) instead of (in_features, num_channels).
+    embed_names = [
+        ("embed_dgram", False),  # 0: [N,N,39] → 64, num_input_dims=1
+        ("embed_pseudo_beta", True),  # 1: [N,N] scalar → 64, num_input_dims=0
+        ("embed_aatype_row", False),  # 2: [1,N,31] → 64, num_input_dims=1
+        ("embed_aatype_col", False),  # 3: [N,1,31] → 64, num_input_dims=1
+        ("embed_unit_vec_x", True),  # 4: [N,N] scalar → 64, num_input_dims=0
+        ("embed_unit_vec_y", True),  # 5: [N,N] scalar → 64, num_input_dims=0
+        ("embed_unit_vec_z", True),  # 6: [N,N] scalar → 64, num_input_dims=0
+        ("embed_backbone_mask", True),  # 7: [N,N] scalar → 64, num_input_dims=0
+        ("embed_query", False),  # 8: [N,N,128] → 64, num_input_dims=1
+    ]
+    for i, (pt_name, is_scalar) in enumerate(embed_names):
+        if is_scalar:
+            emit(_linear_scalar(get(ste + f"template_pair_embedding_{i}"), f"{ste_pt}.{pt_name}"))
+        else:
+            emit(_linear(get(ste + f"template_pair_embedding_{i}"), f"{ste_pt}.{pt_name}"))
+
+    emit(_layernorm(get(ste + "output_layer_norm"), f"{ste_pt}.output_norm"))
+
+    # Template PairFormer stack (2 layers, stacked via layer_stack_no_per_layer)
+    te_pf_base = ste + "__layer_stack_no_per_layer/template_embedding_iteration/"
+    # Detect number of layers from any stacked param
+    te_pf_test_scope = te_pf_base + "triangle_multiplication_outgoing/center_norm"
+    n_te_pf = num_layers(te_pf_test_scope)
+    for i in range(n_te_pf):
+
+        def sl_te(sub, _i=i):
+            return layer_slice(te_pf_base + sub, _i)
+
+        lp = f"{ste_pt}.pairformer.{i}"
+
+        for h_name, pt_name in [
+            ("triangle_multiplication_outgoing", "tri_mul_out"),
+            ("triangle_multiplication_incoming", "tri_mul_in"),
+        ]:
+            emit(
+                _trimul(
+                    {
+                        "left_norm_input": sl_te(f"{h_name}/left_norm_input"),
+                        "projection": sl_te(f"{h_name}/projection"),
+                        "gate": sl_te(f"{h_name}/gate"),
+                        "center_norm": sl_te(f"{h_name}/center_norm"),
+                        "output_projection": sl_te(f"{h_name}/output_projection"),
+                        "gating_linear": sl_te(f"{h_name}/gating_linear"),
+                    },
+                    f"{lp}.{pt_name}",
+                )
+            )
+
+        for h_name, pt_name in [("pair_attention1", "pair_attn_row"), ("pair_attention2", "pair_attn_col")]:
+            emit(
+                _grid_attn(
+                    {
+                        "act_norm": sl_te(f"{h_name}/act_norm"),
+                        "pair_bias_projection": sl_te(f"{h_name}/pair_bias_projection"),
+                        "q_projection": sl_te(f"{h_name}/q_projection"),
+                        "k_projection": sl_te(f"{h_name}/k_projection"),
+                        "v_projection": sl_te(f"{h_name}/v_projection"),
+                        "gating_query": sl_te(f"{h_name}/gating_query"),
+                        "output_projection": sl_te(f"{h_name}/output_projection"),
+                    },
+                    f"{lp}.{pt_name}",
+                )
+            )
+
+        emit(
+            _transition(
+                {
+                    "input_layer_norm": sl_te("pair_transition/input_layer_norm"),
+                    "transition1": sl_te("pair_transition/transition1"),
+                    "transition2": sl_te("pair_transition/transition2"),
+                },
+                f"{lp}.pair_transition",
+            )
+        )
+
+    # Report unmapped scopes
+    skip_prefixes = ("__meta__",)
     for scope in sorted(af3_params.keys()):
         if scope in mapped_scopes:
             continue

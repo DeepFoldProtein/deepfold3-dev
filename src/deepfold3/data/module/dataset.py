@@ -7,6 +7,7 @@ InferenceInput:  builds features directly from a sequence string (no mmCIF neede
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -28,19 +29,21 @@ from deepfold3.data.types import (
     Structure,
 )
 
+if TYPE_CHECKING:
+    from deepfold3.data.parse.templates import TemplateFeatures
+
 
 class TrainingDataset(torch.utils.data.Dataset):
     """PyTorch dataset for DeepFold3 training.
 
-    Loads Record → Structure NPZ + MSA NPZ → tokenize → crop → featurize.
+    Loads Record -> Structure NPZ + MSA NPZ -> tokenize -> crop -> featurize.
 
-    Parameters
-    ----------
-    records :       List of Record objects
-    data_dir :      Root directory containing structures/ and msa/ subdirectories
-    max_tokens :    Maximum tokens per sample
-    max_atoms :     Maximum atoms per sample
-    max_msa_seqs :  Maximum MSA sequences
+    Args:
+        records: List of Record objects.
+        data_dir: Root directory containing structures/ and msa/ subdirectories.
+        max_tokens: Maximum tokens per sample.
+        max_atoms: Maximum atoms per sample.
+        max_msa_seqs: Maximum MSA sequences.
     """
 
     def __init__(
@@ -78,7 +81,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         inp = Input(structure=structure, msa=msa)
 
-        # Tokenize → crop → featurize
+        # Tokenize -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
         feats = self.featurizer.process(tokenized, training=True, random_rot=True)
@@ -86,11 +89,23 @@ class TrainingDataset(torch.utils.data.Dataset):
         return feats
 
 
-class InferenceInput:
-    """Build model-ready features from a raw sequence string.
+def _tokenize_and_featurize(
+    inp: Input,
+    max_msa_seqs: int = 2048,
+    templates: list[TemplateFeatures] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Shared tokenize -> featurize pipeline for inference inputs."""
+    tokenizer = Tokenizer()
+    featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+    tokenized = tokenizer.tokenize(inp)
+    return featurizer.process(tokenized, training=False, random_rot=False, templates=templates)
 
-    No mmCIF or MSA files required — uses CCD ideal coordinates and a
-    single-sequence "MSA" (just the query).
+
+class InferenceInput:
+    """Build model-ready features from a raw sequence string, A3M, or JSON.
+
+    Uses CCD ideal coordinates for structure building.  MSA is either
+    parsed from an A3M file or synthesized as a single-sequence placeholder.
     """
 
     @staticmethod
@@ -98,79 +113,128 @@ class InferenceInput:
         a3m_text: str,
         mol_type: str = "protein",
         max_msa_seqs: int = 2048,
+        templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features from an A3M-format MSA string.
 
         The query sequence (first record) determines the structure;
         all sequences contribute to the MSA features.
 
-        Parameters
-        ----------
-        a3m_text :    Full A3M text (headers + sequences)
-        mol_type :    'protein', 'rna', or 'dna'
-        max_msa_seqs: maximum MSA sequences to keep
+        Args:
+            a3m_text: Full A3M text (headers + sequences).
+            mol_type: 'protein', 'rna', or 'dna'.
+            max_msa_seqs: Maximum MSA sequences to keep.
+            templates: Optional list of TemplateFeatures for template embedding.
         """
         from deepfold3.data.parse.a3m import parse_a3m
 
         mt = const.MOL_TYPE_IDS.get(mol_type.upper(), const.MOL_PROTEIN)
 
-        # Parse MSA — query sequence is the first record
         msa_obj = parse_a3m(a3m_text, mt)
         if msa_obj.sequences.shape[0] == 0:
             raise ValueError("A3M file contains no sequences")
 
-        # Extract query sequence from MSA row 0 (MSA indices → 1-letter)
-        query_encoded = msa_obj.sequences[0]  # [N] int8 MSA indices
-        query_seq = _msa_indices_to_sequence(query_encoded, mt)
-
-        # Build structure from query sequence
+        query_seq = _msa_indices_to_sequence(msa_obj.sequences[0], mt)
         structure = _sequence_to_structure(query_seq, mt)
-
         inp = Input(structure=structure, msa={0: msa_obj})
-
-        tokenizer = Tokenizer()
-        featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
-
-        tokenized = tokenizer.tokenize(inp)
-        feats = featurizer.process(tokenized, training=False, random_rot=False)
-
-        return feats
+        return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=templates)
 
     @staticmethod
     def from_sequence(
         sequence: str,
         mol_type: str = "protein",
         max_msa_seqs: int = 1,
+        templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features for a single sequence.
 
-        Parameters
-        ----------
-        sequence :    1-letter sequence string (protein) or RNA/DNA sequence
-        mol_type :    'protein', 'rna', or 'dna'
-        max_msa_seqs: maximum MSA sequences (default 1 = single sequence)
+        Args:
+            sequence: 1-letter sequence string (protein) or RNA/DNA sequence.
+            mol_type: 'protein', 'rna', or 'dna'.
+            max_msa_seqs: Maximum MSA sequences (default 1 = single sequence).
+            templates: Optional list of TemplateFeatures for template embedding.
 
-        Returns
-        -------
-        dict[str, torch.Tensor] ready for model.forward()
+        Returns:
+            dict[str, torch.Tensor] ready for model.forward().
         """
         mt = const.MOL_TYPE_IDS.get(mol_type.upper(), const.MOL_PROTEIN)
-
-        # Build Structure from sequence
         structure = _sequence_to_structure(sequence, mt)
-
-        # Build single-sequence MSA
         msa = _sequence_to_msa(sequence, mt)
-
         inp = Input(structure=structure, msa={0: msa})
+        return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=templates)
 
-        tokenizer = Tokenizer()
-        featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+    @staticmethod
+    def from_json(
+        json_path: str | Path,
+        job_index: int = 0,
+        max_msa_seqs: int = 2048,
+        max_templates: int = 4,
+        template_cache_dir: str | Path | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build features from a Protenix-format JSON input file.
 
-        tokenized = tokenizer.tokenize(inp)
-        feats = featurizer.process(tokenized, training=False, random_rot=False)
+        Supports single-chain protein with optional MSA and HHR template files.
 
-        return feats
+        Args:
+            json_path: Path to the JSON input file.
+            job_index: Which job entry to use (default 0).
+            max_msa_seqs: Maximum MSA sequences to keep.
+            max_templates: Maximum number of templates to extract.
+            template_cache_dir: Directory to cache downloaded template mmCIF files.
+
+        Returns:
+            dict[str, torch.Tensor] ready for model.forward().
+        """
+        from deepfold3.data.parse.a3m import parse_a3m
+        from deepfold3.data.parse.json_input import parse_json_input
+
+        json_path = Path(json_path)
+        jobs = parse_json_input(json_path)
+
+        if job_index >= len(jobs):
+            raise IndexError(f"Job index {job_index} out of range (file has {len(jobs)} jobs)")
+
+        job = jobs[job_index]
+
+        if len(job.protein_chains) != 1:
+            raise ValueError(
+                f"Only single-chain protein is supported, got {len(job.protein_chains)} chains in job {job.name!r}"
+            )
+
+        chain = job.protein_chains[0]
+        mt = const.MOL_PROTEIN
+
+        # Load MSA: prefer unpaired, fallback to paired, fallback to single-sequence
+        msa_obj = None
+        for msa_path in [chain.unpaired_msa_path, chain.paired_msa_path]:
+            if msa_path is not None and msa_path.exists():
+                a3m_text = msa_path.read_text()
+                msa_obj = parse_a3m(a3m_text, mt)
+                if msa_obj.sequences.shape[0] > 0:
+                    break
+                msa_obj = None
+
+        if msa_obj is None:
+            msa_obj = _sequence_to_msa(chain.sequence, mt)
+
+        # Load templates from HHR if available
+        template_feats = None
+        if chain.templates_path is not None and chain.templates_path.exists():
+            if chain.templates_path.suffix.lower() == ".hhr":
+                from deepfold3.data.parse.templates import parse_hhr_templates
+
+                template_feats = parse_hhr_templates(
+                    chain.templates_path,
+                    query_length=len(chain.sequence),
+                    max_templates=max_templates,
+                    cache_dir=template_cache_dir,
+                )
+                if not template_feats:
+                    template_feats = None
+
+        structure = _sequence_to_structure(chain.sequence, mt)
+        inp = Input(structure=structure, msa={0: msa_obj})
+        return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=template_feats)
 
 
 def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
