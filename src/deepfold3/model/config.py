@@ -1,0 +1,119 @@
+"""Model configuration dataclasses for DeepFold3."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AtomTransformerConfig:
+    num_blocks: int = 3
+    num_intermediate_factor: int = 2
+    num_head: int = 4
+    key_dim: int = 128
+    value_dim: int = 128
+
+
+@dataclass
+class AtomCrossAttConfig:
+    per_token_channels: int = 768  # diffusion transformer channel dim
+    per_atom_channels: int = 128
+    per_atom_pair_channels: int = 16
+    atom_transformer: AtomTransformerConfig = field(default_factory=AtomTransformerConfig)
+    queries_subset_size: int = 32  # Q: atoms per query subset (non-overlapping)
+    keys_subset_size: int = 128  # K: atoms per key window (overlapping, centered on Q)
+
+
+@dataclass
+class MSAAttentionConfig:
+    num_head: int = 8
+
+
+@dataclass
+class GridAttentionConfig:
+    num_head: int = 4
+
+
+@dataclass
+class TransitionConfig:
+    num_intermediate_factor: int = 4
+
+
+@dataclass
+class TriMulConfig:
+    equation: str = "ikc,jkc->ijc"  # outgoing
+
+
+@dataclass
+class EvoformerConfig:
+    num_layer: int = 4
+    msa_channel: int = 64
+    seq_channel: int = 384
+    pair_channel: int = 128
+    num_msa: int = 1024
+    max_relative_idx: int = 32
+    max_relative_chain: int = 2
+    msa_attention: MSAAttentionConfig = field(default_factory=MSAAttentionConfig)
+    outer_product_num_channel: int = 32
+    pair_attention: GridAttentionConfig = field(default_factory=GridAttentionConfig)
+
+
+@dataclass
+class PairFormerConfig:
+    num_layer: int = 48
+    pair_channel: int = 128
+    seq_channel: int = 384
+    pair_attention: GridAttentionConfig = field(default_factory=GridAttentionConfig)
+    single_attention_num_head: int = 16
+    single_key_dim: int = 384
+    single_value_dim: int = 384
+
+
+@dataclass
+class DiffusionTransformerConfig:
+    num_blocks: int = 24
+    num_head: int = 16
+    key_dim: int | None = None  # None → use num_channels (c_diff = 768)
+    value_dim: int | None = None  # None → use num_channels
+    num_intermediate_factor: int = 2
+    super_block_size: int = 4
+
+
+@dataclass
+class DiffusionConfig:
+    conditioning_pair_channel: int = 128
+    conditioning_seq_channel: int = 384
+    # Sampling
+    steps: int = 200
+    num_samples: int = 5
+    gamma_0: float = 0.8
+    gamma_min: float = 1.0
+    noise_scale: float = 1.003
+    step_scale: float = 1.5
+    # Noise schedule
+    sigma_data: float = 16.0
+    smin: float = 0.0004
+    smax: float = 160.0
+    noise_p: float = 7.0
+    transformer: DiffusionTransformerConfig = field(default_factory=DiffusionTransformerConfig)
+    atom_cross_att: AtomCrossAttConfig = field(default_factory=AtomCrossAttConfig)
+
+
+@dataclass
+class ConfidenceConfig:
+    num_layer: int = 4
+    pair_channel: int = 128
+    seq_channel: int = 384
+    num_plddt_bins: int = 50
+    num_distogram_bins: int = 64
+    max_error_bin: float = 31.0
+    max_atoms_per_token: int = 24  # AF3 dense atom representation max
+
+
+@dataclass
+class ModelConfig:
+    evoformer: EvoformerConfig = field(default_factory=EvoformerConfig)
+    pairformer: PairFormerConfig = field(default_factory=PairFormerConfig)
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    num_recycles: int = 10

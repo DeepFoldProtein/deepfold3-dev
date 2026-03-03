@@ -1,0 +1,254 @@
+"""Evoformer trunk: MSA stack + PairFormer stack.
+
+Haiku scope hierarchy (separator '~/'):
+    diffuser~/evoformer~/
+        __layer_stack_no_per_layer/msa_stack/layer_{i}/
+            msa_attention1~/        → row_attn
+            outer_product_mean~/    → outer_product
+            triangle_multiplication_outgoing~/  → tri_mul_out
+            triangle_multiplication_incoming~/  → tri_mul_in
+            pair_attention1~/       → pair_attn_row
+            pair_attention2~/       → pair_attn_col
+            pair_transition~/       → pair_transition
+            msa_transition~/        → msa_transition
+        __layer_stack_no_per_layer_1/trunk_pairformer/layer_{i}/
+            triangle_multiplication_outgoing~/  → tri_mul_out
+            triangle_multiplication_incoming~/  → tri_mul_in
+            pair_attention1~/       → pair_attn_row
+            pair_attention2~/       → pair_attn_col
+            pair_transition~/       → pair_transition
+            single_pair_logits_norm~/           → single_to_pair_norm (on pair act)
+            single_pair_logits_projection~/     → single_to_pair
+            single_attention_~/                 → single_attn
+            single_transition~/                 → single_transition
+
+Key dimension facts from AF3 weight file:
+    left_single / right_single / single_activations / extra_msa_target_feat:
+        input dim = 447  (= 63 raw target_feat + 384 evoformer_conditioning token_act)
+    msa_activations:
+        input dim = 34   (= 32 msa_1hot + 1 has_deletion + 1 deletion_value)
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
+from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, TransitionBlock
+
+# Full target_feat dimension fed into the Evoformer (raw_feat + evo_cond_token_act)
+_TARGET_FEAT_DIM = 447
+# MSA feature dimension: one_hot(32) + has_deletion(1) + deletion_value(1)
+_MSA_FEAT_DIM = 34
+
+
+class EvoformerBlock(nn.Module):
+    """Single layer of the Evoformer MSA stack.
+
+    Haiku: EvoformerIteration, name='msa_stack'
+    """
+
+    def __init__(self, c_msa: int, c_pair: int, num_msa_heads: int = 8, num_pair_heads: int = 4):
+        super().__init__()
+        self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads)
+        self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=32)
+        self.tri_mul_out = TriangleMulOutgoing(c_pair)
+        self.tri_mul_in = TriangleMulIncoming(c_pair)
+        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False)
+        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True)
+        self.pair_transition = TransitionBlock(c_pair)
+        self.msa_transition = TransitionBlock(c_msa)
+
+    def forward(
+        self,
+        msa: torch.Tensor,  # [B?, S, N, c_msa]
+        pair: torch.Tensor,  # [B?, N, N, c_pair]
+        msa_mask: torch.Tensor,  # [B?, S, N]
+        pair_mask: torch.Tensor,  # [B?, N, N]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Update pair from MSA
+        pair = pair + self.outer_product(msa, msa_mask)
+        # Update MSA from pair
+        msa = msa + self.row_attn(msa, msa_mask, pair)
+        msa = msa + self.msa_transition(msa)
+        # Update pair
+        pair = pair + self.tri_mul_out(pair, pair_mask)
+        pair = pair + self.tri_mul_in(pair, pair_mask)
+        pair = pair + self.pair_attn_row(pair, pair_mask)
+        pair = pair + self.pair_attn_col(pair, pair_mask)
+        pair = pair + self.pair_transition(pair)
+        return msa, pair
+
+
+class PairFormerBlock(nn.Module):
+    """Single layer of the PairFormer trunk (with single track).
+
+    Haiku: PairFormerIteration with_single=True, name='trunk_pairformer'
+
+    The pair_logits for single attention come from the pair representation
+    (not from single), following AF3: single_pair_logits_projection(single_pair_logits_norm(pair)).
+    """
+
+    def __init__(
+        self,
+        c_pair: int,
+        c_single: int,
+        num_pair_heads: int = 4,
+        num_single_heads: int = 16,
+        single_key_dim: int = 384,
+        single_value_dim: int = 384,
+    ):
+        super().__init__()
+        self.tri_mul_out = TriangleMulOutgoing(c_pair)
+        self.tri_mul_in = TriangleMulIncoming(c_pair)
+        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False)
+        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True)
+        self.pair_transition = TransitionBlock(c_pair)
+        # Single track
+        self.single_to_pair_norm = LayerNorm(c_pair)  # normalizes pair act
+        self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
+        self.single_attn = SingleAttention(
+            c_single,
+            num_heads=num_single_heads,
+            key_dim=single_key_dim,
+            value_dim=single_value_dim,
+        )
+        self.single_transition = TransitionBlock(c_single)
+
+    def forward(
+        self,
+        pair: torch.Tensor,  # [B?, N, N, c_pair]
+        single: torch.Tensor,  # [B?, N, c_single]
+        pair_mask: torch.Tensor,  # [B?, N, N]
+        seq_mask: torch.Tensor,  # [B?, N]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Pair updates
+        pair = pair + self.tri_mul_out(pair, pair_mask)
+        pair = pair + self.tri_mul_in(pair, pair_mask)
+        pair = pair + self.pair_attn_row(pair, pair_mask)
+        pair = pair + self.pair_attn_col(pair, pair_mask)
+        pair = pair + self.pair_transition(pair)
+        # Single update: pair → logits, then single attention
+        pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+        pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
+        single = single + self.single_attn(single, seq_mask, pair_logits)
+        single = single + self.single_transition(single)
+        return pair, single
+
+
+class Evoformer(nn.Module):
+    """Full Evoformer trunk: embedders + MSA stack + PairFormer stack.
+
+    Handles recycled pair/single embeddings and the full Evoformer + PairFormer stacks.
+
+    Haiku scope: diffuser~/evoformer~/
+
+    Dimensions (from AF3 weight file):
+        target_feat input: 447-dim (raw 63 + evo conditioning 384)
+        msa_feat input: 34-dim (one_hot(32) + has_deletion + deletion_value)
+    """
+
+    def __init__(self, cfg: EvoformerConfig, pf_cfg: PairFormerConfig):
+        super().__init__()
+        c_msa = cfg.msa_channel
+        c_pair = cfg.pair_channel
+        c_single = cfg.seq_channel
+
+        # Input embeddings for single and MSA — dimensions from AF3 weight file
+        self.msa_activations = LinearNoBias(_MSA_FEAT_DIM, c_msa)
+        self.extra_msa_target_feat = LinearNoBias(_TARGET_FEAT_DIM, c_msa)
+
+        # Pair embeddings from sequence (target_feat = 447-dim)
+        self.left_single = LinearNoBias(_TARGET_FEAT_DIM, c_pair)
+        self.right_single = LinearNoBias(_TARGET_FEAT_DIM, c_pair)
+
+        # Bond embedding
+        self.bond_embedding = LinearNoBias(1, c_pair)
+
+        # Previous embedding projections (recycling)
+        self.prev_embedding_layer_norm = LayerNorm(c_pair)
+        self.prev_embedding = LinearNoBias(c_pair, c_pair)
+        self.prev_single_embedding_layer_norm = LayerNorm(c_single)
+        self.prev_single_embedding = LinearNoBias(c_single, c_single)
+
+        # Position activations for relative encoding
+        # rel_feat_dim = rel_pos(66) + rel_token(66) + entity_same(1) + rel_chain(6) = 139
+        rel_feat_dim = 2 * (2 * cfg.max_relative_idx + 2) + 1 + (2 * cfg.max_relative_chain + 2)
+        self.position_activations = LinearNoBias(rel_feat_dim, c_pair)
+
+        # Single activations from target feat (447-dim input)
+        self.single_activations = LinearNoBias(_TARGET_FEAT_DIM, c_single)
+
+        # MSA stack
+        self.msa_stack = nn.ModuleList(
+            [EvoformerBlock(c_msa, c_pair, num_msa_heads=8, num_pair_heads=4) for _ in range(cfg.num_layer)]
+        )
+
+        # PairFormer stack
+        self.trunk_pairformer = nn.ModuleList(
+            [
+                PairFormerBlock(
+                    c_pair,
+                    c_single,
+                    num_pair_heads=4,
+                    num_single_heads=pf_cfg.single_attention_num_head,
+                    single_key_dim=pf_cfg.single_key_dim,
+                    single_value_dim=pf_cfg.single_value_dim,
+                )
+                for _ in range(pf_cfg.num_layer)
+            ]
+        )
+
+    def forward(
+        self,
+        target_feat: torch.Tensor,  # [B?, N, 447]
+        msa_feat: torch.Tensor,  # [B?, S, N, 34]
+        rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
+        pair_mask: torch.Tensor,  # [B?, N, N]
+        seq_mask: torch.Tensor,  # [B?, N]
+        msa_mask: torch.Tensor,  # [B?, S, N]
+        prev_pair: torch.Tensor,  # [B?, N, N, c_pair]
+        prev_single: torch.Tensor,  # [B?, N, c_single]
+        bond_matrix: torch.Tensor | None = None,  # [B?, N, N, 1]
+    ) -> dict[str, torch.Tensor]:
+        # Build initial pair activations (negative indices work for both batched/unbatched)
+        left = self.left_single(target_feat).unsqueeze(-2)  # [..., N, 1, c_pair]
+        right = self.right_single(target_feat).unsqueeze(-3)  # [..., 1, N, c_pair]
+        pair = left + right  # [..., N, N, c_pair]
+
+        # Add recycling pair
+        pair = pair + self.prev_embedding(self.prev_embedding_layer_norm(prev_pair))
+
+        # Add relative position encoding
+        pair = pair + self.position_activations(rel_feat)
+
+        # Add bond embedding
+        if bond_matrix is not None:
+            pair = pair + self.bond_embedding(bond_matrix)
+
+        # Initial single activations
+        single = self.single_activations(target_feat)
+
+        # Add recycling single
+        single = single + self.prev_single_embedding(self.prev_single_embedding_layer_norm(prev_single))
+
+        # MSA embedding: msa_feat [..., S, N, 34] → [..., S, N, c_msa]
+        msa_act = self.msa_activations(msa_feat)
+        msa_act = msa_act + self.extra_msa_target_feat(target_feat).unsqueeze(-3)
+
+        # MSA stack
+        for layer in self.msa_stack:
+            msa_act, pair = layer(msa_act, pair, msa_mask, pair_mask)
+
+        # PairFormer stack
+        for layer in self.trunk_pairformer:
+            pair, single = layer(pair, single, pair_mask, seq_mask)
+
+        return {
+            "pair": pair,
+            "single": single,
+            "target_feat": target_feat,
+        }

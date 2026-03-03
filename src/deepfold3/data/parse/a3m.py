@@ -1,0 +1,123 @@
+"""A3M multiple sequence alignment parser.
+
+Converts raw A3M text into an MSA dataclass.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from deepfold3.data import const
+from deepfold3.data.types import MSA
+
+
+def _encode_sequence(seq: str, mol_type: int) -> tuple[list[int], list[int]]:
+    """Encode one A3M sequence to MSA indices and deletion counts.
+
+    Returns
+    -------
+    residues : list[int]  — encoded match-state residues
+    deletions : list[int] — number of insertions before each match state
+    """
+    residues: list[int] = []
+    deletions: list[int] = []
+    del_count = 0
+
+    if mol_type == const.MOL_PROTEIN:
+        lookup = const.PROTEIN_MSA_ID
+        unk = 20
+    elif mol_type == const.MOL_RNA:
+        lookup = const.RNA_MSA_ID
+        unk = const.MSA_UNK_NUCLEIC
+    elif mol_type == const.MOL_DNA:
+        lookup = const.DNA_MSA_ID
+        unk = const.MSA_UNK_NUCLEIC
+    else:
+        lookup = const.PROTEIN_MSA_ID
+        unk = 20
+
+    for ch in seq:
+        if ch.islower():
+            # Insertion: increment deletion counter, don't add to match states
+            del_count += 1
+        else:
+            # Match state
+            encoded = lookup.get(ch.upper(), unk)
+            residues.append(encoded)
+            deletions.append(del_count)
+            del_count = 0
+
+    return residues, deletions
+
+
+def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
+    """Parse an A3M-format MSA string into an MSA dataclass.
+
+    Parameters
+    ----------
+    text :     A3M text (lines may or may not start with '>')
+    mol_type : MOL_PROTEIN / MOL_RNA / MOL_DNA
+
+    Returns
+    -------
+    MSA with:
+        sequences [S, N] int8
+        mask      [S, N] bool   (always True for non-gap positions)
+        deletion_matrix [S, N] int8
+    """
+    # Split into (header, sequence) pairs
+    seqs: list[str] = []
+    current_seq: list[str] = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            if current_seq:
+                seqs.append("".join(current_seq))
+                current_seq = []
+        else:
+            current_seq.append(line)
+    if current_seq:
+        seqs.append("".join(current_seq))
+
+    if not seqs:
+        # Return single empty sequence
+        return MSA(
+            sequences=np.zeros((0, 0), dtype=np.int8),
+            mask=np.zeros((0, 0), dtype=bool),
+            deletion_matrix=np.zeros((0, 0), dtype=np.int8),
+        )
+
+    # Encode all sequences; determine N from query (first) sequence
+    encoded_list: list[list[int]] = []
+    deletion_list: list[list[int]] = []
+
+    for seq in seqs:
+        res, dels = _encode_sequence(seq, mol_type)
+        encoded_list.append(res)
+        deletion_list.append(dels)
+
+    # N = number of match states in query
+    N = len(encoded_list[0])
+
+    # Build arrays; sequences shorter/longer than N are padded/truncated
+    S = len(encoded_list)
+    sequences = np.zeros((S, N), dtype=np.int8)
+    deletion_matrix = np.zeros((S, N), dtype=np.int8)
+
+    for i, (res, dels) in enumerate(zip(encoded_list, deletion_list, strict=False)):
+        L = min(len(res), N)
+        sequences[i, :L] = res[:L]
+        deletion_matrix[i, :L] = [min(d, 127) for d in dels[:L]]
+
+    # mask: True at valid aligned positions (including gaps).
+    # AF3 treats gaps as valid evolutionary signal — only padding is False.
+    mask = np.ones((S, N), dtype=bool)
+    for i, res in enumerate(encoded_list):
+        L = min(len(res), N)
+        if L < N:
+            mask[i, L:] = False  # padding beyond sequence length
+
+    return MSA(sequences=sequences, mask=mask, deletion_matrix=deletion_matrix)
