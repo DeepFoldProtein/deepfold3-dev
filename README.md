@@ -4,10 +4,12 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 
 ## Features
 
-- **Diffusion-based structure prediction** — Evoformer trunk (MSA + PairFormer) with 200-step denoising diffusion head
-- **Full confidence metrics** — pLDDT, PAE, PDE, pTM, ipTM, experimentally resolved, ranking score
-- **AF3 weight compatibility** — direct conversion from official AlphaFold 3 parameters
-- **mmCIF + JSON output** — standard structure files with per-atom pLDDT and comprehensive confidence JSON
+- **Diffusion-based structure prediction** -- Evoformer trunk (MSA + PairFormer) with 200-step denoising diffusion head
+- **Template embedding** -- structural templates from PDB via mmCIF directory or HHsearch `.hhr` files
+- **Full confidence metrics** -- pLDDT, PAE, PDE, pTM, ipTM, experimentally resolved, ranking score
+- **AF3 weight compatibility** -- direct conversion from official AlphaFold 3 parameters
+- **Flexible input** -- A3M MSA files, Protenix-format JSON with paired/unpaired MSAs and HHR templates
+- **mmCIF + JSON output** -- standard structure files with per-atom pLDDT and comprehensive confidence JSON
 
 ## Installation
 
@@ -37,19 +39,30 @@ deepfold3 convert \
 
 ### 2. Run inference
 
+From an A3M MSA file:
+
 ```bash
 deepfold3 inference \
     --msa data/query.a3m \
     --output output/prediction.cif \
     --params resources/deepfold3.safetensors \
-    --num-recycles 3 \
     --num-samples 5
+```
+
+Or from a Protenix-format JSON (with MSA paths and HHR templates):
+
+```bash
+deepfold3 inference \
+    --json input.json \
+    --output output/prediction.cif \
+    --params resources/deepfold3.safetensors \
+    --template-cache /tmp/template_cache
 ```
 
 This produces:
 
-- `prediction.cif` — mmCIF with MODEL blocks per diffusion sample, pLDDT as B-factors
-- `prediction_confidences.json` — full confidence metrics (PAE, PDE, pTM, ipTM, contacts, etc.)
+- `prediction.cif` -- mmCIF with MODEL blocks per diffusion sample, pLDDT as B-factors
+- `prediction_confidences.json` -- full confidence metrics (PAE, PDE, pTM, ipTM, contacts, etc.)
 
 ### 3. Plot confidence maps
 
@@ -70,46 +83,46 @@ deepfold3 plot --help
 
 | Command | Description |
 | ------- | ----------- |
-| `deepfold3 inference` | Run structure prediction from an A3M MSA file |
+| `deepfold3 inference` | Run structure prediction from A3M or JSON input |
 | `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
 | `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
 
 ## Architecture
 
-```
+```text
 Input features (tokens + atoms)
-    → Per-atom conditioning (AtomCrossAttEncoder)
-    → Evoformer trunk  [10 recycles]
-        ├─ MSA processing (EvoformerBlock × 4)
-        └─ PairFormer stack (48 layers)
-               → single [N, 384]  +  pair [N, N, 128]
-    → Diffusion Head  (200-step denoising)
-        └─ atom_positions [S, N, M, 3]
-    → Confidence Head (pLDDT, PAE, PDE, exp_resolved)
-    → Distogram Head
+    -> Per-atom conditioning (AtomCrossAttEncoder)
+    -> Evoformer trunk  [10 recycles]
+        |-- Template embedding (optional, T templates -> pair)
+        |-- MSA processing (EvoformerBlock x 4)
+        +-- PairFormer stack (48 layers)
+               -> single [N, 384]  +  pair [N, N, 128]
+    -> Diffusion Head  (200-step denoising)
+        +-- atom_positions [S, N, M, 3]
+    -> Confidence Head (pLDDT, PAE, PDE, exp_resolved)
+    -> Distogram Head
 ```
 
 Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffusion_steps=200`.
 
 ## TODO
 
-- [ ] Structured inputs (mmCIF/JSON input, multi-chain complexes, ligands)
+- [ ] Multi-chain complexes and ligand support
 - [ ] Full data pipeline (PDB preprocessing, clustering, dataset generation)
-- [ ] Template embedding (structural templates from PDB hits)
 - [ ] Training pipeline
 
 ## Confidence Metrics
 
 | Metric | Shape | Description |
 | ------ | ----- | ----------- |
-| pLDDT | per-atom | Predicted local distance difference test (0–100) |
-| PAE | N×N | Predicted aligned error (Å) |
-| PDE | N×N | Predicted distance error (Å, symmetrised) |
+| pLDDT | per-atom | Predicted local distance difference test (0-100) |
+| PAE | NxN | Predicted aligned error (Å) |
+| PDE | NxN | Predicted distance error (Å, symmetrised) |
 | pTM | scalar | Predicted TM-score |
 | ipTM | scalar | Interface predicted TM-score (multi-chain only) |
-| Ranking | scalar | 0.8×ipTM + 0.2×pTM |
+| Ranking | scalar | 0.8 x ipTM + 0.2 x pTM |
 | gPDE | scalar | Global average PDE |
-| Contacts | N×N | P(distance < 8 Å) from distogram |
+| Contacts | NxN | P(distance < 8 Å) from distogram |
 
 ## Development
 
@@ -131,20 +144,26 @@ uv run pytest tests/test_weight_loading.py::TestWeightLoadingIntegrity::test_no_
 
 ```
 src/deepfold3/
-├── model/              # Neural network modules
-│   ├── primitives.py   # LinearNoBias, LayerNorm, SwiGLU, TransitionBlock
-│   ├── config.py       # All model configuration dataclasses
-│   ├── attention.py    # GridSelfAttention, MSAAttention, SingleAttention
-│   ├── ops.py          # TriangleMul, OuterProductMean
-│   ├── evoformer.py    # EvoformerBlock, PairFormerBlock, Evoformer
-│   ├── atom_cross_attn.py  # AtomCrossAtt encoder/decoder
-│   ├── diffusion.py    # DiffusionTransformer, DiffusionHead
-│   ├── confidence.py   # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
-│   └── model.py        # DeepFold3 (top-level), DistogramHead
-├── data/               # Data pipeline (parse → tokenize → crop → featurize)
-├── convert/af3.py      # Haiku → PyTorch weight converter
-├── io/                 # Output: mmCIF + confidences JSON
-└── scripts/            # CLI: inference, convert, plot
+|-- model/              # Neural network modules
+|   |-- primitives.py   # LinearNoBias, LayerNorm, SwiGLU, TransitionBlock
+|   |-- config.py       # All model configuration dataclasses
+|   |-- attention.py    # GridSelfAttention, MSAAttention, SingleAttention
+|   |-- ops.py          # TriangleMul, OuterProductMean
+|   |-- evoformer.py    # EvoformerBlock, PairFormerBlock, Evoformer
+|   |-- template_embedding.py  # TemplateEmbedding, TemplatePairFormerBlock
+|   |-- atom_cross_attn.py     # AtomCrossAtt encoder/decoder
+|   |-- diffusion.py    # DiffusionTransformer, DiffusionHead
+|   |-- confidence.py   # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
+|   +-- model.py        # DeepFold3 (top-level), DistogramHead
+|-- data/               # Data pipeline
+|   |-- parse/          # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
+|   |-- tokenize/       # tokenizer.py (Input -> Tokenized)
+|   |-- crop/           # cropper.py (contiguous + spatial)
+|   |-- feature/        # featurizer.py, ref_atoms.py (CCD)
+|   +-- module/         # dataset.py (InferenceInput), collate.py
+|-- convert/af3.py      # Haiku -> PyTorch weight converter
+|-- io/                 # Output: mmCIF + confidences JSON
++-- scripts/            # CLI: inference, convert, plot
 ```
 
 ## References
