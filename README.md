@@ -91,6 +91,13 @@ Input features (tokens + atoms)
 
 Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffusion_steps=200`.
 
+## TODO
+
+- [ ] Structured inputs (mmCIF/JSON input, multi-chain complexes, ligands)
+- [ ] Full data pipeline (PDB preprocessing, clustering, dataset generation)
+- [ ] Template embedding (structural templates from PDB hits)
+- [ ] Training pipeline
+
 ## Confidence Metrics
 
 | Metric | Shape | Description |
