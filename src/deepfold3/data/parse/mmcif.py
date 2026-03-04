@@ -169,6 +169,8 @@ def parse_mmcif(path: Path) -> Structure:
                     atom_name = atom.name[:4].ljust(4)
                     is_present = True  # gemmi only gives resolved atoms
 
+                    b_factor = float(atom.b_iso) if hasattr(atom, "b_iso") else 0.0
+
                     all_atoms.append(
                         (
                             float(pos.x),
@@ -178,6 +180,7 @@ def parse_mmcif(path: Path) -> Structure:
                             charge,
                             atom_name.encode("ascii"),
                             is_present,
+                            b_factor,
                         )
                     )
                     atom_idx_global += 1

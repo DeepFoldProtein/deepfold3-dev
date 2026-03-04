@@ -6,7 +6,8 @@ Structure follows Boltz; dtypes follow plan spec.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ ATOM_DTYPE = np.dtype(
         ("charge", np.float16),  # formal charge
         ("name", "S4"),  # atom name, max 4 chars
         ("is_present", np.bool_),  # resolved in structure
+        ("b_factor", np.float32),  # B-factor or pLDDT confidence
     ]
 )
 
@@ -91,6 +93,7 @@ class Structure:
     bonds: np.ndarray  # BOND_DTYPE
     residues: np.ndarray  # RESIDUE_DTYPE
     chains: np.ndarray  # CHAIN_DTYPE
+    name: str = field(default="unset")
 
     def save(self, path: Path) -> None:
         np.savez_compressed(
@@ -99,16 +102,133 @@ class Structure:
             bonds=self.bonds,
             residues=self.residues,
             chains=self.chains,
+            name=np.array(self.name),
         )
 
     @classmethod
     def load(cls, path: Path) -> Structure:
         data = np.load(path, allow_pickle=False)
+        atoms_raw = data["atoms"]
+        # Backward compatibility: old files lack the b_factor field
+        if atoms_raw.dtype != ATOM_DTYPE:
+            old_atoms = atoms_raw.view(np.dtype([f for f in ATOM_DTYPE.descr if f[0] != "b_factor"]))
+            new_atoms = np.zeros(len(old_atoms), dtype=ATOM_DTYPE)
+            for field_name in old_atoms.dtype.names:
+                new_atoms[field_name] = old_atoms[field_name]
+            atoms_raw = new_atoms
+        else:
+            atoms_raw = atoms_raw.view(ATOM_DTYPE)
+        name = str(data["name"]) if "name" in data else "unset"
         return cls(
-            atoms=data["atoms"].view(ATOM_DTYPE),
+            atoms=atoms_raw,
             bonds=data["bonds"].view(BOND_DTYPE),
             residues=data["residues"].view(RESIDUE_DTYPE),
             chains=data["chains"].view(CHAIN_DTYPE),
+            name=name,
+        )
+
+    def save_split(self, directory: Path) -> None:
+        """Save structure as split files: coords.npz + meta.json."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        # coords.npz: x, y, z, b_factor
+        np.savez_compressed(
+            str(directory / "coords.npz"),
+            x=self.atoms["x"],
+            y=self.atoms["y"],
+            z=self.atoms["z"],
+            b_factor=self.atoms["b_factor"],
+        )
+
+        # meta.json: name + table data (excluding coordinates)
+        def _bytes_to_str(v: object) -> object:
+            if isinstance(v, bytes):
+                return v.decode("ascii", errors="replace")
+            if isinstance(v, np.generic):
+                return v.item()
+            return v
+
+        def _row_to_dict(row: np.void) -> dict:
+            return {name: _bytes_to_str(row[name]) for name in row.dtype.names}
+
+        meta = {
+            "name": self.name,
+            "chains": [_row_to_dict(r) for r in self.chains],
+            "residues": [_row_to_dict(r) for r in self.residues],
+            "bonds": [_row_to_dict(r) for r in self.bonds],
+            "atoms": [
+                {
+                    "element": int(a["element"]),
+                    "charge": float(a["charge"]),
+                    "name": a["name"].decode("ascii", errors="replace"),
+                    "is_present": bool(a["is_present"]),
+                }
+                for a in self.atoms
+            ],
+        }
+        (directory / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    @classmethod
+    def load_split(cls, directory: Path) -> Structure:
+        """Load structure from split files: coords.npz + meta.json."""
+        directory = Path(directory)
+        coords = np.load(directory / "coords.npz", allow_pickle=False)
+        with open(directory / "meta.json") as f:
+            meta = json.load(f)
+
+        n_atoms = len(coords["x"])
+        atoms = np.zeros(n_atoms, dtype=ATOM_DTYPE)
+        atoms["x"] = coords["x"]
+        atoms["y"] = coords["y"]
+        atoms["z"] = coords["z"]
+        atoms["b_factor"] = coords["b_factor"]
+        atom_meta = meta["atoms"]
+        if atom_meta:
+            atoms["element"] = [a["element"] for a in atom_meta]
+            atoms["charge"] = [a["charge"] for a in atom_meta]
+            atoms["name"] = [a["name"].encode("ascii") for a in atom_meta]
+            atoms["is_present"] = [a["is_present"] for a in atom_meta]
+
+        chains = (
+            np.array(
+                [
+                    tuple(c["name"].encode("ascii") if k == "name" else c[k] for k in CHAIN_DTYPE.names)
+                    for c in meta["chains"]
+                ],
+                dtype=CHAIN_DTYPE,
+            )
+            if meta["chains"]
+            else np.empty(0, dtype=CHAIN_DTYPE)
+        )
+
+        residues = (
+            np.array(
+                [
+                    tuple(r["name"].encode("ascii") if k == "name" else r[k] for k in RESIDUE_DTYPE.names)
+                    for r in meta["residues"]
+                ],
+                dtype=RESIDUE_DTYPE,
+            )
+            if meta["residues"]
+            else np.empty(0, dtype=RESIDUE_DTYPE)
+        )
+
+        bonds = (
+            np.array(
+                [tuple(b[k] for k in BOND_DTYPE.names) for b in meta["bonds"]],
+                dtype=BOND_DTYPE,
+            )
+            if meta["bonds"]
+            else np.empty(0, dtype=BOND_DTYPE)
+        )
+
+        return cls(
+            atoms=atoms,
+            bonds=bonds,
+            residues=residues,
+            chains=chains,
+            name=meta.get("name", "unset"),
         )
 
 

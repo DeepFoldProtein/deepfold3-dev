@@ -205,6 +205,12 @@ def save_mmcif(
 ) -> None:
     """Write predicted structure(s) to an mmCIF file.
 
+    Converts model output to Structure objects (one per sample), then
+    delegates to structure_to_mmcif() for mmCIF generation.
+
+    For multi-sample output, only the first sample is written (each sample
+    can be saved separately via prediction_to_structure + save_structure_mmcif).
+
     Parameters
     ----------
     path :           Output file path (.cif)
@@ -214,20 +220,45 @@ def save_mmcif(
                      asym_id, residue_index)
     num_plddt_bins : Number of pLDDT bins used by the confidence head (50)
     """
+    from deepfold3.io.structure_builder import prediction_to_structure
+    from deepfold3.io.structure_mmcif import save_structure_mmcif
+
     path = Path(path)
 
-    # Move all tensors to CPU
-    atom_positions = output.atom_positions.cpu()  # [S, N, M, 3]
-    ref_mask = features["ref_mask"].cpu()  # [N, M] bool
-    ref_element = features["ref_element"].cpu()  # [N, M] int64
-    ref_atom_name_chars = features["ref_atom_name_chars"].cpu()  # [N, M, 4]
-    res_type = features["res_type"].cpu()  # [N] int64
-    asym_id = features["asym_id"].cpu()  # [N] int64
-    residue_index = features["residue_index"].cpu()  # [N] int64
+    # Build one Structure per sample and write the first one
+    # (multi-model mmCIF with all samples from a single Structure would
+    # require merging, which is not yet supported — callers can save
+    # individual samples separately)
+    num_samples = output.atom_positions.shape[0]
+
+    if num_samples == 1:
+        structure = prediction_to_structure(
+            output, features, sample_idx=0, name=path.stem, num_plddt_bins=num_plddt_bins
+        )
+        save_structure_mmcif(path, structure, entry_id=path.stem)
+    else:
+        # For backward compatibility: write multi-model mmCIF using legacy path
+        # for multi-sample outputs, since Structure only holds one model.
+        _save_mmcif_legacy(path, output, features, num_plddt_bins)
+
+
+def _save_mmcif_legacy(
+    path: Path,
+    output: DeepFold3Output,
+    features: dict[str, torch.Tensor],
+    num_plddt_bins: int = 50,
+) -> None:
+    """Legacy multi-model mmCIF writer (used when num_samples > 1)."""
+    atom_positions = output.atom_positions.cpu()
+    ref_mask = features["ref_mask"].cpu()
+    ref_element = features["ref_element"].cpu()
+    ref_atom_name_chars = features["ref_atom_name_chars"].cpu()
+    res_type = features["res_type"].cpu()
+    asym_id = features["asym_id"].cpu()
+    residue_index = features["residue_index"].cpu()
 
     num_samples, N, M = atom_positions.shape[:3]
 
-    # Per-atom pLDDT in [0, 100]
     if output.plddt is not None:
         plddt_cpu = output.plddt.cpu()
         if plddt_cpu.dim() == 2:
@@ -236,13 +267,11 @@ def save_mmcif(
     else:
         plddt_per_sample = torch.zeros(num_samples, N, M)
 
-    # Build gemmi Structure
     st = gemmi.Structure()
     st.name = path.stem
     st.cell = gemmi.UnitCell(1.0, 1.0, 1.0, 90.0, 90.0, 90.0)
     st.spacegroup_hm = "P 1"
 
-    # Build models
     unique_asym_ids = asym_id.unique().tolist()
 
     for sample_idx in range(num_samples):
@@ -267,14 +296,11 @@ def save_mmcif(
                 for atom_j in range(M):
                     if not bool(ref_mask[token_i, atom_j]):
                         continue
-
                     atom_name = _decode_atom_name(ref_atom_name_chars[token_i, atom_j])
                     if not atom_name:
                         continue
-
                     elem_num = int(ref_element[token_i, atom_j])
                     elem_sym = _INT_TO_ELEMENT.get(elem_num, "C")
-
                     x, y, z = atom_positions[sample_idx, token_i, atom_j].tolist()
                     bfactor = float(plddt_per_sample[sample_idx, token_i, atom_j])
 
@@ -287,7 +313,6 @@ def save_mmcif(
                         atom.element = gemmi.Element(elem_sym)
                     except Exception:
                         atom.element = gemmi.Element("C")
-
                     residue.add_atom(atom)
 
                 if len(residue) > 0:
@@ -298,14 +323,11 @@ def save_mmcif(
 
         st.add_model(model)
 
-    # Let gemmi auto-assign entities and subchains.
     st.setup_entities()
 
-    # Rename entity IDs to numeric (gemmi defaults to chain names).
     for i, entity in enumerate(st.entities, start=1):
         entity.name = str(i)
 
-    # Rename subchains to simple chain letters (gemmi may generate multi-char labels).
     subchain_remap: dict[str, str] = {}
     for mdl in st:
         for chain in mdl:
@@ -318,7 +340,6 @@ def save_mmcif(
     for entity in st.entities:
         entity.subchains = [subchain_remap.get(s, s) for s in entity.subchains]
 
-    # Set entity.full_sequence for _entity_poly_seq table generation.
     chain_sequences: dict[str, list[str]] = {}
     for chain in st[0]:
         chain_sequences[chain.name] = [res.name for res in chain]
@@ -331,13 +352,12 @@ def save_mmcif(
 
     st.assign_label_seq_id()
 
-    # Build per-residue pLDDT for metric table (average over atoms, first sample).
     plddt_per_residue: dict[tuple[str, str, int], float] = {}
     for asym in unique_asym_ids:
         chain_name = asym_id_to_chain_name(int(asym))
         token_indices = (asym_id == asym).nonzero(as_tuple=True)[0]
         for token_i in token_indices.tolist():
-            mask_i = ref_mask[token_i]  # [M]
+            mask_i = ref_mask[token_i]
             if mask_i.any():
                 plddt_vals = plddt_per_sample[0, token_i][mask_i]
                 avg_plddt = float(plddt_vals.mean())
@@ -348,14 +368,10 @@ def save_mmcif(
             seq_id = int(residue_index[token_i])
             plddt_per_residue[(chain_name, res_name, seq_id)] = avg_plddt
 
-    # Generate base mmCIF from gemmi
     doc = st.make_mmcif_document()
     base_text = doc.as_string()
-
-    # Enrich _chem_comp.type
     base_text = _enrich_cif_text(base_text)
 
-    # Fix _entity_poly.pdbx_seq_one_letter_code
     entity_sequences: dict[str, str] = {}
     for entity in st.entities:
         if entity.entity_type == gemmi.EntityType.Polymer and entity.subchains:
@@ -365,14 +381,10 @@ def save_mmcif(
             entity_sequences[entity.name] = one_letter
     base_text = _fix_seq_one_letter_code(base_text, entity_sequences)
 
-    # Insert header after the first line (data_xxx)
     header = _build_header(path.stem)
     lines = base_text.split("\n", 1)
     final_text = lines[0] + "\n" + header + lines[1]
-
-    # Append pLDDT metric table
     final_text += _build_plddt_metric_table(plddt_per_residue)
 
-    # Write
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(final_text)
