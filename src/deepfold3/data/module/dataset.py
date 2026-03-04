@@ -51,7 +51,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         records: list[Record],
         data_dir: Path,
         max_tokens: int = 384,
-        max_atoms: int = 2048,
+        max_atoms: int = 4096,
         max_msa_seqs: int = 2048,
     ):
         self.records = records
@@ -91,7 +91,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 
 def _tokenize_and_featurize(
     inp: Input,
-    max_msa_seqs: int = 2048,
+    max_msa_seqs: int = 16384,
     templates: list[TemplateFeatures] | None = None,
     template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -119,7 +119,7 @@ class InferenceInput:
     def from_a3m(
         a3m_text: str,
         mol_type: str = "protein",
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = 16384,
         templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features from an A3M-format MSA string.
@@ -174,14 +174,17 @@ class InferenceInput:
     def from_json(
         json_path: str | Path,
         job_index: int = 0,
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = 16384,
         max_templates: int = 4,
         template_cache_dir: str | Path | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Build features from a Protenix-format JSON input file.
+        """Build features from a Protenix-format or AF3-format JSON input file.
 
         Supports multi-chain complexes with protein, DNA, and RNA chains.
-        Each chain can optionally specify paired/unpaired MSA paths.
+        Each chain can optionally specify paired/unpaired MSAs and templates.
+
+        All file I/O (reading A3M files, downloading template CIFs) is handled
+        by ``parse_json_input()``.  This method only does computation.
 
         Args:
             json_path: Path to the JSON input file.
@@ -194,9 +197,10 @@ class InferenceInput:
             dict[str, torch.Tensor] ready for model.forward().
         """
         from deepfold3.data.parse.json_input import parse_json_input
+        from deepfold3.data.parse.templates import TemplateHitInput, template_hit_input_to_features
 
         json_path = Path(json_path)
-        jobs = parse_json_input(json_path)
+        jobs = parse_json_input(json_path, max_templates=max_templates, template_cache_dir=template_cache_dir)
 
         if job_index >= len(jobs):
             raise IndexError(f"Job index {job_index} out of range (file has {len(jobs)} jobs)")
@@ -204,16 +208,14 @@ class InferenceInput:
         job = jobs[job_index]
 
         # Collect all chains in order: protein, DNA, RNA
-        # Each entry: (sequence, mol_type, paired_msa_path, unpaired_msa_path, templates_path)
-        chain_specs: list[tuple] = []
+        # Each entry: (sequence, mol_type, paired_msa, unpaired_msa, template_hits)
+        chain_specs: list[tuple[str, int, MSA | None, MSA | None, list[TemplateHitInput]]] = []
         for pc in job.protein_chains:
-            chain_specs.append(
-                (pc.sequence, const.MOL_PROTEIN, pc.paired_msa_path, pc.unpaired_msa_path, pc.templates_path)
-            )
+            chain_specs.append((pc.sequence, const.MOL_PROTEIN, pc.paired_msa, pc.unpaired_msa, pc.template_hits))
         for dc in job.dna_chains:
-            chain_specs.append((dc.sequence, const.MOL_DNA, dc.paired_msa_path, dc.unpaired_msa_path, None))
+            chain_specs.append((dc.sequence, dc.mol_type, dc.paired_msa, dc.unpaired_msa, []))
         for rc in job.rna_chains:
-            chain_specs.append((rc.sequence, const.MOL_RNA, rc.paired_msa_path, rc.unpaired_msa_path, None))
+            chain_specs.append((rc.sequence, rc.mol_type, rc.paired_msa, rc.unpaired_msa, []))
 
         if not chain_specs:
             raise ValueError(f"No chains found in job {job.name!r}")
@@ -222,30 +224,32 @@ class InferenceInput:
         chain_tuples = [(seq, mt, chr(ord("A") + i)) for i, (seq, mt, _, _, _) in enumerate(chain_specs)]
         structure = _build_complex_structure(chain_tuples)
 
-        # Load MSA for each chain (separate paired + unpaired)
+        # Assemble MSA dicts from parsed objects
         paired_msa_dict: dict[int, MSA] = {}
         unpaired_msa_dict: dict[int, MSA] = {}
-        for asym_id, (seq, mt, paired_path, unpaired_path, _) in enumerate(chain_specs):
-            paired, unpaired = _load_chain_msa(mt, seq, paired_path, unpaired_path)
-            if paired is not None:
-                paired_msa_dict[asym_id] = paired
-            unpaired_msa_dict[asym_id] = unpaired
+        for asym_id, (seq, mt, paired_msa, unpaired_msa, _) in enumerate(chain_specs):
+            if paired_msa is not None:
+                paired_msa_dict[asym_id] = paired_msa
+            if unpaired_msa is not None:
+                unpaired_msa_dict[asym_id] = unpaired_msa
+            elif paired_msa is None:
+                # No MSA at all — fall back to single-sequence MSA
+                unpaired_msa_dict[asym_id] = _sequence_to_msa(seq, mt)
+            else:
+                # Only paired exists — use single-sequence as unpaired
+                unpaired_msa_dict[asym_id] = _sequence_to_msa(seq, mt)
 
-        # Load templates: check for whole-complex JSON template hits first
+        # Convert template hits to features
         template_feats: list[TemplateFeatures] | None = None
         template_feats_per_chain: dict[int, list[TemplateFeatures]] = {}
 
+        # Check for whole-complex JSON template hits (query_indices populated)
         json_tmpl_found = False
-        for _asym_id, (_seq, _mt, _, _, tmpl_path) in enumerate(chain_specs):
-            if tmpl_path is not None and tmpl_path.suffix.lower() == ".json" and tmpl_path.exists():
-                from deepfold3.data.parse.templates import parse_json_templates
-
-                total_tokens = sum(len(seq) for seq, _, _, _, _ in chain_specs)
-                template_feats = parse_json_templates(
-                    tmpl_path,
-                    query_length=total_tokens,
-                    max_templates=max_templates,
-                )
+        for _asym_id, (_seq, _mt, _, _, tmpl_hits) in enumerate(chain_specs):
+            if tmpl_hits and tmpl_hits[0].query_indices is not None:
+                # JSON-mode templates: whole-complex alignment
+                total_tokens = sum(len(s) for s, _, _, _, _ in chain_specs)
+                template_feats = [template_hit_input_to_features(h, total_tokens) for h in tmpl_hits]
                 if not template_feats:
                     template_feats = None
                 json_tmpl_found = True
@@ -253,21 +257,12 @@ class InferenceInput:
 
         # Fall back to per-chain HHR templates
         if not json_tmpl_found:
-            for asym_id, (seq, mt, _, _, tmpl_path) in enumerate(chain_specs):
-                if mt == const.MOL_PROTEIN and tmpl_path is not None and tmpl_path.exists():
-                    if tmpl_path.suffix.lower() == ".hhr":
-                        from deepfold3.data.parse.templates import parse_hhr_templates
+            for asym_id, (seq, mt, _, _, tmpl_hits) in enumerate(chain_specs):
+                if mt == const.MOL_PROTEIN and tmpl_hits:
+                    chain_templates = [template_hit_input_to_features(h, len(seq)) for h in tmpl_hits]
+                    if chain_templates:
+                        template_feats_per_chain[asym_id] = chain_templates
 
-                        chain_templates = parse_hhr_templates(
-                            tmpl_path,
-                            query_length=len(seq),
-                            max_templates=max_templates,
-                            cache_dir=template_cache_dir,
-                        )
-                        if chain_templates:
-                            template_feats_per_chain[asym_id] = chain_templates
-
-            # For backward compatibility: if only one chain has templates, pass as flat list
             if len(template_feats_per_chain) == 1:
                 template_feats = next(iter(template_feats_per_chain.values()))
             elif len(template_feats_per_chain) > 1:
@@ -324,6 +319,7 @@ def _build_chain_atoms_residues(
                     0.0,  # charge
                     _atom_name_from_chars(ref.atom_name_chars[j]).encode("ascii"),
                     True,
+                    0.0,  # b_factor
                 )
             )
 
@@ -422,48 +418,6 @@ def _build_complex_structure(chains: list[tuple[str, int, str]]) -> Structure:
 def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
     """Build a single-chain Structure from a 1-letter sequence (no mmCIF needed)."""
     return _build_complex_structure([(sequence, mol_type, "A")])
-
-
-def _load_chain_msa(
-    mol_type: int, sequence: str, paired_path: Path | None, unpaired_path: Path | None
-) -> tuple[MSA | None, MSA]:
-    """Load paired and unpaired MSA separately for a chain.
-
-    Returns:
-        (paired_msa, unpaired_msa) — paired_msa is None if no paired A3M exists.
-        Falls back to a single-sequence MSA for unpaired if neither file exists.
-    """
-    from deepfold3.data.parse.a3m import parse_a3m
-
-    paired_msa: MSA | None = None
-    unpaired_msa: MSA | None = None
-
-    if paired_path is not None:
-        try:
-            text = paired_path.read_text()
-            msa = parse_a3m(text, mol_type)
-            if msa.sequences.shape[0] > 0:
-                paired_msa = msa
-        except (FileNotFoundError, OSError):
-            pass
-
-    if unpaired_path is not None:
-        try:
-            text = unpaired_path.read_text()
-            msa = parse_a3m(text, mol_type)
-            if msa.sequences.shape[0] > 0:
-                unpaired_msa = msa
-        except (FileNotFoundError, OSError):
-            pass
-
-    # If we have neither, fall back to single-sequence MSA
-    if unpaired_msa is None and paired_msa is None:
-        unpaired_msa = _sequence_to_msa(sequence, mol_type)
-    elif unpaired_msa is None:
-        # Only paired exists — use query row from paired as the unpaired MSA
-        unpaired_msa = _sequence_to_msa(sequence, mol_type)
-
-    return paired_msa, unpaired_msa
 
 
 def _sequence_to_msa(sequence: str, mol_type: int) -> MSA:

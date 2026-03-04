@@ -31,9 +31,10 @@ except ImportError:
     gemmi = None  # type: ignore[assignment]
 
 from deepfold3.data import const
+from deepfold3.data.parse.hhr import TemplateHit
 
 if TYPE_CHECKING:
-    from deepfold3.data.parse.hhr import TemplateHit
+    from deepfold3.data.types import Structure
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,126 @@ def empty_template_features(num_tokens: int, max_atoms: int = const.MAX_ATOMS_PE
         atom_positions=np.zeros((num_tokens, max_atoms, 3), dtype=np.float32),
         atom_mask=np.zeros((num_tokens, max_atoms), dtype=bool),
     )
+
+
+@dataclasses.dataclass
+class TemplateHitInput:
+    """A parsed template hit ready for feature extraction (no further I/O needed).
+
+    Three alignment modes:
+    1. JSON hits: query_indices + template_indices populated
+    2. HHR hits: hhr_hit populated (carries query_to_hit_mapping)
+    3. Structure: structure populated with query_to_template mapping
+    """
+
+    mmcif_text: str = ""
+    query_indices: list[int] | None = None  # 0-based query positions (JSON mode)
+    template_indices: list[int] | None = None  # label_seq_id numbers (JSON mode)
+    hhr_hit: TemplateHit | None = None  # full HHR hit (HHR mode)
+    chain_id: str | None = None
+    structure: Structure | None = None  # Structure object (Structure mode)
+    query_to_template: dict[int, int] | None = None  # query pos → template residue index
+
+
+def template_hit_input_to_features(
+    hit_input: TemplateHitInput,
+    query_length: int,
+    max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+) -> TemplateFeatures:
+    """Convert a TemplateHitInput to TemplateFeatures (pure computation, no I/O).
+
+    Dispatches to Structure-based, HHR-based, or index-pair-based extraction
+    depending on which fields are populated.
+
+    Args:
+        hit_input: A TemplateHitInput with alignment info.
+        query_length: Number of tokens in the query sequence.
+        max_atoms: Maximum atoms per residue.
+
+    Returns:
+        TemplateFeatures aligned to query tokens.
+    """
+    # Structure mode
+    if hit_input.structure is not None and hit_input.query_to_template is not None:
+        return extract_template_features_from_structure(
+            hit_input.structure,
+            hit_input.query_to_template,
+            query_length,
+            max_atoms=max_atoms,
+        )
+
+    if hit_input.hhr_hit is not None:
+        return extract_template_features_from_hhr(
+            hit_input.mmcif_text,
+            hit_input.hhr_hit,
+            query_length,
+            chain_id=hit_input.chain_id,
+            max_atoms=max_atoms,
+        )
+
+    # JSON mode: query_indices + template_indices
+    if hit_input.query_indices is None or hit_input.template_indices is None:
+        logger.warning("TemplateHitInput has neither hhr_hit nor index pairs nor structure")
+        return empty_template_features(query_length, max_atoms)
+
+    return _extract_from_index_pairs(
+        hit_input.mmcif_text,
+        hit_input.query_indices,
+        hit_input.template_indices,
+        query_length,
+        chain_id=hit_input.chain_id,
+        max_atoms=max_atoms,
+    )
+
+
+def _extract_from_index_pairs(
+    mmcif_text: str,
+    query_indices: list[int],
+    template_indices: list[int],
+    query_length: int,
+    chain_id: str | None = None,
+    max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+) -> TemplateFeatures:
+    """Extract template features using pre-computed query/template index pairs.
+
+    Args:
+        mmcif_text: mmCIF file contents.
+        query_indices: 0-based query token positions.
+        template_indices: Residue label_seq_id numbers in the template CIF.
+        query_length: Total number of tokens in the query.
+        chain_id: Chain to use from the template (None = first polymer).
+        max_atoms: Maximum atoms per residue.
+
+    Returns:
+        TemplateFeatures aligned to query tokens.
+    """
+    result = _parse_mmcif_chain(mmcif_text, chain_id=chain_id)
+    if result is None:
+        return empty_template_features(query_length, max_atoms)
+    _, target_chain = result
+
+    # Build label_seq -> residue features lookup
+    residue_lookup: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
+    for residue in target_chain:
+        residue_lookup[residue.label_seq] = _extract_residue_features(residue, max_atoms)
+
+    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
+    mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
+
+    matched = 0
+    for qi, ti in zip(query_indices, template_indices, strict=False):
+        if qi < 0 or qi >= query_length:
+            continue
+        if ti in residue_lookup:
+            aa, pos, msk = residue_lookup[ti]
+            aatype_arr[qi] = aa
+            pos_arr[qi] = pos
+            mask_arr[qi] = msk
+            matched += 1
+
+    logger.info("Index-pair template: %d/%d matched", matched, len(query_indices))
+    return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr)
 
 
 def fetch_pdb_mmcif(pdb_id: str, cache_dir: Path | None = None) -> str:
@@ -253,6 +374,18 @@ def parse_template_mmcifs(
     return templates
 
 
+def _get_canonical_atoms(res_name: str) -> list[str]:
+    """Get canonical atom order for a residue name, with nonstandard fallback."""
+    canonical = const.REF_ATOMS.get(res_name)
+    if canonical is None:
+        std_name = const._NONSTANDARD_TO_STANDARD.get(res_name)
+        if std_name is not None:
+            canonical = const.REF_ATOMS.get(std_name)
+    if canonical is None:
+        canonical = const.REF_ATOMS.get("UNK", ["N", "CA", "C", "O", "CB"])
+    return canonical
+
+
 def _extract_residue_features(
     residue,
     max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
@@ -264,14 +397,7 @@ def _extract_residue_features(
     """
     res_name = residue.name.strip()
     aatype = const.res_name_to_type(res_name)
-
-    canonical_atoms = const.REF_ATOMS.get(res_name)
-    if canonical_atoms is None:
-        std_name = const._NONSTANDARD_TO_STANDARD.get(res_name)
-        if std_name is not None:
-            canonical_atoms = const.REF_ATOMS.get(std_name)
-    if canonical_atoms is None:
-        canonical_atoms = const.REF_ATOMS.get("UNK", ["N", "CA", "C", "O", "CB"])
+    canonical_atoms = _get_canonical_atoms(res_name)
 
     positions = np.zeros((max_atoms, 3), dtype=np.float32)
     mask = np.zeros(max_atoms, dtype=bool)
@@ -468,37 +594,89 @@ def parse_json_templates(
                 continue
 
             mmcif_text = cif_path.read_text()
-            result = _parse_mmcif_chain(mmcif_text, label=cif_name)
-            if result is None:
-                continue
-            _, target_chain = result
-
-            # Build label_seq -> residue features lookup
-            # (templateIndices use mmCIF label_seq_id numbering)
-            residue_lookup: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
-            for residue in target_chain:
-                residue_lookup[residue.label_seq] = _extract_residue_features(residue, max_atoms)
-
-            # Place features at query positions using the alignment
-            aatype_arr = np.full(query_length, 20, dtype=np.int64)
-            pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
-            mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
-
-            matched = 0
-            for qi, ti in zip(query_indices, template_indices, strict=False):
-                if qi < 0 or qi >= query_length:
-                    continue
-                if ti in residue_lookup:
-                    aa, pos, msk = residue_lookup[ti]
-                    aatype_arr[qi] = aa
-                    pos_arr[qi] = pos
-                    mask_arr[qi] = msk
-                    matched += 1
-
-            templates.append(TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr))
-            logger.info("Loaded JSON template %s (%d/%d matched)", cif_name, matched, len(query_indices))
+            feats = _extract_from_index_pairs(
+                mmcif_text,
+                query_indices,
+                template_indices,
+                query_length,
+                max_atoms=max_atoms,
+            )
+            templates.append(feats)
+            logger.info("Loaded JSON template %s", cif_name)
 
         except Exception:
             logger.warning("Failed to process JSON template hit", exc_info=True)
 
     return templates
+
+
+def extract_template_features_from_structure(
+    structure: Structure,
+    query_to_template: dict[int, int],
+    query_length: int,
+    max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+) -> TemplateFeatures:
+    """Extract template features from a Structure object.
+
+    Uses pre-computed query-to-template residue mapping to align template
+    features to query token positions.
+
+    Args:
+        structure: A Structure object with atoms, residues, chains arrays.
+        query_to_template: Maps 0-based query position → 0-based template
+            residue index in the Structure's residues array.
+        query_length: Number of tokens in the query sequence.
+        max_atoms: Maximum atoms per residue.
+
+    Returns:
+        TemplateFeatures aligned to query tokens.
+    """
+    atoms = structure.atoms
+    residues = structure.residues
+
+    # Build residue index → features lookup
+    residue_lookup: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
+
+    for ri in range(len(residues)):
+        res = residues[ri]
+        res_name = res["name"].decode("ascii").strip()
+        aatype = const.res_name_to_type(res_name)
+        canonical_atoms = _get_canonical_atoms(res_name)
+
+        positions = np.zeros((max_atoms, 3), dtype=np.float32)
+        mask = np.zeros(max_atoms, dtype=bool)
+
+        atom_name_to_idx = {name: i for i, name in enumerate(canonical_atoms[:max_atoms])}
+
+        atom_start = int(res["atom_idx"])
+        atom_end = atom_start + int(res["atom_num"])
+        for ai in range(atom_start, atom_end):
+            a = atoms[ai]
+            if not bool(a["is_present"]):
+                continue
+            a_name = a["name"].decode("ascii").strip()
+            idx = atom_name_to_idx.get(a_name)
+            if idx is not None and idx < max_atoms:
+                positions[idx] = [float(a["x"]), float(a["y"]), float(a["z"])]
+                mask[idx] = True
+
+        residue_lookup[ri] = (aatype, positions, mask)
+
+    # Align to query tokens
+    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
+    mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
+
+    matched = 0
+    for qi, ti in query_to_template.items():
+        if qi < 0 or qi >= query_length:
+            continue
+        if ti in residue_lookup:
+            aa, pos, msk = residue_lookup[ti]
+            aatype_arr[qi] = aa
+            pos_arr[qi] = pos
+            mask_arr[qi] = msk
+            matched += 1
+
+    logger.info("Structure template: %d/%d matched", matched, len(query_to_template))
+    return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr)

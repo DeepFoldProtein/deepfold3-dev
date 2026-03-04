@@ -36,7 +36,7 @@ class Featurizer:
     def __init__(
         self,
         max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = 16384,
         max_templates: int = 4,
     ):
         self.max_atoms = max_atoms
@@ -291,7 +291,7 @@ class Featurizer:
                 return np.empty((0, N), np.int8), np.empty((0, N), bool), np.empty((0, N), np.int8)
             S_msa, N_msa = msa.sequences.shape
             seqs = np.full((S_msa, N), 21, dtype=np.int8)  # gap for cross-chain
-            masks = np.ones((S_msa, N), dtype=bool)  # AF3: gaps are valid aligned positions
+            masks = np.ones((S_msa, N), dtype=bool)  # AF3: all positions valid, even cross-chain gaps
             dels = np.zeros((S_msa, N), dtype=np.int8)
             L = min(N_msa, len(chain_pos))
             seqs[:, chain_pos[:L]] = msa.sequences[:, :L]

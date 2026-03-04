@@ -17,6 +17,20 @@ During **inference**, cropping and random rotation are skipped. The `InferenceIn
 
 During **training**, all stages run: `TrainingDataset.__getitem__()` loads a Structure + MSA from disk, tokenizes, crops, and featurizes with random augmentation.
 
+### Structure as Central Data Type
+
+Structure is the canonical representation throughout the assembly lifecycle:
+
+```text
+mmCIF file  ──→  parse_mmcif()       ──→  Structure
+JSON input  ──→  _build_complex_structure() ──→  Structure
+Prediction  ──→  prediction_to_structure()  ──→  Structure  ──→  structure_to_mmcif()  ──→  mmCIF string
+                                                            ──→  save_split()          ──→  coords.npz + meta.json
+Templates   ──→  extract_template_features_from_structure() ──→  TemplateFeatures
+```
+
+**Split serialization** (`save_split` / `load_split`): separates coordinates (coords.npz: x, y, z, b_factor) from metadata (meta.json: name, chains, residues, bonds, atom metadata). Useful for large datasets where coordinate updates are frequent but metadata is static.
+
 ## Data Types (`data/types.py`)
 
 All intermediate representations use numpy structured arrays with explicit dtypes. Access fields with dict syntax: `atoms["x"]`, not `atoms.x`.
@@ -32,6 +46,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 | `charge` | float16 | Formal charge |
 | `name` | S4 | Atom name (e.g. "CA", "C1'"), max 4 chars |
 | `is_present` | bool | Resolved in experimental structure |
+| `b_factor` | float32 | B-factor (experimental) or pLDDT (predicted) |
 
 ### `BOND_DTYPE`
 
@@ -92,7 +107,7 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 ### Dataclasses
 
-**`Structure`**: `atoms` (ATOM_DTYPE), `bonds` (BOND_DTYPE), `residues` (RESIDUE_DTYPE), `chains` (CHAIN_DTYPE). Has `save(path)` / `load(path)` for npz serialization.
+**`Structure`**: `atoms` (ATOM_DTYPE), `bonds` (BOND_DTYPE), `residues` (RESIDUE_DTYPE), `chains` (CHAIN_DTYPE), `name` (str). Has `save(path)` / `load(path)` for NPZ serialization, `save_split(directory)` / `load_split(directory)` for split serialization (coords.npz + meta.json). Structure is the central data type for the full assembly lifecycle: mmCIF → Structure, JSON → Structure, prediction → Structure, Structure → mmCIF.
 
 **`MSA`**: `sequences` (int8 `[S, N]`), `mask` (bool `[S, N]`), `deletion_matrix` (int8 `[S, N]`). Has `save(path)` / `load(path)`.
 
@@ -133,16 +148,18 @@ def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
 ```python
 def extract_template_features(mmcif_text, query_residue_index, ...) -> TemplateFeatures:
 def extract_template_features_from_hhr(mmcif_text, hit, query_length, ...) -> TemplateFeatures:
+def extract_template_features_from_structure(structure, query_to_template, query_length, ...) -> TemplateFeatures:
 def parse_template_mmcifs(template_dir, query_residue_index, max_templates=4) -> list[TemplateFeatures]:
 def parse_hhr_templates(hhr_path, query_length, max_templates=4, cache_dir=None) -> list[TemplateFeatures]:
 def fetch_pdb_mmcif(pdb_id, cache_dir=None) -> str:
 ```
 
 - `TemplateFeatures` dataclass: `aatype [N]` int64, `atom_positions [N, 24, 3]` float32, `atom_mask [N, 24]` bool
-- Three alignment modes:
+- Four alignment modes:
   - **Residue-index matching**: `extract_template_features()` aligns template to query by residue_index values (for mmCIF directory input)
   - **HHR alignment**: `extract_template_features_from_hhr()` uses HHR query-to-hit mapping for alignment (for HHsearch output)
   - **JSON template hits**: `parse_json_templates()` uses pre-computed query-to-template index mappings with local CIF files
+  - **Structure-based**: `extract_template_features_from_structure()` extracts features directly from a Structure object with a query-to-template residue mapping
 - `parse_hhr_templates()` reads an HHR file, selects top hits by `sum_probs`, downloads structures from RCSB, and extracts features
 - `parse_json_templates()` reads a JSON file containing alignment mappings and local CIF template structures (see format below)
 - Unaligned positions are filled with zeros and aatype=20 (UNK)
@@ -180,14 +197,17 @@ def parse_hhr(hhr_text: str) -> list[TemplateHit]:
 ### JSON Input (`data/parse/json_input.py`)
 
 ```python
-def parse_json_input(json_path: Path) -> list[JobInput]:
+def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None) -> list[JobInput]:
 ```
 
-- Parses Protenix-format JSON specifying protein chains with MSA and template paths
-- `ProteinChainInput`: `sequence`, `count`, `paired_msa_path`, `unpaired_msa_path`, `templates_path`
-- `JobInput`: `name`, `protein_chains`, `model_seeds`
+- Parses Protenix-format or AF3-format JSON specifying chains with MSA and template data
+- All file I/O (reading A3M files, downloading template CIFs) happens at parse time
+- `ProteinChainInput`: `sequence`, `count`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`, `template_hits: list[TemplateHitInput]`
+- `NucleotideChainInput`: `sequence`, `count`, `mol_type: int`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`
+- `TemplateHitInput` (in `templates.py`): `mmcif_text`, `query_indices | hhr_hit` — holds parsed template data ready for feature extraction
+- `JobInput`: `name`, `protein_chains`, `dna_chains`, `rna_chains`, `model_seeds`
 - Resolves relative paths against the JSON file's directory
-- Currently supports single-chain protein only (`count=1`)
+- Supports multi-chain protein/DNA/RNA complexes (`count=1`)
 
 ## Tokenization (`data/tokenize/tokenizer.py`)
 
@@ -309,10 +329,12 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 
 ### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=2048, max_templates=4, template_cache_dir=None)`
 
-- Parses Protenix-format or AF3-format JSON via `parse_json_input()`
-- Loads paired and unpaired MSAs separately per chain. Paired MSAs produce cross-chain zipped rows; unpaired MSAs produce block-diagonal rows
-- If templates path is `.json`: calls `parse_json_templates()` for whole-complex alignment with local CIF files
-- If templates path is `.hhr`: calls `parse_hhr_templates()` per protein chain to download and extract template features
+- Parses Protenix-format or AF3-format JSON via `parse_json_input()` — all file I/O (A3M reading, CIF downloading) happens in `parse_json_input()`
+- MSA objects and template hits come pre-parsed from `JobInput` chain dataclasses — `from_json()` does only computation
+- Falls back to single-sequence MSA when no MSA data is provided for a chain
+- Converts `TemplateHitInput` objects to `TemplateFeatures` via `template_hit_input_to_features()` (no I/O)
+- JSON-mode templates (query_indices populated): whole-complex alignment
+- HHR-mode templates (hhr_hit populated): per-chain alignment
 - Builds multi-chain Structure from query sequences, tokenizes and featurizes
 - Supports multi-chain protein/DNA/RNA complexes
 

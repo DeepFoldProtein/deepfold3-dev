@@ -10,6 +10,10 @@ Supports two JSON dialects:
 Format is auto-detected per entry.  Both dialects produce the same
 ``JobInput`` output.
 
+All file I/O (reading A3M files, downloading template CIFs) happens at
+parse time.  The resulting dataclasses hold parsed objects (MSA, template
+hits) rather than file paths, so downstream consumers need no I/O.
+
 Protenix example::
 
     [
@@ -45,8 +49,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import tempfile
+import logging
+from dataclasses import field
 from pathlib import Path
+
+from deepfold3.data import const
+from deepfold3.data.parse.a3m import parse_a3m
+from deepfold3.data.parse.templates import TemplateHitInput, fetch_pdb_mmcif
+from deepfold3.data.types import MSA
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -56,16 +68,16 @@ class ProteinChainInput:
     Attributes:
         sequence: 1-letter amino acid sequence.
         count: Number of copies of this chain (must be 1 for now).
-        paired_msa_path: Path to paired MSA A3M file (optional).
-        unpaired_msa_path: Path to unpaired MSA A3M file (optional).
-        templates_path: Path to HHR template file (optional).
+        paired_msa: Parsed paired MSA object (optional).
+        unpaired_msa: Parsed unpaired MSA object (optional).
+        template_hits: Parsed template hits ready for feature extraction.
     """
 
     sequence: str
     count: int
-    paired_msa_path: Path | None = None
-    unpaired_msa_path: Path | None = None
-    templates_path: Path | None = None
+    paired_msa: MSA | None = None
+    unpaired_msa: MSA | None = None
+    template_hits: list[TemplateHitInput] = field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -75,14 +87,16 @@ class NucleotideChainInput:
     Attributes:
         sequence: 1-letter nucleotide sequence (ACGT for DNA, ACGU for RNA).
         count: Number of copies of this chain (must be 1 for now).
-        paired_msa_path: Path to paired MSA A3M file (optional).
-        unpaired_msa_path: Path to unpaired MSA A3M file (optional).
+        mol_type: const.MOL_DNA or const.MOL_RNA.
+        paired_msa: Parsed paired MSA object (optional).
+        unpaired_msa: Parsed unpaired MSA object (optional).
     """
 
     sequence: str
     count: int
-    paired_msa_path: Path | None = None
-    unpaired_msa_path: Path | None = None
+    mol_type: int
+    paired_msa: MSA | None = None
+    unpaired_msa: MSA | None = None
 
 
 @dataclasses.dataclass
@@ -108,11 +122,21 @@ _DNA_KEYS = ("dnaSequence", "dnaChain")
 _RNA_KEYS = ("rnaSequence", "rnaChain")
 
 
-def parse_json_input(json_path: str | Path) -> list[JobInput]:
+def parse_json_input(
+    json_path: str | Path,
+    max_templates: int = 4,
+    template_cache_dir: str | Path | None = None,
+) -> list[JobInput]:
     """Parse a JSON input file (auto-detects Protenix or AF3 format).
+
+    All file I/O (reading A3M files, downloading template CIFs) happens
+    here.  The returned ``JobInput`` objects hold fully parsed MSA and
+    template hit objects.
 
     Args:
         json_path: Path to the JSON file.
+        max_templates: Maximum number of template hits to load per chain.
+        template_cache_dir: Directory to cache downloaded template mmCIF files.
 
     Returns:
         List of JobInput objects, one per job entry.
@@ -124,6 +148,8 @@ def parse_json_input(json_path: str | Path) -> list[JobInput]:
     json_path = Path(json_path)
     base_dir = json_path.parent
 
+    cache_dir = Path(template_cache_dir) if template_cache_dir is not None else None
+
     with open(json_path) as f:
         data = json.load(f)
 
@@ -133,9 +159,9 @@ def parse_json_input(json_path: str | Path) -> list[JobInput]:
     jobs: list[JobInput] = []
     for entry in data:
         if _is_af3_format(entry):
-            jobs.append(_parse_af3_entry(entry, base_dir))
+            jobs.append(_parse_af3_entry(entry, base_dir, max_templates, cache_dir))
         else:
-            jobs.append(_parse_protenix_entry(entry, base_dir))
+            jobs.append(_parse_protenix_entry(entry, base_dir, max_templates, cache_dir))
 
     return jobs
 
@@ -156,7 +182,7 @@ def _is_af3_format(entry: dict) -> bool:
     return False
 
 
-def _parse_protenix_entry(entry: dict, base_dir: Path) -> JobInput:
+def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None) -> JobInput:
     """Parse a single Protenix-format job entry."""
     name = entry.get("name", "unnamed")
     model_seeds = entry.get("modelSeeds", [42])
@@ -175,9 +201,9 @@ def _parse_protenix_entry(entry: dict, base_dir: Path) -> JobInput:
                 ProteinChainInput(
                     sequence=pc["sequence"],
                     count=count,
-                    paired_msa_path=_resolve_path(base_dir, pc.get("pairedMsaPath")),
-                    unpaired_msa_path=_resolve_path(base_dir, pc.get("unpairedMsaPath")),
-                    templates_path=_resolve_path(base_dir, pc.get("templatesPath")),
+                    paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("pairedMsaPath"), None),
+                    unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("unpairedMsaPath"), None),
+                    template_hits=_resolve_template_hits(base_dir, pc.get("templatesPath"), max_templates, cache_dir),
                 )
             )
         elif any(k in seq_item for k in _DNA_KEYS):
@@ -190,8 +216,9 @@ def _parse_protenix_entry(entry: dict, base_dir: Path) -> JobInput:
                 NucleotideChainInput(
                     sequence=dc["sequence"],
                     count=count,
-                    paired_msa_path=_resolve_path(base_dir, dc.get("pairedMsaPath")),
-                    unpaired_msa_path=_resolve_path(base_dir, dc.get("unpairedMsaPath")),
+                    mol_type=const.MOL_DNA,
+                    paired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("pairedMsaPath"), None),
+                    unpaired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("unpairedMsaPath"), None),
                 )
             )
         elif any(k in seq_item for k in _RNA_KEYS):
@@ -204,8 +231,9 @@ def _parse_protenix_entry(entry: dict, base_dir: Path) -> JobInput:
                 NucleotideChainInput(
                     sequence=rc["sequence"],
                     count=count,
-                    paired_msa_path=_resolve_path(base_dir, rc.get("pairedMsaPath")),
-                    unpaired_msa_path=_resolve_path(base_dir, rc.get("unpairedMsaPath")),
+                    mol_type=const.MOL_RNA,
+                    paired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("pairedMsaPath"), None),
+                    unpaired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("unpairedMsaPath"), None),
                 )
             )
         elif "ligand" in seq_item:
@@ -223,7 +251,7 @@ def _parse_protenix_entry(entry: dict, base_dir: Path) -> JobInput:
     )
 
 
-def _parse_af3_entry(entry: dict, base_dir: Path) -> JobInput:
+def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None) -> JobInput:
     """Parse a single AlphaFold 3-format job entry.
 
     AF3 format uses ``protein``, ``dna``, ``rna`` keys in sequence items.
@@ -244,47 +272,49 @@ def _parse_af3_entry(entry: dict, base_dir: Path) -> JobInput:
             p = seq_item["protein"]
             ids = _ensure_id_list(p.get("id", []))
             seq = p["sequence"]
-            unpaired = _resolve_af3_msa(base_dir, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
-            paired = _resolve_af3_msa(base_dir, p.get("pairedMsaPath"), p.get("pairedMsa"))
-            tmpl = _resolve_path(base_dir, p.get("templatesPath"))
+            unpaired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
+            paired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("pairedMsaPath"), p.get("pairedMsa"))
+            tmpl_hits = _resolve_template_hits(base_dir, p.get("templatesPath"), max_templates, cache_dir)
             for _ in ids or [None]:
                 protein_chains.append(
                     ProteinChainInput(
                         sequence=seq,
                         count=1,
-                        paired_msa_path=paired,
-                        unpaired_msa_path=unpaired,
-                        templates_path=tmpl,
+                        paired_msa=paired,
+                        unpaired_msa=unpaired,
+                        template_hits=tmpl_hits,
                     )
                 )
         elif "dna" in seq_item:
             d = seq_item["dna"]
             ids = _ensure_id_list(d.get("id", []))
             seq = d["sequence"]
-            unpaired = _resolve_af3_msa(base_dir, d.get("unpairedMsaPath"), d.get("unpairedMsa"))
-            paired = _resolve_af3_msa(base_dir, d.get("pairedMsaPath"), d.get("pairedMsa"))
+            unpaired = _resolve_msa(base_dir, const.MOL_DNA, d.get("unpairedMsaPath"), d.get("unpairedMsa"))
+            paired = _resolve_msa(base_dir, const.MOL_DNA, d.get("pairedMsaPath"), d.get("pairedMsa"))
             for _ in ids or [None]:
                 dna_chains.append(
                     NucleotideChainInput(
                         sequence=seq,
                         count=1,
-                        paired_msa_path=paired,
-                        unpaired_msa_path=unpaired,
+                        mol_type=const.MOL_DNA,
+                        paired_msa=paired,
+                        unpaired_msa=unpaired,
                     )
                 )
         elif "rna" in seq_item:
             r = seq_item["rna"]
             ids = _ensure_id_list(r.get("id", []))
             seq = r["sequence"]
-            unpaired = _resolve_af3_msa(base_dir, r.get("unpairedMsaPath"), r.get("unpairedMsa"))
-            paired = _resolve_af3_msa(base_dir, r.get("pairedMsaPath"), r.get("pairedMsa"))
+            unpaired = _resolve_msa(base_dir, const.MOL_RNA, r.get("unpairedMsaPath"), r.get("unpairedMsa"))
+            paired = _resolve_msa(base_dir, const.MOL_RNA, r.get("pairedMsaPath"), r.get("pairedMsa"))
             for _ in ids or [None]:
                 rna_chains.append(
                     NucleotideChainInput(
                         sequence=seq,
                         count=1,
-                        paired_msa_path=paired,
-                        unpaired_msa_path=unpaired,
+                        mol_type=const.MOL_RNA,
+                        paired_msa=paired,
+                        unpaired_msa=unpaired,
                     )
                 )
         elif "ligand" in seq_item:
@@ -309,20 +339,193 @@ def _ensure_id_list(ids: str | list[str]) -> list[str]:
     return list(ids)
 
 
-def _resolve_af3_msa(base_dir: Path, path_str: str | None, inline_str: str | None) -> Path | None:
-    """Resolve MSA from either a file path or an inline string.
+# ---------------------------------------------------------------------------
+# MSA resolution
+# ---------------------------------------------------------------------------
 
-    If an inline MSA string is provided (and no file path), it is written to
-    a temporary file and the path to that file is returned.
+
+def _resolve_msa(base_dir: Path, mol_type: int, path_str: str | None, inline_str: str | None) -> MSA | None:
+    """Resolve MSA from a file path or inline string into a parsed MSA object.
+
+    Args:
+        base_dir: Base directory for resolving relative paths.
+        mol_type: Molecule type (MOL_PROTEIN, MOL_DNA, MOL_RNA).
+        path_str: Path to an A3M file (relative or absolute), or None.
+        inline_str: Inline A3M text, or None.
+
+    Returns:
+        Parsed MSA object, or None if neither path nor inline string is provided.
     """
     if path_str is not None:
-        return _resolve_path(base_dir, path_str)
+        resolved = _resolve_path(base_dir, path_str)
+        if resolved is not None:
+            try:
+                text = resolved.read_text()
+                msa = parse_a3m(text, mol_type)
+                if msa.sequences.shape[0] > 0:
+                    return msa
+            except (FileNotFoundError, OSError) as e:
+                logger.warning("Failed to read MSA file %s: %s", resolved, e)
+        return None
+
     if inline_str is not None and inline_str.strip():
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".a3m", delete=False)
-        tmp.write(inline_str)
-        tmp.close()
-        return Path(tmp.name)
+        msa = parse_a3m(inline_str, mol_type)
+        if msa.sequences.shape[0] > 0:
+            return msa
+
     return None
+
+
+# ---------------------------------------------------------------------------
+# Template resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_template_hits(
+    base_dir: Path, templates_path_str: str | None, max_templates: int, cache_dir: Path | None
+) -> list[TemplateHitInput]:
+    """Resolve template hits from a file path into parsed TemplateHitInput objects.
+
+    Supports two template path formats:
+    - ``.json``: JSON template hits file with pre-computed alignments and local CIF files
+    - ``.hhr``: HHsearch output — parses hits and downloads CIFs from RCSB
+
+    Args:
+        base_dir: Base directory for resolving relative paths.
+        templates_path_str: Path to template file (JSON or HHR), or None.
+        max_templates: Maximum number of template hits to load.
+        cache_dir: Directory to cache downloaded template mmCIF files.
+
+    Returns:
+        List of TemplateHitInput objects (empty if no templates specified).
+    """
+    if templates_path_str is None:
+        return []
+
+    resolved = _resolve_path(base_dir, templates_path_str)
+    if resolved is None or not resolved.exists():
+        logger.warning("Templates path not found: %s", templates_path_str)
+        return []
+
+    suffix = resolved.suffix.lower()
+    if suffix == ".json":
+        return _load_json_template_hits(resolved, max_templates)
+    elif suffix == ".hhr":
+        return _load_hhr_template_hits(resolved, max_templates, cache_dir)
+    else:
+        logger.warning("Unsupported template file type: %s", suffix)
+        return []
+
+
+def _load_json_template_hits(json_path: Path, max_templates: int) -> list[TemplateHitInput]:
+    """Load template hits from a JSON file with pre-computed alignments.
+
+    Expected format::
+
+        [
+            {
+                "name": "template_hit_0.cif",
+                "queryIndices": [0, 1, 5, ...],
+                "templateIndices": [10, 11, 15, ...]
+            },
+            ...
+        ]
+
+    Returns:
+        List of TemplateHitInput with mmCIF text and index pairs.
+    """
+    json_dir = json_path.parent
+
+    try:
+        with open(json_path) as f:
+            hits = json.load(f)
+    except Exception:
+        logger.warning("Failed to read JSON template file %s", json_path, exc_info=True)
+        return []
+
+    if not isinstance(hits, list):
+        logger.warning("JSON template hits file %s is not an array", json_path)
+        return []
+
+    result: list[TemplateHitInput] = []
+    for hit in hits[:max_templates]:
+        try:
+            cif_name = hit["name"]
+            query_indices = hit["queryIndices"]
+            template_indices = hit["templateIndices"]
+
+            if len(query_indices) != len(template_indices):
+                logger.warning("Mismatched index lengths in template %s, skipping", cif_name)
+                continue
+
+            cif_path = json_dir / cif_name
+            if not cif_path.exists():
+                logger.warning("Template CIF not found: %s", cif_path)
+                continue
+
+            mmcif_text = cif_path.read_text()
+            result.append(
+                TemplateHitInput(
+                    mmcif_text=mmcif_text,
+                    query_indices=query_indices,
+                    template_indices=template_indices,
+                )
+            )
+            logger.info("Loaded JSON template hit %s", cif_name)
+        except Exception:
+            logger.warning("Failed to process JSON template hit", exc_info=True)
+
+    return result
+
+
+def _load_hhr_template_hits(hhr_path: Path, max_templates: int, cache_dir: Path | None) -> list[TemplateHitInput]:
+    """Load template hits from an HHR file, downloading CIFs from RCSB.
+
+    Returns:
+        List of TemplateHitInput with mmCIF text and HHR hit objects.
+    """
+    from deepfold3.data.parse.hhr import parse_hhr
+
+    try:
+        hhr_text = hhr_path.read_text()
+    except (FileNotFoundError, OSError) as e:
+        logger.warning("Failed to read HHR file %s: %s", hhr_path, e)
+        return []
+
+    hits = parse_hhr(hhr_text)
+    if not hits:
+        logger.warning("No hits found in HHR file %s", hhr_path)
+        return []
+
+    result: list[TemplateHitInput] = []
+    for hit in hits:
+        if len(result) >= max_templates:
+            break
+        try:
+            mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir)
+            result.append(
+                TemplateHitInput(
+                    mmcif_text=mmcif_text,
+                    hhr_hit=hit,
+                    chain_id=hit.chain_id,
+                )
+            )
+            logger.info(
+                "Loaded HHR template %s_%s (e_value=%.1e, aligned_cols=%d)",
+                hit.pdb_id,
+                hit.chain_id,
+                hit.e_value,
+                hit.aligned_cols,
+            )
+        except Exception:
+            logger.warning("Failed to download template %s_%s", hit.pdb_id, hit.chain_id, exc_info=True)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Path resolution
+# ---------------------------------------------------------------------------
 
 
 def _resolve_path(base_dir: Path, raw: str | None) -> Path | None:
