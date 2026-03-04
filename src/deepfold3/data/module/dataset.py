@@ -72,14 +72,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         structure_path = self.data_dir / "structures" / f"{record.id}.npz"
         structure = Structure.load(structure_path)
 
-        # Load MSAs keyed by chain index
+        # Load MSAs keyed by chain index (treated as unpaired for disk-loaded MSAs)
         msa: dict[int, MSA] = {}
         for chain_info in record.chains:
             msa_path = self.data_dir / "msa" / f"{chain_info.msa_id}.npz"
             if msa_path.exists():
                 msa[chain_info.chain_id] = MSA.load(msa_path)
 
-        inp = Input(structure=structure, msa=msa)
+        inp = Input(structure=structure, paired_msa={}, unpaired_msa=msa)
 
         # Tokenize -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
@@ -93,12 +93,19 @@ def _tokenize_and_featurize(
     inp: Input,
     max_msa_seqs: int = 2048,
     templates: list[TemplateFeatures] | None = None,
+    template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Shared tokenize -> featurize pipeline for inference inputs."""
     tokenizer = Tokenizer()
     featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
     tokenized = tokenizer.tokenize(inp)
-    return featurizer.process(tokenized, training=False, random_rot=False, templates=templates)
+    return featurizer.process(
+        tokenized,
+        training=False,
+        random_rot=False,
+        templates=templates,
+        template_feats_per_chain=template_feats_per_chain,
+    )
 
 
 class InferenceInput:
@@ -136,7 +143,7 @@ class InferenceInput:
 
         query_seq = _msa_indices_to_sequence(msa_obj.sequences[0], mt)
         structure = _sequence_to_structure(query_seq, mt)
-        inp = Input(structure=structure, msa={0: msa_obj})
+        inp = Input(structure=structure, paired_msa={}, unpaired_msa={0: msa_obj})
         return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=templates)
 
     @staticmethod
@@ -160,7 +167,7 @@ class InferenceInput:
         mt = const.MOL_TYPE_IDS.get(mol_type.upper(), const.MOL_PROTEIN)
         structure = _sequence_to_structure(sequence, mt)
         msa = _sequence_to_msa(sequence, mt)
-        inp = Input(structure=structure, msa={0: msa})
+        inp = Input(structure=structure, paired_msa={}, unpaired_msa={0: msa})
         return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=templates)
 
     @staticmethod
@@ -173,7 +180,8 @@ class InferenceInput:
     ) -> dict[str, torch.Tensor]:
         """Build features from a Protenix-format JSON input file.
 
-        Supports single-chain protein with optional MSA and HHR template files.
+        Supports multi-chain complexes with protein, DNA, and RNA chains.
+        Each chain can optionally specify paired/unpaired MSA paths.
 
         Args:
             json_path: Path to the JSON input file.
@@ -185,7 +193,6 @@ class InferenceInput:
         Returns:
             dict[str, torch.Tensor] ready for model.forward().
         """
-        from deepfold3.data.parse.a3m import parse_a3m
         from deepfold3.data.parse.json_input import parse_json_input
 
         json_path = Path(json_path)
@@ -196,72 +203,114 @@ class InferenceInput:
 
         job = jobs[job_index]
 
-        if len(job.protein_chains) != 1:
-            raise ValueError(
-                f"Only single-chain protein is supported, got {len(job.protein_chains)} chains in job {job.name!r}"
+        # Collect all chains in order: protein, DNA, RNA
+        # Each entry: (sequence, mol_type, paired_msa_path, unpaired_msa_path, templates_path)
+        chain_specs: list[tuple] = []
+        for pc in job.protein_chains:
+            chain_specs.append(
+                (pc.sequence, const.MOL_PROTEIN, pc.paired_msa_path, pc.unpaired_msa_path, pc.templates_path)
             )
+        for dc in job.dna_chains:
+            chain_specs.append((dc.sequence, const.MOL_DNA, dc.paired_msa_path, dc.unpaired_msa_path, None))
+        for rc in job.rna_chains:
+            chain_specs.append((rc.sequence, const.MOL_RNA, rc.paired_msa_path, rc.unpaired_msa_path, None))
 
-        chain = job.protein_chains[0]
-        mt = const.MOL_PROTEIN
+        if not chain_specs:
+            raise ValueError(f"No chains found in job {job.name!r}")
 
-        # Load MSA: prefer unpaired, fallback to paired, fallback to single-sequence
-        msa_obj = None
-        for msa_path in [chain.unpaired_msa_path, chain.paired_msa_path]:
-            if msa_path is not None and msa_path.exists():
-                a3m_text = msa_path.read_text()
-                msa_obj = parse_a3m(a3m_text, mt)
-                if msa_obj.sequences.shape[0] > 0:
-                    break
-                msa_obj = None
+        # Build multi-chain structure with auto-generated chain names
+        chain_tuples = [(seq, mt, chr(ord("A") + i)) for i, (seq, mt, _, _, _) in enumerate(chain_specs)]
+        structure = _build_complex_structure(chain_tuples)
 
-        if msa_obj is None:
-            msa_obj = _sequence_to_msa(chain.sequence, mt)
+        # Load MSA for each chain (separate paired + unpaired)
+        paired_msa_dict: dict[int, MSA] = {}
+        unpaired_msa_dict: dict[int, MSA] = {}
+        for asym_id, (seq, mt, paired_path, unpaired_path, _) in enumerate(chain_specs):
+            paired, unpaired = _load_chain_msa(mt, seq, paired_path, unpaired_path)
+            if paired is not None:
+                paired_msa_dict[asym_id] = paired
+            unpaired_msa_dict[asym_id] = unpaired
 
-        # Load templates from HHR if available
-        template_feats = None
-        if chain.templates_path is not None and chain.templates_path.exists():
-            if chain.templates_path.suffix.lower() == ".hhr":
-                from deepfold3.data.parse.templates import parse_hhr_templates
+        # Load templates: check for whole-complex JSON template hits first
+        template_feats: list[TemplateFeatures] | None = None
+        template_feats_per_chain: dict[int, list[TemplateFeatures]] = {}
 
-                template_feats = parse_hhr_templates(
-                    chain.templates_path,
-                    query_length=len(chain.sequence),
+        json_tmpl_found = False
+        for _asym_id, (_seq, _mt, _, _, tmpl_path) in enumerate(chain_specs):
+            if tmpl_path is not None and tmpl_path.suffix.lower() == ".json" and tmpl_path.exists():
+                from deepfold3.data.parse.templates import parse_json_templates
+
+                total_tokens = sum(len(seq) for seq, _, _, _, _ in chain_specs)
+                template_feats = parse_json_templates(
+                    tmpl_path,
+                    query_length=total_tokens,
                     max_templates=max_templates,
-                    cache_dir=template_cache_dir,
                 )
                 if not template_feats:
                     template_feats = None
+                json_tmpl_found = True
+                break
 
-        structure = _sequence_to_structure(chain.sequence, mt)
-        inp = Input(structure=structure, msa={0: msa_obj})
-        return _tokenize_and_featurize(inp, max_msa_seqs=max_msa_seqs, templates=template_feats)
+        # Fall back to per-chain HHR templates
+        if not json_tmpl_found:
+            for asym_id, (seq, mt, _, _, tmpl_path) in enumerate(chain_specs):
+                if mt == const.MOL_PROTEIN and tmpl_path is not None and tmpl_path.exists():
+                    if tmpl_path.suffix.lower() == ".hhr":
+                        from deepfold3.data.parse.templates import parse_hhr_templates
+
+                        chain_templates = parse_hhr_templates(
+                            tmpl_path,
+                            query_length=len(seq),
+                            max_templates=max_templates,
+                            cache_dir=template_cache_dir,
+                        )
+                        if chain_templates:
+                            template_feats_per_chain[asym_id] = chain_templates
+
+            # For backward compatibility: if only one chain has templates, pass as flat list
+            if len(template_feats_per_chain) == 1:
+                template_feats = next(iter(template_feats_per_chain.values()))
+            elif len(template_feats_per_chain) > 1:
+                template_feats = next(iter(template_feats_per_chain.values()))
+
+        inp = Input(structure=structure, paired_msa=paired_msa_dict, unpaired_msa=unpaired_msa_dict)
+        return _tokenize_and_featurize(
+            inp,
+            max_msa_seqs=max_msa_seqs,
+            templates=template_feats,
+            template_feats_per_chain=template_feats_per_chain if len(template_feats_per_chain) > 1 else None,
+        )
 
 
-def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
-    """Build a Structure from a 1-letter sequence (no mmCIF needed)."""
-    sequence = sequence.strip().upper()
-    n = len(sequence)
+def _letter_to_res_name(letter: str, mol_type: int) -> str:
+    """Map a single-character residue letter to its canonical residue name."""
+    if mol_type == const.MOL_PROTEIN:
+        return const.ONE_LETTER_TO_THREE.get(letter, "UNK")
+    elif mol_type == const.MOL_RNA:
+        return const.RNA_LETTER_TO_RES.get(letter, "N")
+    elif mol_type == const.MOL_DNA:
+        return const.DNA_LETTER_TO_RES.get(letter, "DN")
+    return "UNK"
 
+
+def _build_chain_atoms_residues(
+    sequence: str,
+    mol_type: int,
+    atom_offset: int,
+) -> tuple[list[tuple], list[tuple], int]:
+    """Build atom and residue tuples for a single chain.
+
+    Returns:
+        (atoms_list, residues_list, total_atoms_in_chain)
+    """
     atoms_list: list[tuple] = []
     residues_list: list[tuple] = []
 
-    atom_idx = 0
+    atom_idx = atom_offset
     for ri, letter in enumerate(sequence):
-        # Map 1-letter to residue name
-        if mol_type == const.MOL_PROTEIN:
-            res_name_3 = const.ONE_LETTER_TO_THREE.get(letter, "UNK")
-        elif mol_type == const.MOL_RNA:
-            rna_map = {"A": "A", "G": "G", "C": "C", "U": "U"}
-            res_name_3 = rna_map.get(letter, "N")
-        elif mol_type == const.MOL_DNA:
-            dna_map = {"A": "DA", "G": "DG", "C": "DC", "T": "DT"}
-            res_name_3 = dna_map.get(letter, "DN")
-        else:
-            res_name_3 = "UNK"
-
+        res_name_3 = _letter_to_res_name(letter, mol_type)
         res_type = const.res_name_to_type(res_name_3)
 
-        # Get reference atoms (ideal CCD positions)
         ref = get_ref_atoms(res_name_3, mol_type)
         n_atoms = int(ref.mask.sum())
 
@@ -292,25 +341,74 @@ def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
         )
         atom_idx += n_atoms
 
-    # Single chain
-    total_atoms = atom_idx
-    chains_list = [
-        (
-            b"A",  # name
-            mol_type,  # mol_type
-            1,  # entity_id (1-based, mmCIF convention)
-            0,  # sym_id
-            0,  # asym_id
-            0,  # res_idx
-            n,  # res_num
-            0,  # atom_idx
-            total_atoms,  # atom_num
-        )
-    ]
+    return atoms_list, residues_list, atom_idx - atom_offset
 
-    atoms_arr = np.array(atoms_list, dtype=ATOM_DTYPE) if atoms_list else np.empty(0, dtype=ATOM_DTYPE)
-    residues_arr = np.array(residues_list, dtype=RESIDUE_DTYPE)
-    chains_arr = np.array(chains_list, dtype=CHAIN_DTYPE)
+
+def _build_complex_structure(chains: list[tuple[str, int, str]]) -> Structure:
+    """Build a multi-chain Structure with sequence-based entity_id grouping.
+
+    Chains with identical (normalized) sequences share the same entity_id,
+    with incrementing sym_id to distinguish copies. This matches AF3 semantics
+    where entity_id encodes sequence identity and sym_id encodes copy number.
+
+    Args:
+        chains: List of (sequence, mol_type, chain_name) tuples. mol_type is
+            one of const.MOL_PROTEIN, const.MOL_DNA, const.MOL_RNA.
+
+    Returns:
+        Structure with properly assigned entity_id and sym_id.
+    """
+    # Map normalized sequences to (entity_id, next_sym_id)
+    seq_to_entity: dict[str, list[int]] = {}  # normalized_seq -> [entity_id, next_sym_id]
+    next_entity_id = 1
+
+    all_atoms: list[tuple] = []
+    all_residues: list[tuple] = []
+    all_chains: list[tuple] = []
+
+    atom_offset = 0
+    res_offset = 0
+
+    for chain_idx, (sequence, mol_type, chain_name) in enumerate(chains):
+        sequence = sequence.strip().upper()
+        n_residues = len(sequence)
+
+        # Determine entity_id and sym_id based on sequence identity
+        if sequence in seq_to_entity:
+            entity_id = seq_to_entity[sequence][0]
+            sym_id = seq_to_entity[sequence][1]
+            seq_to_entity[sequence][1] += 1
+        else:
+            entity_id = next_entity_id
+            sym_id = 0
+            seq_to_entity[sequence] = [entity_id, 1]
+            next_entity_id += 1
+
+        # Build atoms and residues for this chain
+        chain_atoms, chain_residues, chain_atom_count = _build_chain_atoms_residues(sequence, mol_type, atom_offset)
+        all_atoms.extend(chain_atoms)
+        all_residues.extend(chain_residues)
+
+        all_chains.append(
+            (
+                chain_name.encode("ascii"),
+                mol_type,
+                entity_id,  # sequence-based entity_id (1-based)
+                sym_id,  # copy index within entity (0-based)
+                chain_idx,  # asym_id (unique chain index)
+                res_offset,  # res_idx
+                n_residues,  # res_num
+                atom_offset,  # atom_idx
+                chain_atom_count,  # atom_num
+            )
+        )
+
+        atom_offset += chain_atom_count
+        res_offset += n_residues
+
+    atoms_arr = np.array(all_atoms, dtype=ATOM_DTYPE) if all_atoms else np.empty(0, dtype=ATOM_DTYPE)
+    residues_arr = np.array(all_residues, dtype=RESIDUE_DTYPE) if all_residues else np.empty(0, dtype=RESIDUE_DTYPE)
+    chains_arr = np.array(all_chains, dtype=CHAIN_DTYPE) if all_chains else np.empty(0, dtype=CHAIN_DTYPE)
     bonds_arr = np.empty(0, dtype=BOND_DTYPE)
 
     return Structure(
@@ -319,6 +417,53 @@ def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
         residues=residues_arr,
         chains=chains_arr,
     )
+
+
+def _sequence_to_structure(sequence: str, mol_type: int) -> Structure:
+    """Build a single-chain Structure from a 1-letter sequence (no mmCIF needed)."""
+    return _build_complex_structure([(sequence, mol_type, "A")])
+
+
+def _load_chain_msa(
+    mol_type: int, sequence: str, paired_path: Path | None, unpaired_path: Path | None
+) -> tuple[MSA | None, MSA]:
+    """Load paired and unpaired MSA separately for a chain.
+
+    Returns:
+        (paired_msa, unpaired_msa) — paired_msa is None if no paired A3M exists.
+        Falls back to a single-sequence MSA for unpaired if neither file exists.
+    """
+    from deepfold3.data.parse.a3m import parse_a3m
+
+    paired_msa: MSA | None = None
+    unpaired_msa: MSA | None = None
+
+    if paired_path is not None:
+        try:
+            text = paired_path.read_text()
+            msa = parse_a3m(text, mol_type)
+            if msa.sequences.shape[0] > 0:
+                paired_msa = msa
+        except (FileNotFoundError, OSError):
+            pass
+
+    if unpaired_path is not None:
+        try:
+            text = unpaired_path.read_text()
+            msa = parse_a3m(text, mol_type)
+            if msa.sequences.shape[0] > 0:
+                unpaired_msa = msa
+        except (FileNotFoundError, OSError):
+            pass
+
+    # If we have neither, fall back to single-sequence MSA
+    if unpaired_msa is None and paired_msa is None:
+        unpaired_msa = _sequence_to_msa(sequence, mol_type)
+    elif unpaired_msa is None:
+        # Only paired exists — use query row from paired as the unpaired MSA
+        unpaired_msa = _sequence_to_msa(sequence, mol_type)
+
+    return paired_msa, unpaired_msa
 
 
 def _sequence_to_msa(sequence: str, mol_type: int) -> MSA:

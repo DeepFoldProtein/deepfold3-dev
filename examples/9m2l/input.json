@@ -1,0 +1,24 @@
+[
+  {
+    "sequences": [
+      {
+        "protein": {
+          "id": [
+            "A",
+            "B"
+          ],
+          "sequence": "GDRGPEFTLTENVMKPQIQRFTRDHDPKVLWQVVEEDGAVIIEGFLPHEVIQKFDCELDVRSKATKGGEMNQEFYQMPVPTTTKWMNDLTATCPTFRHEILNNDILHSLCNVAFEPHGDYWLLNGMAMEMMPGNPTQQIHNDHGTHPILQYLRPDAPAPVFSIITAVTEFTESNGATRVILGSHRWPQGQKAKDDQAVRAALQPGDALVMHRSTKHGGAAHDADNQDHRRLLLTCMGTCQLAPYETNVTVPRPIVESMTPLAQKMIGWRSTRPVISNVTGLNTVRMKHLENQIELKSNVPLNVGG",
+          "unpairedMsaPath": "./msas/fold_9m2l_unpaired_msa_chains_a_b.a3m",
+          "pairedMsaPath": "./msas/fold_9m2l_paired_msa_chains_a_b.a3m",
+          "templatesPath": "./templates/fold_9m2l_template_hits_chains_a_b_query_to_hit.json"
+        }
+      }
+    ],
+    "name": "9m2l",
+    "modelSeeds": [
+      42
+    ],
+    "dialect": "alphafold3",
+    "version": 2
+  }
+]

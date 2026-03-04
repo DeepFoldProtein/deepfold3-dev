@@ -1,0 +1,27 @@
+[{
+  "name": "7r6r",
+  "modelSeeds": [42],
+  "sequences": [
+    {
+      "proteinChain": {
+        "sequence": "MGSSHHHHHHSSGLVPRGSHMSGKIQHKAVVPAPSRIPLTLSEIEDLRRKGFNQTEIAELYGVTRQAVSWHKKTYGGRLTTRQIVQQNWPWDTRKPHDKSKAFQRLRDHGEYMRVGSFRTMSEDKKKRLLSWWKMLRDNDLVLEFDPSIEPYEGMAGGGFRYVPRDISDDDLLIRVNEHTQLTAEGELLWSWPDDIEELLSEP",
+        "count": 1,
+        "unpairedMsaPath": "./msas/fold_7r6r_unpaired_msa_chains_a.a3m",
+        "pairedMsaPath": "./msas/fold_7r6r_paired_msa_chains_a.a3m",
+        "templatesPath": "./templates/fold_7r6r_template_hits_chains_a_query_to_hit.json"
+      }
+    },
+    {
+      "dnaSequence": {
+        "sequence": "TTTCGGTGGCTGTCAAGCGGG",
+        "count": 1
+      }
+    },
+    {
+      "dnaSequence": {
+        "sequence": "CCCGCTTGACAGCCACCGAAA",
+        "count": 1
+      }
+    }
+  ]
+}]

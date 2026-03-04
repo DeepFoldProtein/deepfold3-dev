@@ -3,9 +3,10 @@
 Downloads template structures from RCSB PDB, aligns them to query tokens,
 and extracts dense atom positions/masks for the template embedding module.
 
-Supports two alignment modes:
+Supports three alignment modes:
   - Residue-index matching (mmCIF directory input)
   - HHR alignment mapping (HHsearch output + PDB download)
+  - JSON template hits (pre-computed query-to-template index mappings + local CIF files)
 
 Template features (per template, aligned to query tokens):
     aatype         [N]         int64   residue type indices
@@ -16,6 +17,7 @@ Template features (per template, aligned to query tokens):
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import urllib.request
 from pathlib import Path
@@ -399,5 +401,104 @@ def parse_hhr_templates(
             )
         except Exception:
             logger.warning("Failed to process template %s_%s", hit.pdb_id, hit.chain_id, exc_info=True)
+
+    return templates
+
+
+def parse_json_templates(
+    json_path: str | Path,
+    query_length: int,
+    max_templates: int = 4,
+    max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+) -> list[TemplateFeatures]:
+    """Parse templates from a JSON template hits file with pre-computed alignments.
+
+    The JSON file contains an array of hits, each with a CIF filename and
+    paired queryIndices/templateIndices arrays that map query token positions
+    to template residue seqid numbers.
+
+    Expected JSON format::
+
+        [
+            {
+                "name": "template_hit_0.cif",
+                "queryIndices": [0, 1, 5, ...],
+                "templateIndices": [10, 11, 15, ...]
+            },
+            ...
+        ]
+
+    - ``name``: CIF filename in the same directory as the JSON file.
+    - ``queryIndices``: 0-based token positions in the full query complex.
+    - ``templateIndices``: Residue label_seq_id numbers (mmCIF canonical numbering) in the template CIF.
+
+    Args:
+        json_path: Path to the JSON template hits file.
+        query_length: Total number of tokens in the query complex.
+        max_templates: Maximum number of templates to process.
+        max_atoms: Maximum atoms per residue.
+
+    Returns:
+        List of TemplateFeatures, one per successfully processed hit.
+    """
+    json_path = Path(json_path)
+    json_dir = json_path.parent
+
+    with open(json_path) as f:
+        hits = json.load(f)
+
+    if not isinstance(hits, list):
+        logger.warning("JSON template hits file %s is not an array", json_path)
+        return []
+
+    templates: list[TemplateFeatures] = []
+    for hit in hits[:max_templates]:
+        try:
+            cif_name = hit["name"]
+            query_indices = hit["queryIndices"]
+            template_indices = hit["templateIndices"]
+
+            if len(query_indices) != len(template_indices):
+                logger.warning("Mismatched index lengths in template %s, skipping", cif_name)
+                continue
+
+            cif_path = json_dir / cif_name
+            if not cif_path.exists():
+                logger.warning("Template CIF not found: %s", cif_path)
+                continue
+
+            mmcif_text = cif_path.read_text()
+            result = _parse_mmcif_chain(mmcif_text, label=cif_name)
+            if result is None:
+                continue
+            _, target_chain = result
+
+            # Build label_seq -> residue features lookup
+            # (templateIndices use mmCIF label_seq_id numbering)
+            residue_lookup: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
+            for residue in target_chain:
+                residue_lookup[residue.label_seq] = _extract_residue_features(residue, max_atoms)
+
+            # Place features at query positions using the alignment
+            aatype_arr = np.full(query_length, 20, dtype=np.int64)
+            pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
+            mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
+
+            matched = 0
+            for qi, ti in zip(query_indices, template_indices, strict=False):
+                if qi < 0 or qi >= query_length:
+                    continue
+                if ti in residue_lookup:
+                    aa, pos, msk = residue_lookup[ti]
+                    aatype_arr[qi] = aa
+                    pos_arr[qi] = pos
+                    mask_arr[qi] = msk
+                    matched += 1
+
+            templates.append(TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr))
+            logger.info("Loaded JSON template %s (%d/%d matched)", cif_name, matched, len(query_indices))
+
+        except Exception:
+            logger.warning("Failed to process JSON template hit", exc_info=True)
 
     return templates

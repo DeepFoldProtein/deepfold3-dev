@@ -96,9 +96,9 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 **`MSA`**: `sequences` (int8 `[S, N]`), `mask` (bool `[S, N]`), `deletion_matrix` (int8 `[S, N]`). Has `save(path)` / `load(path)`.
 
-**`Input`**: `structure: Structure`, `msa: dict[int, MSA]` (keyed by asym_id).
+**`Input`**: `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]` (both keyed by asym_id). Paired MSAs carry cross-chain co-evolutionary signal (same row = same species across chains). Use `Input.from_msa(structure, msa)` to treat all MSAs as unpaired (single-chain compat).
 
-**`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `msa: dict[int, MSA]`.
+**`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]`.
 
 **`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]` -- metadata for training dataset indexing.
 
@@ -139,13 +139,33 @@ def fetch_pdb_mmcif(pdb_id, cache_dir=None) -> str:
 ```
 
 - `TemplateFeatures` dataclass: `aatype [N]` int64, `atom_positions [N, 24, 3]` float32, `atom_mask [N, 24]` bool
-- Two alignment modes:
+- Three alignment modes:
   - **Residue-index matching**: `extract_template_features()` aligns template to query by residue_index values (for mmCIF directory input)
   - **HHR alignment**: `extract_template_features_from_hhr()` uses HHR query-to-hit mapping for alignment (for HHsearch output)
+  - **JSON template hits**: `parse_json_templates()` uses pre-computed query-to-template index mappings with local CIF files
 - `parse_hhr_templates()` reads an HHR file, selects top hits by `sum_probs`, downloads structures from RCSB, and extracts features
+- `parse_json_templates()` reads a JSON file containing alignment mappings and local CIF template structures (see format below)
 - Unaligned positions are filled with zeros and aatype=20 (UNK)
 - `fetch_pdb_mmcif()` downloads from RCSB (`https://files.rcsb.org/download/{pdb_id}.cif`) with optional caching
 - Template features are converted to pseudo-beta positions, backbone frames, and masks in the featurizer
+
+**JSON template hits format** (produced by tools like Protenix/Boltz):
+
+```json
+[
+  {
+    "name": "template_hit_0.cif",
+    "queryIndices": [0, 5, 10, ...],
+    "templateIndices": [1, 6, 11, ...]
+  }
+]
+```
+
+- `name`: CIF filename in the same directory as the JSON file
+- `queryIndices`: 0-based token positions in the full query complex
+- `templateIndices`: residue label_seq_id numbers (mmCIF canonical numbering) in the template CIF
+- JSON templates are whole-complex (aligned to all chains at once), unlike HHR which is per-chain
+- Set `templatesPath` in the JSON input to point to the `*_query_to_hit.json` file
 
 ### HHR (`data/parse/hhr.py`)
 
@@ -229,13 +249,15 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `sym_id` | `[N]` | int64 | Symmetry ID |
 | `seq_mask` | `[N]` | bool | Valid token mask |
 | `pair_mask` | `[N, N]` | bool | `seq_mask[:, None] & seq_mask[None, :]` |
+| `frames_mask` | `[N]` | bool | True for polymer tokens with backbone frames (protein/RNA/DNA) |
+| `token_to_rep_atom` | `[N]` | int64 | Representative atom index: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand |
 | `ref_pos` | `[N, M, 3]` | float32 | Reference atom positions (CCD ideal coords) |
 | `ref_mask` | `[N, M]` | bool | Valid atom mask |
 | `ref_element` | `[N, M]` | int64 | Atomic number (0-127 via `ELEMENT_TO_INT`) |
 | `ref_charge` | `[N, M]` | float32 | Formal charge |
 | `ref_atom_name_chars` | `[N, M, 4]` | int64 | Atom name encoding: `ord(c)-32` for each char of `name.ljust(4)[:4]` |
-| `msa` | `[S, N]` | int64 | MSA sequences (same vocab as `res_type` for overlap) |
-| `msa_mask` | `[S, N]` | bool | MSA validity mask (gaps are valid; only padding is False) |
+| `msa` | `[S, N]` | int64 | MSA sequences: query row + paired rows + unpaired block-diagonal rows |
+| `msa_mask` | `[S, N]` | bool | MSA validity mask (cross-chain gaps are valid; only padding is False) |
 | `deletion_matrix` | `[S, N]` | int64 | Raw deletion counts (number of insertions before each match state) |
 | `profile` | `[N, 31]` | float32 | Per-position residue frequency (includes gap class at idx 21) |
 | `deletion_mean` | `[N]` | float32 | `mean(deletion_matrix, dim=0)` -- raw mean, arctan applied later in model |
@@ -287,11 +309,12 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 
 ### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=2048, max_templates=4, template_cache_dir=None)`
 
-- Parses Protenix-format JSON via `parse_json_input()`
-- Loads unpaired MSA (preferred) or paired MSA via `parse_a3m()`; falls back to single-sequence MSA
-- If templates path is `.hhr`: calls `parse_hhr_templates()` to download and extract template features
-- Builds Structure from query sequence, tokenizes and featurizes
-- Currently supports single-chain protein only
+- Parses Protenix-format or AF3-format JSON via `parse_json_input()`
+- Loads paired and unpaired MSAs separately per chain. Paired MSAs produce cross-chain zipped rows; unpaired MSAs produce block-diagonal rows
+- If templates path is `.json`: calls `parse_json_templates()` for whole-complex alignment with local CIF files
+- If templates path is `.hhr`: calls `parse_hhr_templates()` per protein chain to download and extract template features
+- Builds multi-chain Structure from query sequences, tokenizes and featurizes
+- Supports multi-chain protein/DNA/RNA complexes
 
 All methods accept `mol_type` as `"protein"`, `"rna"`, or `"dna"` (case-insensitive).
 
