@@ -174,7 +174,8 @@ class Cropper:
                 tokens=empty_tokens,
                 bonds=empty_bonds,
                 structure=data.structure,
-                msa=data.msa,
+                paired_msa=data.paired_msa,
+                unpaired_msa=data.unpaired_msa,
             )
 
         old_tokens = data.tokens[selected]
@@ -226,31 +227,33 @@ class Cropper:
             chains=data.structure.chains,
         )
 
-        # Crop MSA to match selected tokens (by asym_id)
+        # Crop paired and unpaired MSA to match selected tokens (by asym_id)
         selected_asym_ids = set(int(t["asym_id"]) for t in new_tokens)
-        new_msa = {k: v for k, v in data.msa.items() if k in selected_asym_ids}
-        # Crop MSA columns to match token count per chain
-        new_msa_cropped: dict[int, object] = {}
-        for asym_id, msa in new_msa.items():
-            chain_tokens = new_tokens[new_tokens["asym_id"] == asym_id]
-            n_chain = len(chain_tokens)
-            if msa.sequences.shape[1] != n_chain:
-                # Truncate / pad
-                S, N_old = msa.sequences.shape
-                seqs = np.zeros((S, n_chain), dtype=msa.sequences.dtype)
-                dmat = np.zeros((S, n_chain), dtype=msa.deletion_matrix.dtype)
-                mask = np.zeros((S, n_chain), dtype=msa.mask.dtype)
-                L = min(N_old, n_chain)
-                seqs[:, :L] = msa.sequences[:, :L]
-                dmat[:, :L] = msa.deletion_matrix[:, :L]
-                mask[:, :L] = msa.mask[:, :L]
-                new_msa_cropped[asym_id] = MSAType(sequences=seqs, mask=mask, deletion_matrix=dmat)
-            else:
-                new_msa_cropped[asym_id] = msa
+
+        def _crop_msa_dict(msa_dict: dict[int, MSAType]) -> dict[int, MSAType]:
+            filtered = {k: v for k, v in msa_dict.items() if k in selected_asym_ids}
+            cropped: dict[int, MSAType] = {}
+            for asym_id, msa in filtered.items():
+                chain_tokens = new_tokens[new_tokens["asym_id"] == asym_id]
+                n_chain = len(chain_tokens)
+                if msa.sequences.shape[1] != n_chain:
+                    S, N_old = msa.sequences.shape
+                    seqs = np.zeros((S, n_chain), dtype=msa.sequences.dtype)
+                    dmat = np.zeros((S, n_chain), dtype=msa.deletion_matrix.dtype)
+                    mask = np.zeros((S, n_chain), dtype=msa.mask.dtype)
+                    L = min(N_old, n_chain)
+                    seqs[:, :L] = msa.sequences[:, :L]
+                    dmat[:, :L] = msa.deletion_matrix[:, :L]
+                    mask[:, :L] = msa.mask[:, :L]
+                    cropped[asym_id] = MSAType(sequences=seqs, mask=mask, deletion_matrix=dmat)
+                else:
+                    cropped[asym_id] = msa
+            return cropped
 
         return Tokenized(
             tokens=new_tokens,
             bonds=new_bonds,
             structure=new_structure,
-            msa=new_msa_cropped,
+            paired_msa=_crop_msa_dict(data.paired_msa),
+            unpaired_msa=_crop_msa_dict(data.unpaired_msa),
         )

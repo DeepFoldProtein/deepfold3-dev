@@ -182,6 +182,15 @@ class DeepFold3(nn.Module):
             template_kwargs["template_backbone_frame"] = features["template_backbone_frame"].float()
             template_kwargs["template_backbone_mask"] = features["template_backbone_mask"].float()
 
+        # Bond matrix: polymer-ligand and ligand-ligand covalent bonds [N, N, 1]
+        bond_matrix = features.get("bond_matrix")
+        if bond_matrix is not None:
+            bond_matrix = bond_matrix.to(device).float()
+
+        # Multichain mask: same-chain pairs for template masking [N, N]
+        asym_id_tensor = features["asym_id"].to(device)
+        multichain_mask = (asym_id_tensor.unsqueeze(-1) == asym_id_tensor.unsqueeze(-2)).float()
+
         # Recycle
         for recycle_idx in range(num_recycles + 1):
             embeddings = self.evoformer(
@@ -193,6 +202,8 @@ class DeepFold3(nn.Module):
                 msa_mask=msa_mask,
                 prev_pair=prev_pair,
                 prev_single=prev_single,
+                bond_matrix=bond_matrix,
+                multichain_mask=multichain_mask,
                 **template_kwargs,
             )
             if recycle_idx < num_recycles:

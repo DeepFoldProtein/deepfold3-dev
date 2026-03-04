@@ -132,6 +132,9 @@ ONE_LETTER_TO_THREE: dict[str, str] = {
 THREE_LETTER_TO_ONE: dict[str, str] = {v: k for k, v in ONE_LETTER_TO_THREE.items()}
 THREE_LETTER_TO_ONE["UNK"] = "X"
 
+RNA_LETTER_TO_RES: dict[str, str] = {"A": "A", "G": "G", "C": "C", "U": "U"}
+DNA_LETTER_TO_RES: dict[str, str] = {"A": "DA", "G": "DG", "C": "DC", "T": "DT"}
+
 
 def res_name_to_type(name: str) -> int:
     """Convert residue name (3-letter or short nucleic code) to type index."""

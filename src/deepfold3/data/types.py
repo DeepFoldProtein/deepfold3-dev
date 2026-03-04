@@ -145,10 +145,23 @@ class MSA:
 
 @dataclass
 class Input:
-    """Input to the tokenizer: structure + per-chain MSAs."""
+    """Input to the tokenizer: structure + per-chain MSAs.
+
+    For multimer MSA pairing, paired and unpaired MSAs are stored separately.
+    Paired MSAs have cross-chain co-evolutionary signal: row i from each chain's
+    paired MSA corresponds to the same species and should be placed on the same
+    full-width MSA row. Unpaired MSAs are chain-specific and go into
+    block-diagonal rows.
+    """
 
     structure: Structure
-    msa: dict[int, MSA]  # keyed by asym_id (chain index)
+    paired_msa: dict[int, MSA]  # keyed by asym_id — paired (cross-chain) MSA
+    unpaired_msa: dict[int, MSA]  # keyed by asym_id — unpaired (chain-specific) MSA
+
+    @classmethod
+    def from_msa(cls, structure: Structure, msa: dict[int, MSA]) -> Input:
+        """Convenience constructor: treat all MSAs as unpaired (single-chain compat)."""
+        return cls(structure=structure, paired_msa={}, unpaired_msa=msa)
 
 
 @dataclass(frozen=True)
@@ -158,7 +171,8 @@ class Tokenized:
     tokens: np.ndarray  # TOKEN_DTYPE [N_tokens]
     bonds: np.ndarray  # TOKEN_BOND_DTYPE [N_bonds]
     structure: Structure
-    msa: dict[int, MSA]  # keyed by asym_id
+    paired_msa: dict[int, MSA]  # keyed by asym_id
+    unpaired_msa: dict[int, MSA]  # keyed by asym_id
 
 
 @dataclass

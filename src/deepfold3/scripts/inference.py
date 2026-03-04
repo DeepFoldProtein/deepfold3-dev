@@ -221,6 +221,14 @@ def inference(
     seq_mask_cpu = feats["seq_mask"].float().cpu()
     seq_mask_sum = seq_mask_cpu.sum().clamp(min=1)
 
+    # Use frames_mask for pTM/ipTM (excludes frameless tokens like ions/ligands)
+    if "frames_mask" in feats:
+        tm_mask = feats["frames_mask"].float().to(dev)
+        tm_pair_mask = (tm_mask.unsqueeze(-1) * tm_mask.unsqueeze(-2)) * pair_mask
+    else:
+        tm_mask = seq_mask
+        tm_pair_mask = pair_mask
+
     # Compute pLDDT once for all samples
     per_token_plddt = None
     if model_output.plddt is not None:
@@ -234,8 +242,8 @@ def inference(
             metrics.append(f"pLDDT={mean_plddt:.1f}")
 
         if model_output.pae is not None:
-            ptm = compute_ptm(model_output.pae[s], seq_mask, pair_mask)
-            iptm = compute_iptm(model_output.pae[s], seq_mask, pair_mask, asym_id)
+            ptm = compute_ptm(model_output.pae[s], tm_mask, tm_pair_mask)
+            iptm = compute_iptm(model_output.pae[s], tm_mask, tm_pair_mask, asym_id)
             ranking = compute_ranking_score(ptm, iptm)
             metrics.append(f"pTM={ptm:.3f}")
             if not math.isnan(iptm):

@@ -49,7 +49,6 @@ class Tokenizer:
 
             if mol_type in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA):
                 # One token per residue
-                prev_token_idx = None
                 for ri in range(res_start, res_end):
                     res = structure.residues[ri]
                     res_type = int(res["res_type"])
@@ -83,11 +82,11 @@ class Tokenizer:
                         )
                     )
 
-                    # Add polymer backbone bond between consecutive residues
-                    if prev_token_idx is not None:
-                        token_bonds_list.append((prev_token_idx, token_idx))
+                    # NOTE: backbone bonds are NOT included in the bond matrix.
+                    # AF3 restricts the bond matrix to polymer-ligand and
+                    # ligand-ligand covalent bonds only.  Backbone connectivity
+                    # is already captured by the sequence/relative-position encoding.
 
-                    prev_token_idx = token_idx
                     token_idx += 1
 
             elif mol_type == const.MOL_NONPOLYMER:
@@ -151,7 +150,8 @@ class Tokenizer:
             tokens=tokens_arr,
             bonds=bonds_arr,
             structure=structure,
-            msa=inp.msa,
+            paired_msa=inp.paired_msa,
+            unpaired_msa=inp.unpaired_msa,
         )
 
 

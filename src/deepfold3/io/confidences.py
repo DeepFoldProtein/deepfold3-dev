@@ -155,7 +155,7 @@ def compute_exp_resolved(
 
 def _compute_tm_adjusted_pae(
     pae_logits: torch.Tensor,
-    num_tokens: int,
+    num_tokens: int | torch.Tensor,
     max_error_bin: float = _DEFAULT_CFG.max_error_bin,
     num_bins: int = _DEFAULT_CFG.num_distogram_bins,
 ) -> torch.Tensor:
@@ -165,19 +165,25 @@ def _compute_tm_adjusted_pae(
 
     Args:
         pae_logits: [N, N, num_bins] logits for a single sample.
-        num_tokens: total number of tokens (for d0 computation).
+        num_tokens: total number of tokens (scalar for pTM) or [N, N] tensor
+            of per-pair token counts (for ipTM with per-chain-pair d0).
 
     Returns:
         [N, N] TM-adjusted PAE values.
     """
     centers = _error_bin_centers(max_error_bin, num_bins).to(pae_logits.device)
 
-    # d0 from TM-score formula: Yang & Skolnick 2004
-    clipped_num_res = max(num_tokens, 19)
-    d0 = 1.24 * (clipped_num_res - 15) ** (1.0 / 3) - 1.8
-
-    # TM-score term for every bin
-    tm_per_bin = 1.0 / (1.0 + (centers / d0) ** 2)
+    if isinstance(num_tokens, torch.Tensor):
+        # Per-pair d0: num_tokens is [N, N]
+        clipped = num_tokens.clamp(min=19).float()
+        d0 = 1.24 * (clipped - 15) ** (1.0 / 3) - 1.8  # [N, N]
+        # centers [B] → [1, 1, B], d0 [N, N] → [N, N, 1]
+        tm_per_bin = 1.0 / (1.0 + (centers.unsqueeze(0).unsqueeze(0) / d0.unsqueeze(-1)) ** 2)
+    else:
+        # Scalar d0 (pTM path)
+        clipped_num_res = max(num_tokens, 19)
+        d0 = 1.24 * (clipped_num_res - 15) ** (1.0 / 3) - 1.8
+        tm_per_bin = 1.0 / (1.0 + (centers / d0) ** 2)
 
     probs = pae_logits.softmax(dim=-1)  # [N, N, num_bins]
     return (probs * tm_per_bin).sum(-1)  # [N, N]
@@ -224,6 +230,9 @@ def compute_iptm(
 ) -> float:
     """Compute interface predicted TM-score (ipTM) for a single sample.
 
+    Uses per-chain-pair d0 following AF3: d0[i,j] = f(N_chain_i + N_chain_j)
+    rather than d0 = f(N_total).
+
     Args:
         pae_logits: [N, N, num_bins] logits.
         seq_mask: [N] float mask.
@@ -240,8 +249,12 @@ def compute_iptm(
     if interface_mask.sum() == 0:
         return float("nan")
 
-    N = int(seq_mask.sum().item())
-    tm_adj = _compute_tm_adjusted_pae(pae_logits, N, max_error_bin, num_bins)
+    # Per-chain-pair token counts: N_chain_i + N_chain_j for each (i, j) pair
+    same_chain = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)  # [N, N]
+    chain_sizes = (same_chain.float() * seq_mask.unsqueeze(0)).sum(-1)  # [N] — size of each token's chain
+    interface_n = chain_sizes.unsqueeze(-1) + chain_sizes.unsqueeze(-2)  # [N, N]
+
+    tm_adj = _compute_tm_adjusted_pae(pae_logits, interface_n, max_error_bin, num_bins)
 
     denom = interface_mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     normed_mask = interface_mask / denom
@@ -323,6 +336,14 @@ def save_confidences_json(
     N = seq_mask.shape[0]
     M = atom_mask.shape[-1]
 
+    # frames_mask: use for pTM/ipTM if available (excludes frameless tokens like ions/ligands)
+    if "frames_mask" in features:
+        tm_mask = features["frames_mask"].float().to(device)
+        tm_pair_mask = (tm_mask.unsqueeze(-1) * tm_mask.unsqueeze(-2)) * pair_mask
+    else:
+        tm_mask = seq_mask
+        tm_pair_mask = pair_mask
+
     result: dict = {}
 
     # Chain IDs per token
@@ -366,10 +387,10 @@ def save_confidences_json(
         pae_sample = pae_full[sample_idx].cpu()
         result["pae"] = [[round(float(v), 2) for v in row] for row in pae_sample]
 
-        # pTM and ipTM
+        # pTM and ipTM (using frames_mask to exclude frameless tokens)
         pae_logits_s = output.pae[sample_idx]
-        ptm = compute_ptm(pae_logits_s, seq_mask, pair_mask, max_error_bin, num_bins)
-        iptm = compute_iptm(pae_logits_s, seq_mask, pair_mask, asym_id, max_error_bin, num_bins)
+        ptm = compute_ptm(pae_logits_s, tm_mask, tm_pair_mask, max_error_bin, num_bins)
+        iptm = compute_iptm(pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins)
     else:
         ptm = 0.0
         iptm = float("nan")
