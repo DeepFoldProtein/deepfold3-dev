@@ -85,8 +85,9 @@ def _cif_quote(value: str) -> str:
     return value
 
 
-def _build_header(entry_id: str) -> str:
+def _build_header(entry_id: str, title: str | None = None) -> str:
     """Build standard mmCIF header categories."""
+    title_str = _cif_quote(title) if title else "'DeepFold3 predicted structure'"
     return f"""\
 #
 _audit_conform.dict_name       mmcif_pdbx.dic
@@ -94,7 +95,7 @@ _audit_conform.dict_version    5.398
 _audit_conform.dict_location   http://mmcif.pdb.org/dictionaries/ascii/mmcif_pdbx.dic
 #
 _struct.entry_id                  {entry_id}
-_struct.title                     'DeepFold3 predicted structure'
+_struct.title                     {title_str}
 _struct.pdbx_model_details        ?
 _struct.pdbx_model_type_details   ?
 #
@@ -114,7 +115,7 @@ def _build_plddt_metric_table(
         "#",
         "_ma_qa_metric.id                 1",
         "_ma_qa_metric.name               pLDDT",
-        "_ma_qa_metric.description         'Predicted per-residue confidence score (0-100)'",
+        "_ma_qa_metric.description        'Predicted per-residue confidence score (0-100)'",
         "_ma_qa_metric.type               pLDDT",
         "_ma_qa_metric.mode               local",
         "_ma_qa_metric.software_group_id  1",
@@ -161,6 +162,56 @@ def _enrich_cif_text(text: str) -> str:
     return "\n".join(result)
 
 
+def _add_entity_descriptions(text: str, entity_descriptions: dict[str, str]) -> str:
+    """Insert _entity.pdbx_description into the _entity loop block.
+
+    Args:
+        text: mmCIF text.
+        entity_descriptions: Mapping from entity id (str) to description text.
+
+    Returns:
+        Updated mmCIF text with pdbx_description column added.
+    """
+    if not entity_descriptions:
+        return text
+
+    lines = text.split("\n")
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Detect start of _entity loop
+        if line.strip() == "loop_" and i + 1 < len(lines) and lines[i + 1].strip() == "_entity.id":
+            result.append(line)
+            i += 1
+            # Collect column headers
+            col_names: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("_entity."):
+                col_names.append(lines[i].strip())
+                result.append(lines[i])
+                i += 1
+            # Add description column header
+            result.append("_entity.pdbx_description")
+            id_col = next((j for j, c in enumerate(col_names) if c == "_entity.id"), 0)
+            # Process data rows until blank line, loop_, or #
+            while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith("loop_") and not lines[i].strip().startswith("#"):
+                parts = lines[i].split()
+                if len(parts) > id_col:
+                    entity_id = parts[id_col]
+                    desc = entity_descriptions.get(entity_id)
+                    if desc:
+                        result.append(lines[i] + " " + _cif_quote(desc))
+                    else:
+                        result.append(lines[i] + " ?")
+                else:
+                    result.append(lines[i] + " ?")
+                i += 1
+        else:
+            result.append(line)
+            i += 1
+    return "\n".join(result)
+
+
 def _fix_seq_one_letter_code(text: str, entity_sequences: dict[str, str]) -> str:
     """Replace ? in pdbx_seq_one_letter_code with actual 1-letter sequence."""
     lines = text.split("\n")
@@ -202,6 +253,8 @@ def save_mmcif(
     output: DeepFold3Output,
     features: dict[str, torch.Tensor],
     num_plddt_bins: int = 50,
+    entity_descriptions: dict[str, str] | None = None,
+    title: str | None = None,
 ) -> None:
     """Write predicted structure(s) to an mmCIF file.
 
@@ -219,6 +272,9 @@ def save_mmcif(
                      ref_element, ref_atom_name_chars, res_type,
                      asym_id, residue_index)
     num_plddt_bins : Number of pLDDT bins used by the confidence head (50)
+    entity_descriptions : Optional mapping from chain name to description
+                          string, written as _entity.pdbx_description.
+    title :          Optional structure title, written as _struct.title.
     """
     from deepfold3.io.structure_builder import prediction_to_structure
     from deepfold3.io.structure_mmcif import save_structure_mmcif
@@ -235,11 +291,15 @@ def save_mmcif(
         structure = prediction_to_structure(
             output, features, sample_idx=0, name=path.stem, num_plddt_bins=num_plddt_bins
         )
-        save_structure_mmcif(path, structure, entry_id=path.stem)
+        save_structure_mmcif(
+            path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title
+        )
     else:
         # For backward compatibility: write multi-model mmCIF using legacy path
         # for multi-sample outputs, since Structure only holds one model.
-        _save_mmcif_legacy(path, output, features, num_plddt_bins)
+        _save_mmcif_legacy(
+            path, output, features, num_plddt_bins, entity_descriptions=entity_descriptions, title=title
+        )
 
 
 def _save_mmcif_legacy(
@@ -247,6 +307,8 @@ def _save_mmcif_legacy(
     output: DeepFold3Output,
     features: dict[str, torch.Tensor],
     num_plddt_bins: int = 50,
+    entity_descriptions: dict[str, str] | None = None,
+    title: str | None = None,
 ) -> None:
     """Legacy multi-model mmCIF writer (used when num_samples > 1)."""
     atom_positions = output.atom_positions.cpu()
@@ -415,7 +477,17 @@ def _save_mmcif_legacy(
             entity_sequences[entity.name] = one_letter
     base_text = _fix_seq_one_letter_code(base_text, entity_sequences)
 
-    header = _build_header(path.stem)
+    # Add entity descriptions
+    if entity_descriptions:
+        ent_desc_by_id: dict[str, str] = {}
+        for entity in st.entities:
+            for sub in entity.subchains:
+                if sub in entity_descriptions:
+                    ent_desc_by_id[entity.name] = entity_descriptions[sub]
+                    break
+        base_text = _add_entity_descriptions(base_text, ent_desc_by_id)
+
+    header = _build_header(path.stem, title=title)
     lines = base_text.split("\n", 1)
     final_text = lines[0] + "\n" + header + lines[1]
     final_text += _build_plddt_metric_table(plddt_per_residue)

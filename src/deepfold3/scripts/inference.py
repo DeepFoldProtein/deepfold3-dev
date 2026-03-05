@@ -160,6 +160,8 @@ def inference(
     from deepfold3.data.module.dataset import InferenceInput
 
     job_name: str | None = None
+    entity_descriptions: dict[str, str] | None = None
+    job_title: str | None = None
     if json_input is not None:
         click.echo(f"[inference] featurizing {json_input} …")
         from deepfold3.data.parse.json_input import parse_json_input
@@ -167,7 +169,36 @@ def inference(
         jobs = parse_json_input(json_input, template_cache_dir=template_cache)
         if not jobs:
             raise click.UsageError("No jobs found in JSON input")
-        job_name = jobs[0].name
+        job = jobs[0]
+        job_name = job.name
+        job_title = job.name
+
+        # Build entity descriptions from chain descriptions
+        chain_idx = 0
+        desc_map: dict[str, str] = {}
+        for pc in job.protein_chains:
+            chain_name = chr(ord("A") + chain_idx)
+            if pc.description:
+                desc_map[chain_name] = pc.description
+            chain_idx += 1
+        for dc in job.dna_chains:
+            chain_name = chr(ord("A") + chain_idx)
+            if dc.description:
+                desc_map[chain_name] = dc.description
+            chain_idx += 1
+        for rc in job.rna_chains:
+            chain_name = chr(ord("A") + chain_idx)
+            if rc.description:
+                desc_map[chain_name] = rc.description
+            chain_idx += 1
+        for lc in job.ligand_chains:
+            chain_name = chr(ord("A") + chain_idx)
+            if lc.description:
+                desc_map[chain_name] = lc.description
+            chain_idx += 1
+        if desc_map:
+            entity_descriptions = desc_map
+
         feats = InferenceInput.from_json(
             json_input,
             template_cache_dir=template_cache,
@@ -231,6 +262,8 @@ def inference(
         compute_plddt,
         compute_ptm,
         compute_ranking_score,
+        fraction_disordered,
+        has_clash,
         save_confidences_json,
     )
 
@@ -254,6 +287,11 @@ def inference(
     if model_output.plddt is not None:
         _, per_token_plddt = compute_plddt(model_output.plddt, atom_mask)
 
+    # Polymer mask for clash/disorder
+    polymer_mask = feats["frames_mask"].to(dev) if "frames_mask" in feats else seq_mask.bool()
+
+    sample_rankings: list[tuple[float, int]] = []  # (ranking_score, sample_idx)
+
     for s in range(num_samples):
         metrics = []
 
@@ -261,20 +299,42 @@ def inference(
             mean_plddt = float((per_token_plddt[s].cpu() * seq_mask_cpu).sum() / seq_mask_sum)
             metrics.append(f"pLDDT={mean_plddt:.1f}")
 
+        ptm = 0.0
+        iptm = float("nan")
         if model_output.pae is not None:
             ptm = compute_ptm(model_output.pae[s], tm_mask, tm_pair_mask)
             iptm = compute_iptm(model_output.pae[s], tm_mask, tm_pair_mask, asym_id)
-            ranking = compute_ranking_score(ptm, iptm)
             metrics.append(f"pTM={ptm:.3f}")
             if not math.isnan(iptm):
                 metrics.append(f"ipTM={iptm:.3f}")
-            metrics.append(f"ranking={ranking:.3f}")
 
         if model_output.pde is not None:
             _, avg_pde = compute_pde(model_output.pde, pair_mask)
             metrics.append(f"gPDE={float(avg_pde[s]):.2f}")
 
+        frac_disorder = 0.0
+        if per_token_plddt is not None:
+            frac_disorder = fraction_disordered(per_token_plddt[s].to(dev), polymer_mask)
+        sample_clash = has_clash(
+            model_output.atom_positions[s], atom_mask,
+            feats["residue_index"].to(dev), asym_id, polymer_mask,
+        )
+        ranking = compute_ranking_score(ptm, iptm, frac_disorder, sample_clash)
+        metrics.append(f"disorder={frac_disorder:.3f}")
+        if sample_clash:
+            metrics.append("CLASH")
+        metrics.append(f"ranking={ranking:.3f}")
+
+        sample_rankings.append((ranking, s))
         click.echo(f"  sample {s}: {', '.join(metrics)}")
+
+    # Print ranked summary
+    if num_samples > 1:
+        sample_rankings.sort(reverse=True)
+        click.echo("[inference] ranking:")
+        for rank, (score, s_idx) in enumerate(sample_rankings, 1):
+            name = f"{job_name}_sample{s_idx}" if job_name else f"sample_{s_idx}"
+            click.echo(f"  #{rank}  {name}  ranking_score={score:.4f}")
 
     # Determine output paths
     if job_name is not None:
@@ -292,7 +352,7 @@ def inference(
     click.echo(f"[inference] writing {cif_path} …")
     from deepfold3.io.mmcif import save_mmcif
 
-    save_mmcif(cif_path, model_output, feats)
+    save_mmcif(cif_path, model_output, feats, entity_descriptions=entity_descriptions, title=job_title)
     click.echo(f"  saved  {cif_path.resolve()}")
 
     # Save confidences JSON (per sample)

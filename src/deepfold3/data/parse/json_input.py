@@ -33,14 +33,16 @@ AlphaFold 3 example::
     [
         {
             "sequences": [
-                {"protein": {"id": "A", "sequence": "MKTII...", "unpairedMsaPath": "..."}},
-                {"dna": {"id": ["B", "C"], "sequence": "ATGC"}},
-                {"rna": {"id": "D", "sequence": "AUGC"}}
+                {"protein": {"id": "A", "sequence": "MKTII...", "description": "Myoglobin",
+                              "unpairedMsaPath": "..."}},
+                {"dna": {"id": ["B", "C"], "sequence": "ATGC", "description": "Promoter"}},
+                {"rna": {"id": "D", "sequence": "AUGC"}},
+                {"ligand": {"id": "E", "ccdCodes": ["ATP"], "description": "Cofactor"}}
             ],
             "modelSeeds": [1],
             "name": "job_name",
             "dialect": "alphafold3",
-            "version": 2
+            "version": 4
         }
     ]
 """
@@ -71,6 +73,7 @@ class ProteinChainInput:
         paired_msa: Parsed paired MSA object (optional).
         unpaired_msa: Parsed unpaired MSA object (optional).
         template_hits: Parsed template hits ready for feature extraction.
+        description: Optional textual description of this chain.
     """
 
     sequence: str
@@ -78,6 +81,7 @@ class ProteinChainInput:
     paired_msa: MSA | None = None
     unpaired_msa: MSA | None = None
     template_hits: list[TemplateHitInput] = field(default_factory=list)
+    description: str | None = None
 
 
 @dataclasses.dataclass
@@ -90,6 +94,7 @@ class NucleotideChainInput:
         mol_type: const.MOL_DNA or const.MOL_RNA.
         paired_msa: Parsed paired MSA object (optional).
         unpaired_msa: Parsed unpaired MSA object (optional).
+        description: Optional textual description of this chain.
     """
 
     sequence: str
@@ -97,6 +102,7 @@ class NucleotideChainInput:
     mol_type: int
     paired_msa: MSA | None = None
     unpaired_msa: MSA | None = None
+    description: str | None = None
 
 
 @dataclasses.dataclass
@@ -109,11 +115,13 @@ class LigandChainInput:
         ccd_ids: List of CCD component codes (e.g. ["ATP"]).
         smiles: SMILES string for a custom molecule.
         count: Number of copies of this ligand.
+        description: Optional textual description of this ligand.
     """
 
     ccd_ids: list[str] | None = None
     smiles: str | None = None
     count: int = 1
+    description: str | None = None
 
 
 @dataclasses.dataclass
@@ -237,6 +245,7 @@ def _parse_protenix_entry(
                     paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("pairedMsaPath"), None),
                     unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("unpairedMsaPath"), None),
                     template_hits=_resolve_template_hits(base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir),
+                    description=pc.get("description"),
                 )
             )
         elif any(k in seq_item for k in _DNA_KEYS):
@@ -252,6 +261,7 @@ def _parse_protenix_entry(
                     mol_type=const.MOL_DNA,
                     paired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("pairedMsaPath"), None),
                     unpaired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("unpairedMsaPath"), None),
+                    description=dc.get("description"),
                 )
             )
         elif any(k in seq_item for k in _RNA_KEYS):
@@ -267,6 +277,7 @@ def _parse_protenix_entry(
                     mol_type=const.MOL_RNA,
                     paired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("pairedMsaPath"), None),
                     unpaired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("unpairedMsaPath"), None),
+                    description=rc.get("description"),
                 )
             )
         elif "ligand" in seq_item:
@@ -322,6 +333,7 @@ def _parse_af3_entry(
             unpaired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("pairedMsaPath"), p.get("pairedMsa"))
             tmpl_hits = _resolve_template_hits(base_dir, p.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir)
+            desc = p.get("description")
             for _ in ids or [None]:
                 protein_chains.append(
                     ProteinChainInput(
@@ -330,6 +342,7 @@ def _parse_af3_entry(
                         paired_msa=paired,
                         unpaired_msa=unpaired,
                         template_hits=tmpl_hits,
+                        description=desc,
                     )
                 )
         elif "dna" in seq_item:
@@ -338,6 +351,7 @@ def _parse_af3_entry(
             seq = d["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_DNA, d.get("unpairedMsaPath"), d.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_DNA, d.get("pairedMsaPath"), d.get("pairedMsa"))
+            desc = d.get("description")
             for _ in ids or [None]:
                 dna_chains.append(
                     NucleotideChainInput(
@@ -346,6 +360,7 @@ def _parse_af3_entry(
                         mol_type=const.MOL_DNA,
                         paired_msa=paired,
                         unpaired_msa=unpaired,
+                        description=desc,
                     )
                 )
         elif "rna" in seq_item:
@@ -354,6 +369,7 @@ def _parse_af3_entry(
             seq = r["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_RNA, r.get("unpairedMsaPath"), r.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_RNA, r.get("pairedMsaPath"), r.get("pairedMsa"))
+            desc = r.get("description")
             for _ in ids or [None]:
                 rna_chains.append(
                     NucleotideChainInput(
@@ -362,6 +378,7 @@ def _parse_af3_entry(
                         mol_type=const.MOL_RNA,
                         paired_msa=paired,
                         unpaired_msa=unpaired,
+                        description=desc,
                     )
                 )
         elif "ligand" in seq_item:
@@ -369,11 +386,12 @@ def _parse_af3_entry(
             ids = _ensure_id_list(lig.get("id", []))
             ccd_codes = lig.get("ccdCodes")
             smiles_str = lig.get("smiles")
+            desc = lig.get("description")
             for _ in ids or [None]:
                 if ccd_codes:
-                    ligand_chains.append(LigandChainInput(ccd_ids=list(ccd_codes), count=1))
+                    ligand_chains.append(LigandChainInput(ccd_ids=list(ccd_codes), count=1, description=desc))
                 elif smiles_str:
-                    ligand_chains.append(LigandChainInput(smiles=smiles_str, count=1))
+                    ligand_chains.append(LigandChainInput(smiles=smiles_str, count=1, description=desc))
 
     if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")

@@ -8,7 +8,9 @@ Computes all AF3 confidence metrics from raw logits:
   - ipTM (interface predicted TM-score)
   - Experimentally resolved probability
   - Contact probabilities from distogram
-  - Ranking score (0.8*ipTM + 0.2*pTM)
+  - has_clash (steric clash detection via KD-tree)
+  - fraction_disordered (fraction of disordered protein residues)
+  - Ranking score: 0.8*ipTM + 0.2*pTM + 0.5*fraction_disordered - 100*has_clash
 """
 
 from __future__ import annotations
@@ -17,12 +19,21 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from deepfold3.model.config import ConfidenceConfig
 from deepfold3.model.model import DeepFold3Output, DistogramHead
 
 _DEFAULT_CFG = ConfidenceConfig()
+
+# Clash detection constants (AF3 confidences.py:131-182)
+_CLASH_CUTOFF = 1.1  # Angstroms
+_MIN_CLASHES = 100
+_MIN_CLASH_FRACTION = 0.5
+
+# Disorder detection constant (pLDDT-based proxy)
+_DISORDER_PLDDT_THRESHOLD = 50.0
 
 
 def _sanitize_for_json(obj: object) -> object:
@@ -264,11 +275,133 @@ def compute_iptm(
     return float(per_alignment.max().item())
 
 
-def compute_ranking_score(ptm: float, iptm: float) -> float:
-    """Compute AF3 ranking score: 0.8*ipTM + 0.2*pTM (or just pTM if single-chain)."""
+def has_clash(
+    atom_positions: torch.Tensor,
+    atom_mask: torch.Tensor,
+    residue_index: torch.Tensor,
+    asym_id: torch.Tensor,
+    polymer_mask: torch.Tensor,
+    cutoff: float = _CLASH_CUTOFF,
+    min_clashes: int = _MIN_CLASHES,
+    min_clash_fraction: float = _MIN_CLASH_FRACTION,
+) -> bool:
+    """Detect steric clashes in predicted structure using KD-tree.
+
+    AF3 algorithm: for each polymer atom, find neighbors within cutoff_radius.
+    An atom is clashing if any neighbor is >1 residue apart or on a different chain.
+    A chain has a clash if num_clashes > min_clashes OR frac_clashes > min_clash_fraction.
+
+    Args:
+        atom_positions: [N, M, 3] predicted coordinates.
+        atom_mask: [N, M] float mask of real atoms.
+        residue_index: [N] int residue indices.
+        asym_id: [N] int chain identifiers.
+        polymer_mask: [N] bool mask of polymer tokens.
+        cutoff: Distance threshold in Angstroms (1.1).
+        min_clashes: Minimum clash count per chain to flag (100).
+        min_clash_fraction: Minimum fraction of clashing atoms per chain (0.5).
+
+    Returns:
+        True if any chain has a clash.
+    """
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        return False
+
+    pos = atom_positions.detach().cpu()
+    mask = atom_mask.detach().cpu()
+    poly = polymer_mask.detach().cpu().bool()
+    res_idx = residue_index.detach().cpu()
+    chain_id = asym_id.detach().cpu()
+
+    N, M = mask.shape
+
+    # Collect polymer atom coords, token index, and chain id
+    coords = []
+    token_indices = []
+    chain_ids = []
+    for i in range(N):
+        if not poly[i]:
+            continue
+        for j in range(M):
+            if mask[i, j] > 0:
+                coords.append(pos[i, j].numpy())
+                token_indices.append(int(res_idx[i]))
+                chain_ids.append(int(chain_id[i]))
+
+    if len(coords) < 2:
+        return False
+
+    coords_arr = np.stack(coords)
+    token_indices_arr = np.array(token_indices)
+    chain_ids_arr = np.array(chain_ids)
+
+    tree = KDTree(coords_arr)
+    neighbors = tree.query_ball_tree(tree, cutoff)
+
+    # Mark atoms as clashing
+    is_clashing = np.zeros(len(coords), dtype=bool)
+    for i, nbrs in enumerate(neighbors):
+        for j in nbrs:
+            if i == j:
+                continue
+            if chain_ids_arr[i] != chain_ids_arr[j] or abs(token_indices_arr[i] - token_indices_arr[j]) > 1:
+                is_clashing[i] = True
+                break
+
+    # Per-chain check
+    unique_chains = np.unique(chain_ids_arr)
+    for c in unique_chains:
+        chain_sel = chain_ids_arr == c
+        n_atoms = int(chain_sel.sum())
+        if n_atoms == 0:
+            continue
+        n_clashes = int(is_clashing[chain_sel].sum())
+        if n_clashes > min_clashes or (n_clashes / n_atoms) > min_clash_fraction:
+            return True
+
+    return False
+
+
+def fraction_disordered(
+    per_token_plddt: torch.Tensor,
+    polymer_mask: torch.Tensor,
+    threshold: float = _DISORDER_PLDDT_THRESHOLD,
+) -> float:
+    """Compute fraction of disordered protein residues from pLDDT.
+
+    Uses pLDDT < threshold as a proxy for disorder (standard AF2/AF3 convention).
+
+    Args:
+        per_token_plddt: [N] per-token pLDDT values.
+        polymer_mask: [N] bool mask of polymer tokens.
+        threshold: pLDDT below this is considered disordered (50.0).
+
+    Returns:
+        Fraction of polymer tokens that are disordered (0.0 to 1.0).
+    """
+    poly = polymer_mask.bool()
+    n_polymer = int(poly.sum().item())
+    if n_polymer == 0:
+        return 0.0
+    disordered = (per_token_plddt < threshold) & poly
+    return float(disordered.sum().item()) / n_polymer
+
+
+def compute_ranking_score(
+    ptm: float, iptm: float, frac_disordered: float = 0.0, clash: bool = False
+) -> float:
+    """Compute AF3 ranking score.
+
+    Formula: 0.8*ipTM + 0.2*pTM + 0.5*fraction_disordered - 100*has_clash.
+    Single-chain: pTM + 0.5*fraction_disordered - 100*has_clash.
+    """
     if math.isnan(iptm):
-        return ptm
-    return 0.8 * iptm + 0.2 * ptm
+        ptm_iptm_average = ptm
+    else:
+        ptm_iptm_average = 0.8 * iptm + 0.2 * ptm
+    return ptm_iptm_average + 0.5 * frac_disordered - 100.0 * clash
 
 
 def compute_contact_probs(
@@ -420,8 +553,24 @@ def save_confidences_json(
         contact_probs = compute_contact_probs(output.distogram)
         result["contact_probs"] = [[round(float(v), 3) for v in row] for row in contact_probs.cpu()]
 
+    # Clash detection
+    polymer_mask = features["frames_mask"].to(device) if "frames_mask" in features else seq_mask.bool()
+    sample_clash = has_clash(
+        output.atom_positions[sample_idx],
+        atom_mask,
+        features["residue_index"].to(device),
+        asym_id,
+        polymer_mask,
+    )
+
+    # Fraction disordered
+    if output.plddt is not None:
+        frac_disorder = fraction_disordered(per_token_plddt[sample_idx].to(device), polymer_mask)
+    else:
+        frac_disorder = 0.0
+
     # Ranking score
-    ranking_score = compute_ranking_score(ptm, iptm)
+    ranking_score = compute_ranking_score(ptm, iptm, frac_disorder, sample_clash)
 
     # Number of unique chains
     num_chains = int(asym_cpu.unique().numel())
@@ -432,6 +581,8 @@ def save_confidences_json(
         "ranking_score": round(ranking_score, 4),
         "mean_plddt": round(mean_plddt, 2),
         "average_pde": round(average_pde, 2),
+        "fraction_disordered": round(frac_disorder, 4),
+        "has_clash": sample_clash,
         "num_tokens": N,
         "num_chains": num_chains,
         "seed": seed,

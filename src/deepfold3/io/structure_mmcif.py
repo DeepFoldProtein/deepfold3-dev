@@ -21,6 +21,7 @@ from deepfold3.data.const import THREE_LETTER_TO_ONE
 from deepfold3.data.types import Structure
 from deepfold3.io.mmcif import (
     _INT_TO_ELEMENT,
+    _add_entity_descriptions,
     _build_header,
     _build_plddt_metric_table,
     _enrich_cif_text,
@@ -36,13 +37,21 @@ _MOL_TYPE_TO_GEMMI: dict[int, tuple[gemmi.EntityType, gemmi.PolymerType]] = {
 }
 
 
-def structure_to_mmcif(structure: Structure, entry_id: str | None = None) -> str:
+def structure_to_mmcif(
+    structure: Structure,
+    entry_id: str | None = None,
+    entity_descriptions: dict[str, str] | None = None,
+    title: str | None = None,
+) -> str:
     """Convert a Structure to an mmCIF string.
 
     Parameters
     ----------
     structure : Structure with atoms, residues, chains arrays.
     entry_id  : Entry identifier for the mmCIF header. Defaults to structure.name.
+    entity_descriptions : Optional mapping from chain name to description
+                          string, written as _entity.pdbx_description.
+    title     : Optional structure title, written as _struct.title.
 
     Returns
     -------
@@ -167,8 +176,18 @@ def structure_to_mmcif(structure: Structure, entry_id: str | None = None) -> str
             entity_sequences[entity.name] = one_letter
     base_text = _fix_seq_one_letter_code(base_text, entity_sequences)
 
+    # Add entity descriptions
+    if entity_descriptions:
+        ent_desc_by_id: dict[str, str] = {}
+        for entity in st.entities:
+            for sub in entity.subchains:
+                if sub in entity_descriptions:
+                    ent_desc_by_id[entity.name] = entity_descriptions[sub]
+                    break
+        base_text = _add_entity_descriptions(base_text, ent_desc_by_id)
+
     # Insert header
-    header = _build_header(entry_id)
+    header = _build_header(entry_id, title=title)
     lines = base_text.split("\n", 1)
     final_text = lines[0] + "\n" + header + lines[1]
 
@@ -199,7 +218,13 @@ def structure_to_mmcif(structure: Structure, entry_id: str | None = None) -> str
     return final_text
 
 
-def save_structure_mmcif(path: str | Path, structure: Structure, entry_id: str | None = None) -> None:
+def save_structure_mmcif(
+    path: str | Path,
+    structure: Structure,
+    entry_id: str | None = None,
+    entity_descriptions: dict[str, str] | None = None,
+    title: str | None = None,
+) -> None:
     """Write a Structure to an mmCIF file.
 
     Parameters
@@ -207,7 +232,11 @@ def save_structure_mmcif(path: str | Path, structure: Structure, entry_id: str |
     path      : Output file path (.cif).
     structure : Structure to write.
     entry_id  : Optional entry identifier.
+    entity_descriptions : Optional mapping from chain name to description.
+    title     : Optional structure title, written as _struct.title.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(structure_to_mmcif(structure, entry_id=entry_id))
+    path.write_text(
+        structure_to_mmcif(structure, entry_id=entry_id, entity_descriptions=entity_descriptions, title=title)
+    )
