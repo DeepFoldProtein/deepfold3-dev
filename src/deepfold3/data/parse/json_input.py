@@ -100,6 +100,23 @@ class NucleotideChainInput:
 
 
 @dataclasses.dataclass
+class LigandChainInput:
+    """A single ligand chain specification from JSON input.
+
+    Exactly one of ``ccd_ids`` or ``smiles`` must be provided.
+
+    Attributes:
+        ccd_ids: List of CCD component codes (e.g. ["ATP"]).
+        smiles: SMILES string for a custom molecule.
+        count: Number of copies of this ligand.
+    """
+
+    ccd_ids: list[str] | None = None
+    smiles: str | None = None
+    count: int = 1
+
+
+@dataclasses.dataclass
 class JobInput:
     """A single prediction job from JSON input.
 
@@ -108,6 +125,7 @@ class JobInput:
         protein_chains: List of protein chain inputs.
         dna_chains: List of DNA chain inputs.
         rna_chains: List of RNA chain inputs.
+        ligand_chains: List of ligand chain inputs.
         model_seeds: List of random seeds for diffusion sampling.
     """
 
@@ -115,7 +133,8 @@ class JobInput:
     protein_chains: list[ProteinChainInput]
     dna_chains: list[NucleotideChainInput]
     rna_chains: list[NucleotideChainInput]
-    model_seeds: list[int]
+    ligand_chains: list[LigandChainInput] = field(default_factory=list)
+    model_seeds: list[int] = field(default_factory=lambda: [42])
 
 
 _DNA_KEYS = ("dnaSequence", "dnaChain")
@@ -177,7 +196,14 @@ def _is_af3_format(entry: dict) -> bool:
     if entry.get("dialect") == "alphafold3":
         return True
     for seq_item in entry.get("sequences", []):
-        if any(k in seq_item for k in ("protein", "dna", "rna")):
+        if any(k in seq_item for k in ("protein", "dna", "rna", "ligand")):
+            # AF3 uses bare "ligand" key too, but so does Protenix.
+            # Distinguish by checking for AF3-specific subkeys.
+            if "ligand" in seq_item and not any(k in seq_item for k in ("protein", "dna", "rna")):
+                lig = seq_item["ligand"]
+                if isinstance(lig, dict) and ("ccdCodes" in lig or "id" in lig):
+                    return True
+                continue  # might be Protenix
             return True
     return False
 
@@ -190,6 +216,7 @@ def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache
     protein_chains: list[ProteinChainInput] = []
     dna_chains: list[NucleotideChainInput] = []
     rna_chains: list[NucleotideChainInput] = []
+    ligand_chains: list[LigandChainInput] = []
 
     for seq_item in entry.get("sequences", []):
         if "proteinChain" in seq_item:
@@ -237,9 +264,19 @@ def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache
                 )
             )
         elif "ligand" in seq_item:
-            raise ValueError(f"Unsupported entity type 'ligand' in job {name!r}")
+            lig = seq_item["ligand"]
+            ligand_str = lig.get("ligand", "")
+            count = lig.get("count", 1)
+            if isinstance(ligand_str, str) and ligand_str.startswith("CCD_"):
+                ccd_code = ligand_str[4:]
+                for _ in range(count):
+                    ligand_chains.append(LigandChainInput(ccd_ids=[ccd_code], count=1))
+            elif isinstance(ligand_str, str) and ligand_str:
+                # Assume SMILES if not CCD_ prefixed
+                for _ in range(count):
+                    ligand_chains.append(LigandChainInput(smiles=ligand_str, count=1))
 
-    if not protein_chains and not dna_chains and not rna_chains:
+    if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")
 
     return JobInput(
@@ -247,6 +284,7 @@ def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache
         protein_chains=protein_chains,
         dna_chains=dna_chains,
         rna_chains=rna_chains,
+        ligand_chains=ligand_chains,
         model_seeds=model_seeds,
     )
 
@@ -266,6 +304,7 @@ def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir:
     protein_chains: list[ProteinChainInput] = []
     dna_chains: list[NucleotideChainInput] = []
     rna_chains: list[NucleotideChainInput] = []
+    ligand_chains: list[LigandChainInput] = []
 
     for seq_item in entry.get("sequences", []):
         if "protein" in seq_item:
@@ -318,9 +357,17 @@ def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir:
                     )
                 )
         elif "ligand" in seq_item:
-            raise ValueError(f"Unsupported entity type 'ligand' in job {name!r}")
+            lig = seq_item["ligand"]
+            ids = _ensure_id_list(lig.get("id", []))
+            ccd_codes = lig.get("ccdCodes")
+            smiles_str = lig.get("smiles")
+            for _ in ids or [None]:
+                if ccd_codes:
+                    ligand_chains.append(LigandChainInput(ccd_ids=list(ccd_codes), count=1))
+                elif smiles_str:
+                    ligand_chains.append(LigandChainInput(smiles=smiles_str, count=1))
 
-    if not protein_chains and not dna_chains and not rna_chains:
+    if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")
 
     return JobInput(
@@ -328,6 +375,7 @@ def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir:
         protein_chains=protein_chains,
         dna_chains=dna_chains,
         rna_chains=rna_chains,
+        ligand_chains=ligand_chains,
         model_seeds=model_seeds,
     )
 

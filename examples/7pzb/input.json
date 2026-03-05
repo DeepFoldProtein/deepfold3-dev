@@ -1,0 +1,36 @@
+[
+  {
+    "name": "7pzb",
+    "dialect": "alphafold3",
+    "version": 2,
+    "sequences": [
+      {
+        "protein": {
+          "id": ["A", "B"],
+          "sequence": "MAEVIRSSAFWRSFPIFEEFDSETLCELSGIASYRKWSAGTVIFQRGDQGDYMIVVVSGRIKLSLFTPQGRELMLRQHEAGALFGEMALLDGQPRSADATAVTAAEGYVIGKKDFLALITQRPKTAEAVIRFLCAQLRDTTDRLETIALYDLNARVARFFLATLRQIHGSEMPQSANLRLTLSQTDIASILGASRPKVNRAILSLEESGAIKRADGIICCNVGRLLSIADPEEDLEHHHHHHHH",
+          "unpairedMsaPath": "./msas/7pzb_unpaired.a3m",
+          "pairedMsaPath": "./msas/7pzb_paired.a3m"
+        }
+      },
+      {
+        "dna": {
+          "id": ["C", "E"],
+          "sequence": "CTAGGTAACATTACTCGCG"
+        }
+      },
+      {
+        "dna": {
+          "id": ["D", "F"],
+          "sequence": "GCGAGTAATGTTAC"
+        }
+      },
+      {
+        "ligand": {
+          "id": ["G", "H"],
+          "ccdCodes": ["PCG"]
+        }
+      }
+    ],
+    "modelSeeds": [42]
+  }
+]

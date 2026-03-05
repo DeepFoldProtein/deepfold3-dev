@@ -30,6 +30,7 @@ from deepfold3.data.types import (
 )
 
 if TYPE_CHECKING:
+    from deepfold3.data.ccd import CcdMolecule
     from deepfold3.data.parse.templates import TemplateFeatures
 
 
@@ -91,7 +92,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 
 def _tokenize_and_featurize(
     inp: Input,
-    max_msa_seqs: int = 16384,
+    max_msa_seqs: int = 2048,
     templates: list[TemplateFeatures] | None = None,
     template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -119,7 +120,7 @@ class InferenceInput:
     def from_a3m(
         a3m_text: str,
         mol_type: str = "protein",
-        max_msa_seqs: int = 16384,
+        max_msa_seqs: int = 2048,
         templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features from an A3M-format MSA string.
@@ -174,7 +175,7 @@ class InferenceInput:
     def from_json(
         json_path: str | Path,
         job_index: int = 0,
-        max_msa_seqs: int = 16384,
+        max_msa_seqs: int = 2048,
         max_templates: int = 4,
         template_cache_dir: str | Path | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -207,7 +208,7 @@ class InferenceInput:
 
         job = jobs[job_index]
 
-        # Collect all chains in order: protein, DNA, RNA
+        # Collect all polymer chains in order: protein, DNA, RNA
         # Each entry: (sequence, mol_type, paired_msa, unpaired_msa, template_hits)
         chain_specs: list[tuple[str, int, MSA | None, MSA | None, list[TemplateHitInput]]] = []
         for pc in job.protein_chains:
@@ -217,14 +218,43 @@ class InferenceInput:
         for rc in job.rna_chains:
             chain_specs.append((rc.sequence, rc.mol_type, rc.paired_msa, rc.unpaired_msa, []))
 
-        if not chain_specs:
+        if not chain_specs and not job.ligand_chains:
             raise ValueError(f"No chains found in job {job.name!r}")
 
-        # Build multi-chain structure with auto-generated chain names
-        chain_tuples = [(seq, mt, chr(ord("A") + i)) for i, (seq, mt, _, _, _) in enumerate(chain_specs)]
-        structure = _build_complex_structure(chain_tuples)
+        # Build chain names
+        next_chain_idx = 0
+        chain_tuples = []
+        for seq, mt, _, _, _ in chain_specs:
+            chain_tuples.append((seq, mt, chr(ord("A") + next_chain_idx)))
+            next_chain_idx += 1
 
-        # Assemble MSA dicts from parsed objects
+        # Build ligand molecules
+        ligand_mol_chains: list[tuple[CcdMolecule, str]] = []
+        if job.ligand_chains:
+            from deepfold3.data.ccd import load_ccd_molecule, smiles_to_molecule
+
+            for lig in job.ligand_chains:
+                if lig.ccd_ids:
+                    for ccd_code in lig.ccd_ids:
+                        mol = load_ccd_molecule(ccd_code)
+                        chain_name = chr(ord("A") + next_chain_idx)
+                        ligand_mol_chains.append((mol, chain_name))
+                        next_chain_idx += 1
+                elif lig.smiles:
+                    mol = smiles_to_molecule(lig.smiles)
+                    chain_name = chr(ord("A") + next_chain_idx)
+                    ligand_mol_chains.append((mol, chain_name))
+                    next_chain_idx += 1
+
+        # Build structure (with ligands if present)
+        if ligand_mol_chains:
+            structure = _build_complex_structure_with_ligands(chain_tuples, ligand_mol_chains)
+        elif chain_tuples:
+            structure = _build_complex_structure(chain_tuples)
+        else:
+            raise ValueError(f"No valid chains in job {job.name!r}")
+
+        # Assemble MSA dicts from parsed objects (polymer chains only)
         paired_msa_dict: dict[int, MSA] = {}
         unpaired_msa_dict: dict[int, MSA] = {}
         for asym_id, (seq, mt, paired_msa, unpaired_msa, _) in enumerate(chain_specs):
@@ -238,6 +268,7 @@ class InferenceInput:
             else:
                 # Only paired exists — use single-sequence as unpaired
                 unpaired_msa_dict[asym_id] = _sequence_to_msa(seq, mt)
+        # Ligand chains don't have MSA — skip
 
         # Convert template hits to features
         template_feats: list[TemplateFeatures] | None = None
@@ -293,10 +324,15 @@ def _build_chain_atoms_residues(
     mol_type: int,
     atom_offset: int,
 ) -> tuple[list[tuple], list[tuple], int]:
-    """Build atom and residue tuples for a single chain.
+    """Builds atom and residue tuples for a single polymer chain.
+
+    Args:
+        sequence: 1-letter sequence string.
+        mol_type: Molecule type (MOL_PROTEIN, MOL_DNA, MOL_RNA).
+        atom_offset: Global atom index offset for this chain.
 
     Returns:
-        (atoms_list, residues_list, total_atoms_in_chain)
+        A tuple of (atoms_list, residues_list, total_atoms_in_chain).
     """
     atoms_list: list[tuple] = []
     residues_list: list[tuple] = []
@@ -340,16 +376,68 @@ def _build_chain_atoms_residues(
     return atoms_list, residues_list, atom_idx - atom_offset
 
 
-def _build_complex_structure(chains: list[tuple[str, int, str]]) -> Structure:
-    """Build a multi-chain Structure with sequence-based entity_id grouping.
+def _build_ligand_chain_atoms_residues(
+    mol: CcdMolecule,
+    atom_offset: int,
+) -> tuple[list[tuple], list[tuple], list[tuple], int]:
+    """Builds atom, bond, and residue tuples for a ligand chain.
 
-    Chains with identical (normalized) sequences share the same entity_id,
-    with incrementing sym_id to distinguish copies. This matches AF3 semantics
-    where entity_id encodes sequence identity and sym_id encodes copy number.
+    Each CCD component becomes one residue with all its heavy atoms.
 
     Args:
-        chains: List of (sequence, mol_type, chain_name) tuples. mol_type is
-            one of const.MOL_PROTEIN, const.MOL_DNA, const.MOL_RNA.
+        mol: CcdMolecule with atom data and bonds.
+        atom_offset: Global atom index offset for this chain.
+
+    Returns:
+        A tuple of (atoms_list, bonds_list, residues_list, total_atoms).
+    """
+    atoms_list: list[tuple] = []
+    bonds_list: list[tuple] = []
+
+    for j, name in enumerate(mol.atom_names):
+        elem_int = const.ELEMENT_TO_INT.get(mol.elements[j].upper(), 6)
+        atoms_list.append(
+            (
+                float(mol.positions[j, 0]),
+                float(mol.positions[j, 1]),
+                float(mol.positions[j, 2]),
+                int(np.clip(elem_int, 0, 127)),
+                float(mol.charges[j]),
+                name[:4].encode("ascii"),
+                True,
+                0.0,  # b_factor
+            )
+        )
+
+    for a1, a2, order in mol.bonds:
+        bonds_list.append((atom_offset + a1, atom_offset + a2, order))
+
+    n_atoms = len(mol.atom_names)
+    res_type = 20  # UNK — ligand tokens use res_type=20 in the model
+    residues_list = [
+        (
+            mol.res_name[:5].encode("ascii"),
+            res_type,
+            const.MOL_NONPOLYMER,
+            1,  # res_id
+            atom_offset,
+            n_atoms,
+            False,  # is_standard
+            True,  # is_present
+        )
+    ]
+
+    return atoms_list, bonds_list, residues_list, n_atoms
+
+
+def _build_complex_structure(chains: list[tuple[str, int, str]]) -> Structure:
+    """Builds a multi-chain Structure with sequence-based entity_id grouping.
+
+    Chains with identical (normalized) sequences share the same entity_id,
+    with incrementing sym_id to distinguish copies.
+
+    Args:
+        chains: List of (sequence, mol_type, chain_name) tuples.
 
     Returns:
         Structure with properly assigned entity_id and sym_id.
@@ -406,6 +494,91 @@ def _build_complex_structure(chains: list[tuple[str, int, str]]) -> Structure:
     residues_arr = np.array(all_residues, dtype=RESIDUE_DTYPE) if all_residues else np.empty(0, dtype=RESIDUE_DTYPE)
     chains_arr = np.array(all_chains, dtype=CHAIN_DTYPE) if all_chains else np.empty(0, dtype=CHAIN_DTYPE)
     bonds_arr = np.empty(0, dtype=BOND_DTYPE)
+
+    return Structure(
+        atoms=atoms_arr,
+        bonds=bonds_arr,
+        residues=residues_arr,
+        chains=chains_arr,
+    )
+
+
+def _build_complex_structure_with_ligands(
+    chains: list[tuple[str, int, str]],
+    ligand_chains: list[tuple[CcdMolecule, str]],
+) -> Structure:
+    """Builds a multi-chain Structure with both polymer and ligand chains.
+
+    Args:
+        chains: List of (sequence, mol_type, chain_name) tuples for polymer chains.
+        ligand_chains: List of (CcdMolecule, chain_name) tuples for ligand chains.
+
+    Returns:
+        Structure with entity_id, sym_id, and intra-ligand bonds.
+    """
+    # Start with polymer chains
+    structure = _build_complex_structure(chains)
+
+    if not ligand_chains:
+        return structure
+
+    # Extend with ligand chains
+    all_atoms = list(structure.atoms)
+    all_bonds = list(structure.bonds)
+    all_residues = list(structure.residues)
+    all_chains = list(structure.chains)
+
+    atom_offset = len(structure.atoms)
+    res_offset = len(structure.residues)
+    chain_idx = len(chains)
+
+    # Entity tracking: ligand sequences grouped by res_name for entity_id
+    seq_to_entity: dict[str, list[int]] = {}
+    next_entity_id = max((int(c["entity_id"]) for c in structure.chains), default=0) + 1
+
+    for mol, chain_name in ligand_chains:
+        lig_atoms, lig_bonds, lig_residues, n_atoms = _build_ligand_chain_atoms_residues(mol, atom_offset)
+        all_atoms.extend(lig_atoms)
+        all_residues.extend(lig_residues)
+
+        # Add bonds as BOND_DTYPE
+        for a1, a2, order in lig_bonds:
+            all_bonds.append((a1, a2, order))
+
+        # Entity/sym assignment by ligand res_name
+        seq_key = mol.res_name
+        if seq_key in seq_to_entity:
+            entity_id = seq_to_entity[seq_key][0]
+            sym_id = seq_to_entity[seq_key][1]
+            seq_to_entity[seq_key][1] += 1
+        else:
+            entity_id = next_entity_id
+            sym_id = 0
+            seq_to_entity[seq_key] = [entity_id, 1]
+            next_entity_id += 1
+
+        all_chains.append(
+            (
+                chain_name[:4].encode("ascii"),
+                const.MOL_NONPOLYMER,
+                entity_id,
+                sym_id,
+                chain_idx,
+                res_offset,
+                1,  # res_num (one residue per ligand)
+                atom_offset,
+                n_atoms,
+            )
+        )
+
+        atom_offset += n_atoms
+        res_offset += 1
+        chain_idx += 1
+
+    atoms_arr = np.array(all_atoms, dtype=ATOM_DTYPE) if all_atoms else np.empty(0, dtype=ATOM_DTYPE)
+    bonds_arr = np.array(all_bonds, dtype=BOND_DTYPE) if all_bonds else np.empty(0, dtype=BOND_DTYPE)
+    residues_arr = np.array(all_residues, dtype=RESIDUE_DTYPE) if all_residues else np.empty(0, dtype=RESIDUE_DTYPE)
+    chains_arr = np.array(all_chains, dtype=CHAIN_DTYPE) if all_chains else np.empty(0, dtype=CHAIN_DTYPE)
 
     return Structure(
         atoms=atoms_arr,
