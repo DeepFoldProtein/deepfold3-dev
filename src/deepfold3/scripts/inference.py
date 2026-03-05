@@ -84,6 +84,12 @@ import torch
     type=click.Path(path_type=Path),
     help="Directory to cache downloaded template mmCIF files (used with --json)",
 )
+@click.option(
+    "--pdb-mmcif-dir",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Local PDB mmCIF mirror directory (layout: {dir}/{mid2}/{id}.cif.gz)",
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -96,6 +102,7 @@ def inference(
     device: str | None,
     templates: Path | None,
     template_cache: Path | None,
+    pdb_mmcif_dir: Path | None,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -164,6 +171,7 @@ def inference(
         feats = InferenceInput.from_json(
             json_input,
             template_cache_dir=template_cache,
+            pdb_mmcif_dir=pdb_mmcif_dir,
         )
     else:
         click.echo(f"[inference] featurizing {msa} …")

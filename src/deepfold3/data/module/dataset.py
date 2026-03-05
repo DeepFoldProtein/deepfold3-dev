@@ -178,6 +178,7 @@ class InferenceInput:
         max_msa_seqs: int = 2048,
         max_templates: int = 4,
         template_cache_dir: str | Path | None = None,
+        pdb_mmcif_dir: str | Path | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features from a Protenix-format or AF3-format JSON input file.
 
@@ -193,6 +194,8 @@ class InferenceInput:
             max_msa_seqs: Maximum MSA sequences to keep.
             max_templates: Maximum number of templates to extract.
             template_cache_dir: Directory to cache downloaded template mmCIF files.
+            pdb_mmcif_dir: Optional local PDB mmCIF mirror directory
+                (layout: ``{dir}/{mid2}/{id}.cif.gz``).
 
         Returns:
             dict[str, torch.Tensor] ready for model.forward().
@@ -201,7 +204,9 @@ class InferenceInput:
         from deepfold3.data.parse.templates import TemplateHitInput, template_hit_input_to_features
 
         json_path = Path(json_path)
-        jobs = parse_json_input(json_path, max_templates=max_templates, template_cache_dir=template_cache_dir)
+        jobs = parse_json_input(
+            json_path, max_templates=max_templates, template_cache_dir=template_cache_dir, pdb_mmcif_dir=pdb_mmcif_dir
+        )
 
         if job_index >= len(jobs):
             raise IndexError(f"Job index {job_index} out of range (file has {len(jobs)} jobs)")

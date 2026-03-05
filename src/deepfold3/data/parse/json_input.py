@@ -145,6 +145,7 @@ def parse_json_input(
     json_path: str | Path,
     max_templates: int = 4,
     template_cache_dir: str | Path | None = None,
+    pdb_mmcif_dir: str | Path | None = None,
 ) -> list[JobInput]:
     """Parse a JSON input file (auto-detects Protenix or AF3 format).
 
@@ -156,6 +157,8 @@ def parse_json_input(
         json_path: Path to the JSON file.
         max_templates: Maximum number of template hits to load per chain.
         template_cache_dir: Directory to cache downloaded template mmCIF files.
+        pdb_mmcif_dir: Optional local PDB mmCIF mirror directory
+            (layout: ``{dir}/{mid2}/{id}.cif.gz``).
 
     Returns:
         List of JobInput objects, one per job entry.
@@ -168,6 +171,7 @@ def parse_json_input(
     base_dir = json_path.parent
 
     cache_dir = Path(template_cache_dir) if template_cache_dir is not None else None
+    pdb_dir = Path(pdb_mmcif_dir) if pdb_mmcif_dir is not None else None
 
     with open(json_path) as f:
         data = json.load(f)
@@ -178,9 +182,9 @@ def parse_json_input(
     jobs: list[JobInput] = []
     for entry in data:
         if _is_af3_format(entry):
-            jobs.append(_parse_af3_entry(entry, base_dir, max_templates, cache_dir))
+            jobs.append(_parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
         else:
-            jobs.append(_parse_protenix_entry(entry, base_dir, max_templates, cache_dir))
+            jobs.append(_parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
 
     return jobs
 
@@ -208,7 +212,9 @@ def _is_af3_format(entry: dict) -> bool:
     return False
 
 
-def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None) -> JobInput:
+def _parse_protenix_entry(
+    entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None, pdb_mmcif_dir: Path | None = None
+) -> JobInput:
     """Parse a single Protenix-format job entry."""
     name = entry.get("name", "unnamed")
     model_seeds = entry.get("modelSeeds", [42])
@@ -230,7 +236,7 @@ def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache
                     count=count,
                     paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("pairedMsaPath"), None),
                     unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("unpairedMsaPath"), None),
-                    template_hits=_resolve_template_hits(base_dir, pc.get("templatesPath"), max_templates, cache_dir),
+                    template_hits=_resolve_template_hits(base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir),
                 )
             )
         elif any(k in seq_item for k in _DNA_KEYS):
@@ -289,7 +295,9 @@ def _parse_protenix_entry(entry: dict, base_dir: Path, max_templates: int, cache
     )
 
 
-def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None) -> JobInput:
+def _parse_af3_entry(
+    entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None, pdb_mmcif_dir: Path | None = None
+) -> JobInput:
     """Parse a single AlphaFold 3-format job entry.
 
     AF3 format uses ``protein``, ``dna``, ``rna`` keys in sequence items.
@@ -313,7 +321,7 @@ def _parse_af3_entry(entry: dict, base_dir: Path, max_templates: int, cache_dir:
             seq = p["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("pairedMsaPath"), p.get("pairedMsa"))
-            tmpl_hits = _resolve_template_hits(base_dir, p.get("templatesPath"), max_templates, cache_dir)
+            tmpl_hits = _resolve_template_hits(base_dir, p.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir)
             for _ in ids or [None]:
                 protein_chains.append(
                     ProteinChainInput(
@@ -430,7 +438,11 @@ def _resolve_msa(base_dir: Path, mol_type: int, path_str: str | None, inline_str
 
 
 def _resolve_template_hits(
-    base_dir: Path, templates_path_str: str | None, max_templates: int, cache_dir: Path | None
+    base_dir: Path,
+    templates_path_str: str | None,
+    max_templates: int,
+    cache_dir: Path | None,
+    pdb_mmcif_dir: Path | None = None,
 ) -> list[TemplateHitInput]:
     """Resolve template hits from a file path into parsed TemplateHitInput objects.
 
@@ -443,6 +455,7 @@ def _resolve_template_hits(
         templates_path_str: Path to template file (JSON or HHR), or None.
         max_templates: Maximum number of template hits to load.
         cache_dir: Directory to cache downloaded template mmCIF files.
+        pdb_mmcif_dir: Optional local PDB mmCIF mirror directory.
 
     Returns:
         List of TemplateHitInput objects (empty if no templates specified).
@@ -459,7 +472,7 @@ def _resolve_template_hits(
     if suffix == ".json":
         return _load_json_template_hits(resolved, max_templates)
     elif suffix == ".hhr":
-        return _load_hhr_template_hits(resolved, max_templates, cache_dir)
+        return _load_hhr_template_hits(resolved, max_templates, cache_dir, pdb_mmcif_dir=pdb_mmcif_dir)
     else:
         logger.warning("Unsupported template file type: %s", suffix)
         return []
@@ -474,10 +487,14 @@ def _load_json_template_hits(json_path: Path, max_templates: int) -> list[Templa
             {
                 "name": "template_hit_0.cif",
                 "queryIndices": [0, 1, 5, ...],
-                "templateIndices": [10, 11, 15, ...]
+                "templateIndices": [10, 11, 15, ...],
+                "chainId": "A"
             },
             ...
         ]
+
+    ``chainId`` is optional — selects which chain to use from the template
+    mmCIF.  Defaults to the first polymer chain if omitted.
 
     Returns:
         List of TemplateHitInput with mmCIF text and index pairs.
@@ -511,12 +528,19 @@ def _load_json_template_hits(json_path: Path, max_templates: int) -> list[Templa
                 logger.warning("Template CIF not found: %s", cif_path)
                 continue
 
-            mmcif_text = cif_path.read_text()
+            if cif_path.name.endswith(".gz"):
+                import gzip
+
+                with gzip.open(cif_path, "rt", encoding="utf-8") as gz:
+                    mmcif_text = gz.read()
+            else:
+                mmcif_text = cif_path.read_text()
             result.append(
                 TemplateHitInput(
                     mmcif_text=mmcif_text,
                     query_indices=query_indices,
                     template_indices=template_indices,
+                    chain_id=hit.get("chainId"),
                 )
             )
             logger.info("Loaded JSON template hit %s", cif_name)
@@ -526,7 +550,12 @@ def _load_json_template_hits(json_path: Path, max_templates: int) -> list[Templa
     return result
 
 
-def _load_hhr_template_hits(hhr_path: Path, max_templates: int, cache_dir: Path | None) -> list[TemplateHitInput]:
+def _load_hhr_template_hits(
+    hhr_path: Path,
+    max_templates: int,
+    cache_dir: Path | None,
+    pdb_mmcif_dir: Path | None = None,
+) -> list[TemplateHitInput]:
     """Load template hits from an HHR file, downloading CIFs from RCSB.
 
     Returns:
@@ -550,7 +579,7 @@ def _load_hhr_template_hits(hhr_path: Path, max_templates: int, cache_dir: Path 
         if len(result) >= max_templates:
             break
         try:
-            mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir)
+            mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir, pdb_mmcif_dir=pdb_mmcif_dir)
             result.append(
                 TemplateHitInput(
                     mmcif_text=mmcif_text,

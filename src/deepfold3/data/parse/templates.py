@@ -17,6 +17,7 @@ Template features (per template, aligned to query tokens):
 from __future__ import annotations
 
 import dataclasses
+import gzip
 import json
 import logging
 import urllib.request
@@ -193,25 +194,110 @@ def _extract_from_index_pairs(
     return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr)
 
 
-def fetch_pdb_mmcif(pdb_id: str, cache_dir: Path | None = None) -> str:
-    """Download an mmCIF file from RCSB PDB.
+def _find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
+    """Find the file path of a PDB mmCIF in a local PDB mirror.
+
+    Same search order as ``_find_pdb_mmcif_local`` but returns the ``Path``
+    instead of reading the file content.  Useful for creating symbolic links.
+    """
+    pdb_lower = pdb_id.lower()
+    mid2 = pdb_lower[1:3]
+    candidates = [
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.gz",
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / f"{pdb_lower}.cif.gz",
+        pdb_mmcif_dir / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.gz",
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def _find_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
+    """Look up a PDB mmCIF file in a local PDB mirror directory.
+
+    Searches the standard PDB mirror layout::
+
+        {pdb_mmcif_dir}/{mid2}/{pdb_id}.cif.gz
+        {pdb_mmcif_dir}/{mid2}/{pdb_id}.cif
+
+    where ``mid2`` is the middle two characters of the PDB ID (e.g. ``"3v"``
+    for ``"a3vb"``).  Also tries the flat layout ``{pdb_mmcif_dir}/{pdb_id}.cif[.gz]``
+    as a fallback.
+
+    Args:
+        pdb_id: 4-character PDB ID (case-insensitive; lowercased for path).
+        pdb_mmcif_dir: Root directory of the local PDB mirror.
+
+    Returns:
+        mmCIF text on success, None if not found.
+    """
+    pdb_lower = pdb_id.lower()
+    mid2 = pdb_lower[1:3]
+
+    candidates = [
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.gz",
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / f"{pdb_lower}.cif.gz",
+        pdb_mmcif_dir / f"{pdb_lower}.cif",
+        # Also try uppercase variants
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.gz",
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif",
+    ]
+
+    for path in candidates:
+        if path.is_file():
+            logger.info("Found local template %s at %s", pdb_id, path)
+            if path.suffix == ".gz":
+                with gzip.open(path, "rt", encoding="utf-8") as f:
+                    return f.read()
+            else:
+                return path.read_text()
+
+    return None
+
+
+def fetch_pdb_mmcif(
+    pdb_id: str,
+    cache_dir: Path | None = None,
+    pdb_mmcif_dir: Path | None = None,
+) -> str:
+    """Fetch an mmCIF file from a local PDB mirror or RCSB PDB.
+
+    Resolution order:
+    1. ``pdb_mmcif_dir`` — local PDB mirror (``{dir}/{mid2}/{id}.cif.gz``)
+    2. ``cache_dir`` — previously downloaded file
+    3. RCSB download (result cached if ``cache_dir`` is set)
 
     Args:
         pdb_id: 4-character PDB ID (e.g., "1ABC").
-        cache_dir: Optional directory to cache downloaded files. If the file
-            already exists in the cache, it is read from disk.
+        cache_dir: Optional directory to cache downloaded files.
+        pdb_mmcif_dir: Optional local PDB mmCIF mirror directory.
+            Standard layout: ``{dir}/{mid2}/{id}.cif.gz`` where ``mid2``
+            is the middle two characters of the lowercased PDB ID.
 
     Returns:
         mmCIF file contents as a string.
 
     Raises:
         ValueError: If pdb_id is not a valid 4-character code.
-        urllib.error.URLError: If the download fails.
+        urllib.error.URLError: If the download fails and no local source found.
     """
     pdb_id = pdb_id.strip().upper()
     if len(pdb_id) != 4:
         raise ValueError(f"PDB ID must be 4 characters, got: {pdb_id!r}")
 
+    # 1. Local PDB mirror
+    if pdb_mmcif_dir is not None:
+        content = _find_pdb_mmcif_local(pdb_id, Path(pdb_mmcif_dir))
+        if content is not None:
+            return content
+        logger.debug("PDB ID %s not found in local mirror %s", pdb_id, pdb_mmcif_dir)
+
+    # 2. Cache
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +305,7 @@ def fetch_pdb_mmcif(pdb_id: str, cache_dir: Path | None = None) -> str:
         if cached.exists():
             return cached.read_text()
 
+    # 3. RCSB download
     url = f"https://files.rcsb.org/download/{pdb_id}.cif"
     logger.info("Downloading template %s from %s", pdb_id, url)
 
@@ -477,6 +564,7 @@ def parse_hhr_templates(
     max_templates: int = 4,
     max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
     cache_dir: str | Path | None = None,
+    pdb_mmcif_dir: str | Path | None = None,
 ) -> list[TemplateFeatures]:
     """Parse templates from an HHR file by downloading structures from RCSB.
 
@@ -490,6 +578,8 @@ def parse_hhr_templates(
         max_templates: Maximum number of templates to extract.
         max_atoms: Maximum atoms per residue.
         cache_dir: Optional directory to cache downloaded mmCIF files.
+        pdb_mmcif_dir: Optional local PDB mmCIF mirror directory
+            (layout: ``{dir}/{mid2}/{id}.cif.gz``).
 
     Returns:
         List of TemplateFeatures, one per successfully processed template.
@@ -503,6 +593,8 @@ def parse_hhr_templates(
         logger.warning("No hits found in HHR file %s", hhr_path)
         return []
 
+    pdb_dir = Path(pdb_mmcif_dir) if pdb_mmcif_dir is not None else None
+
     # HHR hits are already ranked by Probab/E-value; take top K in file order,
     # skipping failures until we have enough.
     templates: list[TemplateFeatures] = []
@@ -510,7 +602,7 @@ def parse_hhr_templates(
         if len(templates) >= max_templates:
             break
         try:
-            mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir)
+            mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir, pdb_mmcif_dir=pdb_dir)
             feats = extract_template_features_from_hhr(
                 mmcif_text,
                 hit,
