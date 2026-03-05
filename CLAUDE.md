@@ -32,8 +32,13 @@ uv run ruff check src/
 uv run ruff format src/
 
 # CLI (unified entry point via click — registered in pyproject.toml as deepfold3)
+deepfold3 msa       --sequence MKTII --output msa_out/ --json
+deepfold3 msa       --sequence SEQ1:SEQ2:SEQ1 --output msa_out/ --use-pairing --json
+deepfold3 msa       --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --json
+deepfold3 msa       --sequence MKTII --output msa_out/ --link-templates --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensors
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache
+deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 plot      --input out_confidences.json --output confidences.png
 ```
@@ -95,6 +100,7 @@ src/deepfold3/
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
+│   ├── msa/             # mmseqs2.py (server API + local binary MSA search + template m8 parsing)
 │   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)
@@ -108,6 +114,7 @@ src/deepfold3/
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
 │   ├── __init__.py       # click.Group `cli` — unified entry point
 │   ├── inference.py      # `deepfold3 inference`
+│   ├── msa_search.py     # `deepfold3 msa`
 │   ├── convert_weights.py  # `deepfold3 convert`
 │   └── plot_confidences.py # `deepfold3 plot`
 └── params.py        # read_af3_params() (zstd decompression)

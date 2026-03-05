@@ -5,6 +5,7 @@ This document traces a biomolecular input through every stage of the DeepFold3 d
 ## Pipeline Overview
 
 ```text
+Sequence(s)  ──→  MSA Search  ──→  A3M files
 Raw input (mmCIF / A3M / sequence string / JSON)
   -> Parse     ->  Structure + MSA objects
   -> Tokenize  ->  Tokenized (tokens[], bonds[], structure, msa)
@@ -117,6 +118,88 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 **`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]` -- metadata for training dataset indexing.
 
+## MSA Search (`data/msa/mmseqs2.py`)
+
+The `deepfold3 msa` command searches for MSAs using MMseqs2, producing A3M files that feed into `deepfold3 inference --msa`.
+
+### Server Mode (default)
+
+```bash
+# Monomer — searches ColabFold public API
+deepfold3 msa --sequence MKTIIALSYIFCLVFA --output msa_out/
+
+# Multimer — colon-separated chains (duplicates searched only once)
+deepfold3 msa --sequence AAAA:BBBB:AAAA --output msa_out/
+
+# Multimer from FASTA with pairing
+deepfold3 msa --fasta complex.fasta --output msa_out/ --use-pairing
+
+# With caching
+deepfold3 msa --fasta query.fasta --output msa_out/ --cache-dir /tmp/msa_cache/
+
+# With templates (default on) + skeleton JSON
+deepfold3 msa --sequence MKTII... --output msa_out/ --json
+
+# Templates: save pdb70.m8 but skip mmCIF download
+deepfold3 msa --sequence MKTII... --output msa_out/ --no-fetch-templates
+
+# Disable template search entirely
+deepfold3 msa --sequence MKTII... --output msa_out/ --no-templates
+```
+
+Uses the ColabFold MMseqs2 server API (`https://api.colabfold.com`). Submits sequences, polls for completion, downloads result tar.gz, and extracts per-chain A3M files. Supports environmental DB (`--use-env`, default on) and cross-chain pairing (`--use-pairing`).
+
+**Templates**: The server returns `pdb70.m8` with template hits. By default, `--use-templates` extracts these hits and downloads mmCIF structures from RCSB (or a local PDB mirror via `--pdb-mmcif-dir`). Template options:
+
+- `--fetch-templates` (default) — download mmCIF files, write per-chain JSON template hits with `chainId`
+- `--link-templates` — create symlinks to files in `--pdb-mmcif-dir` instead of copying (requires `--pdb-mmcif-dir`)
+- `--no-fetch-templates` — save only `pdb70.m8`, skip downloading structures
+- `--no-templates` — disable template extraction entirely
+
+**Colon-separated multimer**: `--sequence SEQ1:SEQ2:SEQ1` splits on `:` and deduplicates — only unique sequences are searched, results are copied to all matching chains.
+
+### Local Mode
+
+```bash
+deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/
+```
+
+Requires a local `mmseqs` binary and pre-built databases:
+
+- `{db_dir}/uniref30_2302_db` (required)
+- `{db_dir}/colabfold_envdb_202108_db` (optional, for `--use-env`)
+
+Database setup: download from [ColabFold databases](https://colabfold.mmseqs.com/).
+
+Pipeline: `createdb` → `search` (3 iterations, sensitivity 8) → `mvdb` (profile) → `expandaln` → `align` → `filterresult` → `result2msa` → `mergedbs` → `unpackdb`. For pairing: additional `pairaln` + `result2msa` with `msa-format-mode 5`.
+
+### Output
+
+- `{output}/unpaired_0.a3m`, `unpaired_1.a3m`, ... (one per chain)
+- `{output}/paired_0.a3m`, `paired_1.a3m`, ... (if pairing enabled)
+- `{output}/pdb70.m8` — template hits in BLAST tabular format (if `--use-templates`)
+- `{output}/templates/` — downloaded mmCIF files + per-chain JSON hits (if `--fetch-templates`)
+- `{output}/{name}.json` — AF3-format skeleton JSON for `deepfold3 inference --json` (if `--json`)
+
+The skeleton JSON uses AlphaFold 3 dialect (`"dialect": "alphafold3"`, `"version": 2`) with chain IDs (A, B, ...), relative paths to A3M files, and `templatesPath` references to per-chain JSON template hits (with `chainId` for selecting the correct chain from each mmCIF).
+
+### API
+
+```python
+from deepfold3.data.msa import search_server, search_local, MsaResult, parse_m8
+
+result = search_server(["MKTII..."], use_env=True)
+# result.unpaired[0] → A3M text for chain 0
+# result.m8_text → raw pdb70.m8 content (template hits)
+
+result = search_local(["SEQ1", "SEQ2"], db_dir="/data/dbs/", use_pairing=True)
+# result.paired[0], result.paired[1] → paired A3M text
+
+# Parse template hits from m8
+hits = parse_m8(result.m8_text)
+# hits[0] → list of TemplateM8Hit for chain 0
+```
+
 ## Parsing Stage
 
 ### mmCIF (`data/parse/mmcif.py`)
@@ -150,8 +233,8 @@ def extract_template_features(mmcif_text, query_residue_index, ...) -> TemplateF
 def extract_template_features_from_hhr(mmcif_text, hit, query_length, ...) -> TemplateFeatures:
 def extract_template_features_from_structure(structure, query_to_template, query_length, ...) -> TemplateFeatures:
 def parse_template_mmcifs(template_dir, query_residue_index, max_templates=4) -> list[TemplateFeatures]:
-def parse_hhr_templates(hhr_path, query_length, max_templates=4, cache_dir=None) -> list[TemplateFeatures]:
-def fetch_pdb_mmcif(pdb_id, cache_dir=None) -> str:
+def parse_hhr_templates(hhr_path, query_length, max_templates=4, cache_dir=None, pdb_mmcif_dir=None) -> list[TemplateFeatures]:
+def fetch_pdb_mmcif(pdb_id, cache_dir=None, pdb_mmcif_dir=None) -> str:
 ```
 
 - `TemplateFeatures` dataclass: `aatype [N]` int64, `atom_positions [N, 24, 3]` float32, `atom_mask [N, 24]` bool
@@ -163,7 +246,7 @@ def fetch_pdb_mmcif(pdb_id, cache_dir=None) -> str:
 - `parse_hhr_templates()` reads an HHR file, selects top hits by `sum_probs`, downloads structures from RCSB, and extracts features
 - `parse_json_templates()` reads a JSON file containing alignment mappings and local CIF template structures (see format below)
 - Unaligned positions are filled with zeros and aatype=20 (UNK)
-- `fetch_pdb_mmcif()` downloads from RCSB (`https://files.rcsb.org/download/{pdb_id}.cif`) with optional caching
+- `fetch_pdb_mmcif()` resolves template structures in order: (1) local PDB mirror `pdb_mmcif_dir` (layout: `{dir}/{mid2}/{id}.cif.gz`, supports gzip), (2) `cache_dir`, (3) RCSB download. CLI: `--pdb-mmcif-dir`
 - Template features are converted to pseudo-beta positions, backbone frames, and masks in the featurizer
 
 **JSON template hits format** (produced by tools like Protenix/Boltz):

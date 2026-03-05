@@ -5,10 +5,11 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 ## Features
 
 - **Diffusion-based structure prediction** -- Evoformer trunk (MSA + PairFormer) with 200-step denoising diffusion head
-- **Template embedding** -- structural templates from PDB via mmCIF directory or HHsearch `.hhr` files
+- **Built-in MSA search** -- `deepfold3 msa` via ColabFold MMseqs2 server or local binary, with template search and multimer pairing
+- **Template embedding** -- structural templates from PDB via mmCIF directory, HHsearch `.hhr` files, or automatic server-side search
 - **Full confidence metrics** -- pLDDT, PAE, PDE, pTM, ipTM, experimentally resolved, ranking score
 - **AF3 weight compatibility** -- direct conversion from official AlphaFold 3 parameters
-- **Flexible input** -- A3M MSA files, Protenix-format JSON with paired/unpaired MSAs and HHR templates
+- **Flexible input** -- A3M MSA files, AlphaFold 3 / Protenix-format JSON with paired/unpaired MSAs and templates
 - **mmCIF + JSON output** -- standard structure files with per-atom pLDDT and comprehensive confidence JSON
 
 ## Installation
@@ -37,26 +38,45 @@ deepfold3 convert \
     --output resources/deepfold3.safetensors
 ```
 
-### 2. Run inference
+### 2. Search for MSAs
 
-From an A3M MSA file:
+Search using the ColabFold MMseqs2 server (no local databases required):
+
+```bash
+# Monomer
+deepfold3 msa --sequence MKTIIALSYIFCLVFA --output msa_out/ --json
+
+# Multimer (colon-separated chains, duplicates auto-deduplicated)
+deepfold3 msa --sequence AAAA:BBBB:AAAA --output msa_out/ --json
+```
+
+This produces A3M files, template hits (`pdb70.m8`), downloaded template structures, and an AlphaFold 3-format JSON ready for inference.
+
+For local search with your own databases:
+
+```bash
+deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --json
+```
+
+### 3. Run inference
+
+From the skeleton JSON produced by `deepfold3 msa`:
+
+```bash
+deepfold3 inference \
+    --json msa_out/query.json \
+    --output output/ \
+    --params resources/deepfold3.safetensors \
+    --num-samples 5
+```
+
+Or directly from an A3M MSA file:
 
 ```bash
 deepfold3 inference \
     --msa data/query.a3m \
     --output output/prediction.cif \
-    --params resources/deepfold3.safetensors \
-    --num-samples 5
-```
-
-Or from a Protenix-format JSON (with MSA paths and HHR templates):
-
-```bash
-deepfold3 inference \
-    --json input.json \
-    --output output/prediction.cif \
-    --params resources/deepfold3.safetensors \
-    --template-cache /tmp/template_cache
+    --params resources/deepfold3.safetensors
 ```
 
 This produces:
@@ -64,7 +84,7 @@ This produces:
 - `prediction.cif` -- mmCIF with MODEL blocks per diffusion sample, pLDDT as B-factors
 - `prediction_confidences.json` -- full confidence metrics (PAE, PDE, pTM, ipTM, contacts, etc.)
 
-### 3. Plot confidence maps
+### 4. Plot confidence maps
 
 ```bash
 deepfold3 plot \
@@ -76,6 +96,7 @@ deepfold3 plot \
 
 ```
 deepfold3 --help
+deepfold3 msa --help
 deepfold3 inference --help
 deepfold3 convert --help
 deepfold3 plot --help
@@ -83,6 +104,7 @@ deepfold3 plot --help
 
 | Command | Description |
 | ------- | ----------- |
+| `deepfold3 msa` | Search MSAs via MMseqs2 (server or local), with template hits |
 | `deepfold3 inference` | Run structure prediction from A3M or JSON input |
 | `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
 | `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
@@ -156,6 +178,7 @@ src/deepfold3/
 |   |-- confidence.py   # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
 |   +-- model.py        # DeepFold3 (top-level), DistogramHead
 |-- data/               # Data pipeline
+|   |-- msa/            # MMseqs2 MSA search (server API + local binary)
 |   |-- parse/          # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
 |   |-- tokenize/       # tokenizer.py (Input -> Tokenized)
 |   |-- crop/           # cropper.py (contiguous + spatial)
@@ -163,7 +186,7 @@ src/deepfold3/
 |   +-- module/         # dataset.py (InferenceInput), collate.py
 |-- convert/af3.py      # Haiku -> PyTorch weight converter
 |-- io/                 # Output: mmCIF + confidences JSON
-+-- scripts/            # CLI: inference, convert, plot
++-- scripts/            # CLI: msa, inference, convert, plot
 ```
 
 ## References
