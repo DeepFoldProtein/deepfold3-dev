@@ -40,7 +40,6 @@ class EvoformerConfig:
     msa_channel: int = 64
     seq_channel: int = 384
     pair_channel: int = 128
-    num_msa: int = 1024
     max_relative_idx: int = 32
     max_relative_chain: int = 2
     msa_attention: MSAAttentionConfig = field(default_factory=MSAAttentionConfig)

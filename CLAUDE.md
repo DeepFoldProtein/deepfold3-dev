@@ -33,14 +33,14 @@ uv run ruff format src/
 
 # CLI (unified entry point via click — registered in pyproject.toml as deepfold3)
 deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensors
-deepfold3 inference --json input.json --output out.cif --params weights.safetensors --template-cache /tmp/cache
+deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 plot      --input out_confidences.json --output confidences.png
 ```
 
 ## Ruff Configuration
 
-Line length 120; rules: E, F, I (isort), B (bugbear), UP (pyupgrade). `E501` is ignored (handled by `ruff format`). Double quotes, space indent.
+Line length 120; rules: E, F, I (isort), B (bugbear), UP (pyupgrade). `E501` is ignored (handled by `ruff format`). Double quotes, space indent. Google-style docstrings (`Args:`, `Returns:`, `Raises:`, `Attributes:`).
 
 ## Documentation Maintenance
 
@@ -94,6 +94,7 @@ src/deepfold3/
 ├── data/            # Data pipeline
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
+│   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)

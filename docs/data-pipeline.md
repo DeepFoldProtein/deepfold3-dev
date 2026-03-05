@@ -205,9 +205,25 @@ def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None) 
 - `ProteinChainInput`: `sequence`, `count`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`, `template_hits: list[TemplateHitInput]`
 - `NucleotideChainInput`: `sequence`, `count`, `mol_type: int`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`
 - `TemplateHitInput` (in `templates.py`): `mmcif_text`, `query_indices | hhr_hit` — holds parsed template data ready for feature extraction
-- `JobInput`: `name`, `protein_chains`, `dna_chains`, `rna_chains`, `model_seeds`
+- `LigandChainInput`: `ccd_ids: list[str] | None`, `smiles: str | None`, `count: int` — exactly one of ccd_ids or smiles
+- `JobInput`: `name`, `protein_chains`, `dna_chains`, `rna_chains`, `ligand_chains`, `model_seeds`
 - Resolves relative paths against the JSON file's directory
-- Supports multi-chain protein/DNA/RNA complexes (`count=1`)
+- Supports multi-chain protein/DNA/RNA/ligand complexes (`count=1`)
+- Protenix ligand format: `{"ligand": {"ligand": "CCD_ATP", "count": 1}}` (strip `CCD_` prefix)
+- AF3 ligand format: `{"ligand": {"id": "B", "ccdCodes": ["ATP"]}}` or `{"ligand": {"id": "B", "smiles": "CCO"}}`
+
+### CCD Molecule Builder (`data/ccd.py`)
+
+```python
+def load_ccd_molecule(ccd_code: str) -> CcdMolecule:
+def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
+```
+
+- `CcdMolecule` dataclass: `atom_names`, `positions [n_atoms, 3]`, `elements`, `charges`, `bonds: list[(idx1, idx2, order)]`, `res_name`
+- `load_ccd_molecule()` downloads CIF from RCSB, parses with gemmi, skips H atoms, extracts bonds from `_chem_comp_bond`
+- `smiles_to_molecule()` uses RDKit (optional): `MolFromSmiles` -> AddHs -> ETKDG conformer -> MMFF optimize -> RemoveHs
+- CCD files cached in `/tmp/deepfold3_ccd_cache/`; molecules cached in-memory per process
+- Used by `InferenceInput.from_json()` for ligand chain assembly
 
 ## Tokenization (`data/tokenize/tokenizer.py`)
 
@@ -267,6 +283,8 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `asym_id` | `[N]` | int64 | Chain ID |
 | `entity_id` | `[N]` | int64 | Entity ID |
 | `sym_id` | `[N]` | int64 | Symmetry ID |
+| `mol_type` | `[N]` | int64 | Molecule type (0=protein, 1=DNA, 2=RNA, 3=non-polymer) |
+| `token_res_name` | `[N, 5]` | int8 | Residue name as ASCII bytes (e.g. "ALA", "PCG"), 0-padded |
 | `seq_mask` | `[N]` | bool | Valid token mask |
 | `pair_mask` | `[N, N]` | bool | `seq_mask[:, None] & seq_mask[None, :]` |
 | `frames_mask` | `[N]` | bool | True for polymer tokens with backbone frames (protein/RNA/DNA) |
@@ -276,6 +294,7 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `ref_element` | `[N, M]` | int64 | Atomic number (0-127 via `ELEMENT_TO_INT`) |
 | `ref_charge` | `[N, M]` | float32 | Formal charge |
 | `ref_atom_name_chars` | `[N, M, 4]` | int64 | Atom name encoding: `ord(c)-32` for each char of `name.ljust(4)[:4]` |
+| `ref_space_uid` | `[N, M]` | int64 | Reference space group ID: token_idx for polymer, first token of ligand residue for ligand atoms |
 | `msa` | `[S, N]` | int64 | MSA sequences: query row + paired rows + unpaired block-diagonal rows |
 | `msa_mask` | `[S, N]` | bool | MSA validity mask (cross-chain gaps are valid; only padding is False) |
 | `deletion_matrix` | `[S, N]` | int64 | Raw deletion counts (number of insertions before each match state) |
@@ -289,13 +308,14 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 
 ### Reference Atom Augmentation
 
-When `random_rot=True` (training), each token's `ref_pos` is:
+When `random_rot=True` (training), `ref_pos` is augmented per `ref_space_uid` group:
 
-1. Centered on the mean of valid atoms
-2. Rotated by a uniformly random SO(3) rotation (QR decomposition of N(0,1) matrix)
-3. Translated by a random N(0,1) vector
+1. All tokens sharing the same `ref_space_uid` are grouped (polymer: each token independent; ligand: all tokens of one residue share a UID)
+2. Centered on the group mean of valid atoms
+3. Rotated by a uniformly random SO(3) rotation (QR decomposition of N(0,1) matrix)
+4. Translated by a random N(0,1) vector
 
-This matches AF3's `random_augmentation()` and is skipped during inference.
+This ensures ligand atoms within the same residue maintain their relative geometry while getting a shared random augmentation. Skipped during inference.
 
 ## Reference Atoms (`data/feature/ref_atoms.py`)
 
@@ -310,6 +330,8 @@ CCD lookup flow:
 3. Pad/truncate to `max_atoms`, encode atom names as `[ord(c)-32 for c in name.ljust(4)[:4]]`
 
 Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M]`, `atom_name_chars [M, 4]`.
+
+**Ligand ref_pos**: For `MOL_NONPOLYMER` tokens, the featurizer looks up the CCD residue name from the structure and retrieves the atom's ideal position from the CCD entry. If CCD lookup fails (e.g. custom ligand from SMILES), it falls back to positions stored in the Structure atoms.
 
 ## Inference Entry Points (`data/module/dataset.py`)
 
@@ -336,7 +358,8 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 - JSON-mode templates (query_indices populated): whole-complex alignment
 - HHR-mode templates (hhr_hit populated): per-chain alignment
 - Builds multi-chain Structure from query sequences, tokenizes and featurizes
-- Supports multi-chain protein/DNA/RNA complexes
+- Supports multi-chain protein/DNA/RNA/ligand complexes
+- Ligand chains: built from CCD codes via `load_ccd_molecule()` or SMILES via `smiles_to_molecule()`; no MSA or templates for ligands
 
 All methods accept `mol_type` as `"protein"`, `"rna"`, or `"dna"` (case-insensitive).
 

@@ -23,7 +23,7 @@ Requirements: Python 3.12 (pinned in `.python-version`), `uv` package manager.
 
 - `LinearNoBias` consistently used instead of `nn.Linear(bias=False)` — matches AF3's `hm.Linear` default
 - Type hints on all function signatures
-- Docstrings: module-level (purpose + Haiku scope mapping), class-level (attribute map for weight converter), function-level (args/returns for public API)
+- Docstrings: Google style (`Args:`, `Returns:`, `Raises:` sections). Module-level (purpose + Haiku scope mapping), class-level (`Attributes:` for dataclasses), function-level (args/returns for public API)
 
 ## Testing
 
@@ -40,7 +40,7 @@ uv run pytest -m "not slow"                  # skip slow tests
 
 ### Test Structure
 
-9 test files, ~121 tests total:
+10 test files, ~130 tests total:
 
 | File | Purpose |
 |---|---|
@@ -53,6 +53,7 @@ uv run pytest -m "not slow"                  # skip slow tests
 | `test_jax_comparison.py` | PyTorch vs JAX/Haiku numerical validation |
 | `test_weight_loading.py` | AF3 weight converter: missing/unexpected keys, shapes |
 | `test_e2e.py` | Full forward pass, distogram properties, data pipeline |
+| `test_ligand.py` | CCD molecule loading, SMILES, JSON parsing, ligand featurization |
 
 ### Fixtures (`conftest.py`)
 
@@ -83,6 +84,7 @@ Function-scoped (fresh per test):
 **Markers**:
 
 - `@pytest.mark.slow` — expensive tests (full forward pass, multi-sample inference)
+- `@pytest.mark.network` — tests requiring network access (CCD downloads from RCSB)
 - `@pytest.mark.timeout(120)` — override global 60s timeout for slow tests
 
 ## How to Add a New Model Head

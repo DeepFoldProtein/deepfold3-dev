@@ -49,7 +49,12 @@ import torch
     type=click.Path(exists=True, path_type=Path),
     help="Protenix-format JSON input file (alternative to --msa)",
 )
-@click.option("--output", required=True, type=click.Path(path_type=Path), help="Output mmCIF file path")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Output path: directory for --json (filenames from job name), or .cif file for --msa",
+)
 @click.option(
     "--params",
     required=True,
@@ -147,8 +152,15 @@ def inference(
     t0 = time.perf_counter()
     from deepfold3.data.module.dataset import InferenceInput
 
+    job_name: str | None = None
     if json_input is not None:
         click.echo(f"[inference] featurizing {json_input} …")
+        from deepfold3.data.parse.json_input import parse_json_input
+
+        jobs = parse_json_input(json_input, template_cache_dir=template_cache)
+        if not jobs:
+            raise click.UsageError("No jobs found in JSON input")
+        job_name = jobs[0].name
         feats = InferenceInput.from_json(
             json_input,
             template_cache_dir=template_cache,
@@ -256,19 +268,32 @@ def inference(
 
         click.echo(f"  sample {s}: {', '.join(metrics)}")
 
+    # Determine output paths
+    if job_name is not None:
+        # JSON input: output is a directory, filenames from job name
+        output_dir = output
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cif_path = output_dir / f"{job_name}.cif"
+    else:
+        # MSA input: output is a .cif file path
+        cif_path = output
+        output_dir = cif_path.parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
     # Save mmCIF
-    click.echo(f"[inference] writing {output} …")
+    click.echo(f"[inference] writing {cif_path} …")
     from deepfold3.io.mmcif import save_mmcif
 
-    save_mmcif(output, model_output, feats)
-    click.echo(f"  saved  {output.resolve()}")
+    save_mmcif(cif_path, model_output, feats)
+    click.echo(f"  saved  {cif_path.resolve()}")
 
     # Save confidences JSON (per sample)
     for s in range(num_samples):
+        stem = job_name if job_name is not None else cif_path.stem
         if num_samples == 1:
-            json_path = output.with_name(output.stem + "_confidences.json")
+            json_path = output_dir / f"{stem}_confidences.json"
         else:
-            json_path = output.with_name(output.stem + f"_sample{s}_confidences.json")
+            json_path = output_dir / f"{stem}_sample{s}_confidences.json"
         save_confidences_json(json_path, model_output, feats, sample_idx=s, seed=seed)
         click.echo(f"  saved  {json_path.resolve()}")
 
