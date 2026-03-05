@@ -24,8 +24,8 @@ from deepfold3.model.model import DeepFold3Output
 
 
 def _res_type_to_mol_type(res_type: int) -> int:
-    """Infer mol_type from res_type index."""
-    if res_type <= 20:
+    """Infer mol_type from res_type index (fallback when mol_type feature unavailable)."""
+    if res_type < 20:
         return const.MOL_PROTEIN
     if 22 <= res_type <= 25:
         return const.MOL_RNA
@@ -63,6 +63,14 @@ def prediction_to_structure(
     asym_id = features["asym_id"].cpu()  # [N] int64
     residue_index = features["residue_index"].cpu()  # [N] int64
 
+    # mol_type feature: definitive polymer/non-polymer indicator
+    has_mol_type = "mol_type" in features
+    mol_type_feat = features["mol_type"].cpu() if has_mol_type else None  # [N] int64
+
+    # token_res_name feature: actual CCD residue name (e.g. "PCG" for ligands)
+    has_res_name = "token_res_name" in features
+    token_res_name = features["token_res_name"].cpu() if has_res_name else None  # [N, 5] int8
+
     N, M = ref_mask.shape
 
     # Compute per-atom pLDDT
@@ -92,9 +100,12 @@ def prediction_to_structure(
         token_indices = (asym_id == asym).nonzero(as_tuple=True)[0].tolist()
         chain_name = asym_id_to_chain_name(int(asym))
 
-        # Determine mol_type from first token's res_type
-        first_rt = int(res_type[token_indices[0]])
-        mol_type = _res_type_to_mol_type(first_rt)
+        # Determine mol_type from feature tensor (definitive) or infer from res_type (fallback)
+        if mol_type_feat is not None:
+            mol_type = int(mol_type_feat[token_indices[0]])
+        else:
+            first_rt = int(res_type[token_indices[0]])
+            mol_type = _res_type_to_mol_type(first_rt)
 
         # Build sequence key for entity dedup
         seq_key = "|".join(str(int(res_type[ti])) for ti in token_indices)
@@ -113,7 +124,14 @@ def prediction_to_structure(
 
         for token_i in token_indices:
             rt = int(res_type[token_i])
-            res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+            # Use actual residue name from feature if available (needed for ligands
+            # where res_type=20 maps to "UNK" but actual name is e.g. "PCG")
+            if token_res_name is not None:
+                res_name = bytes(int(b) for b in token_res_name[token_i] if int(b) != 0).decode("ascii", errors="replace")
+                if not res_name:
+                    res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+            else:
+                res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
             res_seq_num = int(residue_index[token_i])
 
             res_atom_start = atom_idx_global

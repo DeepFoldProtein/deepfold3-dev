@@ -18,7 +18,7 @@ try:
 except ImportError as e:
     raise ImportError("gemmi is required for mmCIF output: pip install gemmi") from e
 
-from deepfold3.data.const import ELEMENT_TO_INT, RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
+from deepfold3.data.const import ELEMENT_TO_INT, MOL_NONPOLYMER, RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
 from deepfold3.io.confidences import compute_plddt
 from deepfold3.model.model import DeepFold3Output
 
@@ -150,7 +150,7 @@ def _enrich_cif_text(text: str) -> str:
             parts = line.split()
             if len(parts) >= 2:
                 comp_id = parts[0]
-                comp_type = _CHEM_COMP_TYPE.get(comp_id, "other")
+                comp_type = _CHEM_COMP_TYPE.get(comp_id, "non-polymer")
                 result.append(f"{comp_id} '{comp_type}'")
                 continue
             else:
@@ -257,6 +257,16 @@ def _save_mmcif_legacy(
     asym_id = features["asym_id"].cpu()
     residue_index = features["residue_index"].cpu()
 
+    # mol_type feature: definitive polymer/non-polymer indicator
+    mol_type_feat = features.get("mol_type")
+    if mol_type_feat is not None:
+        mol_type_feat = mol_type_feat.cpu()
+
+    # token_res_name feature: actual CCD residue name
+    token_res_name = features.get("token_res_name")
+    if token_res_name is not None:
+        token_res_name = token_res_name.cpu()
+
     num_samples, N, M = atom_positions.shape[:3]
 
     if output.plddt is not None:
@@ -285,13 +295,32 @@ def _save_mmcif_legacy(
 
             for token_i in token_indices.tolist():
                 rt = int(res_type[token_i])
-                res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+
+                # Resolve residue name: use actual CCD name from feature if available
+                if token_res_name is not None:
+                    res_name = bytes(int(b) for b in token_res_name[token_i] if int(b) != 0).decode(
+                        "ascii", errors="replace"
+                    )
+                    if not res_name:
+                        res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+                else:
+                    res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+
                 res_seq_num = int(residue_index[token_i])
 
                 residue = gemmi.Residue()
                 residue.name = res_name
                 residue.seqid = gemmi.SeqId(str(res_seq_num))
-                residue.entity_type = gemmi.EntityType.Polymer
+
+                # Determine entity type from mol_type feature (definitive) or
+                # fall back to _CHEM_COMP_TYPE lookup
+                if mol_type_feat is not None:
+                    mt = int(mol_type_feat[token_i])
+                    residue.entity_type = gemmi.EntityType.NonPolymer if mt == MOL_NONPOLYMER else gemmi.EntityType.Polymer
+                elif res_name not in _CHEM_COMP_TYPE:
+                    residue.entity_type = gemmi.EntityType.NonPolymer
+                else:
+                    residue.entity_type = gemmi.EntityType.Polymer
 
                 for atom_j in range(M):
                     if not bool(ref_mask[token_i, atom_j]):
@@ -364,9 +393,14 @@ def _save_mmcif_legacy(
             else:
                 avg_plddt = 0.0
             rt = int(res_type[token_i])
-            res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+            if token_res_name is not None:
+                rn = bytes(int(b) for b in token_res_name[token_i] if int(b) != 0).decode("ascii", errors="replace")
+                if not rn:
+                    rn = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
+            else:
+                rn = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
             seq_id = int(residue_index[token_i])
-            plddt_per_residue[(chain_name, res_name, seq_id)] = avg_plddt
+            plddt_per_residue[(chain_name, rn, seq_id)] = avg_plddt
 
     doc = st.make_mmcif_document()
     base_text = doc.as_string()

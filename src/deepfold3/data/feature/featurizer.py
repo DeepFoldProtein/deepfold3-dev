@@ -36,7 +36,7 @@ class Featurizer:
     def __init__(
         self,
         max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
-        max_msa_seqs: int = 16384,
+        max_msa_seqs: int = 2048,
         max_templates: int = 4,
     ):
         self.max_atoms = max_atoms
@@ -52,34 +52,32 @@ class Featurizer:
         templates: list[TemplateFeatures] | None = None,
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Process tokenized data into a feature dictionary.
+        """Processes tokenized data into a feature dictionary.
 
-        Returns
-        -------
-        dict with keys:
-            res_type          [N]         int64
-            residue_index     [N]         int64
-            token_index       [N]         int64
-            asym_id           [N]         int64
-            entity_id         [N]         int64
-            sym_id            [N]         int64
-            seq_mask          [N]         bool
-            ref_pos           [N, M, 3]   float32
-            ref_mask          [N, M]      bool
-            ref_element       [N, M]      int64
-            ref_charge        [N, M]      float32
-            ref_atom_name_chars [N, M, 4] int64
-            msa               [S, N]      int64
-            msa_mask          [S, N]      bool
-            deletion_matrix   [S, N]      int64
-            profile           [N, 31]     float32
-            deletion_mean     [N]         float32
-            bond_matrix       [N, N, 1]   float32  (only when ligand bonds exist)
-            template_aatype            [T, N]         int64    (if templates provided)
-            template_pseudo_beta       [T, N, 3]      float32
-            template_pseudo_beta_mask  [T, N]         bool
-            template_backbone_frame    [T, N, 3, 3]   float32
-            template_backbone_mask     [T, N]         bool
+        Args:
+            data: Tokenized input (tokens, bonds, structure, MSA).
+            training: Whether to apply training augmentations.
+            random_rot: Whether to apply random rotation to ref_pos.
+            seed: Random seed for augmentation reproducibility.
+            templates: Flat list of TemplateFeatures (single-chain or whole-complex).
+            template_feats_per_chain: Per-chain template features keyed by asym_id.
+
+        Returns:
+            Dict of tensors with keys:
+                res_type [N] int64, residue_index [N] int64,
+                token_index [N] int64, asym_id [N] int64,
+                entity_id [N] int64, sym_id [N] int64,
+                seq_mask [N] bool, pair_mask [N,N] bool,
+                frames_mask [N] bool, token_to_rep_atom [N] int64,
+                ref_pos [N,M,3] float32, ref_mask [N,M] bool,
+                ref_element [N,M] int64, ref_charge [N,M] float32,
+                ref_atom_name_chars [N,M,4] int64,
+                ref_space_uid [N,M] int64,
+                msa [S,N] int64, msa_mask [S,N] bool,
+                deletion_matrix [S,N] int64, profile [N,31] float32,
+                deletion_mean [N] float32,
+                bond_matrix [N,N,1] float32 (if ligand bonds exist),
+                template_* [T,N,...] (if templates provided).
         """
         rng = np.random.default_rng(seed)
         tokens = data.tokens
@@ -110,41 +108,76 @@ class Featurizer:
         ref_charge = np.zeros((N, M), dtype=np.float32)
         ref_atom_name_chars = np.zeros((N, M, 4), dtype=np.int64)
 
+        # ref_space_uid: groups atoms sharing the same reference space.
+        # For polymer: uid = token_idx. For ligand: uid = first token of the ligand residue.
+        ref_space_uid = np.zeros((N, M), dtype=np.int64)
+
+        # Pre-compute ligand residue → CCD entry mapping for ref_pos lookup
+        _ligand_ccd_cache: dict[str, tuple[list[str], np.ndarray]] = {}
+
         for i, tok in enumerate(tokens):
             mol_type_tok = int(tok["mol_type"])
 
-            # Get residue name
-            # For polymer residues, look up in residues array
-            # For ligand (nonpolymer), each token = 1 atom
             if mol_type_tok == const.MOL_NONPOLYMER:
-                # Single atom token: use actual atom data
+                # Single atom token: look up CCD residue for ideal positions
                 atom_idx = int(tok["atom_idx"])
+                res_name = _find_res_name(data, atom_idx)
                 if atom_idx < len(data.structure.atoms):
                     atom = data.structure.atoms[atom_idx]
                     atom_name = atom["name"].decode("ascii", errors="replace").strip()
                     elem_int = int(np.clip(atom["element"], 0, 127))
                     chg = float(atom["charge"])
+
+                    # Look up this atom's ideal position from the CCD entry
+                    if res_name not in _ligand_ccd_cache:
+                        from deepfold3.data.feature.ref_atoms import _get_ccd_entry
+
+                        entry = _get_ccd_entry(res_name)
+                        if entry is not None:
+                            _ligand_ccd_cache[res_name] = (entry.atom_names, entry.positions)
+                        else:
+                            _ligand_ccd_cache[res_name] = ([], np.zeros((0, 3), dtype=np.float32))
+
+                    ccd_names, ccd_pos = _ligand_ccd_cache[res_name]
                     ref_atom_data = get_ref_atoms(
-                        res_name="LIG",
+                        res_name=res_name,
                         mol_type=mol_type_tok,
                         max_atoms=M,
                         atom_names_override=[atom_name],
                     )
+
+                    # Set ideal position from CCD if available, else from Structure atoms
+                    if atom_name in ccd_names:
+                        ccd_idx = ccd_names.index(atom_name)
+                        ref_atom_data.positions[0] = ccd_pos[ccd_idx]
+                    else:
+                        # Fall back to positions stored in Structure (from CcdMolecule or mmCIF)
+                        ref_atom_data.positions[0] = [
+                            float(atom["x"]),
+                            float(atom["y"]),
+                            float(atom["z"]),
+                        ]
+
                     ref_atom_data.element[0] = elem_int
                     ref_atom_data.charge[0] = chg
                 else:
                     ref_atom_data = get_ref_atoms("UNK", mol_type_tok, M)
+
+                # ref_space_uid for ligand: first token of the same residue
+                res_info = _find_residue(data, atom_idx)
+                if res_info is not None:
+                    first_atom = int(res_info["atom_idx"])
+                    # Find token index of first atom in this residue
+                    first_tok = _find_token_by_atom_idx(tokens, first_atom)
+                    ref_space_uid[i, :] = first_tok
+                else:
+                    ref_space_uid[i, :] = i
             else:
-                # Find the residue name from the structure
-                # token atom_idx points to first atom of this residue
                 atom_idx = int(tok["atom_idx"])
                 atom_num = int(tok["atom_num"])
                 res_name = _find_res_name(data, atom_idx)
                 ref_atom_data = get_ref_atoms(res_name, mol_type_tok, M)
 
-                # Override positions and elements with actual structure data
-                # (for training we use ideal CCD positions with random rotation)
-                # Copy actual atom info into ref features
                 for j in range(min(atom_num, M)):
                     if atom_idx + j < len(data.structure.atoms):
                         atom = data.structure.atoms[atom_idx + j]
@@ -154,21 +187,41 @@ class Featurizer:
                             aname = atom["name"].decode("ascii", errors="replace").strip()
                             ref_atom_data.atom_name_chars[j] = _encode_atom_name(aname)
 
-            # Apply random augmentation (center → rotate → translate) per token.
-            # Matches AF3's random_augmentation(): center to mean of valid atoms,
-            # random SO(3) rotation, then random N(0,1) translation.
-            if random_rot and ref_atom_data.mask.any():
-                valid = ref_atom_data.mask.astype(bool)
-                center = ref_atom_data.positions[valid].mean(axis=0)
-                rot = _random_rotation_matrix(rng)  # [3, 3]
-                translation = rng.standard_normal(3).astype(np.float32)
-                ref_atom_data.positions[:] = (ref_atom_data.positions - center) @ rot.T + translation
+                # Polymer: ref_space_uid = token index
+                ref_space_uid[i, :] = i
 
             ref_pos[i] = ref_atom_data.positions
             ref_mask[i] = ref_atom_data.mask
             ref_element[i] = ref_atom_data.element
             ref_charge[i] = ref_atom_data.charge
             ref_atom_name_chars[i] = ref_atom_data.atom_name_chars
+
+        # Apply random augmentation grouped by ref_space_uid.
+        # For polymer tokens each gets independent augmentation.
+        # For ligand tokens all tokens sharing the same uid get the same rotation+translation.
+        if random_rot:
+            unique_uids = np.unique(ref_space_uid[:, 0])
+            for uid in unique_uids:
+                uid_mask = ref_space_uid[:, 0] == uid
+                uid_indices = np.where(uid_mask)[0]
+
+                # Collect all valid positions across tokens in this group
+                all_valid_pos = []
+                for idx in uid_indices:
+                    valid = ref_mask[idx].astype(bool)
+                    if valid.any():
+                        all_valid_pos.append(ref_pos[idx][valid])
+
+                if not all_valid_pos:
+                    continue
+
+                all_valid = np.concatenate(all_valid_pos, axis=0)
+                center = all_valid.mean(axis=0)
+                rot = _random_rotation_matrix(rng)
+                translation = rng.standard_normal(3).astype(np.float32)
+
+                for idx in uid_indices:
+                    ref_pos[idx] = (ref_pos[idx] - center) @ rot.T + translation
 
         # ------------------------------------------------------------------
         # MSA features
@@ -220,6 +273,27 @@ class Featurizer:
                             break
             # Ligand: default 0 (first/only atom)
 
+        # ------------------------------------------------------------------
+        # mol_type: molecule type per token (protein/DNA/RNA/non-polymer)
+        # Used by output layer to determine entity type correctly (ligands
+        # have res_type=20 same as UNK protein, so res_type alone is ambiguous).
+        # ------------------------------------------------------------------
+        mol_type_tensor = torch.from_numpy(tokens["mol_type"].astype(np.int64))
+
+        # ------------------------------------------------------------------
+        # token_res_name: residue name per token as [N, 5] int8
+        # Encoded as raw ASCII bytes, padded with 0 (null).
+        # Needed by output layer to write correct CCD codes for ligands
+        # (res_type=20 maps to "UNK" but actual name may be e.g. "PCG").
+        # ------------------------------------------------------------------
+        token_res_name = np.zeros((N, 5), dtype=np.int8)
+        for i, tok in enumerate(tokens):
+            atom_idx = int(tok["atom_idx"])
+            name = _find_res_name(data, atom_idx)
+            name_bytes = name.encode("ascii", errors="replace")[:5]
+            for j, b in enumerate(name_bytes):
+                token_res_name[i, j] = b
+
         result = {
             "res_type": res_type,
             "residue_index": residue_index,
@@ -227,6 +301,8 @@ class Featurizer:
             "asym_id": asym_id,
             "entity_id": entity_id,
             "sym_id": sym_id,
+            "mol_type": mol_type_tensor,
+            "token_res_name": torch.from_numpy(token_res_name),
             "seq_mask": seq_mask,
             "pair_mask": pair_mask,
             "frames_mask": frames_mask,
@@ -236,6 +312,7 @@ class Featurizer:
             "ref_element": torch.from_numpy(ref_element),
             "ref_charge": torch.from_numpy(ref_charge),
             "ref_atom_name_chars": torch.from_numpy(ref_atom_name_chars),
+            "ref_space_uid": torch.from_numpy(ref_space_uid),
             "msa": msa_tensor.long(),
             "msa_mask": msa_mask_tensor,
             "deletion_matrix": del_matrix_tensor.long(),
@@ -562,6 +639,8 @@ class Featurizer:
             "asym_id": torch.zeros(0, dtype=torch.int64),
             "entity_id": torch.zeros(0, dtype=torch.int64),
             "sym_id": torch.zeros(0, dtype=torch.int64),
+            "mol_type": torch.zeros(0, dtype=torch.int64),
+            "token_res_name": torch.zeros(0, 5, dtype=torch.int8),
             "seq_mask": torch.zeros(0, dtype=torch.bool),
             "pair_mask": torch.zeros(0, 0, dtype=torch.bool),
             "frames_mask": torch.zeros(0, dtype=torch.bool),
@@ -571,6 +650,7 @@ class Featurizer:
             "ref_element": torch.zeros(0, M, dtype=torch.int64),
             "ref_charge": torch.zeros(0, M),
             "ref_atom_name_chars": torch.zeros(0, M, 4, dtype=torch.int64),
+            "ref_space_uid": torch.zeros(0, M, dtype=torch.int64),
             "msa": torch.zeros(1, 0, dtype=torch.int64),
             "msa_mask": torch.zeros(1, 0, dtype=torch.bool),
             "deletion_matrix": torch.zeros(1, 0, dtype=torch.int64),
@@ -592,3 +672,21 @@ def _find_res_name(data: Tokenized, atom_idx: int) -> str:
         if start <= atom_idx < end:
             return res["name"].decode("ascii", errors="replace").strip()
     return "UNK"
+
+
+def _find_residue(data: Tokenized, atom_idx: int) -> np.void | None:
+    """Find the residue record containing the given atom index."""
+    for res in data.structure.residues:
+        start = int(res["atom_idx"])
+        end = start + int(res["atom_num"])
+        if start <= atom_idx < end:
+            return res
+    return None
+
+
+def _find_token_by_atom_idx(tokens: np.ndarray, atom_idx: int) -> int:
+    """Find the token index that starts at the given atom index."""
+    matches = np.where(tokens["atom_idx"] == atom_idx)[0]
+    if len(matches) > 0:
+        return int(matches[0])
+    return 0
