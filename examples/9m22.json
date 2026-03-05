@@ -1,0 +1,26 @@
+[
+  {
+    "name": "9m22",
+    "sequences": [
+      {
+        "protein": {
+          "id": "A",
+          "sequence": "MVDAFLGTWKLVDSKNFDDYMKSLGVGFATRQVASMTKPTTIIEKNGDILTLKTHSTFKNTEISFKLGVEFDETTADDRKVKSIVTLDGGKLVHLQKWDGQETTLVRELIDGKLILTLTHGTAVCTRTYEKEA",
+          "description": "Human heart fatty acid-binding protein",
+          "unpairedMsaPath": "./9m22_msa/unpaired_0.a3m",
+          "templatesPath": "./9m22_msa/templates/templates_0.json"
+        }
+      },
+      {
+        "ligand": {
+          "id": "B",
+          "ccdCodes": ["P6G"],
+          "description": "Hexaethylene glycol"
+        }
+      }
+    ],
+    "modelSeeds": [42],
+    "dialect": "alphafold3",
+    "version": 4
+  }
+]

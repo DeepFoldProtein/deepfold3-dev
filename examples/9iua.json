@@ -1,0 +1,33 @@
+[
+  {
+    "name": "9iua",
+    "sequences": [
+      {
+        "protein": {
+          "id": "A",
+          "sequence": "MRALVVIRLSRVTDATTSPERQLESCQQLCAQRGWDVVGVAEDLDVSGAVDPFDRKRRPNLARWLAFEEQPFDVIVAYRVDRLTRSIRHLQQLVHWAEDHKKLVVSATEAHFDTTTPFAAVVIALMGTVAQMELEAIKERNRSAAHFNIRAGKYRGSLPPWGYLPTRVDGEWRLVPDPVQRERILEVYHRVVDNHEPLHLVAHDLNRRGVLSPKDYFAQLQGREPQGREWSATALKRSMISEAMLGYATLNGKTVRDDDGAPLVRAEPILTREQLEALRAELVKTSRAKPAVSTPSLLLRVLFCAVCGEPAYKFAGGGRKHPRYRCRSMGFPKHCGNGTVAMAEWDAFCEEQVLDLLGDAERLEKVWVAGSDSAVELAEVNAELVDLTSLIGSPAYRAGSPQREALDARIAALAARQEELEGLEARPSGWEWRETGQRFGDWWREQDTAAKNTWLRSMNVRLTFDVRGGLTRTIDFGDLQEYEQHLRLGSVVERLHTGMS",
+          "description": "Bxb1 serine recombinase",
+          "unpairedMsaPath": "./9iua_msa/unpaired_0.a3m",
+          "templatesPath": "./9iua_msa/templates/templates_0.json"
+        }
+      },
+      {
+        "dna": {
+          "id": "B",
+          "sequence": "GGCCGGCTTGTCGACGACGGCGGT",
+          "description": "attP DNA"
+        }
+      },
+      {
+        "dna": {
+          "id": "C",
+          "sequence": "CGCCGTCGTCGACAAGCCGGCC",
+          "description": "attB-L DNA"
+        }
+      }
+    ],
+    "modelSeeds": [42],
+    "dialect": "alphafold3",
+    "version": 4
+  }
+]

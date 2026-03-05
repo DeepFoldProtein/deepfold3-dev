@@ -1,0 +1,30 @@
+[
+  {
+    "name": "9j1y",
+    "sequences": [
+      {
+        "protein": {
+          "id": "A",
+          "sequence": "EIEKRQEENRKDREKAAAKFREYFPNFVGEPKSKDILKLRLYEQQHGKCLYSGKEINLGRLNEKGYVEIDHALPFSRTWDDSFNNKVLVLGSENQNKGNQTPYEYFNGKDNSREWQEFKARVETSRFPRSKKQRILLQLERPHRD",
+          "description": "Nme1Cas9 HNH domain",
+          "unpairedMsaPath": "./9j1y_msa/unpaired_0.a3m",
+          "pairedMsaPath": "./9j1y_msa/paired_0.a3m",
+          "templatesPath": "./9j1y_msa/templates/templates_0.json"
+        }
+      },
+      {
+        "protein": {
+          "id": "B",
+          "sequence": "MAKEVFKLKPELVTYKGCGWALACIKDGEIIDLTYVRDLGIEEYDENFDGLEPEIIYYDVVASQACKEVAYRYEEMGEFTFGLCSCWEFNVMLEHHHHHH",
+          "description": "anti-CRISPR AcrIIC1Boe",
+          "unpairedMsaPath": "./9j1y_msa/unpaired_1.a3m",
+          "pairedMsaPath": "./9j1y_msa/paired_1.a3m",
+          "templatesPath": "./9j1y_msa/templates/templates_1.json"
+        }
+      }
+    ],
+    "modelSeeds": [42],
+    "dialect": "alphafold3",
+    "version": 4
+  }
+]
