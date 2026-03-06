@@ -27,7 +27,7 @@
       }
     ],
     "modelSeeds": [42],
-    "dialect": "alphafold3",
-    "version": 4
+    "dialect": "deepfold3",
+    "version": 3
   }
 ]

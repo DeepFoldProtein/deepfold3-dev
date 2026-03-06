@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline — model, data, I/O, and scripts are implemented in `src/`.
 
-**Not yet implemented:** multi-chain complexes, ligands, full data pipeline (PDB preprocessing, clustering, dataset generation), training pipeline.
+**Not yet implemented:** full data pipeline (PDB preprocessing, clustering, dataset generation), training pipeline.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.12 (pinned in `.python-version`)
@@ -101,7 +101,7 @@ src/deepfold3/
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── msa/             # mmseqs2.py (server API + local binary MSA search + template m8 parsing)
-│   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
+│   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py (4 dialects: alphafold3, alphafoldserver, protenix, deepfold3)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)

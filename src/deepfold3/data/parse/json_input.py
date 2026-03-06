@@ -1,50 +1,36 @@
 """JSON input parser for structure prediction jobs.
 
-Supports two JSON dialects:
+Supports four JSON dialects:
 
-1. **Protenix format** — ``proteinChain``, ``dnaSequence``/``dnaChain``,
-   ``rnaSequence``/``rnaChain`` keys.
-2. **AlphaFold 3 format** — ``protein``, ``dna``, ``rna`` keys with
-   ``id`` fields for chain naming and optional inline MSA strings.
+1. **AlphaFold 3** (``"dialect": "alphafold3"``) — Faithful reproduction of
+   the AF3 input format.  Uses ``protein``, ``dna``, ``rna``, ``ligand``
+   keys with ``id`` fields.  MSA via ``unpairedMsa``/``unpairedMsaPath``,
+   ``pairedMsa``/``pairedMsaPath``.  Templates via inline ``templates``
+   list with ``mmcif``/``mmcifPath`` + ``queryIndices``/``templateIndices``.
+   Reference: ``references/alphafold3/src/alphafold3/common/folding_input.py``
 
-Format is auto-detected per entry.  Both dialects produce the same
+2. **AlphaFold Server** (``"dialect": "alphafoldserver"``) — Server format
+   with ``proteinChain``, ``rnaSequence``, ``dnaSequence``, ``ion`` keys.
+   No MSA/template fields — MSA search and template lookup are run
+   automatically via ColabFold MMseqs2 server.
+
+3. **Protenix** (auto-detected) — ``proteinChain``, ``dnaSequence``,
+   ``rnaSequence`` keys.  MSA via ``msa.precomputed_msa_dir`` (containing
+   ``pairing.a3m`` / ``non_pairing.a3m``) or ``pairedMsaPath``/
+   ``unpairedMsaPath``.  Templates via ``templatesPath`` (``.json`` or
+   ``.hhr``).  Reference: ``references/Protenix/``
+
+4. **DeepFold3** (``"dialect": "deepfold3"``) — Our superset dialect
+   combining AF3 and Protenix features.  Accepts both ``protein``/``dna``/
+   ``rna`` (AF3) and ``proteinChain``/``dnaSequence``/``rnaSequence``
+   (Protenix) keys.  All MSA/template formats supported.
+
+Format is auto-detected per entry.  All dialects produce the same
 ``JobInput`` output.
 
 All file I/O (reading A3M files, downloading template CIFs) happens at
 parse time.  The resulting dataclasses hold parsed objects (MSA, template
 hits) rather than file paths, so downstream consumers need no I/O.
-
-Protenix example::
-
-    [
-        {
-            "sequences": [
-                {"proteinChain": {"sequence": "MKTII...", "count": 1, ...}},
-                {"dnaSequence": {"sequence": "ATGC", "count": 1}},
-                {"rnaSequence": {"sequence": "AUGC", "count": 1}}
-            ],
-            "modelSeeds": [1, 2, 3],
-            "name": "job_name"
-        }
-    ]
-
-AlphaFold 3 example::
-
-    [
-        {
-            "sequences": [
-                {"protein": {"id": "A", "sequence": "MKTII...", "description": "Myoglobin",
-                              "unpairedMsaPath": "..."}},
-                {"dna": {"id": ["B", "C"], "sequence": "ATGC", "description": "Promoter"}},
-                {"rna": {"id": "D", "sequence": "AUGC"}},
-                {"ligand": {"id": "E", "ccdCodes": ["ATP"], "description": "Cofactor"}}
-            ],
-            "modelSeeds": [1],
-            "name": "job_name",
-            "dialect": "alphafold3",
-            "version": 4
-        }
-    ]
 """
 
 from __future__ import annotations
@@ -135,6 +121,7 @@ class JobInput:
         rna_chains: List of RNA chain inputs.
         ligand_chains: List of ligand chain inputs.
         model_seeds: List of random seeds for diffusion sampling.
+        description: Optional job description (written as _struct.title in mmCIF).
     """
 
     name: str
@@ -143,6 +130,7 @@ class JobInput:
     rna_chains: list[NucleotideChainInput]
     ligand_chains: list[LigandChainInput] = field(default_factory=list)
     model_seeds: list[int] = field(default_factory=lambda: [42])
+    description: str | None = None
 
 
 _DNA_KEYS = ("dnaSequence", "dnaChain")
@@ -155,7 +143,7 @@ def parse_json_input(
     template_cache_dir: str | Path | None = None,
     pdb_mmcif_dir: str | Path | None = None,
 ) -> list[JobInput]:
-    """Parse a JSON input file (auto-detects Protenix or AF3 format).
+    """Parse a JSON input file (auto-detects dialect).
 
     All file I/O (reading A3M files, downloading template CIFs) happens
     here.  The returned ``JobInput`` objects hold fully parsed MSA and
@@ -189,121 +177,71 @@ def parse_json_input(
 
     jobs: list[JobInput] = []
     for entry in data:
-        if _is_af3_format(entry):
+        dialect = _detect_dialect(entry)
+        if dialect == "alphafold3":
             jobs.append(_parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
-        else:
+        elif dialect == "alphafoldserver":
+            jobs.append(_parse_alphafoldserver_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+        elif dialect == "protenix":
             jobs.append(_parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+        else:  # deepfold3
+            jobs.append(_parse_deepfold3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
 
     return jobs
 
 
-def _is_af3_format(entry: dict) -> bool:
-    """Detect whether a job entry uses AlphaFold 3 JSON format.
+# ---------------------------------------------------------------------------
+# Dialect detection
+# ---------------------------------------------------------------------------
 
-    AF3 format is identified by:
-    - Explicit ``"dialect": "alphafold3"`` field, OR
-    - Sequence items using ``protein``/``dna``/``rna`` keys (without
-      ``Chain``/``Sequence`` suffix)
+
+def _detect_dialect(entry: dict) -> str:
+    """Detect the JSON dialect.
+
+    Returns one of: ``"alphafold3"``, ``"alphafoldserver"``, ``"protenix"``,
+    ``"deepfold3"``.
+
+    Detection rules:
+    - Explicit ``"dialect"`` field → use as-is (if recognized)
+    - No ``dialect`` + bare ``protein``/``dna``/``rna`` keys → ``"alphafold3"``
+    - No ``dialect`` + ``proteinChain``/etc with MSA fields → ``"protenix"``
+    - No ``dialect`` + ``proteinChain``/etc without MSA → ``"alphafoldserver"``
+    - Fallback → ``"deepfold3"``
     """
-    if entry.get("dialect") == "alphafold3":
-        return True
+    dialect = entry.get("dialect")
+    if dialect in ("alphafold3", "alphafoldserver", "protenix", "deepfold3"):
+        return dialect
+
+    # Check for AF3-style bare keys (protein/dna/rna with id)
     for seq_item in entry.get("sequences", []):
-        if any(k in seq_item for k in ("protein", "dna", "rna", "ligand")):
-            # AF3 uses bare "ligand" key too, but so does Protenix.
-            # Distinguish by checking for AF3-specific subkeys.
-            if "ligand" in seq_item and not any(k in seq_item for k in ("protein", "dna", "rna")):
-                lig = seq_item["ligand"]
-                if isinstance(lig, dict) and ("ccdCodes" in lig or "id" in lig):
-                    return True
-                continue  # might be Protenix
-            return True
-    return False
-
-
-def _parse_protenix_entry(
-    entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None, pdb_mmcif_dir: Path | None = None
-) -> JobInput:
-    """Parse a single Protenix-format job entry."""
-    name = entry.get("name", "unnamed")
-    model_seeds = entry.get("modelSeeds", [42])
-
-    protein_chains: list[ProteinChainInput] = []
-    dna_chains: list[NucleotideChainInput] = []
-    rna_chains: list[NucleotideChainInput] = []
-    ligand_chains: list[LigandChainInput] = []
-
-    for seq_item in entry.get("sequences", []):
-        if "proteinChain" in seq_item:
-            pc = seq_item["proteinChain"]
-            count = pc.get("count", 1)
-            if count != 1:
-                raise ValueError(f"Only count=1 is supported, got count={count} in job {name!r}")
-            protein_chains.append(
-                ProteinChainInput(
-                    sequence=pc["sequence"],
-                    count=count,
-                    paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("pairedMsaPath"), None),
-                    unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, pc.get("unpairedMsaPath"), None),
-                    template_hits=_resolve_template_hits(base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir),
-                    description=pc.get("description"),
-                )
-            )
-        elif any(k in seq_item for k in _DNA_KEYS):
-            key = next(k for k in _DNA_KEYS if k in seq_item)
-            dc = seq_item[key]
-            count = dc.get("count", 1)
-            if count != 1:
-                raise ValueError(f"Only count=1 is supported, got count={count} in job {name!r}")
-            dna_chains.append(
-                NucleotideChainInput(
-                    sequence=dc["sequence"],
-                    count=count,
-                    mol_type=const.MOL_DNA,
-                    paired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("pairedMsaPath"), None),
-                    unpaired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("unpairedMsaPath"), None),
-                    description=dc.get("description"),
-                )
-            )
-        elif any(k in seq_item for k in _RNA_KEYS):
-            key = next(k for k in _RNA_KEYS if k in seq_item)
-            rc = seq_item[key]
-            count = rc.get("count", 1)
-            if count != 1:
-                raise ValueError(f"Only count=1 is supported, got count={count} in job {name!r}")
-            rna_chains.append(
-                NucleotideChainInput(
-                    sequence=rc["sequence"],
-                    count=count,
-                    mol_type=const.MOL_RNA,
-                    paired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("pairedMsaPath"), None),
-                    unpaired_msa=_resolve_msa(base_dir, const.MOL_RNA, rc.get("unpairedMsaPath"), None),
-                    description=rc.get("description"),
-                )
-            )
-        elif "ligand" in seq_item:
+        if any(k in seq_item for k in ("protein", "dna", "rna")):
+            if "ligand" in seq_item:
+                continue
+            return "alphafold3"
+        if "ligand" in seq_item:
             lig = seq_item["ligand"]
-            ligand_str = lig.get("ligand", "")
-            count = lig.get("count", 1)
-            if isinstance(ligand_str, str) and ligand_str.startswith("CCD_"):
-                ccd_code = ligand_str[4:]
-                for _ in range(count):
-                    ligand_chains.append(LigandChainInput(ccd_ids=[ccd_code], count=1))
-            elif isinstance(ligand_str, str) and ligand_str:
-                # Assume SMILES if not CCD_ prefixed
-                for _ in range(count):
-                    ligand_chains.append(LigandChainInput(smiles=ligand_str, count=1))
+            if isinstance(lig, dict) and ("ccdCodes" in lig or "id" in lig):
+                return "alphafold3"
 
-    if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
-        raise ValueError(f"No chains found in job {name!r}")
+    # Check for Protenix/server-style keys
+    has_msa_fields = False
+    for seq_item in entry.get("sequences", []):
+        if any(k in seq_item for k in ("proteinChain", "rnaSequence", "dnaSequence", "ion")):
+            for key in ("proteinChain", "rnaSequence", "dnaSequence"):
+                if key in seq_item:
+                    chain = seq_item[key]
+                    if any(f in chain for f in ("msa", "pairedMsaPath", "unpairedMsaPath", "templatesPath")):
+                        has_msa_fields = True
+            if has_msa_fields:
+                return "protenix"
+            return "alphafoldserver"
 
-    return JobInput(
-        name=name,
-        protein_chains=protein_chains,
-        dna_chains=dna_chains,
-        rna_chains=rna_chains,
-        ligand_chains=ligand_chains,
-        model_seeds=model_seeds,
-    )
+    return "deepfold3"
+
+
+# ---------------------------------------------------------------------------
+# AlphaFold 3 dialect parser (faithful to references/alphafold3)
+# ---------------------------------------------------------------------------
 
 
 def _parse_af3_entry(
@@ -311,11 +249,10 @@ def _parse_af3_entry(
 ) -> JobInput:
     """Parse a single AlphaFold 3-format job entry.
 
-    AF3 format uses ``protein``, ``dna``, ``rna`` keys in sequence items.
-    Each has an ``id`` field (string or list of strings for multi-copy)
-    and a ``sequence`` field.  MSA can be provided inline (``unpairedMsa``,
-    ``pairedMsa``) or as file paths (``unpairedMsaPath``, ``pairedMsaPath``).
-    Templates are specified via ``templates`` list or ``templatesPath``.
+    Faithful to ``references/alphafold3/src/alphafold3/common/folding_input.py``.
+    Uses ``protein``, ``dna``, ``rna``, ``ligand`` keys with ``id`` fields.
+    MSA via ``unpairedMsa``/``unpairedMsaPath``, ``pairedMsa``/``pairedMsaPath``.
+    Templates via inline ``templates`` list or file-based ``templatesPath``.
     """
     name = entry.get("name", "unnamed")
     model_seeds = entry.get("modelSeeds", [42])
@@ -332,7 +269,12 @@ def _parse_af3_entry(
             seq = p["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("pairedMsaPath"), p.get("pairedMsa"))
-            tmpl_hits = _resolve_template_hits(base_dir, p.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir)
+            # Templates: inline list or file path
+            tmpl_hits = _resolve_af3_templates(base_dir, p.get("templates"), max_templates, cache_dir, pdb_mmcif_dir)
+            if not tmpl_hits:
+                tmpl_hits = _resolve_template_hits(
+                    base_dir, p.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir
+                )
             desc = p.get("description")
             for _ in ids or [None]:
                 protein_chains.append(
@@ -403,7 +345,358 @@ def _parse_af3_entry(
         rna_chains=rna_chains,
         ligand_chains=ligand_chains,
         model_seeds=model_seeds,
+        description=entry.get("description"),
     )
+
+
+# ---------------------------------------------------------------------------
+# AlphaFold Server dialect parser
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class _MsaSearchResult:
+    """Cached MSA + template search result for a single sequence."""
+
+    paired_msa: MSA | None = None
+    unpaired_msa: MSA | None = None
+    template_hits: list[TemplateHitInput] = field(default_factory=list)
+
+
+def _run_msa_search(
+    protein_seqs: list[str],
+    max_templates: int = 4,
+    cache_dir: Path | None = None,
+    pdb_mmcif_dir: Path | None = None,
+) -> dict[str, _MsaSearchResult]:
+    """Run ColabFold MMseqs2 server MSA search + template lookup for protein sequences.
+
+    Args:
+        protein_seqs: List of unique protein sequences.
+        max_templates: Maximum template hits per chain.
+        cache_dir: Cache directory for MSA server results and template CIFs.
+        pdb_mmcif_dir: Optional local PDB mmCIF mirror directory.
+
+    Returns:
+        Dict mapping sequence -> _MsaSearchResult with parsed MSAs and template hits.
+    """
+    if not protein_seqs:
+        return {}
+
+    from deepfold3.data.msa.mmseqs2 import parse_m8, search_server
+
+    use_pairing = len(protein_seqs) > 1
+    logger.info(
+        "Running MMseqs2 MSA search for %d protein sequence(s) (pairing=%s)",
+        len(protein_seqs),
+        use_pairing,
+    )
+    msa_result = search_server(
+        protein_seqs,
+        use_pairing=use_pairing,
+        cache_dir=cache_dir,
+    )
+
+    results: dict[str, _MsaSearchResult] = {}
+    for i, seq in enumerate(protein_seqs):
+        unpaired_text = msa_result.unpaired.get(i, "")
+        paired_text = msa_result.paired.get(i, "")
+        unpaired_msa = parse_a3m(unpaired_text, const.MOL_PROTEIN) if unpaired_text.strip() else None
+        paired_msa = parse_a3m(paired_text, const.MOL_PROTEIN) if paired_text.strip() else None
+
+        # Template search from m8 hits
+        tmpl_hits: list[TemplateHitInput] = []
+        if msa_result.m8_text:
+            m8_hits = parse_m8(msa_result.m8_text)
+            chain_m8 = m8_hits.get(i, [])
+            for hit in chain_m8[:max_templates]:
+                try:
+                    mmcif_text = fetch_pdb_mmcif(hit.pdb_id, cache_dir=cache_dir, pdb_mmcif_dir=pdb_mmcif_dir)
+                    query_indices = list(range(hit.qstart - 1, hit.qend))
+                    template_indices = list(range(hit.tstart - 1, hit.tend))
+                    min_len = min(len(query_indices), len(template_indices))
+                    tmpl_hits.append(
+                        TemplateHitInput(
+                            mmcif_text=mmcif_text,
+                            query_indices=query_indices[:min_len],
+                            template_indices=template_indices[:min_len],
+                            chain_id=hit.chain_id,
+                        )
+                    )
+                except Exception:
+                    logger.warning("Failed to fetch template %s_%s", hit.pdb_id, hit.chain_id, exc_info=True)
+
+        if tmpl_hits:
+            logger.info("Chain %d (%s...): %d template(s)", i, seq[:20], len(tmpl_hits))
+
+        results[seq] = _MsaSearchResult(
+            paired_msa=paired_msa,
+            unpaired_msa=unpaired_msa,
+            template_hits=tmpl_hits,
+        )
+
+    return results
+
+
+def _parse_alphafoldserver_entry(
+    entry: dict,
+    base_dir: Path,
+    max_templates: int = 4,
+    cache_dir: Path | None = None,
+    pdb_mmcif_dir: Path | None = None,
+) -> JobInput:
+    """Parse a single AlphaFold Server format job entry.
+
+    Faithful to ``references/alphafold3/src/alphafold3/common/folding_input.py``
+    ``Input.from_alphafoldserver_fold_job``.
+
+    MSA/templates are searched automatically via ColabFold MMseqs2 server.
+    """
+    import random as _random
+
+    name = entry.get("name", "unnamed")
+    raw_seeds = entry.get("modelSeeds", [])
+    model_seeds = [int(s) for s in raw_seeds] if raw_seeds else [_random.randint(0, 2**32 - 1)]
+
+    # First pass: collect chain specs (sequence, count, type) in order
+    chain_specs: list[tuple[str, str, int]] = []  # (sequence, entity_type, count)
+    ligand_chains: list[LigandChainInput] = []
+
+    for seq_item in entry.get("sequences", []):
+        if "proteinChain" in seq_item:
+            pc = seq_item["proteinChain"]
+            chain_specs.append((pc["sequence"], "protein", pc.get("count", 1)))
+        elif "rnaSequence" in seq_item:
+            rc = seq_item["rnaSequence"]
+            chain_specs.append((rc["sequence"], "rna", rc.get("count", 1)))
+        elif "dnaSequence" in seq_item:
+            dc = seq_item["dnaSequence"]
+            chain_specs.append((dc["sequence"], "dna", dc.get("count", 1)))
+        elif "ion" in seq_item:
+            ion = seq_item["ion"]
+            ion_code = ion.get("ion", "")
+            count = ion.get("count", 1)
+            for _ in range(count):
+                ligand_chains.append(LigandChainInput(ccd_ids=[ion_code], count=1))
+        elif "ligand" in seq_item:
+            lig = seq_item["ligand"]
+            ligand_str = lig.get("ligand", "")
+            count = lig.get("count", 1)
+            ccd_code = ligand_str.removeprefix("CCD_") if isinstance(ligand_str, str) else ""
+            if ccd_code:
+                for _ in range(count):
+                    ligand_chains.append(LigandChainInput(ccd_ids=[ccd_code], count=1))
+
+    # Expand chain_specs by count, tracking unique protein sequences for MSA
+    expanded: list[tuple[str, str, int]] = []  # (sequence, entity_type, spec_idx)
+    for spec_idx, (seq, etype, count) in enumerate(chain_specs):
+        for _ in range(count):
+            expanded.append((seq, etype, spec_idx))
+
+    if not expanded and not ligand_chains:
+        raise ValueError(f"No chains found in job {name!r}")
+
+    # Run MSA search for all unique protein sequences
+    protein_seqs = list(dict.fromkeys(seq for seq, etype, _ in expanded if etype == "protein"))
+    msa_cache = _run_msa_search(protein_seqs, max_templates, cache_dir, pdb_mmcif_dir)
+
+    # Build chain inputs
+    protein_chains: list[ProteinChainInput] = []
+    dna_chains: list[NucleotideChainInput] = []
+    rna_chains: list[NucleotideChainInput] = []
+
+    for seq, etype, _ in expanded:
+        if etype == "protein":
+            cached = msa_cache.get(seq)
+            protein_chains.append(
+                ProteinChainInput(
+                    sequence=seq,
+                    count=1,
+                    paired_msa=cached.paired_msa if cached else None,
+                    unpaired_msa=cached.unpaired_msa if cached else None,
+                    template_hits=cached.template_hits if cached else [],
+                )
+            )
+        elif etype == "rna":
+            rna_chains.append(NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_RNA))
+        elif etype == "dna":
+            dna_chains.append(NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_DNA))
+
+    return JobInput(
+        name=name,
+        protein_chains=protein_chains,
+        dna_chains=dna_chains,
+        rna_chains=rna_chains,
+        ligand_chains=ligand_chains,
+        model_seeds=model_seeds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Protenix dialect parser (faithful to references/Protenix)
+# ---------------------------------------------------------------------------
+
+
+def _parse_protenix_entry(
+    entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None, pdb_mmcif_dir: Path | None = None
+) -> JobInput:
+    """Parse a single Protenix-format job entry.
+
+    Faithful to ``references/Protenix/`` format.  Supports:
+    - ``proteinChain``, ``dnaSequence``/``dnaChain``, ``rnaSequence``/``rnaChain``
+    - ``msa.precomputed_msa_dir`` (directory with ``pairing.a3m`` / ``non_pairing.a3m``)
+    - ``pairedMsaPath``/``unpairedMsaPath`` (direct A3M file paths)
+    - ``templatesPath`` (JSON or HHR file)
+    - ``count > 1`` for chain duplication
+    - ``ligand`` with ``CCD_`` prefix
+    """
+    name = entry.get("name", "unnamed")
+    raw_seeds = entry.get("modelSeeds", [])
+    model_seeds = [int(s) for s in raw_seeds] if raw_seeds else [42]
+
+    protein_chains: list[ProteinChainInput] = []
+    dna_chains: list[NucleotideChainInput] = []
+    rna_chains: list[NucleotideChainInput] = []
+    ligand_chains: list[LigandChainInput] = []
+
+    for seq_item in entry.get("sequences", []):
+        if "proteinChain" in seq_item:
+            pc = seq_item["proteinChain"]
+            count = pc.get("count", 1)
+            # Resolve MSA: try pairedMsaPath/unpairedMsaPath first, then msa.precomputed_msa_dir
+            paired_path = pc.get("pairedMsaPath")
+            unpaired_path = pc.get("unpairedMsaPath")
+            if not paired_path and not unpaired_path and pc.get("msa"):
+                msa_dir = pc["msa"].get("precomputed_msa_dir")
+                if msa_dir:
+                    resolved_dir = _resolve_path(base_dir, msa_dir)
+                    if resolved_dir and resolved_dir.is_dir():
+                        pairing_file = resolved_dir / "pairing.a3m"
+                        non_pairing_file = resolved_dir / "non_pairing.a3m"
+                        if pairing_file.exists():
+                            paired_path = str(pairing_file)
+                        if non_pairing_file.exists():
+                            unpaired_path = str(non_pairing_file)
+            for _ in range(count):
+                protein_chains.append(
+                    ProteinChainInput(
+                        sequence=pc["sequence"],
+                        count=1,
+                        paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, paired_path, None),
+                        unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, unpaired_path, None),
+                        template_hits=_resolve_template_hits(
+                            base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir
+                        ),
+                        description=pc.get("description"),
+                    )
+                )
+        elif any(k in seq_item for k in _DNA_KEYS):
+            key = next(k for k in _DNA_KEYS if k in seq_item)
+            dc = seq_item[key]
+            count = dc.get("count", 1)
+            for _ in range(count):
+                dna_chains.append(
+                    NucleotideChainInput(
+                        sequence=dc["sequence"],
+                        count=1,
+                        mol_type=const.MOL_DNA,
+                        paired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("pairedMsaPath"), None),
+                        unpaired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("unpairedMsaPath"), None),
+                        description=dc.get("description"),
+                    )
+                )
+        elif any(k in seq_item for k in _RNA_KEYS):
+            key = next(k for k in _RNA_KEYS if k in seq_item)
+            rc = seq_item[key]
+            count = rc.get("count", 1)
+            # RNA also supports msa.precomputed_msa_dir or direct path
+            unpaired_path = rc.get("unpairedMsaPath")
+            if not unpaired_path and rc.get("msa"):
+                msa_dir = rc["msa"].get("precomputed_msa_dir")
+                if msa_dir:
+                    resolved_dir = _resolve_path(base_dir, msa_dir)
+                    if resolved_dir and resolved_dir.is_dir():
+                        non_pairing_file = resolved_dir / "non_pairing.a3m"
+                        if non_pairing_file.exists():
+                            unpaired_path = str(non_pairing_file)
+            for _ in range(count):
+                rna_chains.append(
+                    NucleotideChainInput(
+                        sequence=rc["sequence"],
+                        count=1,
+                        mol_type=const.MOL_RNA,
+                        unpaired_msa=_resolve_msa(base_dir, const.MOL_RNA, unpaired_path, None),
+                        description=rc.get("description"),
+                    )
+                )
+        elif "ion" in seq_item:
+            ion = seq_item["ion"]
+            ion_code = ion.get("ion", "")
+            count = ion.get("count", 1)
+            for _ in range(count):
+                ligand_chains.append(LigandChainInput(ccd_ids=[ion_code], count=1))
+        elif "ligand" in seq_item:
+            lig = seq_item["ligand"]
+            ligand_str = lig.get("ligand", "")
+            count = lig.get("count", 1)
+            if isinstance(ligand_str, str) and ligand_str.startswith("CCD_"):
+                ccd_code = ligand_str[4:]
+                for _ in range(count):
+                    ligand_chains.append(LigandChainInput(ccd_ids=[ccd_code], count=1))
+            elif isinstance(ligand_str, str) and ligand_str:
+                for _ in range(count):
+                    ligand_chains.append(LigandChainInput(smiles=ligand_str, count=1))
+
+    if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
+        raise ValueError(f"No chains found in job {name!r}")
+
+    return JobInput(
+        name=name,
+        protein_chains=protein_chains,
+        dna_chains=dna_chains,
+        rna_chains=rna_chains,
+        ligand_chains=ligand_chains,
+        model_seeds=model_seeds,
+        description=entry.get("description"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# DeepFold3 dialect parser (superset of AF3 + Protenix)
+# ---------------------------------------------------------------------------
+
+
+def _parse_deepfold3_entry(
+    entry: dict, base_dir: Path, max_templates: int, cache_dir: Path | None, pdb_mmcif_dir: Path | None = None
+) -> JobInput:
+    """Parse a single DeepFold3-format job entry.
+
+    DeepFold3 format is our superset dialect that accepts both AF3-style keys
+    (``protein``, ``dna``, ``rna``, ``ligand`` with ``id``) and Protenix-style
+    keys (``proteinChain``, ``dnaSequence``, ``rnaSequence``).  All MSA and
+    template formats are supported.
+    """
+    # Detect which key style is used and delegate
+    has_af3_keys = False
+    has_protenix_keys = False
+    for seq_item in entry.get("sequences", []):
+        if any(k in seq_item for k in ("protein", "dna", "rna")):
+            has_af3_keys = True
+        if any(k in seq_item for k in ("proteinChain", "dnaSequence", "dnaChain", "rnaSequence", "rnaChain")):
+            has_protenix_keys = True
+
+    if has_af3_keys and not has_protenix_keys:
+        return _parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
+    if has_protenix_keys and not has_af3_keys:
+        return _parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
+
+    # Mixed or ambiguous: try to parse with the protenix parser (more permissive)
+    return _parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _ensure_id_list(ids: str | list[str]) -> list[str]:
@@ -455,6 +748,68 @@ def _resolve_msa(base_dir: Path, mol_type: int, path_str: str | None, inline_str
 # ---------------------------------------------------------------------------
 
 
+def _resolve_af3_templates(
+    base_dir: Path,
+    raw_templates: list[dict] | None,
+    max_templates: int,
+    cache_dir: Path | None,
+    pdb_mmcif_dir: Path | None = None,
+) -> list[TemplateHitInput]:
+    """Resolve inline AF3-format templates.
+
+    AF3 format stores templates as::
+
+        [
+            {
+                "mmcif": "...",          // or "mmcifPath": "path/to/file.cif"
+                "queryIndices": [0, 1, ...],
+                "templateIndices": [5, 6, ...]
+            }
+        ]
+
+    Returns:
+        List of TemplateHitInput objects.
+    """
+    if raw_templates is None:
+        return []
+
+    result: list[TemplateHitInput] = []
+    for tmpl in raw_templates[:max_templates]:
+        mmcif_text = tmpl.get("mmcif")
+        mmcif_path = tmpl.get("mmcifPath")
+
+        if mmcif_text and mmcif_path:
+            logger.warning("Template has both mmcif and mmcifPath; using mmcifPath")
+            mmcif_text = None
+        if mmcif_path:
+            resolved = _resolve_path(base_dir, mmcif_path)
+            if resolved is not None and resolved.exists():
+                mmcif_text = _read_mmcif_file(resolved)
+            else:
+                logger.warning("Template mmcifPath not found: %s", mmcif_path)
+                continue
+
+        if not mmcif_text:
+            logger.warning("Template has no mmcif content, skipping")
+            continue
+
+        query_indices = tmpl.get("queryIndices", [])
+        template_indices = tmpl.get("templateIndices", [])
+        if len(query_indices) != len(template_indices):
+            logger.warning("Mismatched index lengths in template, skipping")
+            continue
+
+        result.append(
+            TemplateHitInput(
+                mmcif_text=mmcif_text,
+                query_indices=query_indices,
+                template_indices=template_indices,
+            )
+        )
+
+    return result
+
+
 def _resolve_template_hits(
     base_dir: Path,
     templates_path_str: str | None,
@@ -464,13 +819,14 @@ def _resolve_template_hits(
 ) -> list[TemplateHitInput]:
     """Resolve template hits from a file path into parsed TemplateHitInput objects.
 
-    Supports two template path formats:
+    Supports template path formats:
     - ``.json``: JSON template hits file with pre-computed alignments and local CIF files
     - ``.hhr``: HHsearch output — parses hits and downloads CIFs from RCSB
+    - ``.a3m``: HMM search A3M output (treated as HHR for template search)
 
     Args:
         base_dir: Base directory for resolving relative paths.
-        templates_path_str: Path to template file (JSON or HHR), or None.
+        templates_path_str: Path to template file (JSON, HHR, or A3M), or None.
         max_templates: Maximum number of template hits to load.
         cache_dir: Directory to cache downloaded template mmCIF files.
         pdb_mmcif_dir: Optional local PDB mmCIF mirror directory.
@@ -489,7 +845,7 @@ def _resolve_template_hits(
     suffix = resolved.suffix.lower()
     if suffix == ".json":
         return _load_json_template_hits(resolved, max_templates)
-    elif suffix == ".hhr":
+    elif suffix in (".hhr", ".a3m"):
         return _load_hhr_template_hits(resolved, max_templates, cache_dir, pdb_mmcif_dir=pdb_mmcif_dir)
     else:
         logger.warning("Unsupported template file type: %s", suffix)
@@ -546,13 +902,7 @@ def _load_json_template_hits(json_path: Path, max_templates: int) -> list[Templa
                 logger.warning("Template CIF not found: %s", cif_path)
                 continue
 
-            if cif_path.name.endswith(".gz"):
-                import gzip
-
-                with gzip.open(cif_path, "rt", encoding="utf-8") as gz:
-                    mmcif_text = gz.read()
-            else:
-                mmcif_text = cif_path.read_text()
+            mmcif_text = _read_mmcif_file(cif_path)
             result.append(
                 TemplateHitInput(
                     mmcif_text=mmcif_text,
@@ -619,8 +969,18 @@ def _load_hhr_template_hits(
 
 
 # ---------------------------------------------------------------------------
-# Path resolution
+# Path resolution / file I/O helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_mmcif_file(path: Path) -> str:
+    """Read an mmCIF file, transparently decompressing ``.gz`` files."""
+    if path.name.endswith(".gz"):
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8") as gz:
+            return gz.read()
+    return path.read_text()
 
 
 def _resolve_path(base_dir: Path, raw: str | None) -> Path | None:

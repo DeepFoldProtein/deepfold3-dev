@@ -171,7 +171,7 @@ def inference(
             raise click.UsageError("No jobs found in JSON input")
         job = jobs[0]
         job_name = job.name
-        job_title = job.name
+        job_title = job.description or job.name
 
         # Build entity descriptions from chain descriptions
         chain_idx = 0

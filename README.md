@@ -9,7 +9,7 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 - **Template embedding** -- structural templates from PDB via mmCIF directory, HHsearch `.hhr` files, or automatic server-side search
 - **Full confidence metrics** -- pLDDT, PAE, PDE, pTM, ipTM, experimentally resolved, ranking score
 - **AF3 weight compatibility** -- direct conversion from official AlphaFold 3 parameters
-- **Flexible input** -- A3M MSA files, AlphaFold 3 / Protenix-format JSON with paired/unpaired MSAs and templates
+- **Flexible input** -- A3M MSA files, four JSON dialects (AlphaFold 3, AlphaFold Server, Protenix, DeepFold3)
 - **mmCIF + JSON output** -- standard structure files with per-atom pLDDT and comprehensive confidence JSON
 
 ## Installation
@@ -50,7 +50,7 @@ deepfold3 msa --sequence MKTIIALSYIFCLVFA --output msa_out/ --json
 deepfold3 msa --sequence AAAA:BBBB:AAAA --output msa_out/ --json
 ```
 
-This produces A3M files, template hits (`pdb70.m8`), downloaded template structures, and an AlphaFold 3-format JSON ready for inference.
+This produces A3M files, template hits (`pdb70.m8`), downloaded template structures, and a DeepFold3-format JSON ready for inference.
 
 For local search with your own databases:
 
@@ -109,6 +109,22 @@ deepfold3 plot --help
 | `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
 | `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
 
+## JSON Input Dialects
+
+DeepFold3 auto-detects and supports four JSON input formats:
+
+| Dialect | Key style | MSA | Templates | Auto-search |
+| ------- | --------- | --- | --------- | ----------- |
+| **`alphafold3`** | `protein`/`dna`/`rna`/`ligand` with `id` | inline or path | inline `templates` list | No |
+| **`alphafoldserver`** | `proteinChain`/`rnaSequence`/`dnaSequence`/`ion` | -- | -- | Yes (MMseqs2) |
+| **`protenix`** | `proteinChain`/`dnaSequence`/`rnaSequence` | `msa.precomputed_msa_dir` or path | `templatesPath` (.json/.hhr) | No |
+| **`deepfold3`** | Both AF3 and Protenix keys | All formats | All formats | No |
+
+- **alphafold3** -- Faithful to `references/alphafold3`. Set `"dialect": "alphafold3"`.
+- **alphafoldserver** -- Faithful to AF3 server format. Set `"dialect": "alphafoldserver"`. MSAs and templates are searched automatically via ColabFold MMseqs2 server.
+- **protenix** -- Faithful to `references/Protenix`. Auto-detected from `proteinChain` keys with MSA fields.
+- **deepfold3** -- Our superset. Set `"dialect": "deepfold3"`. Accepts all key styles and MSA/template formats from both AF3 and Protenix.
+
 ## Architecture
 
 ```text
@@ -129,7 +145,6 @@ Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffus
 
 ## TODO
 
-- [ ] Multi-chain complexes and ligand support
 - [ ] Full data pipeline (PDB preprocessing, clustering, dataset generation)
 - [ ] Training pipeline
 
@@ -155,7 +170,7 @@ uv run ruff check src/
 # Format
 uv run ruff format src/
 
-# Test (121 tests)
+# Test
 uv run pytest
 
 # Single test

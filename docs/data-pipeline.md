@@ -283,7 +283,11 @@ def parse_hhr(hhr_text: str) -> list[TemplateHit]:
 def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None) -> list[JobInput]:
 ```
 
-- Parses Protenix-format or AF3-format JSON specifying chains with MSA and template data
+- Auto-detects and parses four JSON dialects: `alphafold3`, `alphafoldserver`, `protenix`, `deepfold3`
+- **alphafold3**: faithful to AF3 — `protein`/`dna`/`rna`/`ligand` keys with `id`, inline `templates` or paths
+- **alphafoldserver**: faithful to AF3 server — auto runs MMseqs2 MSA search + template lookup
+- **protenix**: faithful to Protenix — `msa.precomputed_msa_dir` or `pairedMsaPath`/`unpairedMsaPath`
+- **deepfold3**: our superset accepting both AF3 and Protenix key styles
 - All file I/O (reading A3M files, downloading template CIFs) happens at parse time
 - `ProteinChainInput`: `sequence`, `count`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`, `template_hits: list[TemplateHitInput]`
 - `NucleotideChainInput`: `sequence`, `count`, `mol_type: int`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`
@@ -434,7 +438,7 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 
 ### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=2048, max_templates=4, template_cache_dir=None)`
 
-- Parses Protenix-format or AF3-format JSON via `parse_json_input()` — all file I/O (A3M reading, CIF downloading) happens in `parse_json_input()`
+- Parses JSON input via `parse_json_input()` (supports all four dialects) — all file I/O happens in `parse_json_input()`
 - MSA objects and template hits come pre-parsed from `JobInput` chain dataclasses — `from_json()` does only computation
 - Falls back to single-sequence MSA when no MSA data is provided for a chain
 - Converts `TemplateHitInput` objects to `TemplateFeatures` via `template_hit_input_to_features()` (no I/O)

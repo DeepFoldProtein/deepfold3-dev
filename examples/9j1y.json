@@ -1,6 +1,7 @@
 [
   {
     "name": "9j1y",
+    "description": "Crystal structure of Nme1Cas9 HNH domain bound to anti-CRISPR AcrIIC1Boe.",
     "sequences": [
       {
         "protein": {
@@ -23,8 +24,8 @@
         }
       }
     ],
-    "modelSeeds": [42],
-    "dialect": "alphafold3",
-    "version": 4
+    "modelSeeds": [ 42 ],
+    "dialect": "deepfold3",
+    "version": 3
   }
 ]
