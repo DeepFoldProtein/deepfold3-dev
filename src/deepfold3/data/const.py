@@ -207,6 +207,10 @@ MSA_UNK_NUCLEIC = 30
 
 MAX_ATOMS_PER_TOKEN = 24
 
+# MSA construction constants
+MAX_MSA_ROWS = 16_384  # Total MSA rows (query + paired + unpaired)
+MAX_PAIRED_MSA_ROWS = 8_191  # Maximum paired cross-chain rows (excluding query)
+
 # Canonical reference atom lists per residue type (for fallback when CCD unavailable)
 # Only heavy atoms; trimmed / padded to MAX_ATOMS_PER_TOKEN during featurization
 REF_ATOMS: dict[str, list[str]] = {

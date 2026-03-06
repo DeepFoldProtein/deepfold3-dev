@@ -145,3 +145,4 @@ class ModelConfig:
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     template: TemplateEmbeddingConfig = field(default_factory=TemplateEmbeddingConfig)
     num_recycles: int = 10
+    msa_crop_size: int = 1024  # MSA rows sampled per recycle

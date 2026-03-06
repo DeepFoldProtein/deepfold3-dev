@@ -53,7 +53,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         data_dir: Path,
         max_tokens: int = 384,
         max_atoms: int = 4096,
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = const.MAX_MSA_ROWS,
     ):
         self.records = records
         self.data_dir = Path(data_dir)
@@ -92,7 +92,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 
 def _tokenize_and_featurize(
     inp: Input,
-    max_msa_seqs: int = 2048,
+    max_msa_seqs: int = const.MAX_MSA_ROWS,
     templates: list[TemplateFeatures] | None = None,
     template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -120,7 +120,7 @@ class InferenceInput:
     def from_a3m(
         a3m_text: str,
         mol_type: str = "protein",
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = const.MAX_MSA_ROWS,
         templates: list[TemplateFeatures] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build features from an A3M-format MSA string.
@@ -175,7 +175,7 @@ class InferenceInput:
     def from_json(
         json_path: str | Path,
         job_index: int = 0,
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = const.MAX_MSA_ROWS,
         max_templates: int = 4,
         template_cache_dir: str | Path | None = None,
         pdb_mmcif_dir: str | Path | None = None,

@@ -36,7 +36,7 @@ class Featurizer:
     def __init__(
         self,
         max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
-        max_msa_seqs: int = 2048,
+        max_msa_seqs: int = const.MAX_MSA_ROWS,
         max_templates: int = 4,
     ):
         self.max_atoms = max_atoms
@@ -343,17 +343,20 @@ class Featurizer:
         N: int,
         rng: np.random.Generator,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build [S, N] MSA tensors with paired + unpaired rows.
+        """Build [S, N] MSA tensors with paired + dense unpaired rows.
 
-        MSA layout (following AF3):
-        1. Query row (row 0): merged from all chains' query sequences
-        2. Paired rows: cross-chain co-evolutionary signal — row i from each
-           chain's paired MSA placed on the same full-width row
-        3. Unpaired block-diagonal rows: each chain's unpaired MSA occupies
-           its own block, gaps elsewhere
+        MSA layout (following AF3 ``merging_features.py``):
+        1. Paired rows (``_all_seq``): cross-chain co-evolutionary signal —
+           row *i* from each chain's paired MSA placed on the same full-width
+           row.  First row is the query.
+        2. Dense unpaired rows: each chain's unpaired MSA is padded to the
+           same number of rows (``max_S``), then all chains are placed on
+           the **same** rows (each chain fills its own columns, gaps elsewhere).
+           This is NOT block-diagonal — row *i* has every chain's *i*-th
+           unpaired sequence simultaneously.
 
-        Cross-chain gap positions have msa_mask=True (AF3 treats gaps as valid
-        aligned positions).
+        Cross-chain gap positions have msa_mask=True (AF3 treats gaps as
+        valid aligned positions).
         """
         # Build chain position maps
         chain_pos_map: dict[int, np.ndarray] = {}
@@ -361,80 +364,93 @@ class Featurizer:
             chain_mask = tokens["asym_id"] == asym_id
             chain_pos_map[int(asym_id)] = np.where(chain_mask)[0]
 
-        # Helper: place a chain's MSA into full-width [S, N] arrays
-        def _place_chain_msa(msa, asym_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            chain_pos = chain_pos_map.get(asym_id)
-            if chain_pos is None or len(chain_pos) == 0:
-                return np.empty((0, N), np.int8), np.empty((0, N), bool), np.empty((0, N), np.int8)
-            S_msa, N_msa = msa.sequences.shape
-            seqs = np.full((S_msa, N), 21, dtype=np.int8)  # gap for cross-chain
-            masks = np.ones((S_msa, N), dtype=bool)  # AF3: all positions valid, even cross-chain gaps
-            dels = np.zeros((S_msa, N), dtype=np.int8)
-            L = min(N_msa, len(chain_pos))
-            seqs[:, chain_pos[:L]] = msa.sequences[:, :L]
-            masks[:, chain_pos[:L]] = msa.mask[:, :L]
-            dels[:, chain_pos[:L]] = msa.deletion_matrix[:, :L]
-            return seqs, masks, dels
-
         combined_seqs: list[np.ndarray] = []
         combined_masks: list[np.ndarray] = []
         combined_dels: list[np.ndarray] = []
 
-        # --- 1. Query row: merge row 0 from all chains' unpaired MSAs ---
-        query_seq = np.full(N, 21, dtype=np.int8)
-        query_mask = np.ones(N, dtype=bool)
-        query_del = np.zeros(N, dtype=np.int8)
-        for asym_id, msa in data.unpaired_msa.items():
-            chain_pos = chain_pos_map.get(int(asym_id))
-            if chain_pos is None or len(chain_pos) == 0 or msa.sequences.shape[0] == 0:
-                continue
-            L = min(msa.sequences.shape[1], len(chain_pos))
-            query_seq[chain_pos[:L]] = msa.sequences[0, :L]
-            query_mask[chain_pos[:L]] = msa.mask[0, :L]
-            query_del[chain_pos[:L]] = msa.deletion_matrix[0, :L]
-        combined_seqs.append(query_seq[None])
-        combined_masks.append(query_mask[None])
-        combined_dels.append(query_del[None])
-
-        # --- 2. Paired rows: zip across chains ---
+        # --- 1. Paired rows: zip across chains (up to MAX_PAIRED_MSA_ROWS) ---
+        # Row 0 is the query (from paired MSA or, if absent, from unpaired).
+        n_paired_rows = 0
         if data.paired_msa:
-            # Determine number of paired rows (min across chains, excluding query row)
             paired_counts = []
             paired_chain_ids = []
             for asym_id, msa in data.paired_msa.items():
                 if int(asym_id) in chain_pos_map and len(chain_pos_map[int(asym_id)]) > 0:
-                    # Skip query row (row 0) — paired rows start from row 1
-                    n_paired = max(0, msa.sequences.shape[0] - 1)
-                    paired_counts.append(n_paired)
+                    paired_counts.append(msa.sequences.shape[0])
                     paired_chain_ids.append(int(asym_id))
             if paired_counts and min(paired_counts) > 0:
-                n_paired_rows = min(paired_counts)
+                n_paired_rows = min(min(paired_counts), const.MAX_PAIRED_MSA_ROWS + 1)
                 for row_i in range(n_paired_rows):
                     row_seq = np.full(N, 21, dtype=np.int8)
-                    row_mask = np.ones(N, dtype=bool)  # cross-chain gaps are valid
+                    row_mask = np.ones(N, dtype=bool)
                     row_del = np.zeros(N, dtype=np.int8)
                     for asym_id in paired_chain_ids:
                         msa = data.paired_msa[asym_id]
                         chain_pos = chain_pos_map[asym_id]
                         L = min(msa.sequences.shape[1], len(chain_pos))
-                        # row_i+1 because row 0 is query
-                        row_seq[chain_pos[:L]] = msa.sequences[row_i + 1, :L]
-                        row_mask[chain_pos[:L]] = msa.mask[row_i + 1, :L]
-                        row_del[chain_pos[:L]] = msa.deletion_matrix[row_i + 1, :L]
+                        row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]
+                        row_mask[chain_pos[:L]] = msa.mask[row_i, :L]
+                        row_del[chain_pos[:L]] = msa.deletion_matrix[row_i, :L]
                     combined_seqs.append(row_seq[None])
                     combined_masks.append(row_mask[None])
                     combined_dels.append(row_del[None])
 
-        # --- 3. Unpaired block-diagonal rows ---
+        # If no paired MSA, build query row from unpaired row 0
+        if n_paired_rows == 0:
+            query_seq = np.full(N, 21, dtype=np.int8)
+            query_mask = np.ones(N, dtype=bool)
+            query_del = np.zeros(N, dtype=np.int8)
+            for asym_id, msa in data.unpaired_msa.items():
+                chain_pos = chain_pos_map.get(int(asym_id))
+                if chain_pos is None or len(chain_pos) == 0 or msa.sequences.shape[0] == 0:
+                    continue
+                L = min(msa.sequences.shape[1], len(chain_pos))
+                query_seq[chain_pos[:L]] = msa.sequences[0, :L]
+                query_mask[chain_pos[:L]] = msa.mask[0, :L]
+                query_del[chain_pos[:L]] = msa.deletion_matrix[0, :L]
+            combined_seqs.append(query_seq[None])
+            combined_masks.append(query_mask[None])
+            combined_dels.append(query_del[None])
+
+        # --- 2. Dense unpaired rows (AF3: pad-to-max then concat along columns) ---
+        # For each chain, crop unpaired rows to at most
+        # (max_msa_seqs - n_paired_rows) then pad all chains to the same
+        # number of rows.  Place each chain's data in its own columns and
+        # gap-fill the rest.
+        max_unpaired = self.max_msa_seqs - max(n_paired_rows, 1)
+        # Collect per-chain unpaired MSA (skip query row = row 0)
+        chain_unpaired: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
+        max_S_unpaired = 0
         for asym_id, msa in data.unpaired_msa.items():
             if msa.sequences.shape[0] <= 1:
                 continue
-            # Skip query row (already added above)
-            seqs, masks, dels = _place_chain_msa(msa, int(asym_id))
-            if seqs.shape[0] > 1:
-                combined_seqs.append(seqs[1:])
-                combined_masks.append(masks[1:])
-                combined_dels.append(dels[1:])
+            # Rows 1.. (skip query)
+            end = min(msa.sequences.shape[0], 1 + max_unpaired)
+            chain_unpaired.append((
+                int(asym_id),
+                msa.sequences[1:end],
+                msa.mask[1:end],
+                msa.deletion_matrix[1:end],
+            ))
+            max_S_unpaired = max(max_S_unpaired, end - 1)
+
+        if max_S_unpaired > 0:
+            # Build dense [max_S_unpaired, N] arrays — all chains on same rows
+            dense_seqs = np.full((max_S_unpaired, N), 21, dtype=np.int8)
+            dense_masks = np.ones((max_S_unpaired, N), dtype=bool)
+            dense_dels = np.zeros((max_S_unpaired, N), dtype=np.int8)
+            for asym_id, seqs, masks, dels in chain_unpaired:
+                chain_pos = chain_pos_map.get(asym_id)
+                if chain_pos is None or len(chain_pos) == 0:
+                    continue
+                S_chain = seqs.shape[0]
+                L = min(seqs.shape[1], len(chain_pos))
+                dense_seqs[:S_chain, chain_pos[:L]] = seqs[:, :L]
+                dense_masks[:S_chain, chain_pos[:L]] = masks[:, :L]
+                dense_dels[:S_chain, chain_pos[:L]] = dels[:, :L]
+            combined_seqs.append(dense_seqs)
+            combined_masks.append(dense_masks)
+            combined_dels.append(dense_dels)
 
         if not combined_seqs:
             msa_arr = np.full((1, N), 21, dtype=np.int8)
@@ -445,13 +461,12 @@ class Featurizer:
             mask_arr = np.concatenate(combined_masks, axis=0)
             del_arr = np.concatenate(combined_dels, axis=0)
 
-        # Sample to max_msa_seqs
+        # Cap total rows at max_msa_seqs
         S = msa_arr.shape[0]
         if S > self.max_msa_seqs:
-            idx = np.concatenate([[0], rng.choice(S - 1, self.max_msa_seqs - 1, replace=False) + 1])
-            msa_arr = msa_arr[idx]
-            mask_arr = mask_arr[idx]
-            del_arr = del_arr[idx]
+            msa_arr = msa_arr[: self.max_msa_seqs]
+            mask_arr = mask_arr[: self.max_msa_seqs]
+            del_arr = del_arr[: self.max_msa_seqs]
 
         return (
             torch.from_numpy(msa_arr.astype(np.int16)),

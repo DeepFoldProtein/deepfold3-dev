@@ -125,8 +125,13 @@ class DeepFold3(nn.Module):
         self,
         features: dict[str, torch.Tensor],
         num_recycles: int,
+        seed: int = 0,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run feature building + evoformer trunk with recycling.
+
+        For each recycle, a fresh random subset of MSA rows is sampled
+        (``msa_crop_size`` rows, always including the query row 0).
+        This follows AF3 paper (S2.3).
 
         Returns:
             (embeddings, rel_feat, target_feat, seq_mask, pair_mask)
@@ -160,12 +165,13 @@ class DeepFold3(nn.Module):
         # Full target_feat [N, 447] = concat(raw[63], evo_cond[384])
         target_feat = torch.cat([raw_feat, evo_cond_act], dim=-1)
 
-        # Build MSA features [S, N, 34]
-        msa_feat = self._build_msa_feat(features)
-
         seq_mask = features["seq_mask"].float()
         pair_mask = features["pair_mask"].float()
-        msa_mask = features["msa_mask"].float()
+
+        # Full MSA tensors (up to 16,384 rows)
+        full_msa = features["msa"]  # [S_full, N]
+        full_msa_mask = features["msa_mask"]  # [S_full, N]
+        full_del_matrix = features.get("deletion_matrix")
 
         # Initialize recycling buffers
         c_pair = self.cfg.evoformer.pair_channel
@@ -191,8 +197,30 @@ class DeepFold3(nn.Module):
         asym_id_tensor = features["asym_id"].to(device)
         multichain_mask = (asym_id_tensor.unsqueeze(-1) == asym_id_tensor.unsqueeze(-2)).float()
 
+        # Per-recycle MSA subsampling (AF3 §2.5.4)
+        S_full = full_msa.shape[0]
+        crop = self.cfg.msa_crop_size
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+
         # Recycle
         for recycle_idx in range(num_recycles + 1):
+            # Sample MSA rows: always include query (row 0), shuffle the rest
+            if S_full <= crop:
+                msa_sub = full_msa
+                msa_mask_sub = full_msa_mask
+                del_sub = full_del_matrix
+            else:
+                perm = torch.randperm(S_full - 1, generator=rng) + 1  # indices 1..S_full-1
+                sel = perm[: crop - 1]
+                idx = torch.cat([torch.zeros(1, dtype=torch.long), sel]).sort().values
+                msa_sub = full_msa[idx]
+                msa_mask_sub = full_msa_mask[idx]
+                del_sub = full_del_matrix[idx] if full_del_matrix is not None else None
+
+            # Build MSA features for this recycle [S_crop, N, 34]
+            msa_feat = self._build_msa_feat_from_tensors(msa_sub, del_sub)
+            msa_mask = msa_mask_sub.float()
+
             embeddings = self.evoformer(
                 target_feat=target_feat,
                 msa_feat=msa_feat,
@@ -240,7 +268,9 @@ class DeepFold3(nn.Module):
             self.diffusion_head.cfg.num_samples = num_samples
 
         try:
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = self._run_evoformer(features, num_recycles)
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = self._run_evoformer(
+                features, num_recycles, seed=seed
+            )
 
             # Diffusion sampling
             device = features["res_type"].device
@@ -315,19 +345,26 @@ class DeepFold3(nn.Module):
         return torch.cat(feat_parts, dim=-1)  # [N, 63]
 
     def _build_msa_feat(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Build MSA feature tensor [S, N, 34] from the full features dict."""
+        return self._build_msa_feat_from_tensors(features["msa"], features.get("deletion_matrix"))
+
+    def _build_msa_feat_from_tensors(
+        self,
+        msa: torch.Tensor,
+        deletion_matrix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Build MSA feature tensor [S, N, 34].
 
         Matches AF3 create_msa_feat:
             msa_1hot(32) + has_deletion(1) + deletion_value(1) = 34
         """
-        msa = features["msa"]  # [S, N] int64
         S, N = msa.shape
         # one-hot over 32 classes (POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP + 1)
         msa_1hot = F.one_hot(msa, _MSA_NUM_CLASSES).float()  # [S, N, 32]
 
         parts = [msa_1hot]
-        if "deletion_matrix" in features:
-            del_mat = features["deletion_matrix"].float()  # [S, N]
+        if deletion_matrix is not None:
+            del_mat = deletion_matrix.float()  # [S, N]
             has_del = del_mat.clamp(0.0, 1.0).unsqueeze(-1)  # [S, N, 1]
             del_val = (torch.arctan(del_mat / 3.0) * (2.0 / torch.pi)).unsqueeze(-1)
             parts.append(has_del)
