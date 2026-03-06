@@ -1,0 +1,266 @@
+[
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.11884800344705582,
+    "peak_memory_mb": 16.26708984375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00980156015432624,
+    "time_p25_ms": 0.11542399972677231,
+    "time_p75_ms": 0.1318719983100891,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.5386559963226318,
+    "peak_memory_mb": 16.2763671875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.04140182294662306,
+    "time_p25_ms": 0.5286080241203308,
+    "time_p75_ms": 0.541375994682312,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.10976000130176544,
+    "peak_memory_mb": 16.2734375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006691370104543141,
+    "time_p25_ms": 0.10972800105810165,
+    "time_p75_ms": 0.11472000181674957,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.29795199632644653,
+    "peak_memory_mb": 16.28515625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.007111559583725366,
+    "time_p25_ms": 0.294048011302948,
+    "time_p75_ms": 0.3062399923801422,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.11347199976444244,
+    "peak_memory_mb": 16.2822265625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006326243235835816,
+    "time_p25_ms": 0.10835199803113937,
+    "time_p75_ms": 0.11628799885511398,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.30134400725364685,
+    "peak_memory_mb": 16.2939453125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.028394010842863884,
+    "time_p25_ms": 0.2900480031967163,
+    "time_p75_ms": 0.3303999900817871,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.11552000045776367,
+    "peak_memory_mb": 16.28564453125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004603937228228281,
+    "time_p25_ms": 0.11123199760913849,
+    "time_p75_ms": 0.11708799749612808,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.3717440068721771,
+    "peak_memory_mb": 16.294921875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.03771934317615375,
+    "time_p25_ms": 0.36425599455833435,
+    "time_p75_ms": 0.3895359933376312,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.11241599917411804,
+    "peak_memory_mb": 16.283203125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005268003732756651,
+    "time_p25_ms": 0.10947199910879135,
+    "time_p75_ms": 0.1136000007390976,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.3038719892501831,
+    "peak_memory_mb": 16.294921875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.013782742104377785,
+    "time_p25_ms": 0.290912002325058,
+    "time_p75_ms": 0.31308799982070923,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.10979200154542923,
+    "peak_memory_mb": 16.2900390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008357209640115762,
+    "time_p25_ms": 0.10463999956846237,
+    "time_p75_ms": 0.11334399878978729,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 4,
+      "C": 8
+    },
+    "mode": "full",
+    "time_ms": 0.2996799945831299,
+    "peak_memory_mb": 16.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009298859618616541,
+    "time_p25_ms": 0.2956799864768982,
+    "time_p75_ms": 0.3089599907398224,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "S": 4,
+      "C_msa": 8,
+      "C_pair": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.1276160031557083,
+    "peak_memory_mb": 16.37158203125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.003648425729496126,
+    "time_p25_ms": 0.12464000284671783,
+    "time_p75_ms": 0.12796799838542938,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 4,
+      "S": 4,
+      "C_msa": 8,
+      "C_pair": 8
+    },
+    "mode": "full",
+    "time_ms": 0.40694400668144226,
+    "peak_memory_mb": 16.43798828125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.07671267810024604,
+    "time_p25_ms": 0.40560001134872437,
+    "time_p75_ms": 0.5292159914970398,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "S": 4,
+      "C_msa": 8,
+      "C_pair": 8
+    },
+    "mode": "fwd",
+    "time_ms": 0.1043199971318245,
+    "peak_memory_mb": 16.40576171875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004502889700502804,
+    "time_p25_ms": 0.100832000374794,
+    "time_p75_ms": 0.10707200318574905,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 4,
+      "S": 4,
+      "C_msa": 8,
+      "C_pair": 8
+    },
+    "mode": "full",
+    "time_ms": 0.30985599756240845,
+    "peak_memory_mb": 16.4892578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0285322396694096,
+    "time_p25_ms": 0.28969600796699524,
+    "time_p75_ms": 0.31279999017715454,
+    "extra": {}
+  }
+]
