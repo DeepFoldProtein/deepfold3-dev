@@ -35,10 +35,7 @@ dev = [
     "pytest-timeout>=2.3.0",
     "ruff>=0.9.4",
 ]
-optim = [
-    "matplotlib>=3.9.0",
-    "triton>=3.0.0",
-]
+optim = ["triton>=3.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
