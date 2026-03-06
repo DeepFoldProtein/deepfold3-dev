@@ -18,8 +18,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder
-from deepfold3.model.config import DiffusionConfig
-from deepfold3.model.primitives import LinearNoBias, TransitionBlock
+from deepfold3.model.config import DiffusionConfig, OptimConfig
+from deepfold3.model.optim import make_transition_block
+from deepfold3.model.primitives import LinearNoBias
 
 
 def noise_schedule(
@@ -323,14 +324,15 @@ class DiffusionConditioningBlock(nn.Module):
         c_pair_out: int,
         c_single_out: int,
         target_feat_dim: int = 447,
+        optim: OptimConfig | None = None,
     ):
         super().__init__()
         # Pair conditioning
         pair_in = c_pair_in + rel_feat_dim
         self.pair_cond_norm_w = nn.Parameter(torch.ones(pair_in))
         self.pair_cond_proj = LinearNoBias(pair_in, c_pair_out)
-        self.pair_trans0 = TransitionBlock(c_pair_out, num_intermediate_factor=2)
-        self.pair_trans1 = TransitionBlock(c_pair_out, num_intermediate_factor=2)
+        self.pair_trans0 = make_transition_block(c_pair_out, num_intermediate_factor=2, config=optim)
+        self.pair_trans1 = make_transition_block(c_pair_out, num_intermediate_factor=2, config=optim)
 
         # Single conditioning: concat(single_embedding, target_feat)
         single_in = c_single_in + target_feat_dim  # 384 + 447 = 831
@@ -344,8 +346,8 @@ class DiffusionConditioningBlock(nn.Module):
         self.noise_emb_norm_w = nn.Parameter(torch.ones(fourier_dim))
         self.noise_emb_proj = LinearNoBias(fourier_dim, c_single_out)
 
-        self.single_trans0 = TransitionBlock(c_single_out, num_intermediate_factor=2)
-        self.single_trans1 = TransitionBlock(c_single_out, num_intermediate_factor=2)
+        self.single_trans0 = make_transition_block(c_single_out, num_intermediate_factor=2, config=optim)
+        self.single_trans1 = make_transition_block(c_single_out, num_intermediate_factor=2, config=optim)
 
     def _fourier_noise_embedding(self, sigma: torch.Tensor) -> torch.Tensor:
         """Fixed Fourier embedding of noise level using registered buffers.
@@ -401,7 +403,14 @@ class DiffusionHead(nn.Module):
 
     SIGMA_DATA = 16.0
 
-    def __init__(self, cfg: DiffusionConfig, c_single: int = 384, c_pair: int = 128, rel_feat_dim: int = 139):
+    def __init__(
+        self,
+        cfg: DiffusionConfig,
+        c_single: int = 384,
+        c_pair: int = 128,
+        rel_feat_dim: int = 139,
+        optim: OptimConfig | None = None,
+    ):
         super().__init__()
         self.cfg = cfg
         c_diff = cfg.atom_cross_att.per_token_channels  # 768
@@ -413,6 +422,7 @@ class DiffusionHead(nn.Module):
             rel_feat_dim=rel_feat_dim,
             c_pair_out=cfg.conditioning_pair_channel,
             c_single_out=cfg.conditioning_seq_channel,
+            optim=optim,
         )
 
         # Atom encoder (per-atom conditioning → token activations)

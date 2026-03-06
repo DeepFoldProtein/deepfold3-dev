@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 
@@ -46,7 +47,7 @@ class GridSelfAttention(nn.Module):
     Supports both unbatched [N, N, C] and batched [B, N, N, C] inputs.
     """
 
-    def __init__(self, c: int, num_heads: int = 4, transpose: bool = False):
+    def __init__(self, c: int, num_heads: int = 4, transpose: bool = False, optim: OptimConfig | None = None):
         super().__init__()
         assert c % num_heads == 0
         self.num_heads = num_heads
@@ -61,6 +62,16 @@ class GridSelfAttention(nn.Module):
         self.to_v = LinearNoBias(c, num_heads * self.head_dim)
         self.to_g = LinearNoBias(c, num_heads * self.head_dim)
         self.out_proj = LinearNoBias(num_heads * self.head_dim, c)
+
+        self._evo_attn = None
+        if optim is not None and optim.use_fused_evo_attention:
+            try:
+                from deepfold3.model.triton.evo_attention import HAS_TRITON, _EvoformerAttention
+
+                if HAS_TRITON:
+                    self._evo_attn = _EvoformerAttention
+            except ImportError:
+                pass
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -94,24 +105,34 @@ class GridSelfAttention(nn.Module):
         # Fold batch and row dims for per-row attention
         z_flat = z.reshape(B * N_rows, N_cols, C)
 
-        q = self.to_q(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
-        k = self.to_k(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
-        v = self.to_v(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+        if self._evo_attn is not None and z.is_cuda:
+            # Fused Triton path: kernel expects [B, N_seq, N_res, H, D]
+            q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D)
+            k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D)
+            v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D)
+            res_mask = torch.where(mask > 0.5, 0.0, float("-inf")).view(B, N_rows, 1, 1, N_cols)
+            pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N]
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, N_rows, N_cols, H, D]
+            out = out.reshape(B * N_rows, N_cols, H * D)
+        else:
+            q = self.to_q(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+            k = self.to_k(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+            v = self.to_v(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
 
-        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B*N_rows, H, N_cols, N_cols]
+            logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B*N_rows, H, N_cols, N_cols]
 
-        # pair_bias: [B, H, N, N] → same for every row within each batch element
-        logits = logits.view(B, N_rows, H, N_cols, N_cols)
-        logits = logits + pb.unsqueeze(1)  # [B, 1, H, N, N] broadcasts over N_rows
-        logits = logits.reshape(B * N_rows, H, N_cols, N_cols)
+            # pair_bias: [B, H, N, N] → same for every row within each batch element
+            logits = logits.view(B, N_rows, H, N_cols, N_cols)
+            logits = logits + pb.unsqueeze(1)  # [B, 1, H, N, N] broadcasts over N_rows
+            logits = logits.reshape(B * N_rows, H, N_cols, N_cols)
 
-        # mask: [B, N_rows, N_cols] → [B*N_rows, 1, 1, N_cols]
-        mask_flat = mask.reshape(B * N_rows, N_cols)
-        logits = logits + 1e9 * (mask_flat.float() - 1.0).view(B * N_rows, 1, 1, N_cols)
+            # mask: [B, N_rows, N_cols] → [B*N_rows, 1, 1, N_cols]
+            mask_flat = mask.reshape(B * N_rows, N_cols)
+            logits = logits + 1e9 * (mask_flat.float() - 1.0).view(B * N_rows, 1, 1, N_cols)
 
-        w = F.softmax(logits, dim=-1)
-        out = torch.matmul(w, v)  # [B*N_rows, H, N_cols, D]
-        out = out.permute(0, 2, 1, 3).reshape(B * N_rows, N_cols, H * D)
+            w = F.softmax(logits.float(), dim=-1).to(z.dtype)
+            out = torch.matmul(w, v)  # [B*N_rows, H, N_cols, D]
+            out = out.permute(0, 2, 1, 3).reshape(B * N_rows, N_cols, H * D)
 
         g = torch.sigmoid(self.to_g(z_flat))
         out = out * g
@@ -135,7 +156,7 @@ class MSAAttention(nn.Module):
     Supports both unbatched [S, N, c] and batched [B, S, N, c] inputs.
     """
 
-    def __init__(self, c_msa: int, c_pair: int, num_heads: int = 8):
+    def __init__(self, c_msa: int, c_pair: int, num_heads: int = 8, optim: OptimConfig | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = c_msa // num_heads
@@ -147,6 +168,31 @@ class MSAAttention(nn.Module):
         self.to_v = LinearNoBias(c_msa, num_heads * self.head_dim)
         self.to_g = LinearNoBias(c_msa, num_heads * self.head_dim)
         self.out_proj = LinearNoBias(num_heads * self.head_dim, c_msa)
+        if optim is not None and optim.use_torch_compile:
+            self._compute = torch.compile(self._compute)
+
+    def _compute(
+        self, msa: torch.Tensor, mask: torch.Tensor, pair: torch.Tensor
+    ) -> torch.Tensor:
+        B, S, N, C = msa.shape
+        H, D = self.num_heads, self.head_dim
+
+        msa = self.norm(msa)
+        pair = self.pair_norm(pair)
+
+        logits = self.pair_logits(pair).permute(0, 3, 1, 2)
+        col_mask, _ = mask.max(dim=-2)
+        logits = logits + 1e9 * (col_mask.float() - 1.0).view(B, 1, 1, N)
+
+        w = F.softmax(logits, dim=-1)
+
+        v = self.to_v(msa).view(B, S, N, H, D)
+        v_avg = torch.einsum("bhqk,bskhc->bsqhc", w, v)
+        v_avg = v_avg.reshape(B, S, N, H * D)
+
+        g = torch.sigmoid(self.to_g(msa))
+        v_avg = v_avg * g
+        return self.out_proj(v_avg)
 
     def forward(
         self,
@@ -160,28 +206,7 @@ class MSAAttention(nn.Module):
             mask = mask.unsqueeze(0)
             pair = pair.unsqueeze(0)
 
-        B, S, N, C = msa.shape
-        H, D = self.num_heads, self.head_dim
-
-        msa = self.norm(msa)
-        pair = self.pair_norm(pair)
-
-        # pair logits: [B, N, N, H] → [B, H, N, N]
-        logits = self.pair_logits(pair).permute(0, 3, 1, 2)
-        # column-wise mask: take max over sequences → [B, N]
-        col_mask, _ = mask.max(dim=-2)
-        logits = logits + 1e9 * (col_mask.float() - 1.0).view(B, 1, 1, N)
-
-        w = F.softmax(logits, dim=-1)  # [B, H, N, N]
-
-        v = self.to_v(msa).view(B, S, N, H, D)  # [B, S, N, H, D]
-        # weighted avg: Σ_k w[b, h, q, k] * v[b, s, k, h, c]
-        v_avg = torch.einsum("bhqk,bskhc->bsqhc", w, v)
-        v_avg = v_avg.reshape(B, S, N, H * D)
-
-        g = torch.sigmoid(self.to_g(msa))
-        v_avg = v_avg * g
-        result = self.out_proj(v_avg)
+        result = self._compute(msa, mask, pair)
 
         if not has_batch:
             result = result.squeeze(0)
@@ -207,7 +232,9 @@ class SingleAttention(nn.Module):
     Supports both unbatched [N, c] and batched [B, N, c] inputs.
     """
 
-    def __init__(self, c: int, num_heads: int = 16, key_dim: int = 384, value_dim: int = 384):
+    def __init__(
+        self, c: int, num_heads: int = 16, key_dim: int = 384, value_dim: int = 384, optim: OptimConfig | None = None
+    ):
         super().__init__()
         assert key_dim % num_heads == 0
         assert value_dim % num_heads == 0
@@ -224,6 +251,37 @@ class SingleAttention(nn.Module):
         self.to_v = LinearNoBias(c, value_dim)
         self.to_g = LinearNoBias(c, value_dim)
         self.out_proj = LinearNoBias(value_dim, c)
+
+        # Fused EvoAttention: SingleAttention is the N_seq=1 case
+        self._evo_attn = None
+        if optim is not None and optim.use_fused_evo_attention and self.key_dim_per_head == self.val_dim_per_head:
+            try:
+                from deepfold3.model.triton.evo_attention import HAS_TRITON, _EvoformerAttention
+
+                if HAS_TRITON:
+                    self._evo_attn = _EvoformerAttention
+            except ImportError:
+                pass
+        if self._evo_attn is None and optim is not None and optim.use_torch_compile:
+            self._compute_baseline = torch.compile(self._compute_baseline)
+
+    def _compute_baseline(
+        self, xn: torch.Tensor, mask: torch.Tensor, pair_logits: torch.Tensor
+    ) -> torch.Tensor:
+        B, N, _ = xn.shape
+        H, Dk, Dv = self.num_heads, self.key_dim_per_head, self.val_dim_per_head
+        q = self.to_q(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)
+        k = self.to_k(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)
+        v = self.to_v(xn).view(B, N, H, Dv).permute(0, 2, 1, 3)
+        logits = torch.matmul(q * self.scale, k.transpose(-2, -1))
+        logits = logits + pair_logits
+        bias_mask = 1e9 * (mask.float() - 1.0)
+        logits = logits + bias_mask.view(B, 1, 1, N)
+        w = F.softmax(logits.float(), dim=-1).to(xn.dtype)
+        out = torch.matmul(w, v)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, H * Dv)
+        g = torch.sigmoid(self.to_g(xn))
+        return self.out_proj(out * g)
 
     def forward(
         self,
@@ -243,21 +301,19 @@ class SingleAttention(nn.Module):
         Dv = self.val_dim_per_head
 
         xn = self.norm(x)
-        q = self.to_q(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)  # [B, H, N, Dk]
-        k = self.to_k(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)
-        v = self.to_v(xn).view(B, N, H, Dv).permute(0, 2, 1, 3)
 
-        logits = torch.matmul(q * self.scale, k.transpose(-2, -1))  # [B, H, N, N]
-        logits = logits + pair_logits
-        bias_mask = 1e9 * (mask.float() - 1.0)  # [B, N]
-        logits = logits + bias_mask.view(B, 1, 1, N)
-        w = F.softmax(logits.float(), dim=-1).to(x.dtype)
-
-        out = torch.matmul(w, v)  # [B, H, N, Dv]
-        out = out.permute(0, 2, 1, 3).reshape(B, N, H * Dv)
-        g = torch.sigmoid(self.to_g(xn))
-        out = out * g
-        result = self.out_proj(out)
+        if self._evo_attn is not None and x.is_cuda:
+            q = self.to_q(xn).view(B, N, H, Dk).unsqueeze(1)  # [B, 1, N, H, D]
+            k = self.to_k(xn).view(B, N, H, Dk).unsqueeze(1)
+            v = self.to_v(xn).view(B, N, H, Dv).unsqueeze(1)
+            res_mask = torch.where(mask > 0.5, 0.0, float("-inf")).view(B, 1, 1, 1, N)
+            pair_bias = pair_logits.unsqueeze(1).float()  # [B, 1, H, N, N]
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, 1, N, H, D]
+            out = out.squeeze(1).reshape(B, N, H * Dv)
+            g = torch.sigmoid(self.to_g(xn))
+            result = self.out_proj(out * g)
+        else:
+            result = self._compute_baseline(xn, mask, pair_logits)
 
         if not has_batch:
             result = result.squeeze(0)

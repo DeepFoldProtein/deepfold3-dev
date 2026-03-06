@@ -138,11 +138,41 @@ class TemplateEmbeddingConfig:
 
 
 @dataclass
+class OptimConfig:
+    """Toggle individual kernel optimization backends.
+
+    All flags default to False (pure PyTorch). Set to True to use the
+    corresponding Triton/fused kernel if available; silently falls back
+    to baseline if the backend is not installed.
+
+    Benchmark results (RTX 5090, bf16):
+    - use_fused_evo_attention: 4-9x faster, 3-10x less memory for GridSelfAttention (104 modules)
+    - use_torch_compile: 1.3-2.7x faster for attention + TriangleMul (156 modules)
+    - use_fused_transition: 1.2-1.3x faster for C>=256 transitions only (48 modules)
+    """
+
+    use_fused_evo_attention: bool = False
+    use_fused_transition: bool = False
+    use_torch_compile: bool = False
+
+    @classmethod
+    def recommended(cls) -> OptimConfig:
+        """Fused evo attention + torch.compile — the two biggest wins."""
+        return cls(use_fused_evo_attention=True, use_torch_compile=True)
+
+    @classmethod
+    def all_enabled(cls) -> OptimConfig:
+        """Enable all optimizations including fused transition."""
+        return cls(use_fused_evo_attention=True, use_fused_transition=True, use_torch_compile=True)
+
+
+@dataclass
 class ModelConfig:
     evoformer: EvoformerConfig = field(default_factory=EvoformerConfig)
     pairformer: PairFormerConfig = field(default_factory=PairFormerConfig)
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     template: TemplateEmbeddingConfig = field(default_factory=TemplateEmbeddingConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
     num_recycles: int = 10
     msa_crop_size: int = 1024  # MSA rows sampled per recycle

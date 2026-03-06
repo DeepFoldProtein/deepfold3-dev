@@ -29,13 +29,20 @@ where = ["src"]
 include = ["deepfold3"]
 
 [dependency-groups]
-dev = ["jax[cpu]>=0.4.30", "pytest>=9.0.0", "pytest-timeout>=2.3.0", "ruff>=0.9.4"]
+dev = [
+    "jax[cpu]>=0.4.30",
+    "pytest>=9.0.0",
+    "pytest-timeout>=2.3.0",
+    "ruff>=0.9.4",
+]
+optim = [
+    "matplotlib>=3.9.0",
+    "triton>=3.0.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 timeout = 60
 
 [tool.ruff]

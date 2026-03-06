@@ -35,9 +35,10 @@ import torch
 import torch.nn as nn
 
 from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
-from deepfold3.model.config import EvoformerConfig, PairFormerConfig, TemplateEmbeddingConfig
+from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, TransitionBlock
+from deepfold3.model.optim import make_transition_block
+from deepfold3.model.primitives import LayerNorm, LinearNoBias
 from deepfold3.model.template_embedding import TemplateEmbedding
 
 # Full target_feat dimension fed into the Evoformer (raw_feat + evo_cond_token_act)
@@ -52,16 +53,23 @@ class EvoformerBlock(nn.Module):
     Haiku: EvoformerIteration, name='msa_stack'
     """
 
-    def __init__(self, c_msa: int, c_pair: int, num_msa_heads: int = 8, num_pair_heads: int = 4):
+    def __init__(
+        self,
+        c_msa: int,
+        c_pair: int,
+        num_msa_heads: int = 8,
+        num_pair_heads: int = 4,
+        optim: OptimConfig | None = None,
+    ):
         super().__init__()
-        self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads)
+        self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads, optim=optim)
         self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=32)
-        self.tri_mul_out = TriangleMulOutgoing(c_pair)
-        self.tri_mul_in = TriangleMulIncoming(c_pair)
-        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False)
-        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True)
-        self.pair_transition = TransitionBlock(c_pair)
-        self.msa_transition = TransitionBlock(c_msa)
+        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
+        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
+        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
+        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
+        self.pair_transition = make_transition_block(c_pair, config=optim)
+        self.msa_transition = make_transition_block(c_msa, config=optim)
 
     def forward(
         self,
@@ -101,13 +109,14 @@ class PairFormerBlock(nn.Module):
         num_single_heads: int = 16,
         single_key_dim: int = 384,
         single_value_dim: int = 384,
+        optim: OptimConfig | None = None,
     ):
         super().__init__()
-        self.tri_mul_out = TriangleMulOutgoing(c_pair)
-        self.tri_mul_in = TriangleMulIncoming(c_pair)
-        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False)
-        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True)
-        self.pair_transition = TransitionBlock(c_pair)
+        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
+        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
+        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
+        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
+        self.pair_transition = make_transition_block(c_pair, config=optim)
         # Single track
         self.single_to_pair_norm = LayerNorm(c_pair)  # normalizes pair act
         self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
@@ -116,8 +125,9 @@ class PairFormerBlock(nn.Module):
             num_heads=num_single_heads,
             key_dim=single_key_dim,
             value_dim=single_value_dim,
+            optim=optim,
         )
-        self.single_transition = TransitionBlock(c_single)
+        self.single_transition = make_transition_block(c_single, config=optim)
 
     def forward(
         self,
@@ -157,6 +167,7 @@ class Evoformer(nn.Module):
         cfg: EvoformerConfig,
         pf_cfg: PairFormerConfig,
         template_cfg: TemplateEmbeddingConfig | None = None,
+        optim: OptimConfig | None = None,
     ):
         super().__init__()
         c_msa = cfg.msa_channel
@@ -196,7 +207,7 @@ class Evoformer(nn.Module):
 
         # MSA stack
         self.msa_stack = nn.ModuleList(
-            [EvoformerBlock(c_msa, c_pair, num_msa_heads=8, num_pair_heads=4) for _ in range(cfg.num_layer)]
+            [EvoformerBlock(c_msa, c_pair, num_msa_heads=8, num_pair_heads=4, optim=optim) for _ in range(cfg.num_layer)]
         )
 
         # PairFormer stack
@@ -209,6 +220,7 @@ class Evoformer(nn.Module):
                     num_single_heads=pf_cfg.single_attention_num_head,
                     single_key_dim=pf_cfg.single_key_dim,
                     single_value_dim=pf_cfg.single_value_dim,
+                    optim=optim,
                 )
                 for _ in range(pf_cfg.num_layer)
             ]

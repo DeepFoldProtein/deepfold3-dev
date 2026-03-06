@@ -106,13 +106,13 @@ class DeepFold3(nn.Module):
         )
 
         # Evoformer trunk (with optional template embedding)
-        self.evoformer = Evoformer(ec, pfc, template_cfg=cfg.template)
+        self.evoformer = Evoformer(ec, pfc, template_cfg=cfg.template, optim=cfg.optim)
 
         # Diffusion head
         # rel_feat_dim = rel_pos(66) + rel_token(66) + entity_same(1) + rel_chain(6) = 139
         rel_feat_dim = 2 * (2 * ec.max_relative_idx + 2) + 1 + (2 * ec.max_relative_chain + 2)
         self.diffusion_head = DiffusionHead(
-            dc, c_single=ec.seq_channel, c_pair=ec.pair_channel, rel_feat_dim=rel_feat_dim
+            dc, c_single=ec.seq_channel, c_pair=ec.pair_channel, rel_feat_dim=rel_feat_dim, optim=cfg.optim
         )
 
         # Confidence head

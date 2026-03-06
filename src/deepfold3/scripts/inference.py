@@ -90,6 +90,12 @@ import torch
     type=click.Path(exists=True, path_type=Path),
     help="Local PDB mmCIF mirror directory (layout: {dir}/{mid2}/{id}.cif.gz)",
 )
+@click.option(
+    "--optim",
+    default=None,
+    type=click.Choice(["none", "recommended", "all", "triton"]),
+    help="Optimization backend: none (default), recommended (evo attention + compile), all, triton (fused kernels only)",
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -103,6 +109,7 @@ def inference(
     templates: Path | None,
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
+    optim: str | None,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -144,7 +151,22 @@ def inference(
         raw_params = read_af3_params(params)
         state_dict = haiku_to_torch(raw_params)
 
-    model = DeepFold3()
+    # Build model config with optimization settings
+    from deepfold3.model.config import ModelConfig, OptimConfig
+
+    model_cfg = ModelConfig()
+    if optim == "all":
+        model_cfg.optim = OptimConfig.all_enabled()
+    elif optim == "recommended":
+        model_cfg.optim = OptimConfig.recommended()
+    elif optim == "triton":
+        model_cfg.optim = OptimConfig(use_fused_evo_attention=True, use_fused_transition=True)
+    # else: default OptimConfig (all False)
+
+    if optim and optim != "none":
+        click.echo(f"[inference] optimizations: {optim}")
+
+    model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         click.echo(f"  [WARN] missing keys   : {len(missing)}")
@@ -235,6 +257,17 @@ def inference(
     T = feats.get("template_aatype", torch.zeros(0)).shape[0]
     click.echo(f"  {N} tokens, {S} MSA sequences, {T} templates  ({time.perf_counter() - t0:.1f}s)")
 
+    # Bucket padding for torch.compile efficiency (avoids per-shape recompilation)
+    original_n = N
+    use_bucket = model_cfg.optim.use_torch_compile
+    if use_bucket:
+        from deepfold3.model.bucket import next_bucket, pad_features
+
+        bucket_n = next_bucket(N)
+        if bucket_n > N:
+            feats, original_n = pad_features(feats, bucket_n)
+            click.echo(f"  bucket padding: {N} → {bucket_n} tokens")
+
     # Move to device
     feats = {k: v.to(dev) for k, v in feats.items()}
 
@@ -250,6 +283,14 @@ def inference(
             num_recycles=num_recycles,
             num_samples=num_samples,
         )
+
+    # Remove bucket padding from output and feats
+    if use_bucket and original_n < feats["res_type"].shape[0]:
+        from deepfold3.model.bucket import unpad_features, unpad_output
+
+        model_output = unpad_output(model_output, original_n)
+        feats = unpad_features(feats, original_n)
+
     elapsed = time.perf_counter() - t0
     click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
 

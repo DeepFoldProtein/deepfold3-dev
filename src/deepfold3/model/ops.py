@@ -26,111 +26,82 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 
-class TriangleMulOutgoing(nn.Module):
+class _TriangleMulBase(nn.Module):
+    """Shared base for outgoing/incoming triangle multiplication.
+
+    Subclasses only differ in the einsum contraction equation.
+    """
+
+    _equation: str  # set by subclasses
+
+    def __init__(self, c_z: int, optim: OptimConfig | None = None):
+        super().__init__()
+        self.norm_left = LayerNorm(c_z)
+        self.proj = LinearNoBias(c_z, c_z * 2)
+        self.gate = LinearNoBias(c_z, c_z * 2)
+        self.norm_center = LayerNorm(c_z)
+        self.out_proj = LinearNoBias(c_z, c_z)
+        self.out_gate = LinearNoBias(c_z, c_z)
+        if optim is not None and optim.use_torch_compile:
+            self._compute = torch.compile(self._compute)
+
+    def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        z0 = self.norm_left(z)
+        proj = self.proj(z0)
+        gate = torch.sigmoid(self.gate(z0))
+        out_gate = torch.sigmoid(self.out_gate(z0))
+        del z0
+        proj = proj * gate
+        a = proj[..., 0::2]
+        b = proj[..., 1::2]
+        m = mask.unsqueeze(-1)
+        a = a * m
+        b = b * m
+        act = torch.einsum(self._equation, a, b)
+        act = self.norm_center(act)
+        act = self.out_proj(act)
+        return act * out_gate
+
+    def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: [B?, N, N, c_z]
+            mask: [B?, N, N]
+        Returns:
+            [B?, N, N, c_z]
+        """
+        has_batch = z.dim() == 4
+        if not has_batch:
+            z = z.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+
+        result = self._compute(z, mask)
+
+        if not has_batch:
+            result = result.squeeze(0)
+        return result
+
+
+class TriangleMulOutgoing(_TriangleMulBase):
     """Triangle Multiplication — outgoing (equation: ikc,jkc->ijc).
 
     Haiku module name: triangle_multiplication_outgoing
     """
 
-    def __init__(self, c_z: int):
-        super().__init__()
-        self.norm_left = LayerNorm(c_z)
-        self.proj = LinearNoBias(c_z, c_z * 2)
-        self.gate = LinearNoBias(c_z, c_z * 2)
-        self.norm_center = LayerNorm(c_z)
-        self.out_proj = LinearNoBias(c_z, c_z)
-        self.out_gate = LinearNoBias(c_z, c_z)
-
-    def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B?, N, N, c_z]
-            mask: [B?, N, N]
-        Returns:
-            [B?, N, N, c_z]
-        """
-        has_batch = z.dim() == 4
-        if not has_batch:
-            z = z.unsqueeze(0)
-            mask = mask.unsqueeze(0)
-
-        z0 = self.norm_left(z)
-        proj = self.proj(z0)  # [B, N, N, 2*c_z]
-        gate = torch.sigmoid(self.gate(z0))  # [B, N, N, 2*c_z]
-        out_gate = torch.sigmoid(self.out_gate(z0))  # compute early to free z0
-        del z0
-        proj = proj * gate
-        # INTERLEAVED split (AF3: reshape [2c]->[c,2] then split axis=1)
-        # a gets even channels (0,2,4,...), b gets odd channels (1,3,5,...)
-        a = proj[..., 0::2]  # [B, N, N, c_z]
-        b = proj[..., 1::2]  # [B, N, N, c_z]
-        # apply mask: [B, N, N, 1]
-        m = mask.unsqueeze(-1)
-        a = a * m
-        b = b * m
-        # outgoing: sum over k for each (i,j) → result[b,i,j,c] = Σ_k a[b,i,k,c]*b[b,j,k,c]
-        act = torch.einsum("bikc,bjkc->bijc", a, b)
-        act = self.norm_center(act)
-        act = self.out_proj(act)
-        result = act * out_gate
-
-        if not has_batch:
-            result = result.squeeze(0)
-        return result
+    _equation = "bikc,bjkc->bijc"
 
 
-class TriangleMulIncoming(nn.Module):
+class TriangleMulIncoming(_TriangleMulBase):
     """Triangle Multiplication — incoming (equation: kjc,kic->ijc).
 
     Haiku module name: triangle_multiplication_incoming
     """
 
-    def __init__(self, c_z: int):
-        super().__init__()
-        self.norm_left = LayerNorm(c_z)
-        self.proj = LinearNoBias(c_z, c_z * 2)
-        self.gate = LinearNoBias(c_z, c_z * 2)
-        self.norm_center = LayerNorm(c_z)
-        self.out_proj = LinearNoBias(c_z, c_z)
-        self.out_gate = LinearNoBias(c_z, c_z)
-
-    def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B?, N, N, c_z]
-            mask: [B?, N, N]
-        Returns:
-            [B?, N, N, c_z]
-        """
-        has_batch = z.dim() == 4
-        if not has_batch:
-            z = z.unsqueeze(0)
-            mask = mask.unsqueeze(0)
-
-        z0 = self.norm_left(z)
-        proj = self.proj(z0)
-        gate = torch.sigmoid(self.gate(z0))
-        out_gate = torch.sigmoid(self.out_gate(z0))  # compute early to free z0
-        del z0
-        proj = proj * gate
-        # INTERLEAVED split (AF3: reshape [2c]->[c,2] then split axis=1)
-        a = proj[..., 0::2]  # [B, N, N, c_z]
-        b = proj[..., 1::2]  # [B, N, N, c_z]
-        m = mask.unsqueeze(-1)
-        a = a * m
-        b = b * m
-        # incoming: result[b,i,j,c] = Σ_k a[b,k,j,c]*b[b,k,i,c]
-        act = torch.einsum("bkjc,bkic->bijc", a, b)
-        act = self.norm_center(act)
-        act = self.out_proj(act)
-        result = act * out_gate
-
-        if not has_batch:
-            result = result.squeeze(0)
-        return result
+    _equation = "bkjc,bkic->bijc"
 
 
 class OuterProductMean(nn.Module):
