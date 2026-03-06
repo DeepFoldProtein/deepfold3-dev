@@ -289,8 +289,8 @@ def _build_skeleton_json(
 
     return {
         "name": job_name,
-        "dialect": "alphafold3",
-        "version": 2,
+        "dialect": "deepfold",
+        "version": 3,
         "modelSeeds": [42],
         "sequences": seq_items,
     }

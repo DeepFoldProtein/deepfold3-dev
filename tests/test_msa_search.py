@@ -314,8 +314,8 @@ def test_skeleton_json_output():
 
         data = json.loads(json_path.read_text())
         assert data["name"] == "test_job"
-        assert data["dialect"] == "alphafold3"
-        assert data["version"] == 2
+        assert data["dialect"] == "deepfold"
+        assert data["version"] == 3
         assert data["modelSeeds"] == [42]
         assert len(data["sequences"]) == 2
 
