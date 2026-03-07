@@ -88,6 +88,7 @@ def _cif_quote(value: str) -> str:
 def _build_header(entry_id: str, title: str | None = None) -> str:
     """Build standard mmCIF header categories."""
     title_str = _cif_quote(title) if title else "'DeepFold3 predicted structure'"
+    entry_id = _cif_quote(entry_id)
     return f"""\
 #
 _audit_conform.dict_name       mmcif_pdbx.dic
