@@ -199,7 +199,7 @@ Processes structural templates (known PDB structures similar to the query) into 
 
 **`DiffusionHead.sample()`** -- 200-step reverse process:
 
-1. `t = linspace(0, 1, 201)` -> `sigma = noise_schedule(t)` (cosine schedule with `sigma_data=16.0`)
+1. `t = linspace(0, 1, 201)` -> `sigma = noise_schedule(t)` (cosine schedule with `sigma_data` from `DiffusionConfig`)
 2. Initial noise: `x ~ N(0, smax^2) * atom_mask`, shape `[S, N, M, 3]`
 3. Each step: `_random_augmentation()` -> denoise -> Euler update with stochastic gamma injection
 4. Gamma: `gamma_0=0.8` if `sigma_next > gamma_min=1.0`, else 0 (no stochasticity near convergence)
@@ -271,7 +271,7 @@ The diffusion head implements a 200-step reverse denoising process:
 
 **Noise schedule**: `sigma(t) = sigma_data * (smax^(1/p) + t * (smin^(1/p) - smax^(1/p)))^p`
 
-- `sigma_data=16.0`, `smin=0.0004`, `smax=160.0`, `p=7.0`
+- All parameters (`sigma_data`, `smin`, `smax`, `noise_p`) read from `DiffusionConfig` (defaults: 16.0, 0.0004, 160.0, 7.0)
 
 **Random augmentation** (critical -- applied at every denoising step):
 
