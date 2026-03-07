@@ -66,9 +66,10 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
     if not fig_rows:
         return
 
-    # Build global provider → color mapping so colors are consistent across rows
+    # Build global provider → color mapping (bijective: each label gets a unique color)
     all_providers = sorted({p for _, _, sd in fig_rows for shapes in sd.values() for p in shapes})
-    provider_colors = {p: plt.cm.Set2(i / max(len(all_providers) - 1, 1)) for i, p in enumerate(all_providers)}
+    palette = plt.cm.Set2.colors  # 8 discrete colors
+    provider_colors = {p: palette[i % len(palette)] for i, p in enumerate(all_providers)}
 
     n_rows = len(fig_rows)
     fig, axes = plt.subplots(n_rows, 2, figsize=(16, 4 * n_rows), squeeze=False)
