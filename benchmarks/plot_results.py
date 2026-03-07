@@ -66,6 +66,10 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
     if not fig_rows:
         return
 
+    # Build global provider → color mapping so colors are consistent across rows
+    all_providers = sorted({p for _, _, sd in fig_rows for shapes in sd.values() for p in shapes})
+    provider_colors = {p: plt.cm.Set2(i / max(len(all_providers) - 1, 1)) for i, p in enumerate(all_providers)}
+
     n_rows = len(fig_rows)
     fig, axes = plt.subplots(n_rows, 2, figsize=(16, 4 * n_rows), squeeze=False)
     fig.suptitle(title, fontsize=14, fontweight="bold", y=1.0)
@@ -78,7 +82,6 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
 
         x = np.arange(n_shapes)
         width = 0.8 / max(n_providers, 1)
-        colors = plt.cm.Set2(np.linspace(0, 1, max(n_providers, 1)))
 
         # Time chart
         ax_time = axes[row_idx, 0]
@@ -90,7 +93,7 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
             yerr_hi = [max(hi - t, 0) for t, hi in zip(times, p75, strict=True)]
             has_err = any(lo > 0 or hi > 0 for lo, hi in zip(yerr_lo, yerr_hi, strict=True))
             ax_time.bar(
-                x + i * width - 0.4 + width / 2, times, width, label=prov, color=colors[i],
+                x + i * width - 0.4 + width / 2, times, width, label=prov, color=provider_colors[prov],
                 yerr=[yerr_lo, yerr_hi] if has_err else None, capsize=2, error_kw={"linewidth": 0.8},
             )
         ax_time.set_ylabel("Time (ms)")
@@ -104,7 +107,7 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
         ax_mem = axes[row_idx, 1]
         for i, prov in enumerate(providers):
             mems = [shape_data[sl].get(prov, {}).get("peak_memory_mb", 0) for sl in shape_labels]
-            ax_mem.bar(x + i * width - 0.4 + width / 2, mems, width, label=prov, color=colors[i])
+            ax_mem.bar(x + i * width - 0.4 + width / 2, mems, width, label=prov, color=provider_colors[prov])
         ax_mem.set_ylabel("Peak Memory (MB)")
         ax_mem.set_title(f"{op_name} [{mode}] — Memory")
         ax_mem.set_xticks(x)
