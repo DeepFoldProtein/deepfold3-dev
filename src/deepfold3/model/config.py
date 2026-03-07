@@ -84,6 +84,9 @@ class DiffusionConfig:
     smin: float = 0.0004
     smax: float = 160.0
     noise_p: float = 7.0
+    # Training noise sampling (log-normal): t = sigma_data * exp(p_mean + p_std * z), z ~ N(0,1)
+    p_mean: float = -1.2
+    p_std: float = 1.5
     transformer: DiffusionTransformerConfig = field(default_factory=DiffusionTransformerConfig)
     atom_cross_att: AtomCrossAttConfig = field(default_factory=AtomCrossAttConfig)
 

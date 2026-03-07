@@ -69,6 +69,23 @@ def _random_augmentation(
     return pos * mask_f
 
 
+def _augment_in_place(
+    positions: torch.Tensor,  # [B?, S, N, M, 3]
+    mask: torch.Tensor,  # [B?, N, M] bool
+    generator: torch.Generator | None,
+) -> None:
+    """Apply random augmentation to each sample in-place."""
+    assert positions.dim() in (4, 5), f"Expected 4D or 5D positions, got {positions.dim()}D"
+    S = positions.shape[-4]
+    if positions.dim() == 5:  # [B, S, N, M, 3]
+        for b in range(positions.shape[0]):
+            for s in range(S):
+                positions[b, s] = _random_augmentation(positions[b, s], mask[b], generator)
+    else:  # [S, N, M, 3]
+        for s in range(S):
+            positions[s] = _random_augmentation(positions[s], mask, generator)
+
+
 class DiffusionTransformerBlock(nn.Module):
     """Single AdaLN-zero transformer block for the diffusion model.
 
@@ -340,9 +357,11 @@ class DiffusionConditioningBlock(nn.Module):
         c_pair_out: int,
         c_single_out: int,
         target_feat_dim: int = 447,
+        sigma_data: float = 16.0,
         optim: OptimConfig | None = None,
     ):
         super().__init__()
+        self.sigma_data = sigma_data
         # Pair conditioning
         pair_in = c_pair_in + rel_feat_dim
         self.pair_cond_norm_w = nn.Parameter(torch.ones(pair_in))
@@ -399,9 +418,11 @@ class DiffusionConditioningBlock(nn.Module):
         single_cond = self.single_cond_proj(single_norm)
 
         # Add noise embedding (broadcast to [..., N, 256])
-        noise_emb = self._fourier_noise_embedding(noise_level / 16.0)  # [256]
-        noise_expanded = noise_emb.view(*([1] * (single_cond.dim() - 1)), -1)
-        noise_expanded = noise_expanded.expand(*single_cond.shape[:-1], -1)
+        # noise_level may be scalar or [B] for per-sample noise in training
+        noise_emb = self._fourier_noise_embedding(noise_level / self.sigma_data)  # [..., 256]
+        while noise_emb.dim() < single_cond.dim():
+            noise_emb = noise_emb.unsqueeze(-2)
+        noise_expanded = noise_emb.expand(*single_cond.shape[:-1], -1)
         noise_norm = F.layer_norm(noise_expanded, [noise_emb.shape[-1]]) * self.noise_emb_norm_w
         single_cond = single_cond + self.noise_emb_proj(noise_norm)
 
@@ -416,8 +437,6 @@ class DiffusionHead(nn.Module):
 
     Haiku scope: diffuser~/diffusion_head~/
     """
-
-    SIGMA_DATA = 16.0
 
     def __init__(
         self,
@@ -438,6 +457,7 @@ class DiffusionHead(nn.Module):
             rel_feat_dim=rel_feat_dim,
             c_pair_out=cfg.conditioning_pair_channel,
             c_single_out=cfg.conditioning_seq_channel,
+            sigma_data=cfg.sigma_data,
             optim=optim,
         )
 
@@ -479,25 +499,36 @@ class DiffusionHead(nn.Module):
 
     def denoise(
         self,
-        noisy_pos: torch.Tensor,  # [N, M, 3]
-        noise_level: torch.Tensor,  # scalar
+        noisy_pos: torch.Tensor,  # [B?, N, M, 3]
+        noise_level: torch.Tensor,  # scalar or [B]
         embeddings: dict[str, torch.Tensor],
-        ref_pos: torch.Tensor,  # [N, M, 3]
-        ref_mask: torch.Tensor,  # [N, M]
-        ref_element: torch.Tensor,  # [N, M] int64
-        ref_charge: torch.Tensor,  # [N, M]
-        ref_atom_name_chars: torch.Tensor,  # [N, M, 4] int64
-        seq_mask: torch.Tensor,  # [N]
-        rel_feat: torch.Tensor,  # [N, N, rel_feat_dim]
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M]
+        ref_element: torch.Tensor,  # [B?, N, M] int64
+        ref_charge: torch.Tensor,  # [B?, N, M]
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
+        seq_mask: torch.Tensor,  # [B?, N]
+        rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
     ) -> torch.Tensor:
-        """Run one denoising step. Returns denoised positions [N, M, 3]."""
-        sd = self.SIGMA_DATA
+        """Run one denoising step. Returns denoised positions [B?, N, M, 3].
+
+        Supports both unbatched and batched inputs. The atom encoder/decoder
+        run per-sample (build_atom_subsets is sample-dependent), while the
+        conditioning block and main transformer run batched.
+        """
+        sd = self.cfg.sigma_data
+        has_batch = noisy_pos.dim() == 4  # [B, N, M, 3]
+
+        # Reshape noise_level for broadcasting with position tensors
+        nl = noise_level
+        while nl.dim() < noisy_pos.dim():
+            nl = nl.unsqueeze(-1)
 
         # Scale inputs
         act_pos = noisy_pos * ref_mask.unsqueeze(-1)
-        act_pos = act_pos / (noise_level**2 + sd**2).sqrt()
+        act_pos = act_pos / (nl**2 + sd**2).sqrt()
 
-        # Conditioning
+        # Conditioning (already batch-aware)
         single_cond, pair_cond = self.conditioning(
             single_emb=embeddings["single"],
             pair_emb=embeddings["pair"],
@@ -506,38 +537,54 @@ class DiffusionHead(nn.Module):
             noise_level=noise_level,
         )
 
-        # Atom encoder
-        enc = self.atom_encoder(
-            ref_pos=ref_pos,
-            ref_mask=ref_mask,
-            ref_element=ref_element,
-            ref_charge=ref_charge,
-            ref_atom_name_chars=ref_atom_name_chars,
-            noisy_atom_pos=act_pos,
-            trunk_single=embeddings["single"],
-            trunk_pair=pair_cond,
-        )
-        act = enc.token_act.float()
+        # Atom encoder: per-sample (build_atom_subsets is sample-dependent)
+        if has_batch:
+            B = noisy_pos.shape[0]
+            enc_list = []
+            for b in range(B):
+                enc_b = self.atom_encoder(
+                    ref_pos=ref_pos[b], ref_mask=ref_mask[b], ref_element=ref_element[b],
+                    ref_charge=ref_charge[b], ref_atom_name_chars=ref_atom_name_chars[b],
+                    noisy_atom_pos=act_pos[b],
+                    trunk_single=embeddings["single"][b], trunk_pair=pair_cond[b],
+                )
+                enc_list.append(enc_b)
+            act = torch.stack([e.token_act for e in enc_list]).float()
+        else:
+            enc = self.atom_encoder(
+                ref_pos=ref_pos, ref_mask=ref_mask, ref_element=ref_element,
+                ref_charge=ref_charge, ref_atom_name_chars=ref_atom_name_chars,
+                noisy_atom_pos=act_pos,
+                trunk_single=embeddings["single"], trunk_pair=pair_cond,
+            )
+            act = enc.token_act.float()
 
         # Add trunk single conditioning to token activations
         sc_norm = F.layer_norm(single_cond, [single_cond.shape[-1]]) * self.single_cond_emb_norm_w
         act = act + self.single_cond_embedding_projection(sc_norm)
 
-        # Main transformer
+        # Main transformer (already batch-aware)
         act = self.transformer(act, seq_mask, single_cond, pair_cond)
 
-        # Atom decoder
-        pos_update = self.atom_decoder(act, enc)  # [N, M, 3]
+        # Atom decoder: per-sample
+        if has_batch:
+            pos_updates = []
+            for b in range(B):
+                pos_updates.append(self.atom_decoder(act[b], enc_list[b]))
+            pos_update = torch.stack(pos_updates)
+        else:
+            pos_update = self.atom_decoder(act, enc)
 
         # Combine skip + update (AF3 EDM-style)
-        skip_scaling = sd**2 / (noise_level**2 + sd**2)
-        out_scaling = noise_level * sd / (noise_level**2 + sd**2).sqrt()
+        skip_scaling = sd**2 / (nl**2 + sd**2)
+        out_scaling = nl * sd / (nl**2 + sd**2).sqrt()
         result = skip_scaling * noisy_pos + out_scaling * pos_update
         return result * ref_mask.unsqueeze(-1)
 
-    @torch.no_grad()
-    def sample(
+    def _denoise_samples(
         self,
+        noisy_pos: torch.Tensor,  # [B?, S, N, M, 3]
+        noise_level: torch.Tensor,  # scalar or [B?, S]
         embeddings: dict[str, torch.Tensor],
         ref_pos: torch.Tensor,
         ref_mask: torch.Tensor,
@@ -546,60 +593,16 @@ class DiffusionHead(nn.Module):
         ref_atom_name_chars: torch.Tensor,
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
-        generator: torch.Generator | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Draw samples from the diffusion model (Euler-Maruyama sampler).
-
-        Returns:
-            dict with 'atom_positions' [num_samples, N, M, 3]
-                  and 'mask' [num_samples, N, M]
-        """
-        cfg = self.cfg
-        N, M = ref_mask.shape
-        device = ref_mask.device
-
-        noise_levels = noise_schedule(
-            torch.linspace(0, 1, cfg.steps + 1, device=device),
-            sigma_data=cfg.sigma_data,
-            smin=cfg.smin,
-            smax=cfg.smax,
-            p=cfg.noise_p,
-        )
-
-        # Initialize from pure noise
-        positions = torch.randn(cfg.num_samples, N, M, 3, device=device, generator=generator)
-        positions = positions * noise_levels[0]
-
-        noise_levels_prev = noise_levels[:-1]
-        noise_levels_next = noise_levels[1:]
-
-        for step in range(cfg.steps):
-            sigma_prev = noise_levels_prev[step]
-            sigma_next = noise_levels_next[step]
-
-            # Random augmentation per sample — required for AF3 equivalence.
-            # The model was trained with random center/rotate/translate at every
-            # denoising step; without this the positions are in a fixed frame
-            # and the denoiser produces garbage.
-            for s in range(cfg.num_samples):
-                positions[s] = _random_augmentation(positions[s], ref_mask.bool(), generator)
-
-            # Stochastic gamma step.
-            # AF3 checks sigma_next (the target level), not sigma_prev.
-            gamma = cfg.gamma_0 if sigma_next > cfg.gamma_min else 0.0
-            sigma_hat = sigma_prev * (1 + gamma)
-
-            # Add noise
-            noise_scale = cfg.noise_scale * (sigma_hat**2 - sigma_prev**2).sqrt()
-            noise = noise_scale * torch.randn_like(positions, generator=generator)
-            positions_hat = positions + noise
-
-            # Denoise each sample
-            denoised_list = []
-            for s in range(cfg.num_samples):
-                denoised = self.denoise(
-                    noisy_pos=positions_hat[s],
-                    noise_level=sigma_hat,
+    ) -> torch.Tensor:
+        """Denoise each sample independently. Returns [B?, S, N, M, 3]."""
+        S = noisy_pos.shape[-4]
+        results = []
+        for s in range(S):
+            nl_s = noise_level if noise_level.dim() == 0 else noise_level[..., s]
+            results.append(
+                self.denoise(
+                    noisy_pos=noisy_pos[..., s, :, :, :],
+                    noise_level=nl_s,
                     embeddings=embeddings,
                     ref_pos=ref_pos,
                     ref_mask=ref_mask,
@@ -609,16 +612,121 @@ class DiffusionHead(nn.Module):
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
                 )
-                denoised_list.append(denoised)
-            denoised_all = torch.stack(denoised_list, dim=0)  # [S, N, M, 3]
+            )
+        return torch.stack(results, dim=-4)
 
-            # Euler step
-            grad = (positions_hat - denoised_all) / sigma_hat
+    @torch.no_grad()
+    def sample(
+        self,
+        embeddings: dict[str, torch.Tensor],
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M]
+        ref_element: torch.Tensor,  # [B?, N, M]
+        ref_charge: torch.Tensor,  # [B?, N, M]
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4]
+        seq_mask: torch.Tensor,  # [B?, N]
+        rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
+        generator: torch.Generator | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Draw samples from the diffusion model (Euler-Maruyama sampler).
+
+        Supports both unbatched and batched inputs. For unbatched inputs,
+        returns 'atom_positions' [S, N, M, 3] and 'mask' [S, N, M].
+        For batched inputs, returns [B, S, N, M, 3] and [B, S, N, M].
+        """
+        cfg = self.cfg
+        N, M = ref_mask.shape[-2:]
+        device = ref_mask.device
+        batch_shape = ref_mask.shape[:-2]  # () or (B,)
+
+        noise_levels = noise_schedule(
+            torch.linspace(0, 1, cfg.steps + 1, device=device),
+            sigma_data=cfg.sigma_data,
+            smin=cfg.smin,
+            smax=cfg.smax,
+            p=cfg.noise_p,
+        )
+
+        # Initialize from pure noise: [B?, S, N, M, 3]
+        positions = torch.randn(*batch_shape, cfg.num_samples, N, M, 3, device=device, generator=generator)
+        positions = positions * noise_levels[0]
+        aug_mask = ref_mask.bool()
+
+        for step in range(cfg.steps):
+            sigma_prev = noise_levels[step]
+            sigma_next = noise_levels[step + 1]
+
+            # Random augmentation per sample — required for AF3 equivalence.
+            _augment_in_place(positions, aug_mask, generator)
+
+            # Stochastic gamma step.
+            gamma = cfg.gamma_0 if sigma_next > cfg.gamma_min else 0.0
+            sigma_hat = sigma_prev * (1 + gamma)
+
+            # Add noise
+            noise_scale = cfg.noise_scale * (sigma_hat**2 - sigma_prev**2).sqrt()
+            positions_hat = positions + noise_scale * torch.randn_like(positions, generator=generator)
+
+            # Denoise + Euler step
+            denoised = self._denoise_samples(
+                positions_hat, sigma_hat, embeddings,
+                ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars,
+                seq_mask, rel_feat,
+            )
             d_t = sigma_next - sigma_hat
-            positions = positions_hat + cfg.step_scale * d_t * grad
+            positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
 
-        mask_expanded = ref_mask.unsqueeze(0).expand(cfg.num_samples, -1, -1)
+        mask_expanded = ref_mask.unsqueeze(-3).expand(*batch_shape, cfg.num_samples, N, M)
         return {
             "atom_positions": positions,
             "mask": mask_expanded,
         }
+
+    def sample_training(
+        self,
+        gt_positions: torch.Tensor,  # [B?, N, M, 3]
+        gt_mask: torch.Tensor,  # [B?, N, M]
+        embeddings: dict[str, torch.Tensor],
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M]
+        ref_element: torch.Tensor,  # [B?, N, M]
+        ref_charge: torch.Tensor,  # [B?, N, M]
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4]
+        seq_mask: torch.Tensor,  # [B?, N]
+        rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
+        num_samples: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Training forward: augment GT, add noise, denoise once (AF3 §3.7.3).
+
+        Returns:
+            gt_augmented: Augmented ground truth [B?, S, N, M, 3].
+            denoised: Denoised predictions [B?, S, N, M, 3].
+            noise_levels: Sampled noise levels [B?, S].
+        """
+        cfg = self.cfg
+        batch_shape = gt_positions.shape[:-3]  # () or (B,)
+        device = gt_positions.device
+
+        # Augment ground truth: expand to S copies, augment each independently
+        gt_aug = gt_positions.unsqueeze(-4).expand(*batch_shape, num_samples, *gt_positions.shape[-3:]).clone()
+        _augment_in_place(gt_aug, gt_mask.bool(), generator=None)
+
+        # Sample noise levels from log-normal: t = sigma_data * exp(p_mean + p_std * z)
+        noise_levels = cfg.sigma_data * torch.exp(
+            cfg.p_mean + cfg.p_std * torch.randn(*batch_shape, num_samples, device=device)
+        )  # [B?, S]
+
+        # Add noise
+        nl = noise_levels
+        while nl.dim() < gt_aug.dim():
+            nl = nl.unsqueeze(-1)
+        noisy_pos = gt_aug + torch.randn_like(gt_aug) * nl  # [B?, S, N, M, 3]
+
+        # Denoise
+        denoised = self._denoise_samples(
+            noisy_pos, noise_levels, embeddings,
+            ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars,
+            seq_mask, rel_feat,
+        )
+
+        return gt_aug, denoised, noise_levels
