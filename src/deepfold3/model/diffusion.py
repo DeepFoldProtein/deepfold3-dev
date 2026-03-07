@@ -107,6 +107,7 @@ class DiffusionTransformerBlock(nn.Module):
         key_dim: int | None = None,
         value_dim: int | None = None,
         num_intermediate_factor: int = 2,
+        optim: OptimConfig | None = None,
     ):
         super().__init__()
         # AF3: key_dim/value_dim default to c (num_channels) when None
@@ -149,21 +150,16 @@ class DiffusionTransformerBlock(nn.Module):
         nn.init.zeros_(self.ffn_zero_cond.weight)
         nn.init.constant_(self.ffn_zero_cond.bias, -2.0)
 
-    def forward(
-        self,
-        x: torch.Tensor,  # [B?, N, c]
-        mask: torch.Tensor,  # [B?, N]
-        single_cond: torch.Tensor,  # [B?, N, c_single_cond]
-        pair_logits: torch.Tensor | None,  # [B?, H, N, N]
-    ) -> torch.Tensor:
-        has_batch = x.dim() == 3
-        if not has_batch:
-            x = x.unsqueeze(0)
-            mask = mask.unsqueeze(0)
-            single_cond = single_cond.unsqueeze(0)
-            if pair_logits is not None:
-                pair_logits = pair_logits.unsqueeze(0)
+        if optim is not None and optim.use_torch_compile:
+            self._compute = torch.compile(self._compute)
 
+    def _compute(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        single_cond: torch.Tensor,
+        pair_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
         B, N, C = x.shape
         Cs = single_cond.shape[-1]
         H = self.num_heads
@@ -209,7 +205,24 @@ class DiffusionTransformerBlock(nn.Module):
         ff = F.silu(a) * b
         ff_out = self.ffn_linear2(ff)
         gate = torch.sigmoid(self.ffn_zero_cond(single_cond))
-        x = x + gate * ff_out
+        return x + gate * ff_out
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [B?, N, c]
+        mask: torch.Tensor,  # [B?, N]
+        single_cond: torch.Tensor,  # [B?, N, c_single_cond]
+        pair_logits: torch.Tensor | None,  # [B?, H, N, N]
+    ) -> torch.Tensor:
+        has_batch = x.dim() == 3
+        if not has_batch:
+            x = x.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+            single_cond = single_cond.unsqueeze(0)
+            if pair_logits is not None:
+                pair_logits = pair_logits.unsqueeze(0)
+
+        x = self._compute(x, mask, single_cond, pair_logits)
 
         if not has_batch:
             x = x.squeeze(0)
@@ -242,6 +255,7 @@ class DiffusionTransformer(nn.Module):
         num_intermediate_factor: int = 2,
         super_block_size: int = 4,
         c_pair: int = 128,
+        optim: OptimConfig | None = None,
     ):
         super().__init__()
         assert num_blocks % super_block_size == 0
@@ -258,7 +272,9 @@ class DiffusionTransformer(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DiffusionTransformerBlock(c, c_single_cond, num_heads, key_dim, value_dim, num_intermediate_factor)
+                DiffusionTransformerBlock(
+                    c, c_single_cond, num_heads, key_dim, value_dim, num_intermediate_factor, optim=optim
+                )
                 for _ in range(num_blocks)
             ]
         )
@@ -450,6 +466,7 @@ class DiffusionHead(nn.Module):
             num_intermediate_factor=cfg.transformer.num_intermediate_factor,
             super_block_size=cfg.transformer.super_block_size,
             c_pair=cfg.conditioning_pair_channel,
+            optim=optim,
         )
 
         # Atom decoder

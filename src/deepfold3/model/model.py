@@ -371,8 +371,7 @@ class DeepFold3(nn.Module):
             parts.append(del_val)
         else:
             # No MSA: deletions are zero
-            parts.append(torch.zeros(S, N, 1, device=msa.device))
-            parts.append(torch.zeros(S, N, 1, device=msa.device))
+            parts.append(torch.zeros(S, N, 2, device=msa.device))
 
         return torch.cat(parts, dim=-1)  # [S, N, 34]
 

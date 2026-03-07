@@ -201,7 +201,6 @@ class InferenceInput:
             dict[str, torch.Tensor] ready for model.forward().
         """
         from deepfold3.data.parse.json_input import parse_json_input
-        from deepfold3.data.parse.templates import TemplateHitInput, template_hit_input_to_features
 
         json_path = Path(json_path)
         jobs = parse_json_input(
@@ -211,7 +210,26 @@ class InferenceInput:
         if job_index >= len(jobs):
             raise IndexError(f"Job index {job_index} out of range (file has {len(jobs)} jobs)")
 
-        job = jobs[job_index]
+        return InferenceInput.from_job(jobs[job_index], max_msa_seqs=max_msa_seqs)
+
+    @staticmethod
+    def from_job(
+        job,
+        max_msa_seqs: int = const.MAX_MSA_ROWS,
+    ) -> dict[str, torch.Tensor]:
+        """Build features from a pre-parsed JobInput object.
+
+        Use this to avoid double-parsing when you already have a JobInput
+        (e.g., from ``parse_json_input()``).
+
+        Args:
+            job: A ``JobInput`` from ``parse_json_input()``.
+            max_msa_seqs: Maximum MSA sequences to keep.
+
+        Returns:
+            dict[str, torch.Tensor] ready for model.forward().
+        """
+        from deepfold3.data.parse.templates import TemplateHitInput, template_hit_input_to_features
 
         # Collect all polymer chains in order: protein, DNA, RNA
         # Each entry: (sequence, mol_type, paired_msa, unpaired_msa, template_hits)

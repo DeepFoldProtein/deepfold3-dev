@@ -160,7 +160,7 @@ def inference(
     elif optim == "recommended":
         model_cfg.optim = OptimConfig.recommended()
     elif optim == "triton":
-        model_cfg.optim = OptimConfig(use_fused_evo_attention=True, use_fused_transition=True)
+        model_cfg.optim = OptimConfig.triton_only()
     # else: default OptimConfig (all False)
 
     if optim and optim != "none":
@@ -188,7 +188,7 @@ def inference(
         click.echo(f"[inference] featurizing {json_input} …")
         from deepfold3.data.parse.json_input import parse_json_input
 
-        jobs = parse_json_input(json_input, template_cache_dir=template_cache)
+        jobs = parse_json_input(json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir)
         if not jobs:
             raise click.UsageError("No jobs found in JSON input")
         job = jobs[0]
@@ -221,11 +221,7 @@ def inference(
         if desc_map:
             entity_descriptions = desc_map
 
-        feats = InferenceInput.from_json(
-            json_input,
-            template_cache_dir=template_cache,
-            pdb_mmcif_dir=pdb_mmcif_dir,
-        )
+        feats = InferenceInput.from_job(job)
     else:
         click.echo(f"[inference] featurizing {msa} …")
         a3m_text = msa.read_text()
@@ -276,7 +272,7 @@ def inference(
     # ------------------------------------------------------------------
     click.echo(f"[inference] running model  (recycles={num_recycles}, samples={num_samples}, seed={seed}) …")
     t0 = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         model_output = model(
             feats,
             seed=seed,
