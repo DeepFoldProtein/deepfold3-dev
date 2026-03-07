@@ -5,41 +5,49 @@ operations. All Triton kernels are self-contained under `src/deepfold3/model/tri
 
 Optimizations are toggled via `OptimConfig` — each can be independently enabled or disabled.
 
-## Benchmark Results (RTX 5090, bf16)
+## Benchmark Results (RTX 5090, bf16, 2026-03-07)
 
 ### Winners (enabled by `--optim recommended`)
 
-| Optimization | Speedup | Memory Savings | Where Used | Count |
+| Optimization | Speedup (full) | Memory Savings (full) | Where Used | Count |
 |---|---|---|---|---|
-| **Triton EvoAttention (Grid)** | **4-9x time** | **3-10x memory** | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
-| **torch.compile (TriangleMul)** | 1.3-1.6x fwd | 1.1-1.2x fwd mem | EvoformerBlock + PairFormerBlock | 104 modules |
-| **torch.compile (MSAAttention)** | 1.4-2.7x fwd | 1.6-2.4x mem | EvoformerBlock (x4) | 4 modules |
-| **torch.compile (SingleAttention)** | 1.3-1.7x time | 1.0-1.3x mem | PairFormerBlock (x48) | 48 modules |
+| **Triton EvoAttention (Grid)** | **2-3x** (raw kernel 4-9x) | **2-5x** (raw 3-10x) | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
+| **torch.compile (TriangleMul)** | 1.25-1.55x | ~1.0x | EvoformerBlock + PairFormerBlock | 104 modules |
+| **torch.compile (MSAAttention)** | 1.5-2.3x | 1.6-2.3x | EvoformerBlock (×4) | 4 modules |
+| **torch.compile (SingleAttention)** | 1.3-1.4x | ~1.0x | PairFormerBlock (×48) | 48 modules |
 
 ### Conditional winners (enabled by `--optim all`)
 
 | Optimization | Speedup | Condition |
 |---|---|---|
-| **Triton FusedTransition (C=384)** | 1.2-1.3x full | Only beneficial for C >= 256; C=64/128 is slower |
-| **Triton LayerNormLinear (C=384)** | 1.1-1.4x full | Composited inside FusedTransitionBlock |
+| **Triton FusedTransition (C=384)** | 1.2-1.3x full | Only beneficial at C≥256 and N≥1024; smaller shapes are slower |
+| **Triton LayerNormLinear (C=384)** | 1.1-1.2x full | Composited inside FusedTransitionBlock; marginal standalone |
 
 ### Not recommended (removed from config)
 
 | Optimization | Result | Reason |
 |---|---|---|
+| Triton EvoAttention (Single) | 0.87-1.03x (slower) | N=1 sequence dim → kernel overhead dominates; torch.compile is better |
 | torch.compile (LayerNorm) | 0.3x (3x slower) | Inductor overhead dominates tiny kernel |
 | torch.compile (LinearNoBias) | 0.3-0.5x (slower) | cuBLAS already optimal |
-| torch.compile (TransitionBlock) | 0.7-0.9x (slower) | Overhead > gain for small shapes |
-| Triton FusedTransition (C=64/128) | 0.5-0.8x (slower) | Shapes too small for Triton overhead |
+| torch.compile (TransitionBlock) | 0.75-0.98x (slower) | Overhead > gain for most shapes |
+| torch.compile (AdaTransitionBlock) | 0.96-1.02x (neutral) | No meaningful benefit |
+| torch.compile (OuterProductMean) | 1.06-1.25x (marginal) | Minimal speedup, not worth compile cost |
+| Triton FusedTransition (C=64/128) | 0.8-1.0x (slower) | Shapes too small for Triton overhead |
+| Triton SwiGLU | 0.73-0.92x (slower) | Kernel launch overhead; 1.4-2.3x memory savings but time regression |
 
 ### Key Insight
 
-The **dominant optimization** is Triton EvoAttention for GridSelfAttention — it's 4-9x
-faster and 3-10x less memory. This covers 104 pair attention modules (the N^2 bottleneck).
-Everything else is marginal in comparison.
+The **dominant optimization** is Triton EvoAttention for GridSelfAttention — the integrated
+module is 2-3x faster with 2-5x less memory (raw kernel: 4-9x time, 3-10x memory). This
+covers 104 pair attention modules (the N² bottleneck). Everything else is marginal.
 
-`torch.compile` helps for attention and TriangleMul (1.3-2.7x) but hurts for small
-primitives (LN, Linear). It is applied selectively at the module level.
+`torch.compile` helps for MSAAttention (1.5-2.3x), TriangleMul (1.3-1.6x), and
+SingleAttention (1.3-1.4x) but hurts for small primitives (LN, Linear) and transitions.
+It is applied selectively at the module level.
+
+**Important**: Triton EvoAttention is NOT beneficial for SingleAttention (N_seq=1 makes
+the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 
 ## Available Backends
 
@@ -129,11 +137,13 @@ DeepFold3(cfg.optim)
             -> GridSelfAttention(optim)     # Triton EvoAttention (4-9x)
             -> TriangleMulOutgoing(optim)   # torch.compile (1.3-1.6x)
             -> TriangleMulIncoming(optim)   # torch.compile (1.3-1.6x)
-            -> SingleAttention(optim)       # Triton EvoAttention or torch.compile
+            -> SingleAttention(optim)       # torch.compile only (1.3-1.4x)
             -> make_transition_block(optim) # FusedTransition (C>=256 only)
   -> DiffusionHead(optim)
        -> DiffusionConditioningBlock(optim)
             -> make_transition_block(optim)
+       -> DiffusionTransformer(optim)
+            -> DiffusionTransformerBlock(optim) # torch.compile (×24, 4800 calls/sample)
 ```
 
 ### FusedTransition min-channels guard
@@ -173,10 +183,12 @@ materializing the N^2 attention matrix.
 - **Column attention**: transposed — `N_seq = N` columns, each attending over `N_res = N` rows
 - **Pair bias**: `[B, 1, H, N, N]` — shared across all rows/columns within a batch
 
-### SingleAttention (EvoAttention or compile)
+### SingleAttention (torch.compile only)
 
-SingleAttention uses EvoAttention with `N_seq = 1` (single sequence). If EvoAttention
-is unavailable, falls back to `torch.compile` on the baseline path (1.3-1.7x speedup).
+SingleAttention previously used EvoAttention with `N_seq = 1`, but benchmarks show
+this is 0.87-1.03x (slower or neutral) due to kernel launch overhead dominating the
+single-sequence case. `torch.compile` on the baseline path gives 1.3-1.4x speedup and
+is now the only optimization applied.
 
 ---
 

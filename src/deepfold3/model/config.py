@@ -145,10 +145,11 @@ class OptimConfig:
     corresponding Triton/fused kernel if available; silently falls back
     to baseline if the backend is not installed.
 
-    Benchmark results (RTX 5090, bf16):
-    - use_fused_evo_attention: 4-9x faster, 3-10x less memory for GridSelfAttention (104 modules)
-    - use_torch_compile: 1.3-2.7x faster for attention + TriangleMul (156 modules)
-    - use_fused_transition: 1.2-1.3x faster for C>=256 transitions only (48 modules)
+    Benchmark results (RTX 5090, bf16, 2026-03-07):
+    - use_fused_evo_attention: 2-3x faster, 2-5x less memory for GridSelfAttention (104 modules)
+    - use_torch_compile: 1.3-2.3x faster for MSAAttention/SingleAttention/TriangleMul (156 modules)
+    - use_fused_transition: 1.2-1.3x faster for C>=256 + N>=1024 transitions only
+    Note: Triton EvoAttention is NOT used for SingleAttention (N_seq=1 overhead dominates).
     """
 
     use_fused_evo_attention: bool = False
@@ -159,6 +160,11 @@ class OptimConfig:
     def recommended(cls) -> OptimConfig:
         """Fused evo attention + torch.compile — the two biggest wins."""
         return cls(use_fused_evo_attention=True, use_torch_compile=True)
+
+    @classmethod
+    def triton_only(cls) -> OptimConfig:
+        """Triton fused kernels only (no torch.compile)."""
+        return cls(use_fused_evo_attention=True, use_fused_transition=True)
 
     @classmethod
     def all_enabled(cls) -> OptimConfig:

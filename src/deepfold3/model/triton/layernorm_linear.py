@@ -25,18 +25,12 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _calculate_settings(n: int) -> tuple[int, int]:
-    """Calculate BLOCK_SIZE (next power of 2) and num_warps for a given dimension."""
-    block_size = max(triton.next_power_of_2(n), 16)
-    num_warps = min(max(block_size // 256, 1), 8)
-    return block_size, num_warps
+from deepfold3.model.triton import calculate_settings as _calculate_settings
+from deepfold3.model.triton.tuning import DEFAULT_CONFIG
 
 
 def _is_cuda() -> bool:
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
-
-
-DEFAULT_CONFIG = (16, 16, 16, 8, 1, 8, 255)
 
 
 if HAS_TRITON:

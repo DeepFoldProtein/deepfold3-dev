@@ -217,7 +217,6 @@ dev = [
     { name = "ruff" },
 ]
 optim = [
-    { name = "matplotlib" },
     { name = "triton" },
 ]
 
@@ -242,10 +241,7 @@ dev = [
     { name = "pytest-timeout", specifier = ">=2.3.0" },
     { name = "ruff", specifier = ">=0.9.4" },
 ]
-optim = [
-    { name = "matplotlib", specifier = ">=3.9.0" },
-    { name = "triton", specifier = ">=3.0.0" },
-]
+optim = [{ name = "triton", specifier = ">=3.0.0" }]
 
 [[package]]
 name = "filelock"

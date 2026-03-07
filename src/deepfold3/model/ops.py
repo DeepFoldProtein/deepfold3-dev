@@ -146,7 +146,8 @@ class OuterProductMean(nn.Module):
         act = torch.einsum("bijef,efc->bijc", ab, self.out_w) + self.out_b
         # normalize by number of valid sequence positions
         eps = 1e-3
-        norm = torch.einsum("bsi,bsj->bij", mask.float(), mask.float())
+        mask_f = mask.float()
+        norm = torch.einsum("bsi,bsj->bij", mask_f, mask_f)
         result = act / (eps + norm.unsqueeze(-1))
 
         if not has_batch:

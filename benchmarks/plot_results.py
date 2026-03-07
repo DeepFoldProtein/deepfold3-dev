@@ -29,15 +29,16 @@ def load_results(filename: str) -> list[dict]:
 
 
 def _shape_label(shape: dict) -> str:
-    """Compact shape label for x-axis (no rotation needed)."""
-    # Primary dimension is N (tokens/rows)
-    n = shape.get("N", "")
-    parts = [str(n)]
+    """Compact shape label for x-axis showing key=value pairs."""
+    # Primary dimension N first, then remaining keys sorted
+    parts = []
+    if "N" in shape:
+        parts.append(f"N={shape['N']}")
     for k in sorted(shape):
         if k == "N":
             continue
-        parts.append(f"{shape[k]}")
-    # e.g. "256/128" or "256/384/16"
+        parts.append(f"{k}={shape[k]}")
+    # e.g. "N=256/C=128" or "N=256/C=384/H=16"
     return "/".join(parts)
 
 
@@ -57,13 +58,10 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
     for (op_name, mode), entries in sorted(groups.items()):
         # Group by shape, collect providers
         shape_data = defaultdict(dict)
-        shape_keys = None
         for e in entries:
             sl = _shape_label(e["shape"])
             shape_data[sl][e["provider"]] = e
-            if shape_keys is None:
-                shape_keys = "/".join(sorted(e["shape"].keys()))
-        fig_rows.append((op_name, mode, shape_data, shape_keys or ""))
+        fig_rows.append((op_name, mode, shape_data))
 
     if not fig_rows:
         return
@@ -72,7 +70,7 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
     fig, axes = plt.subplots(n_rows, 2, figsize=(16, 4 * n_rows), squeeze=False)
     fig.suptitle(title, fontsize=14, fontweight="bold", y=1.0)
 
-    for row_idx, (op_name, mode, shape_data, shape_keys) in enumerate(fig_rows):
+    for row_idx, (op_name, mode, shape_data) in enumerate(fig_rows):
         shape_labels = list(shape_data.keys())
         providers = sorted({p for sd in shape_data.values() for p in sd})
         n_shapes = len(shape_labels)
@@ -98,8 +96,8 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
         ax_time.set_ylabel("Time (ms)")
         ax_time.set_title(f"{op_name} [{mode}] — Time")
         ax_time.set_xticks(x)
-        ax_time.set_xticklabels(shape_labels, fontsize=8)
-        ax_time.set_xlabel(shape_keys, fontsize=8)
+        ax_time.set_xticklabels(shape_labels, fontsize=7, rotation=20, ha="right")
+        ax_time.set_xlabel("")
         ax_time.legend(fontsize=8)
 
         # Memory chart
@@ -110,8 +108,8 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
         ax_mem.set_ylabel("Peak Memory (MB)")
         ax_mem.set_title(f"{op_name} [{mode}] — Memory")
         ax_mem.set_xticks(x)
-        ax_mem.set_xticklabels(shape_labels, fontsize=8)
-        ax_mem.set_xlabel(shape_keys, fontsize=8)
+        ax_mem.set_xticklabels(shape_labels, fontsize=7, rotation=20, ha="right")
+        ax_mem.set_xlabel("")
         ax_mem.legend(fontsize=8)
 
     plt.tight_layout()

@@ -106,7 +106,11 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
         mask = torch.ones(N, N, device=DEVICE, dtype=DTYPE)
         do = torch.randn_like(z)
 
-        results.extend(_bench_grid_pytorch(attn, z, mask, do, shape, warmup, rep))
+        try:
+            results.extend(_bench_grid_pytorch(attn, z, mask, do, shape, warmup, rep))
+        except torch.OutOfMemoryError:
+            print(f"  [skip] PyTorch GridSelfAttention OOM (N={N})")
+            _free_gpu()
 
         # --- Integrated: GridSelfAttention(optim=OptimConfig(use_torch_compile=True)) ---
         try:
@@ -120,6 +124,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
             del attn_comp, z_comp
         except Exception as e:
             print(f"  [skip] torch.compile GridSelfAttention failed (N={N}): {e}")
+            _free_gpu()
 
         # --- Integrated: GridSelfAttention(optim=OptimConfig(use_fused_evo_attention=True)) ---
         if _EvoformerAttention is not None:
@@ -137,6 +142,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
                 del attn_fused, z_fused
             except Exception as e:
                 print(f"  [skip] Triton GridSelfAttention failed (N={N}): {e}")
+                _free_gpu()
 
         del attn, z, mask, do
         _free_gpu()
@@ -158,6 +164,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
                 )
             except Exception as e:
                 print(f"  [skip] Triton raw FusedEvoAttention failed (N={N}): {e}")
+                _free_gpu()
             del q, k, v, rm, pb, do_t
 
         _free_gpu()
@@ -235,10 +242,6 @@ def bench_single_attention(shapes: list[dict], warmup: int, rep: int) -> list[Be
     from deepfold3.model.attention import SingleAttention
     from deepfold3.model.config import OptimConfig
 
-    _EvoformerAttention = try_import(  # noqa: N806
-        "deepfold3.model.triton.evo_attention", "_EvoformerAttention"
-    )
-
     results = []
     for shape in shapes:
         N, C, H = shape["N"], shape["C"], shape["H"]
@@ -254,6 +257,8 @@ def bench_single_attention(shapes: list[dict], warmup: int, rep: int) -> list[Be
         results.extend(_bench_single_pytorch(attn, x, mask, pair_logits, do, shape, warmup, rep))
 
         # --- Integrated: SingleAttention(optim=OptimConfig(use_torch_compile=True)) ---
+        # Note: Triton EvoAttention is NOT benchmarked for SingleAttention — it's slower
+        # than baseline (0.87-1.03x) due to N_seq=1 kernel overhead. torch.compile is better.
         try:
             optim_compile = OptimConfig(use_torch_compile=True)
             attn_c = SingleAttention(C, num_heads=H, optim=optim_compile).to(DEVICE, DTYPE).eval()
@@ -267,27 +272,7 @@ def bench_single_attention(shapes: list[dict], warmup: int, rep: int) -> list[Be
         except Exception as e:
             print(f"  [skip] torch.compile SingleAttention failed (N={N}): {e}")
 
-        del attn
-        _free_gpu()
-
-        # --- Integrated: SingleAttention(optim=OptimConfig(use_fused_evo_attention=True)) ---
-        if _EvoformerAttention is not None:
-            optim_evo = OptimConfig(use_fused_evo_attention=True)
-            attn_fused = SingleAttention(C, num_heads=H, optim=optim_evo).to(DEVICE, DTYPE).eval()
-            x2 = x.detach().clone().requires_grad_(True)
-            try:
-                attn_fused(x2.detach(), mask, pair_logits)  # smoke test
-                triton_results = _bench_single_pytorch(attn_fused, x2, mask, pair_logits, do, shape, warmup, rep)
-                for r in triton_results:
-                    r.provider = "triton"
-                results.extend(triton_results)
-            except Exception as e:
-                print(f"  [skip] Triton SingleAttention failed (N={N}): {e}")
-            del attn_fused, x2
-        else:
-            print(f"  [skip] Triton EvoAttention not available for SingleAttention (N={N})")
-
-        del x, mask, pair_logits, do
+        del attn, x, mask, pair_logits, do
         _free_gpu()
         print(f"  SingleAttention N={N} C={C} done")
 

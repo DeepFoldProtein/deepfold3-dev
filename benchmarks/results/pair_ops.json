@@ -3,264 +3,1248 @@
     "op_name": "TriangleMulOutgoing",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.11884800344705582,
-    "peak_memory_mb": 16.26708984375,
+    "time_ms": 0.17945599555969238,
+    "peak_memory_mb": 84.91015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.00980156015432624,
-    "time_p25_ms": 0.11542399972677231,
-    "time_p75_ms": 0.1318719983100891,
+    "time_std_ms": 0.0026831067055192235,
+    "time_p25_ms": 0.17839999496936798,
+    "time_p75_ms": 0.1807039976119995,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.5386559963226318,
-    "peak_memory_mb": 16.2763671875,
+    "time_ms": 0.6479359865188599,
+    "peak_memory_mb": 153.16015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.04140182294662306,
-    "time_p25_ms": 0.5286080241203308,
-    "time_p75_ms": 0.541375994682312,
+    "time_std_ms": 0.0033602577878079566,
+    "time_p25_ms": 0.6458879709243774,
+    "time_p75_ms": 0.6492159962654114,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.10976000130176544,
-    "peak_memory_mb": 16.2734375,
+    "time_ms": 0.14640000462532043,
+    "peak_memory_mb": 85.2890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.006691370104543141,
-    "time_p25_ms": 0.10972800105810165,
-    "time_p75_ms": 0.11472000181674957,
+    "time_std_ms": 0.00399766748919024,
+    "time_p25_ms": 0.14428800344467163,
+    "time_p75_ms": 0.1483840048313141,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.29795199632644653,
-    "peak_memory_mb": 16.28515625,
+    "time_ms": 0.41683200001716614,
+    "peak_memory_mb": 165.6650390625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007111559583725366,
-    "time_p25_ms": 0.294048011302948,
-    "time_p75_ms": 0.3062399923801422,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 4,
-      "C": 8
-    },
-    "mode": "fwd",
-    "time_ms": 0.11347199976444244,
-    "peak_memory_mb": 16.2822265625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.006326243235835816,
-    "time_p25_ms": 0.10835199803113937,
-    "time_p75_ms": 0.11628799885511398,
+    "time_std_ms": 0.0434401575510534,
+    "time_p25_ms": 0.41356799006462097,
+    "time_p75_ms": 0.4264320135116577,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
     "provider": "compile_integrated",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.14179199934005737,
+    "peak_memory_mb": 93.66796875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.003467463057463084,
+    "time_p25_ms": 0.1404159963130951,
+    "time_p75_ms": 0.14390400052070618,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.30134400725364685,
-    "peak_memory_mb": 16.2939453125,
+    "time_ms": 0.4205760061740875,
+    "peak_memory_mb": 174.0439453125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.028394010842863884,
-    "time_p25_ms": 0.2900480031967163,
-    "time_p75_ms": 0.3303999900817871,
+    "time_std_ms": 0.05813145760796584,
+    "time_p25_ms": 0.4168640077114105,
+    "time_p75_ms": 0.4336000084877014,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.11552000045776367,
-    "peak_memory_mb": 16.28564453125,
+    "time_ms": 0.17878399789333344,
+    "peak_memory_mb": 105.69921875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004603937228228281,
-    "time_p25_ms": 0.11123199760913849,
-    "time_p75_ms": 0.11708799749612808,
+    "time_std_ms": 0.00283194769442086,
+    "time_p25_ms": 0.1775359958410263,
+    "time_p75_ms": 0.18086400628089905,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.3717440068721771,
-    "peak_memory_mb": 16.294921875,
+    "time_ms": 0.6457920074462891,
+    "peak_memory_mb": 173.94921875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.03771934317615375,
-    "time_p25_ms": 0.36425599455833435,
-    "time_p75_ms": 0.3895359933376312,
+    "time_std_ms": 0.0410004760063496,
+    "time_p25_ms": 0.6431999802589417,
+    "time_p75_ms": 0.6518719792366028,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.11241599917411804,
-    "peak_memory_mb": 16.283203125,
+    "time_ms": 0.13846400380134583,
+    "peak_memory_mb": 97.69921875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005268003732756651,
-    "time_p25_ms": 0.10947199910879135,
-    "time_p75_ms": 0.1136000007390976,
+    "time_std_ms": 0.002629905600130238,
+    "time_p25_ms": 0.13654400408267975,
+    "time_p75_ms": 0.13977600634098053,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.3038719892501831,
-    "peak_memory_mb": 16.294921875,
+    "time_ms": 0.416703999042511,
+    "peak_memory_mb": 178.0751953125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.013782742104377785,
-    "time_p25_ms": 0.290912002325058,
-    "time_p75_ms": 0.31308799982070923,
+    "time_std_ms": 0.031323440350347224,
+    "time_p25_ms": 0.4143039882183075,
+    "time_p75_ms": 0.42262399196624756,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "compile_integrated",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.10979200154542923,
-    "peak_memory_mb": 16.2900390625,
+    "time_ms": 0.14070400595664978,
+    "peak_memory_mb": 94.046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.008357209640115762,
-    "time_p25_ms": 0.10463999956846237,
-    "time_p75_ms": 0.11334399878978729,
+    "time_std_ms": 0.0030653405173427157,
+    "time_p25_ms": 0.1393599957227707,
+    "time_p75_ms": 0.14256000518798828,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
     "provider": "compile_integrated",
     "shape": {
-      "N": 4,
-      "C": 8
+      "N": 128,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.2996799945831299,
-    "peak_memory_mb": 16.3017578125,
+    "time_ms": 0.420415997505188,
+    "peak_memory_mb": 174.4228515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.009298859618616541,
-    "time_p25_ms": 0.2956799864768982,
-    "time_p75_ms": 0.3089599907398224,
+    "time_std_ms": 0.05176710888430818,
+    "time_p25_ms": 0.4150719940662384,
+    "time_p75_ms": 0.440064013004303,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.6493120193481445,
+    "peak_memory_mb": 310.921875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004326020980934679,
+    "time_p25_ms": 0.6480000019073486,
+    "time_p75_ms": 0.651199996471405,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 2.3301761150360107,
+    "peak_memory_mb": 583.921875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00785335163059518,
+    "time_p25_ms": 2.327455997467041,
+    "time_p75_ms": 2.333280086517334,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.4769600033760071,
+    "peak_memory_mb": 302.54296875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0028312505020500604,
+    "time_p25_ms": 0.47593599557876587,
+    "time_p75_ms": 0.47808000445365906,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.6923840045928955,
+    "peak_memory_mb": 623.6689453125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.015676857627952605,
+    "time_p25_ms": 1.6897599697113037,
+    "time_p75_ms": 1.697983980178833,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.47673600912094116,
+    "peak_memory_mb": 322.890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.002379953838032349,
+    "time_p25_ms": 0.4756479859352112,
+    "time_p75_ms": 0.4779199957847595,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.688704013824463,
+    "peak_memory_mb": 644.0166015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.018704625726683476,
+    "time_p25_ms": 1.6862080097198486,
+    "time_p75_ms": 1.6930240392684937,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.6515520215034485,
+    "peak_memory_mb": 371.015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0020524391858956596,
+    "time_p25_ms": 0.6511679887771606,
+    "time_p75_ms": 0.6533439755439758,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 2.3390719890594482,
+    "peak_memory_mb": 644.015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0042725662904905615,
+    "time_p25_ms": 2.336416006088257,
+    "time_p75_ms": 2.3415040969848633,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.4864000082015991,
+    "peak_memory_mb": 339.015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0030210318725333654,
+    "time_p25_ms": 0.485152006149292,
+    "time_p75_ms": 0.4891200065612793,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.7238719463348389,
+    "peak_memory_mb": 660.0791015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01980372507497637,
+    "time_p25_ms": 1.7221759557724,
+    "time_p75_ms": 1.7267199754714966,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.49644801020622253,
+    "peak_memory_mb": 323.26953125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01137531634641345,
+    "time_p25_ms": 0.4952000081539154,
+    "time_p75_ms": 0.4992640018463135,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 256,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.7343679666519165,
+    "peak_memory_mb": 644.3330078125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008572940909642751,
+    "time_p25_ms": 1.7317440509796143,
+    "time_p75_ms": 1.7377599477767944,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.6499840021133423,
+    "peak_memory_mb": 712.80078125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005559525159482882,
+    "time_p25_ms": 1.6455999612808228,
+    "time_p75_ms": 1.65392005443573,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 5.092832088470459,
+    "peak_memory_mb": 1327.05078125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.017333542750938572,
+    "time_p25_ms": 5.089536190032959,
+    "time_p75_ms": 5.097439765930176,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.1344319581985474,
+    "peak_memory_mb": 680.80078125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005188401183112021,
+    "time_p25_ms": 1.130560040473938,
+    "time_p75_ms": 1.13919997215271,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 3.999743938446045,
+    "peak_memory_mb": 1403.1767578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011573841923811397,
+    "time_p25_ms": 3.9943039417266846,
+    "time_p75_ms": 4.005792140960693,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.1535999774932861,
+    "peak_memory_mb": 705.0546875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0037780941347747106,
+    "time_p25_ms": 1.1517119407653809,
+    "time_p75_ms": 1.1566400527954102,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 4.02291202545166,
+    "peak_memory_mb": 1427.4306640625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01202919032758589,
+    "time_p25_ms": 4.020256042480469,
+    "time_p75_ms": 4.027743816375732,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.6561280488967896,
+    "peak_memory_mb": 813.3359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008443789387650006,
+    "time_p25_ms": 1.6497600078582764,
+    "time_p75_ms": 1.6622400283813477,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 5.1117119789123535,
+    "peak_memory_mb": 1427.5859375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00768963552945758,
+    "time_p25_ms": 5.107999801635742,
+    "time_p75_ms": 5.11740779876709,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.163040041923523,
+    "peak_memory_mb": 741.3359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004123600709783169,
+    "time_p25_ms": 1.1607999801635742,
+    "time_p75_ms": 1.1672320365905762,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 4.097951889038086,
+    "peak_memory_mb": 1463.6494140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011888674970496498,
+    "time_p25_ms": 4.0913920402526855,
+    "time_p75_ms": 4.105792045593262,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.171072006225586,
+    "peak_memory_mb": 705.43359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005063727783455963,
+    "time_p25_ms": 1.1671040058135986,
+    "time_p75_ms": 1.1752320528030396,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 4.104383945465088,
+    "peak_memory_mb": 1427.7470703125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01757589349218805,
+    "time_p25_ms": 4.098495960235596,
+    "time_p75_ms": 4.111743927001953,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 3.1861441135406494,
+    "peak_memory_mb": 1291.68359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006123294193418702,
+    "time_p25_ms": 3.1814401149749756,
+    "time_p75_ms": 3.1897919178009033,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 9.581952095031738,
+    "peak_memory_mb": 2383.68359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.010169947574233531,
+    "time_p25_ms": 9.576767921447754,
+    "time_p75_ms": 9.588959693908691,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.1706559658050537,
+    "peak_memory_mb": 1219.68359375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.007219867018968962,
+    "time_p25_ms": 2.165343999862671,
+    "time_p75_ms": 2.176543951034546,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 7.474175930023193,
+    "peak_memory_mb": 2503.8095703125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.018948399210187643,
+    "time_p25_ms": 7.468416213989258,
+    "time_p75_ms": 7.483871936798096,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.1816959381103516,
+    "peak_memory_mb": 1239.78125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006576229775351982,
+    "time_p25_ms": 2.1774721145629883,
+    "time_p75_ms": 2.1853439807891846,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 7.479263782501221,
+    "peak_memory_mb": 2523.9072265625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011719490997973522,
+    "time_p25_ms": 7.474016189575195,
+    "time_p75_ms": 7.486591815948486,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 3.2059519290924072,
+    "peak_memory_mb": 1432.28125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0066858683754875275,
+    "time_p25_ms": 3.2006399631500244,
+    "time_p75_ms": 3.2085440158843994,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 9.62326431274414,
+    "peak_memory_mb": 2524.28125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008470263714989504,
+    "time_p25_ms": 9.618335723876953,
+    "time_p75_ms": 9.628031730651855,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.203295946121216,
+    "peak_memory_mb": 1304.28125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005761328909423756,
+    "time_p25_ms": 2.199392080307007,
+    "time_p75_ms": 2.208064079284668,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 7.669312000274658,
+    "peak_memory_mb": 2588.3447265625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.015063346934924983,
+    "time_p25_ms": 7.6644158363342285,
+    "time_p75_ms": 7.676640033721924,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.219520092010498,
+    "peak_memory_mb": 1240.16015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.018413150207022694,
+    "time_p25_ms": 2.2122879028320312,
+    "time_p75_ms": 2.223615884780884,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 7.687551975250244,
+    "peak_memory_mb": 2524.2236328125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.010845727387234435,
+    "time_p25_ms": 7.682208061218262,
+    "time_p75_ms": 7.694015979766846,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 7.064544200897217,
+    "peak_memory_mb": 2798.41015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005389380737542893,
+    "time_p25_ms": 7.06063985824585,
+    "time_p75_ms": 7.06771183013916,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 22.159807205200195,
+    "peak_memory_mb": 5255.41015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.014594585618221623,
+    "time_p25_ms": 22.153440475463867,
+    "time_p75_ms": 22.16534423828125,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.507199764251709,
+    "peak_memory_mb": 2670.03125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006933980733194591,
+    "time_p25_ms": 4.502975940704346,
+    "time_p75_ms": 4.511231899261475,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 16.85523223876953,
+    "peak_memory_mb": 5559.1572265625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.022452733355705697,
+    "time_p25_ms": 16.847871780395508,
+    "time_p75_ms": 16.86457633972168,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.484928131103516,
+    "peak_memory_mb": 2765.91015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011808450496273213,
+    "time_p25_ms": 4.48140811920166,
+    "time_p75_ms": 4.4898881912231445,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 16.826271057128906,
+    "peak_memory_mb": 5655.6611328125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.021477211061510515,
+    "time_p25_ms": 16.820127487182617,
+    "time_p75_ms": 16.836000442504883,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 7.132256031036377,
+    "peak_memory_mb": 3198.91015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.18599585938931062,
+    "time_p25_ms": 7.093152046203613,
+    "time_p75_ms": 7.3542399406433105,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 22.280704498291016,
+    "peak_memory_mb": 5656.53515625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.20358679292357076,
+    "time_p25_ms": 22.204288482666016,
+    "time_p75_ms": 22.486112594604492,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.520351886749268,
+    "peak_memory_mb": 2910.91015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.021682887218386564,
+    "time_p25_ms": 4.515007972717285,
+    "time_p75_ms": 4.525792121887207,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 17.214399337768555,
+    "peak_memory_mb": 5800.5986328125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.018881607206370596,
+    "time_p25_ms": 17.206239700317383,
+    "time_p75_ms": 17.225120544433594,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.515232086181641,
+    "peak_memory_mb": 2766.1640625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.010053630096884838,
+    "time_p25_ms": 4.51043176651001,
+    "time_p75_ms": 4.521056175231934,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 17.213247299194336,
+    "peak_memory_mb": 5655.8525390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.027453390716306092,
+    "time_p25_ms": 17.206079483032227,
+    "time_p75_ms": 17.22444725036621,
     "extra": {}
   },
   {
     "op_name": "OuterProductMean",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "S": 4,
-      "C_msa": 8,
-      "C_pair": 8
+      "N": 128,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.1276160031557083,
-    "peak_memory_mb": 16.37158203125,
+    "time_ms": 0.15065599977970123,
+    "peak_memory_mb": 101.9794921875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.003648425729496126,
-    "time_p25_ms": 0.12464000284671783,
-    "time_p75_ms": 0.12796799838542938,
+    "time_std_ms": 0.0025397644291863617,
+    "time_p25_ms": 0.14988799393177032,
+    "time_p75_ms": 0.15161600708961487,
     "extra": {}
   },
   {
     "op_name": "OuterProductMean",
     "provider": "pytorch",
     "shape": {
-      "N": 4,
-      "S": 4,
-      "C_msa": 8,
-      "C_pair": 8
+      "N": 128,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 0.40694400668144226,
-    "peak_memory_mb": 16.43798828125,
+    "time_ms": 0.42739200592041016,
+    "peak_memory_mb": 178.9951171875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.07671267810024604,
-    "time_p25_ms": 0.40560001134872437,
-    "time_p75_ms": 0.5292159914970398,
+    "time_std_ms": 0.012731902413830312,
+    "time_p25_ms": 0.42559999227523804,
+    "time_p75_ms": 0.43084800243377686,
     "extra": {}
   },
   {
     "op_name": "OuterProductMean",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "S": 4,
-      "C_msa": 8,
-      "C_pair": 8
+      "N": 128,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.1043199971318245,
-    "peak_memory_mb": 16.40576171875,
+    "time_ms": 0.12428800016641617,
+    "peak_memory_mb": 89.462890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004502889700502804,
-    "time_p25_ms": 0.100832000374794,
-    "time_p75_ms": 0.10707200318574905,
+    "time_std_ms": 0.0024879403895591346,
+    "time_p25_ms": 0.12329600006341934,
+    "time_p75_ms": 0.12534399330615997,
     "extra": {}
   },
   {
     "op_name": "OuterProductMean",
     "provider": "compile",
     "shape": {
-      "N": 4,
-      "S": 4,
-      "C_msa": 8,
-      "C_pair": 8
+      "N": 128,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 0.30985599756240845,
-    "peak_memory_mb": 16.4892578125,
+    "time_ms": 0.34147199988365173,
+    "peak_memory_mb": 178.86962890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0285322396694096,
-    "time_p25_ms": 0.28969600796699524,
-    "time_p75_ms": 0.31279999017715454,
+    "time_std_ms": 0.04239052485277468,
+    "time_p25_ms": 0.3389759957790375,
+    "time_p75_ms": 0.34483200311660767,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.5516480207443237,
+    "peak_memory_mb": 348.041015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00557217705371464,
+    "time_p25_ms": 0.550815999507904,
+    "time_p75_ms": 0.5527679920196533,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 256,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 1.4532159566879272,
+    "peak_memory_mb": 654.072265625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006161586281990872,
+    "time_p25_ms": 1.4510079622268677,
+    "time_p75_ms": 1.4561280012130737,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.5138559937477112,
+    "peak_memory_mb": 296.501953125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.003310858788169436,
+    "time_p25_ms": 0.5124800205230713,
+    "time_p75_ms": 0.515999972820282,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 256,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 1.3731199502944946,
+    "peak_memory_mb": 651.31494140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009338859240874024,
+    "time_p25_ms": 1.3700480461120605,
+    "time_p75_ms": 1.3767039775848389,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.109887957572937,
+    "peak_memory_mb": 763.728515625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.003698965233655468,
+    "time_p25_ms": 1.1079360246658325,
+    "time_p75_ms": 1.1128959655761719,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 2.9345600605010986,
+    "peak_memory_mb": 1450.775390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009079647469513846,
+    "time_p25_ms": 2.9314239025115967,
+    "time_p75_ms": 2.939743995666504,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.0348479747772217,
+    "peak_memory_mb": 639.541015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00446967543085673,
+    "time_p25_ms": 1.0326080322265625,
+    "time_p75_ms": 1.0381759405136108,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 384,
+      "S": 32,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 2.7349119186401367,
+    "peak_memory_mb": 1436.01025390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00684386205704969,
+    "time_p25_ms": 2.731679916381836,
+    "time_p75_ms": 2.7392959594726562,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "S": 16,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.986464023590088,
+    "peak_memory_mb": 1343.556640625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008204945613589993,
+    "time_p25_ms": 1.9802240133285522,
+    "time_p75_ms": 1.9927359819412231,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "S": 16,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 5.102240085601807,
+    "peak_memory_mb": 2561.587890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011265844661434661,
+    "time_p25_ms": 5.096447944641113,
+    "time_p75_ms": 5.1078081130981445,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "S": 16,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.8345600366592407,
+    "peak_memory_mb": 1112.501953125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004158693251708805,
+    "time_p25_ms": 1.8321919441223145,
+    "time_p75_ms": 1.8375999927520752,
+    "extra": {}
+  },
+  {
+    "op_name": "OuterProductMean",
+    "provider": "compile",
+    "shape": {
+      "N": 512,
+      "S": 16,
+      "C_msa": 64,
+      "C_pair": 128
+    },
+    "mode": "full",
+    "time_ms": 4.7624640464782715,
+    "peak_memory_mb": 2524.81494140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.016223508090452577,
+    "time_p25_ms": 4.758880138397217,
+    "time_p75_ms": 4.766208171844482,
     "extra": {}
   }
 ]

@@ -21,16 +21,7 @@ except ImportError:
     HAS_TRITON = False
 
 
-def _calculate_settings(n: int) -> tuple[int, int]:
-    """Calculate BLOCK_SIZE (next power of 2) and num_warps for a given dimension."""
-    block_size = max(triton.next_power_of_2(n), 16)
-    num_warps = min(max(block_size // 256, 1), 8)
-    return block_size, num_warps
-
-
-def _ensure_contiguous(*tensors):
-    return tuple(t.contiguous() if t is not None and not t.is_contiguous() else t for t in tensors)
-
+from deepfold3.model.triton import calculate_settings as _calculate_settings
 
 if HAS_TRITON:
 

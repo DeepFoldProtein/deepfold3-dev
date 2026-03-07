@@ -40,6 +40,16 @@ from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 
+def _load_evo_attn():
+    """Load the Triton EvoformerAttention autograd function, or return None."""
+    try:
+        from deepfold3.model.triton.evo_attention import HAS_TRITON, _EvoformerAttention
+
+        return _EvoformerAttention if HAS_TRITON else None
+    except ImportError:
+        return None
+
+
 class GridSelfAttention(nn.Module):
     """Row-wise or column-wise gated self-attention on pair activations.
 
@@ -65,13 +75,33 @@ class GridSelfAttention(nn.Module):
 
         self._evo_attn = None
         if optim is not None and optim.use_fused_evo_attention:
-            try:
-                from deepfold3.model.triton.evo_attention import HAS_TRITON, _EvoformerAttention
+            self._evo_attn = _load_evo_attn()
+        if self._evo_attn is None and optim is not None and optim.use_torch_compile:
+            self._compute_baseline = torch.compile(self._compute_baseline)
 
-                if HAS_TRITON:
-                    self._evo_attn = _EvoformerAttention
-            except ImportError:
-                pass
+    def _compute_baseline(
+        self, z_flat: torch.Tensor, pb: torch.Tensor, mask: torch.Tensor, B: int, N_rows: int, N_cols: int
+    ) -> torch.Tensor:
+        H, D = self.num_heads, self.head_dim
+        q = self.to_q(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+        k = self.to_k(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+        v = self.to_v(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
+
+        logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        logits = logits.view(B, N_rows, H, N_cols, N_cols)
+        logits = logits + pb.unsqueeze(1)
+        logits = logits.reshape(B * N_rows, H, N_cols, N_cols)
+
+        mask_flat = mask.reshape(B * N_rows, N_cols)
+        logits = logits + 1e9 * (mask_flat.float() - 1.0).view(B * N_rows, 1, 1, N_cols)
+
+        w = F.softmax(logits.float(), dim=-1).to(z_flat.dtype)
+        out = torch.matmul(w, v)
+        out = out.permute(0, 2, 1, 3).reshape(B * N_rows, N_cols, H * D)
+
+        g = torch.sigmoid(self.to_g(z_flat))
+        return self.out_proj(out * g)
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -110,33 +140,16 @@ class GridSelfAttention(nn.Module):
             q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D)
             k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D)
             v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D)
-            res_mask = torch.where(mask > 0.5, 0.0, float("-inf")).view(B, N_rows, 1, 1, N_cols)
-            pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N]
+            # Use -1e9 instead of -inf: when ALL keys are masked (bucket-padded rows),
+            # softmax(-inf,...,-inf) = NaN, but softmax(-1e9,...,-1e9) = 1/N (safe).
+            res_mask = torch.where(mask > 0.5, 0.0, -1e9).view(B, N_rows, 1, 1, N_cols)
+            pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N] — kernel requires fp32 bias
             out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, N_rows, N_cols, H, D]
             out = out.reshape(B * N_rows, N_cols, H * D)
+            g = torch.sigmoid(self.to_g(z_flat))
+            out = self.out_proj(out * g)
         else:
-            q = self.to_q(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
-            k = self.to_k(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
-            v = self.to_v(z_flat).view(B * N_rows, N_cols, H, D).permute(0, 2, 1, 3)
-
-            logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B*N_rows, H, N_cols, N_cols]
-
-            # pair_bias: [B, H, N, N] → same for every row within each batch element
-            logits = logits.view(B, N_rows, H, N_cols, N_cols)
-            logits = logits + pb.unsqueeze(1)  # [B, 1, H, N, N] broadcasts over N_rows
-            logits = logits.reshape(B * N_rows, H, N_cols, N_cols)
-
-            # mask: [B, N_rows, N_cols] → [B*N_rows, 1, 1, N_cols]
-            mask_flat = mask.reshape(B * N_rows, N_cols)
-            logits = logits + 1e9 * (mask_flat.float() - 1.0).view(B * N_rows, 1, 1, N_cols)
-
-            w = F.softmax(logits.float(), dim=-1).to(z.dtype)
-            out = torch.matmul(w, v)  # [B*N_rows, H, N_cols, D]
-            out = out.permute(0, 2, 1, 3).reshape(B * N_rows, N_cols, H * D)
-
-        g = torch.sigmoid(self.to_g(z_flat))
-        out = out * g
-        out = self.out_proj(out)
+            out = self._compute_baseline(z_flat, pb, mask, B, N_rows, N_cols)
 
         # Unfold back to [B, N_rows, N_cols, C_out]
         out = out.view(B, N_rows, N_cols, -1)
@@ -184,7 +197,7 @@ class MSAAttention(nn.Module):
         col_mask, _ = mask.max(dim=-2)
         logits = logits + 1e9 * (col_mask.float() - 1.0).view(B, 1, 1, N)
 
-        w = F.softmax(logits, dim=-1)
+        w = F.softmax(logits.float(), dim=-1).to(msa.dtype)
 
         v = self.to_v(msa).view(B, S, N, H, D)
         v_avg = torch.einsum("bhqk,bskhc->bsqhc", w, v)
@@ -252,17 +265,9 @@ class SingleAttention(nn.Module):
         self.to_g = LinearNoBias(c, value_dim)
         self.out_proj = LinearNoBias(value_dim, c)
 
-        # Fused EvoAttention: SingleAttention is the N_seq=1 case
-        self._evo_attn = None
-        if optim is not None and optim.use_fused_evo_attention and self.key_dim_per_head == self.val_dim_per_head:
-            try:
-                from deepfold3.model.triton.evo_attention import HAS_TRITON, _EvoformerAttention
-
-                if HAS_TRITON:
-                    self._evo_attn = _EvoformerAttention
-            except ImportError:
-                pass
-        if self._evo_attn is None and optim is not None and optim.use_torch_compile:
+        # Triton EvoAttention is NOT beneficial for SingleAttention (N_seq=1 makes kernel
+        # overhead dominate — benchmarks show 0.87-1.03x, i.e. slower). Use torch.compile instead.
+        if optim is not None and optim.use_torch_compile:
             self._compute_baseline = torch.compile(self._compute_baseline)
 
     def _compute_baseline(
@@ -295,25 +300,8 @@ class SingleAttention(nn.Module):
             mask = mask.unsqueeze(0)
             pair_logits = pair_logits.unsqueeze(0)
 
-        B, N, C = x.shape
-        H = self.num_heads
-        Dk = self.key_dim_per_head
-        Dv = self.val_dim_per_head
-
         xn = self.norm(x)
-
-        if self._evo_attn is not None and x.is_cuda:
-            q = self.to_q(xn).view(B, N, H, Dk).unsqueeze(1)  # [B, 1, N, H, D]
-            k = self.to_k(xn).view(B, N, H, Dk).unsqueeze(1)
-            v = self.to_v(xn).view(B, N, H, Dv).unsqueeze(1)
-            res_mask = torch.where(mask > 0.5, 0.0, float("-inf")).view(B, 1, 1, 1, N)
-            pair_bias = pair_logits.unsqueeze(1).float()  # [B, 1, H, N, N]
-            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, 1, N, H, D]
-            out = out.squeeze(1).reshape(B, N, H * Dv)
-            g = torch.sigmoid(self.to_g(xn))
-            result = self.out_proj(out * g)
-        else:
-            result = self._compute_baseline(xn, mask, pair_logits)
+        result = self._compute_baseline(xn, mask, pair_logits)
 
         if not has_batch:
             result = result.squeeze(0)
