@@ -21,11 +21,13 @@ def _register_commands() -> None:
     from deepfold3.scripts.inference import inference
     from deepfold3.scripts.msa_search import msa_search
     from deepfold3.scripts.plot_confidences import plot
+    from deepfold3.scripts.train import train
 
     cli.add_command(inference)
     cli.add_command(convert)
     cli.add_command(plot)
     cli.add_command(msa_search)
+    cli.add_command(train)
 
 
 _register_commands()

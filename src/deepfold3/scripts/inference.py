@@ -94,7 +94,7 @@ import torch
     "--optim",
     default=None,
     type=click.Choice(["none", "recommended", "all", "triton"]),
-    help="Optimization backend: none (default), recommended (evo attention + compile), all, triton (fused kernels only)",
+    help="Optimization backend: none (default), recommended (evo attn + triangle mul + compile), all, triton (fused kernels only)",
 )
 def inference(
     msa: Path | None,
@@ -168,8 +168,10 @@ def inference(
 
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        click.echo(f"  [WARN] missing keys   : {len(missing)}")
+    # Fused kernel parameters are derived from base weights via _sync_to_fused — not real misses
+    real_missing = [k for k in missing if not any(p in k for p in ("_fused_gate.", "_fused_ada_ln_linear.", "_fused_swiglu.", "_ln_linear.", "_swiglu."))]
+    if real_missing:
+        click.echo(f"  [WARN] missing keys   : {len(real_missing)}")
     if unexpected:
         click.echo(f"  [WARN] unexpected keys: {len(unexpected)}")
     model.to(dev).eval()
@@ -198,26 +200,12 @@ def inference(
         # Build entity descriptions from chain descriptions
         chain_idx = 0
         desc_map: dict[str, str] = {}
-        for pc in job.protein_chains:
-            chain_name = chr(ord("A") + chain_idx)
-            if pc.description:
-                desc_map[chain_name] = pc.description
-            chain_idx += 1
-        for dc in job.dna_chains:
-            chain_name = chr(ord("A") + chain_idx)
-            if dc.description:
-                desc_map[chain_name] = dc.description
-            chain_idx += 1
-        for rc in job.rna_chains:
-            chain_name = chr(ord("A") + chain_idx)
-            if rc.description:
-                desc_map[chain_name] = rc.description
-            chain_idx += 1
-        for lc in job.ligand_chains:
-            chain_name = chr(ord("A") + chain_idx)
-            if lc.description:
-                desc_map[chain_name] = lc.description
-            chain_idx += 1
+        for chain_list in [job.protein_chains, job.dna_chains, job.rna_chains, job.ligand_chains]:
+            for chain in chain_list:
+                chain_name = chr(ord("A") + chain_idx)
+                if chain.description:
+                    desc_map[chain_name] = chain.description
+                chain_idx += 1
         if desc_map:
             entity_descriptions = desc_map
 
@@ -353,8 +341,11 @@ def inference(
         if per_token_plddt is not None:
             frac_disorder = fraction_disordered(per_token_plddt[s].to(dev), polymer_mask)
         sample_clash = has_clash(
-            model_output.atom_positions[s], atom_mask,
-            feats["residue_index"].to(dev), asym_id, polymer_mask,
+            model_output.atom_positions[s],
+            atom_mask,
+            feats["residue_index"].to(dev),
+            asym_id,
+            polymer_mask,
         )
         ranking = compute_ranking_score(ptm, iptm, frac_disorder, sample_clash)
         metrics.append(f"disorder={frac_disorder:.3f}")
