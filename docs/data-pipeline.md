@@ -116,7 +116,13 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 **`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]`.
 
-**`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]` -- metadata for training dataset indexing.
+**`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]`, `structure_info: StructureInfo | None` -- metadata for training dataset indexing. Has `to_dict()` / `from_dict()` for JSON serialization.
+
+**`ChainInfo`**: `chain_id`, `chain_name`, `mol_type`, `cluster_id`, `msa_id`, `num_residues`, `entity_id`, `valid: bool = True`. Chains failing quality filters are marked `valid=False`.
+
+**`InterfaceInfo`**: `chain_1`, `chain_2`, `valid: bool = True`.
+
+**`StructureInfo`**: `resolution`, `method`, `deposited`, `released`, `num_chains`, `num_interfaces` -- experimental metadata extracted during preprocessing.
 
 ## MSA Search (`data/msa/mmseqs2.py`)
 
@@ -346,9 +352,9 @@ Two strategies (50/50 random selection by default):
 
 **Contiguous**: Pick a random chain, pick a random start position, accumulate tokens forward until `max_tokens` or `max_atoms` is reached.
 
-**Spatial** (requires `scipy.spatial.cKDTree`): Build 3D point cloud from token center coordinates, pick a random seed token, query nearest neighbors, accumulate in distance order. Falls back to contiguous if scipy is unavailable.
+**Spatial** (requires `scipy.spatial.KDTree`): Build 3D point cloud from token center coordinates, pick a random seed token, query nearest neighbors, accumulate in distance order. Falls back to contiguous if scipy is unavailable.
 
-After cropping, `_reindex()` rebuilds all token indices, filters bonds to those with both endpoints in the crop, slices atoms, and trims MSA columns per chain.
+After cropping, `_reindex()` rebuilds all token indices, filters bonds to those with both endpoints in the crop, slices atoms, and crops MSA columns per chain using vectorized column indexing (`np.isin` to map selected tokens back to per-chain MSA positions).
 
 ## Featurization (`data/feature/featurizer.py`)
 
@@ -487,3 +493,59 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 **MSA vocabulary** (`MSA_VOCAB_SIZE = 32`): Same indices as `RES_TYPE_ORDER` for overlapping types. Ambiguous amino acid codes mapped to nearest standard (e.g., B->ASP, Z->GLU, U->CYS).
 
 **Other constants**: `MAX_ATOMS_PER_TOKEN = 24`, `NUM_ELEMENTS = 128`, `MOL_PROTEIN = 0`, `MOL_DNA = 1`, `MOL_RNA = 2`, `MOL_NONPOLYMER = 3`.
+
+**Shared helpers** (public API in `data/const.py`):
+
+- `element_name_to_int(element_name)` — element symbol → atomic number, clamped to [0, 127]
+- `get_res_type(res_name, mol_type)` — residue name → type index (returns 20/UNK for non-polymer)
+
+**Shared helpers** (public API in `data/parse/mmcif.py`):
+
+- `mol_type_from_gemmi(entity)` — maps `gemmi.Entity` type to `MOL_PROTEIN`/`MOL_DNA`/`MOL_RNA`/`MOL_NONPOLYMER`
+
+**Shared helpers** (public API in `data/parse/templates.py`):
+
+- `find_pdb_mmcif_path(pdb_id, pdb_mmcif_dir)` — resolves PDB ID to file path in a local PDB mirror (checks `{mid2}/{id}.cif.gz`, `.cif`, flat layout)
+
+## Data Preprocessing (`data/prepare/`)
+
+Converts raw PDB mmCIF files into training-ready Structure NPZ files with quality filtering and manifest generation.
+
+### Structure Processing (`data/prepare/structure.py`)
+
+```python
+def process_mmcif(path, use_assembly=True, assembly_id="1") -> tuple[Structure, Record]:
+```
+
+- Reads mmCIF via gemmi, expands biological assembly 1 via `gemmi.make_assembly()`
+- Iterates subchains, maps entities to mol types, builds atoms/residues/chains arrays
+- Computes entity dedup (same sequence → same entity_id) and MSA ID (SHA256 of sequence)
+- Detects chain-chain interfaces via KDTree proximity (5 Å cutoff)
+- Extracts metadata (resolution, method, deposition/release dates)
+- Returns `(Structure, Record)` with full `ChainInfo`, `InterfaceInfo`, `StructureInfo`
+
+### Quality Filters (`data/prepare/filters.py`)
+
+```python
+def filter_structure(structure, record, ...) -> Record:
+```
+
+Marks chains as `valid=False` (does not remove them). Per-chain filters:
+
+- **min_length**: reject polymer chains with < 4 or > 5000 resolved residues
+- **all_unknown**: reject chains where all residues are UNK/N
+- **consecutive_ca**: reject protein chains with consecutive CA atoms > 10 Å apart
+- **clashing_chains**: reject chains with > 30% of atoms clashing (< 1.7 Å) with other chains
+
+Interfaces with any invalid chain endpoint are also marked invalid.
+
+### Manifest (`data/prepare/manifest.py`)
+
+```python
+def save_manifest(records, path): ...
+def load_manifest(path) -> list[Record]: ...
+def discover_records(data_dir) -> list[Record]: ...
+```
+
+- `discover_records()` loads `manifest.json` if present, otherwise scans `structures/` for NPZ files and builds minimal records
+- Used by `deepfold3 train` to find training data

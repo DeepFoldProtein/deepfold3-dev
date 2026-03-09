@@ -11,6 +11,8 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 - **AF3 weight compatibility** -- direct conversion from official AlphaFold 3 parameters
 - **Flexible input** -- A3M MSA files, four JSON dialects (AlphaFold 3, AlphaFold Server, Protenix, DeepFold3)
 - **mmCIF + JSON output** -- standard structure files with per-atom pLDDT and comprehensive confidence JSON
+- **Training pipeline** -- native PyTorch DDP with EMA, LR scheduling, gradient accumulation, and checkpointing
+- **Data preprocessing** -- `deepfold3 prepare` converts PDB mmCIF mirror to training data with quality filtering
 
 ## Installation
 
@@ -100,6 +102,8 @@ deepfold3 msa --help
 deepfold3 inference --help
 deepfold3 convert --help
 deepfold3 plot --help
+deepfold3 prepare --help
+deepfold3 train --help
 ```
 
 | Command | Description |
@@ -108,6 +112,8 @@ deepfold3 plot --help
 | `deepfold3 inference` | Run structure prediction from A3M or JSON input |
 | `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
 | `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
+| `deepfold3 prepare` | Preprocess PDB mmCIF files into training data |
+| `deepfold3 train` | Train the model (single GPU or multi-GPU via torchrun) |
 
 ## JSON Input Dialects
 
@@ -145,8 +151,9 @@ Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffus
 
 ## TODO
 
-- [ ] Full data pipeline (PDB preprocessing, clustering, dataset generation)
-- [ ] Training pipeline
+- [ ] Sequence clustering (MMseqs2 at 40% identity)
+- [ ] MSA generation for training (MMseqs2 against UniRef30/ColabFoldDB)
+- [ ] Training-time template pipeline (hmmsearch against PDB HMM profiles)
 
 ## Confidence Metrics
 
@@ -198,10 +205,16 @@ src/deepfold3/
 |   |-- tokenize/       # tokenizer.py (Input -> Tokenized)
 |   |-- crop/           # cropper.py (contiguous + spatial)
 |   |-- feature/        # featurizer.py, ref_atoms.py (CCD)
-|   +-- module/         # dataset.py (InferenceInput), collate.py
+|   |-- prepare/        # structure.py, filters.py, manifest.py (PDB preprocessing)
+|   +-- module/         # dataset.py (TrainingDataset, InferenceInput), collate.py
+|-- training/           # Training pipeline
+|   |-- loss.py         # All loss functions (diffusion MSE, smooth LDDT, distogram, confidence)
+|   |-- ema.py          # Exponential Moving Average
+|   |-- scheduler.py    # AF3 LR scheduler (warmup -> plateau -> decay)
+|   +-- trainer.py      # DDP trainer (training loop, checkpointing, eval)
 |-- convert/af3.py      # Haiku -> PyTorch weight converter
 |-- io/                 # Output: mmCIF + confidences JSON
-+-- scripts/            # CLI: msa, inference, convert, plot
++-- scripts/            # CLI: msa, inference, convert, plot, prepare, train
 ```
 
 ## References

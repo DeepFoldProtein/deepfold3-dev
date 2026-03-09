@@ -23,15 +23,11 @@ from deepfold3.data.types import (
     Structure,
 )
 
-
-def _element_to_int(element_name: str) -> int:
-    """Convert element symbol string to atomic number, clamped to [0, 127]."""
-    sym = element_name.strip().upper()
-    num = const.ELEMENT_TO_INT.get(sym, 0)
-    return int(np.clip(num, 0, 127))
+_ELEMENT_H = gemmi.Element("H")
+_ELEMENT_D = gemmi.Element("D")
 
 
-def _mol_type_from_gemmi(entity: gemmi.Entity) -> int | None:
+def mol_type_from_gemmi(entity: gemmi.Entity) -> int | None:
     """Map gemmi entity type to DeepFold3 mol type. Returns None if should be skipped."""
     if entity.entity_type == gemmi.EntityType.Polymer:
         pt = entity.polymer_type
@@ -49,13 +45,6 @@ def _mol_type_from_gemmi(entity: gemmi.Entity) -> int | None:
     elif entity.entity_type == gemmi.EntityType.Water:
         return None  # skip water
     return None
-
-
-def _get_res_type(res_name: str, mol_type: int) -> int:
-    """Get residue type index for a given residue name and molecule type."""
-    if mol_type == const.MOL_NONPOLYMER:
-        return 20  # UNK
-    return const.res_name_to_type(res_name)
 
 
 def parse_mmcif(path: Path) -> Structure:
@@ -76,7 +65,7 @@ def parse_mmcif(path: Path) -> Structure:
     # Build entity → mol_type mapping
     entity_mol_type: dict[str, int] = {}
     for entity in structure.entities:
-        mt = _mol_type_from_gemmi(entity)
+        mt = mol_type_from_gemmi(entity)
         if mt is not None:
             entity_mol_type[entity.name] = mt
 
@@ -147,7 +136,7 @@ def parse_mmcif(path: Path) -> Structure:
                     continue
 
                 res_name = res.name[:5]  # truncate to 5 chars
-                res_type = _get_res_type(res.name, mol_type)
+                res_type = const.get_res_type(res.name, mol_type)
                 try:
                     res_id = res.seqid.num
                 except Exception:
@@ -159,12 +148,12 @@ def parse_mmcif(path: Path) -> Structure:
 
                 for atom in res:
                     # Skip hydrogens / deuterium
-                    if atom.element in (gemmi.Element("H"), gemmi.Element("D")):
+                    if atom.element in (_ELEMENT_H, _ELEMENT_D):
                         continue
 
                     pos = atom.pos
                     elem_name = atom.element.name
-                    element = _element_to_int(elem_name)
+                    element = const.element_name_to_int(elem_name)
                     charge = float(atom.charge) if hasattr(atom, "charge") else 0.0
                     atom_name = atom.name[:4].ljust(4)
                     is_present = True  # gemmi only gives resolved atoms

@@ -373,7 +373,7 @@ def _link_and_save_templates(
     Returns:
         Dict mapping chain index to relative path of JSON template hits file.
     """
-    from deepfold3.data.parse.templates import _find_pdb_mmcif_path
+    from deepfold3.data.parse.templates import find_pdb_mmcif_path
 
     templates_dir = output_dir / "templates"
     templates_dir.mkdir(exist_ok=True)
@@ -390,7 +390,7 @@ def _link_and_save_templates(
                 continue
             seen_pdbs.add(pdb_key)
 
-            src_path = _find_pdb_mmcif_path(hit.pdb_id, pdb_mmcif_dir)
+            src_path = find_pdb_mmcif_path(hit.pdb_id, pdb_mmcif_dir)
             if src_path is None:
                 logger.warning("Template %s not found in %s", hit.pdb_id, pdb_mmcif_dir)
                 continue

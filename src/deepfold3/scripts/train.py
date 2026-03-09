@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from pathlib import Path
 
 import click
 
@@ -103,10 +104,23 @@ def train(
     if dtype is not None:
         train_cfg.dtype = dtype
 
-    # TODO: Load records from data_dir (implement record discovery)
-    # For now, pass empty records — the trainer will handle this gracefully
-    records: list = []
-    eval_records: list = []
+    # Load records from manifest or by scanning data_dir
+    from deepfold3.data.prepare.manifest import discover_records
+
+    all_records = discover_records(Path(data_dir))
+    if not all_records:
+        logging.getLogger(__name__).warning("No records found in %s", data_dir)
+
+    # Shuffle with fixed seed for reproducible train/eval split
+    import random
+
+    rng = random.Random(42)
+    rng.shuffle(all_records)
+
+    # Split: last 5% for eval (at least 1 if available)
+    n_eval = max(1, len(all_records) // 20)
+    records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
+    eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
 
     trainer = Trainer(
         model_cfg=model_cfg,

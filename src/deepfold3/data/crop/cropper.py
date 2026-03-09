@@ -118,7 +118,7 @@ class Cropper:
     ) -> np.ndarray:
         """Return selected token indices (sorted) for spatial cropping."""
         try:
-            from scipy.spatial import cKDTree
+            from scipy.spatial import KDTree
         except ImportError:
             # Fall back to contiguous
             return self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
@@ -144,11 +144,11 @@ class Cropper:
         seed_idx = rng.randint(0, len(tokens) - 1)
         seed_coord = coords[seed_idx : seed_idx + 1]
 
-        tree = cKDTree(coords)
+        tree = KDTree(coords)
         # Query nearest neighbors progressively
         k = min(max_tokens * 2, len(tokens))
         dists, indices = tree.query(seed_coord, k=k)
-        indices = indices[0]  # flatten
+        indices = np.atleast_1d(indices[0])  # flatten; atleast_1d handles k=1
 
         selected: list[int] = []
         atom_count = 0
@@ -227,27 +227,31 @@ class Cropper:
             chains=data.structure.chains,
         )
 
-        # Crop paired and unpaired MSA to match selected tokens (by asym_id)
-        selected_asym_ids = set(int(t["asym_id"]) for t in new_tokens)
+        # Crop paired and unpaired MSA to match selected tokens (by asym_id).
+        # For each chain, find which positions within the original chain were
+        # selected, then index the corresponding MSA columns.
+        # Build per-chain column index mapping: for each asym_id, the indices
+        # within the original chain ordering that were selected.
+        chain_col_indices: dict[int, np.ndarray] = {}
+        for asym_id in set(int(t["asym_id"]) for t in new_tokens):
+            orig_chain_mask = data.tokens["asym_id"] == asym_id
+            orig_chain_positions = np.where(orig_chain_mask)[0]
+            keep = np.isin(orig_chain_positions, selected)
+            chain_col_indices[asym_id] = np.where(keep)[0].astype(np.int64)
 
         def _crop_msa_dict(msa_dict: dict[int, MSAType]) -> dict[int, MSAType]:
-            filtered = {k: v for k, v in msa_dict.items() if k in selected_asym_ids}
             cropped: dict[int, MSAType] = {}
-            for asym_id, msa in filtered.items():
-                chain_tokens = new_tokens[new_tokens["asym_id"] == asym_id]
-                n_chain = len(chain_tokens)
-                if msa.sequences.shape[1] != n_chain:
-                    S, N_old = msa.sequences.shape
-                    seqs = np.zeros((S, n_chain), dtype=msa.sequences.dtype)
-                    dmat = np.zeros((S, n_chain), dtype=msa.deletion_matrix.dtype)
-                    mask = np.zeros((S, n_chain), dtype=msa.mask.dtype)
-                    L = min(N_old, n_chain)
-                    seqs[:, :L] = msa.sequences[:, :L]
-                    dmat[:, :L] = msa.deletion_matrix[:, :L]
-                    mask[:, :L] = msa.mask[:, :L]
-                    cropped[asym_id] = MSAType(sequences=seqs, mask=mask, deletion_matrix=dmat)
-                else:
-                    cropped[asym_id] = msa
+            for asym_id, msa in msa_dict.items():
+                if asym_id not in chain_col_indices:
+                    continue
+                cols = chain_col_indices[asym_id]
+                if len(cols) == 0:
+                    continue
+                cropped[asym_id] = MSAType(
+                    sequences=msa.sequences[:, cols],
+                    mask=msa.mask[:, cols],
+                    deletion_matrix=msa.deletion_matrix[:, cols],
+                )
             return cropped
 
         return Tokenized(

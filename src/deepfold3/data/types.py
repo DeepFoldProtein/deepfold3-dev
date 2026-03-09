@@ -304,12 +304,26 @@ class ChainInfo:
     msa_id: str | int
     num_residues: int
     entity_id: str | int | None = None
+    valid: bool = True
 
 
 @dataclass
 class InterfaceInfo:
     chain_1: int
     chain_2: int
+    valid: bool = True
+
+
+@dataclass
+class StructureInfo:
+    """Metadata about the experimental structure."""
+
+    resolution: float | None = None
+    method: str | None = None
+    deposited: str | None = None
+    released: str | None = None
+    num_chains: int | None = None
+    num_interfaces: int | None = None
 
 
 @dataclass
@@ -319,3 +333,40 @@ class Record:
     id: str
     chains: list[ChainInfo]
     interfaces: list[InterfaceInfo]
+    structure_info: StructureInfo | None = None
+
+    def to_dict(self) -> dict:
+        d: dict = {"id": self.id}
+        d["chains"] = [
+            {
+                "chain_id": c.chain_id,
+                "chain_name": c.chain_name,
+                "mol_type": c.mol_type,
+                "cluster_id": c.cluster_id,
+                "msa_id": c.msa_id,
+                "num_residues": c.num_residues,
+                "entity_id": c.entity_id,
+                "valid": c.valid,
+            }
+            for c in self.chains
+        ]
+        d["interfaces"] = [{"chain_1": i.chain_1, "chain_2": i.chain_2, "valid": i.valid} for i in self.interfaces]
+        if self.structure_info is not None:
+            si = self.structure_info
+            d["structure_info"] = {
+                "resolution": si.resolution,
+                "method": si.method,
+                "deposited": si.deposited,
+                "released": si.released,
+                "num_chains": si.num_chains,
+                "num_interfaces": si.num_interfaces,
+            }
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Record:
+        chains = [ChainInfo(**c) for c in d["chains"]]
+        interfaces = [InterfaceInfo(**i) for i in d["interfaces"]]
+        si_data = d.get("structure_info")
+        si = StructureInfo(**si_data) if si_data else None
+        return cls(id=d["id"], chains=chains, interfaces=interfaces, structure_info=si)

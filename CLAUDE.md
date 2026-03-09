@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 DeepFold3 is a PyTorch biomolecular complex structure prediction system, architecturally equivalent to AlphaFold 3.
 
-The project has a working inference pipeline — model, data, I/O, and scripts are implemented in `src/`.
+The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** full data pipeline (PDB preprocessing, clustering, dataset generation), training pipeline.
+**Not yet implemented:** sequence clustering, MSA generation/processing for training, multimeric template pipeline.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.12 (pinned in `.python-version`)
@@ -41,6 +41,12 @@ deepfold3 inference --json input.json --output output_dir/ --params weights.safe
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 plot      --input out_confidences.json --output confidences.png
+deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0
+deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
+deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
+deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
+# Multi-GPU training via torchrun
+torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training --output runs/exp1
 ```
 
 ## Ruff Configuration
@@ -86,37 +92,45 @@ Input features (tokens + atoms)
 src/deepfold3/
 ├── model/           # Neural network modules
 │   ├── primitives.py     # LinearNoBias, LayerNorm, SwiGLU, TransitionBlock, AdaLN
-│   ├── config.py         # EvoformerConfig, DiffusionConfig, ConfidenceConfig, ModelConfig
+│   ├── config.py         # EvoformerConfig, DiffusionConfig, ConfidenceConfig, ModelConfig, TrainingConfig
 │   ├── embedders.py      # create_relative_encoding
 │   ├── attention.py      # GridSelfAttention, MSAAttention, SingleAttention
 │   ├── ops.py            # TriangleMul, OuterProductMean
 │   ├── evoformer.py      # EvoformerBlock, PairFormerBlock, Evoformer
 │   ├── template_embedding.py  # TemplateEmbedding, SingleTemplateEmbedding, TemplatePairFormerBlock
 │   ├── atom_cross_attn.py # AtomCrossAttEncoder/Decoder, EvoformerConditioningEncoder
-│   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training)
+│   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training noise/denoise)
 │   ├── confidence.py     # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
-│   └── model.py          # DeepFold3 (top-level), DeepFold3Output, DistogramHead
+│   └── model.py          # DeepFold3 (top-level, forward + forward_training), DeepFold3Output, DistogramHead
 ├── data/            # Data pipeline
-│   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS
+│   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS, element_name_to_int(), get_res_type()
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── msa/             # mmseqs2.py (server API + local binary MSA search + template m8 parsing)
-│   ├── parse/            # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py (4 dialects: alphafold3, alphafoldserver, protenix, deepfold3)
+│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), hhr.py, json_input.py (4 dialects)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   └── module/           # dataset.py (InferenceInput), collate.py (batch)
+│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py
+│   └── module/           # dataset.py (TrainingDataset, InferenceInput), collate.py (batch)
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
 ├── io/              # Output serialization
 │   ├── mmcif.py          # save_mmcif() (gemmi-based, pLDDT in B-factors)
 │   └── confidences.py    # Confidence metric computation + save_confidences_json()
+├── training/        # Training pipeline
+│   ├── loss.py           # smooth_lddt, diffusion_mse, distogram, plddt, pae, pde, exp_resolved, training_loss
+│   ├── ema.py            # EMA with warm-start decay + fused kernel re-sync
+│   ├── scheduler.py      # AF3LRScheduler (warmup → plateau → step decay)
+│   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval)
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
 │   ├── __init__.py       # click.Group `cli` — unified entry point
 │   ├── inference.py      # `deepfold3 inference`
 │   ├── msa_search.py     # `deepfold3 msa`
 │   ├── convert_weights.py  # `deepfold3 convert`
-│   └── plot_confidences.py # `deepfold3 plot`
+│   ├── plot_confidences.py # `deepfold3 plot`
+│   ├── prepare.py        # `deepfold3 prepare`
+│   └── train.py          # `deepfold3 train`
 └── params.py        # read_af3_params() (zstd decompression)
 ```
 
@@ -132,6 +146,87 @@ src/deepfold3/
 | `zstandard` | Compression (model weights are `.zst`) |
 | `click` | CLI interface |
 | `numpy` | Numerical arrays / structured array storage |
+
+## Training Pipeline
+
+### Overview
+
+Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR scheduler are implemented in `src/deepfold3/training/`. See `docs/training.md` for full details.
+
+### Forward Pass (per batch)
+
+```
+1. Evoformer trunk (random 1–max_recycles recycles, gradient on last only)
+2. Diffusion training step (noise sampling + single denoise, with gradient)
+3. Mini-rollout (20-step denoise, no gradient → predicted positions for confidence)
+4. Confidence head (on mini-rollout positions, gradient flows)
+5. Distogram head (cross-entropy on distance bins)
+```
+
+### Loss Weights (AF3 §3.7)
+
+| Loss | Weight | Notes |
+|------|--------|-------|
+| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted: w(σ) = (σ²+σ_d²)/(σ·σ_d)² |
+| Distogram | `alpha_distogram` (0.03) | 64-bin cross-entropy |
+| pLDDT, PDE, exp_resolved | `alpha_confidence` (1e-4) | Per-atom/pair confidence |
+| PAE | `alpha_confidence × alpha_pae` (0) | Disabled in stage 1; set alpha_pae=1.0 for finetuning |
+
+### Training Data Format
+
+```
+data_dir/
+├── manifest.json             # list of Record objects (id, chains, interfaces)
+├── structures/               # {pdb_id}.npz — Structure (atoms, bonds, residues, chains)
+└── msa/                      # {msa_id}.npz — MSA (sequences, mask, deletion_matrix)
+```
+
+Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the MSA file name (SHA256 hash of the chain sequence).
+
+### Data Preprocessing Pipeline
+
+Implemented: `deepfold3 prepare` (step 1 + 5). Remaining steps need implementation.
+
+```bash
+# Process specific PDB IDs
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0,4hhb
+
+# Batch process with resolution filter
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
+
+# Sample N structures
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --limit 100
+```
+
+Steps:
+
+1. **Structure processing** (implemented): PDB mmCIF → `gemmi.make_assembly()` (assembly 1) → quality filters → Structure NPZ. Filters: min/max residue count, all-unknown, consecutive CA distance, chain clashing.
+2. **Sequence clustering** (not yet): MMseqs2 at 40% identity → cluster_id per chain
+3. **MSA generation** (not yet): MMseqs2 against UniRef30/ColabFoldDB → A3M per unique sequence
+4. **Template search** (not yet): `pdb_seqres.txt` → HMM database (hmmpress) → hmmsearch per query → template hits with date cutoff
+5. **MSA processing** (not yet): A3M → MSA NPZ (sequences + deletion matrix)
+6. **Manifest creation** (implemented): collect records/ → `manifest.json`
+
+Source: `src/deepfold3/data/prepare/` (structure.py, filters.py, manifest.py).
+
+PDB mmCIF mirror: `/scratch/pdb/mmCIF/` (layout: `{mid2}/{pdb_id}.cif.gz`, ~250k structures).
+
+### Template Pipeline Design
+
+Two separate search strategies for different purposes:
+
+- **MSAs** (co-evolutionary signal): MMseqs2 — fast, sufficient sensitivity for MSA construction
+- **Templates** (structural homologs): hmmsearch against PDB HMM profiles — better sensitivity, proper E-value statistics, well-suited for finding distant structural homologs
+
+Training-time template pipeline (not yet implemented):
+
+1. Parse `pdb_seqres.txt` → extract all unique PDB polymer sequences
+2. Build per-sequence HMM profiles → `hmmpress` into a searchable HMM database
+3. For each training chain: `hmmsearch` query sequence against PDB HMM DB → ranked template hits
+4. Filter templates by date cutoff (avoid data leakage) and sequence identity
+5. Extract template features from matched PDB structures (backbone frames, pseudo-beta positions)
+
+The current template pipeline (`data/parse/templates.py`) supports per-chain HHR templates and whole-complex JSON templates for inference. The training-time pipeline needs: HMM-based search, date-cutoff filtering, and multi-chain template alignment for multimeric complexes.
 
 ## Confidence Metrics
 

@@ -653,3 +653,16 @@ ELEMENT_TO_INT: dict[str, int] = {
 
 # Maximum atomic number we encode (indices 0..127; 0 = unknown/padding)
 NUM_ELEMENTS = 128
+
+
+def element_name_to_int(element_name: str) -> int:
+    """Convert element symbol string to atomic number, clamped to [0, 127]."""
+    sym = element_name.strip().upper()
+    return min(ELEMENT_TO_INT.get(sym, 0), 127)
+
+
+def get_res_type(res_name: str, mol_type: int) -> int:
+    """Get residue type index for a given residue name and molecule type."""
+    if mol_type == MOL_NONPOLYMER:
+        return 20  # UNK
+    return res_name_to_type(res_name)

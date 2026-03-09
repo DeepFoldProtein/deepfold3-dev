@@ -143,13 +143,20 @@ Training data directory structure:
 
 ```
 data_dir/
+├── manifest.json             # Record index (optional — auto-scanned if missing)
 ├── structures/
-│   ├── {id}.npz          # Structure files (atoms, residues, chains, bonds)
+│   ├── {id}.npz              # Structure files (atoms, residues, chains, bonds)
 │   └── ...
 └── msa/
-    ├── {msa_id}.npz      # MSA files (sequences, mask, deletion_matrix)
+    ├── {msa_id}.npz          # MSA files (sequences, mask, deletion_matrix)
     └── ...
 ```
+
+Records are loaded via `discover_records()` from `data/prepare/manifest.py`: reads `manifest.json` if present, otherwise scans `structures/` for NPZ files.
+
+**Train/eval split**: records are shuffled with a fixed seed (42) then split 95/5 (at least 1 eval record). The seeded shuffle ensures reproducible splits regardless of manifest ordering.
+
+**Preprocessing**: use `deepfold3 prepare` to generate the data directory from a PDB mmCIF mirror. See `docs/data-pipeline.md` § Data Preprocessing for details.
 
 The featurizer produces these training-specific features:
 

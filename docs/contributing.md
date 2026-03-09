@@ -40,7 +40,7 @@ uv run pytest -m "not slow"                  # skip slow tests
 
 ### Test Structure
 
-10 test files, ~130 tests total:
+14 test files, ~190 tests total:
 
 | File | Purpose |
 |---|---|
@@ -149,7 +149,7 @@ Add the Haiku scope → PyTorch key mapping to the conversion table. Pattern: Ha
 - Haiku uses `/` scope separators; PyTorch uses `.` module separators
 - Each module's docstring documents its Haiku attribute names
 
-**`skip_prefixes`**: lists Haiku scopes for unimplemented modules (currently: template embedding). These are silently skipped during conversion.
+**`skip_prefixes`**: lists Haiku scopes for unimplemented modules. These are silently skipped during conversion.
 
 **Validation**: `test_weight_loading.py` loads AF3 params and checks for:
 

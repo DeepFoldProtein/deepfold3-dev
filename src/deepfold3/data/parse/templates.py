@@ -194,7 +194,7 @@ def _extract_from_index_pairs(
     return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr)
 
 
-def _find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
+def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     """Find the file path of a PDB mmCIF in a local PDB mirror.
 
     Same search order as ``_find_pdb_mmcif_local`` but returns the ``Path``
