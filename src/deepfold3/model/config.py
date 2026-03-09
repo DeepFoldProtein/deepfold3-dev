@@ -22,6 +22,9 @@ class AtomCrossAttConfig:
     atom_transformer: AtomTransformerConfig = field(default_factory=AtomTransformerConfig)
     queries_subset_size: int = 32  # Q: atoms per query subset (non-overlapping)
     keys_subset_size: int = 128  # K: atoms per key window (overlapping, centered on Q)
+    num_element_classes: int = 128  # element one-hot vocabulary size
+    num_atom_name_chars: int = 64  # atom name character vocabulary size
+    atom_name_length: int = 4  # characters per atom name
 
 
 @dataclass
@@ -72,6 +75,8 @@ class DiffusionTransformerConfig:
 class DiffusionConfig:
     conditioning_pair_channel: int = 128
     conditioning_seq_channel: int = 384
+    fourier_dim: int = 256  # Fourier noise embedding dimension
+    conditioning_num_intermediate_factor: int = 2  # transition block expansion factor
     # Sampling
     steps: int = 200
     num_samples: int = 5
@@ -100,6 +105,8 @@ class ConfidenceConfig:
     num_distogram_bins: int = 64
     max_error_bin: float = 31.0
     max_atoms_per_token: int = 24  # AF3 dense atom representation max
+    pair_attention_num_head: int = 4
+    single_attention_num_head: int = 16
 
 
 @dataclass
@@ -152,27 +159,213 @@ class OptimConfig:
     - use_fused_evo_attention: 2-3x faster, 2-5x less memory for GridSelfAttention (104 modules)
     - use_torch_compile: 1.3-2.3x faster for MSAAttention/SingleAttention/TriangleMul (156 modules)
     - use_fused_transition: 1.2-1.3x faster for C>=256 + N>=1024 transitions only
+    - use_fused_ada_transition: fused AdaLN+Linear+SwiGLU for diffusion FFN; ~1x at N>=512, overhead at small N
+    - use_fused_triangle_mul: fused LN+proj+gate for TriangleMul pre-einsum; 1.15-1.18x at N>=256
     Note: Triton EvoAttention is NOT used for SingleAttention (N_seq=1 overhead dominates).
     """
 
     use_fused_evo_attention: bool = False
     use_fused_transition: bool = False
+    use_fused_ada_transition: bool = False
+    use_fused_triangle_mul: bool = False
     use_torch_compile: bool = False
+
+    # Substrings that identify derived fused-kernel parameters in state dicts.
+    # These keys are excluded from checkpoints (they are re-synced from base
+    # weights on load) and from EMA shadow copies.
+    FUSED_STATE_DICT_MARKERS: tuple[str, ...] = (
+        "_fused_gate.",
+        "_fused_ada_ln_linear.",
+        "_fused_swiglu.",
+        "_ln_linear.",
+        "_swiglu.",
+    )
 
     @classmethod
     def recommended(cls) -> OptimConfig:
-        """Fused evo attention + torch.compile — the two biggest wins."""
+        """Fused evo attention + torch.compile — the biggest wins."""
         return cls(use_fused_evo_attention=True, use_torch_compile=True)
 
     @classmethod
     def triton_only(cls) -> OptimConfig:
         """Triton fused kernels only (no torch.compile)."""
-        return cls(use_fused_evo_attention=True, use_fused_transition=True)
+        return cls(
+            use_fused_evo_attention=True,
+            use_fused_transition=True,
+            use_fused_ada_transition=True,
+            use_fused_triangle_mul=True,
+        )
 
     @classmethod
     def all_enabled(cls) -> OptimConfig:
-        """Enable all optimizations including fused transition."""
-        return cls(use_fused_evo_attention=True, use_fused_transition=True, use_torch_compile=True)
+        """Enable all optimizations."""
+        return cls(
+            use_fused_evo_attention=True,
+            use_fused_transition=True,
+            use_fused_ada_transition=True,
+            use_fused_triangle_mul=True,
+            use_torch_compile=True,
+        )
+
+
+@dataclass
+class TrainingConfig:
+    """Training hyperparameters.
+
+    All variable training settings are collected here; nothing is hardcoded
+    in the trainer or loss modules.  Override via JSON config or CLI flags.
+
+    Attributes:
+        lr: Peak learning rate for Adam.
+        weight_decay: Weight decay (applied to >= 2-D params only).
+        betas: Adam beta coefficients.
+        eps: Adam epsilon.
+        warmup_steps: Linear LR warmup duration.
+        start_decay_after: Step at which LR decay begins.
+        decay_every: Steps between each LR decay step.
+        decay_factor: Multiplicative LR decay factor.
+        grad_clip_norm: Max L2 gradient norm (0 disables).
+        accumulate_grad_batches: Gradient accumulation steps.
+        ema_decay: EMA decay factor (negative disables EMA).
+        max_tokens: Maximum tokens per crop.
+        max_atoms: Maximum atoms per crop.
+        max_msa_seqs: Maximum MSA sequences.
+        max_recycles: Upper bound for random recycle count per batch.
+        diffusion_batch_size: Number of noise samples per training step.
+        mini_rollout_steps: Denoising steps for the confidence mini-rollout.
+        mini_rollout_samples: Diffusion samples in the mini-rollout.
+        alpha_diffusion: Diffusion loss weight.
+        alpha_distogram: Distogram loss weight.
+        alpha_confidence: Confidence loss weight.
+        alpha_pae: PAE loss multiplier (0 in stage 1, 1 in finetuning).
+        alpha_bond: Bond loss multiplier (0 in stage 1).
+        lddt_cutoffs: Smooth LDDT distance error thresholds (Angstroms).
+        lddt_inclusion_radius: Smooth LDDT pair inclusion radius (Angstroms).
+        min_resolution: Minimum resolution for confidence loss gating (Angstroms).
+        max_resolution: Maximum resolution for confidence loss gating (Angstroms).
+        dtype: Mixed-precision dtype (``"bf16"``, ``"fp16"``, or ``"fp32"``).
+        find_unused_parameters: DDP ``find_unused_parameters`` flag.
+        static_graph: DDP ``static_graph`` flag.
+        max_steps: Total effective training steps.
+        seed: Base random seed (offset by rank for DDP).
+        checkpoint_interval: Save a checkpoint every N effective steps.
+        eval_interval: Run evaluation every N effective steps.
+        log_interval: Log metrics every N effective steps.
+        output_dir: Output directory for checkpoints and logs.
+        data_dir: Root directory containing training data.
+        params_path: Path to pretrained weights (safetensors or .pt).
+    """
+
+    # Optimizer (Adam)
+    lr: float = 0.0018
+    weight_decay: float = 0.0
+    betas: tuple[float, float] = (0.9, 0.95)
+    eps: float = 1e-8
+
+    # LR schedule (AF3-style: warmup, plateau, step decay)
+    warmup_steps: int = 1000
+    start_decay_after: int = 50000
+    decay_every: int = 50000
+    decay_factor: float = 0.95
+
+    # Gradient
+    grad_clip_norm: float = 10.0
+    accumulate_grad_batches: int = 1
+
+    # EMA
+    ema_decay: float = 0.999
+
+    # Data
+    max_tokens: int = 384
+    max_atoms: int = 4096
+    max_msa_seqs: int = 16384
+
+    # Recycling (random 1..max_recycles each batch)
+    max_recycles: int = 4
+
+    # Diffusion training
+    diffusion_batch_size: int = 48
+    mini_rollout_steps: int = 20
+    mini_rollout_samples: int = 1
+
+    # Loss weights
+    alpha_diffusion: float = 4.0
+    alpha_distogram: float = 0.03
+    alpha_confidence: float = 1e-4
+    alpha_pae: float = 0.0
+    alpha_bond: float = 0.0
+
+    # Smooth LDDT thresholds
+    lddt_cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
+    lddt_inclusion_radius: float = 30.0
+    lddt_min_distance: float = 1e-3  # minimum GT distance for LDDT pair inclusion
+
+    # Confidence resolution gating
+    min_resolution: float = 0.1
+    max_resolution: float = 4.0
+
+    # Mixed precision
+    dtype: str = "bf16"
+
+    # DataLoader
+    num_workers: int = 4
+    eval_num_workers: int = 2
+    pin_memory: bool = True
+    drop_last: bool = True
+
+    # DDP
+    find_unused_parameters: bool = False
+    static_graph: bool = True
+
+    # Run control
+    max_steps: int = 200000
+    seed: int = 42
+    checkpoint_interval: int = 1000
+    eval_interval: int = 5000
+    log_interval: int = 50
+
+    # Paths (set at runtime)
+    output_dir: str = "output"
+    data_dir: str = ""
+    params_path: str = ""
+
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+        if self.start_decay_after < self.warmup_steps:
+            raise ValueError(
+                f"start_decay_after ({self.start_decay_after}) must be >= warmup_steps ({self.warmup_steps})"
+            )
+        if self.decay_every <= 0:
+            raise ValueError(f"decay_every must be > 0, got {self.decay_every}")
+        if self.dtype not in ("bf16", "fp16", "fp32"):
+            raise ValueError(f"dtype must be 'bf16', 'fp16', or 'fp32', got '{self.dtype}'")
+        if self.accumulate_grad_batches < 1:
+            raise ValueError(f"accumulate_grad_batches must be >= 1, got {self.accumulate_grad_batches}")
+        if self.max_recycles < 1:
+            raise ValueError(f"max_recycles must be >= 1, got {self.max_recycles}")
+
+    @property
+    def torch_dtype(self):
+        """Returns the ``torch.dtype`` corresponding to ``self.dtype``."""
+        import torch
+
+        return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
+
+
+@dataclass
+class DistogramConfig:
+    num_bins: int = 64
+    first_break: float = 2.3125
+    last_break: float = 21.6875
+
+
+@dataclass
+class DataConfig:
+    max_templates: int = 4
+    max_neighborhood: int = 40
+    spatial_crop_prob: float = 0.5
 
 
 @dataclass
@@ -182,6 +375,8 @@ class ModelConfig:
     diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     template: TemplateEmbeddingConfig = field(default_factory=TemplateEmbeddingConfig)
+    distogram: DistogramConfig = field(default_factory=DistogramConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     num_recycles: int = 10
     msa_crop_size: int = 1024  # MSA rows sampled per recycle

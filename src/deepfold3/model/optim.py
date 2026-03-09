@@ -34,6 +34,8 @@ def is_available(backend: str) -> bool:
         "triton_transition": ("deepfold3.model.triton.fused_transition", "FusedTransitionBlock"),
         "triton_evo_attention": ("deepfold3.model.triton.evo_attention", "fused_evo_attention"),
         "triton_layernorm_linear": ("deepfold3.model.triton.layernorm_linear", "FusedLayerNormLinear"),
+        "triton_ada_transition": ("deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock"),
+        "triton_triangle_mul_gate": ("deepfold3.model.triton.triangle_mul_gate", "FusedTriangleMulGate"),
         "torch_compile": ("torch", "compile"),
     }
     if backend not in checks:
@@ -59,12 +61,27 @@ def make_transition_block(
     return TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor)
 
 
+def make_ada_transition_block(
+    channels: int, cond_dim: int, num_intermediate_factor: int = 2, config: OptimConfig | None = None
+) -> nn.Module:
+    """Create an AdaTransitionBlock, optionally using fused Triton kernels."""
+    if config and config.use_fused_ada_transition:
+        cls = _try_import("deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock")
+        if cls is not None:
+            return cls(channels, cond_dim, num_intermediate_factor=num_intermediate_factor)
+    from deepfold3.model.primitives import AdaTransitionBlock
+
+    return AdaTransitionBlock(channels, cond_dim, num_intermediate_factor=num_intermediate_factor)
+
+
 def print_availability():
     """Print which optimization backends are available."""
     backends = [
         ("triton_transition", "Triton FusedTransition"),
         ("triton_evo_attention", "Triton FusedEvoAttention"),
         ("triton_layernorm_linear", "Triton FusedLayerNormLinear"),
+        ("triton_ada_transition", "Triton FusedAdaTransition"),
+        ("triton_triangle_mul_gate", "Triton FusedTriangleMulGate"),
         ("torch_compile", "torch.compile"),
     ]
     print("Optimization backends:")
