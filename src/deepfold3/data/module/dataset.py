@@ -71,6 +71,8 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         # Load structure
         structure_path = self.data_dir / "structures" / f"{record.id}.npz"
+        if not structure_path.exists():
+            raise FileNotFoundError(f"Structure file not found: {structure_path}")
         structure = Structure.load(structure_path)
 
         # Load MSAs keyed by chain index (treated as unpaired for disk-loaded MSAs)

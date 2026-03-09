@@ -320,6 +320,39 @@ class Featurizer:
             "deletion_mean": deletion_mean,
         }
 
+        # ------------------------------------------------------------------
+        # Ground-truth atom positions for training loss
+        # Uses actual observed coordinates from the Structure (not CCD ideal).
+        # ------------------------------------------------------------------
+        if training:
+            atom_gt_positions = np.zeros((N, M, 3), dtype=np.float32)
+            atom_gt_mask = np.zeros((N, M), dtype=bool)
+
+            for i, tok in enumerate(tokens):
+                atom_idx = int(tok["atom_idx"])
+                atom_num = int(tok["atom_num"])
+                mol_type_tok = int(tok["mol_type"])
+
+                if mol_type_tok == const.MOL_NONPOLYMER:
+                    # Ligand: single atom per token
+                    if atom_idx < len(data.structure.atoms):
+                        atom = data.structure.atoms[atom_idx]
+                        if bool(atom["is_present"]):
+                            atom_gt_positions[i, 0] = [float(atom["x"]), float(atom["y"]), float(atom["z"])]
+                            atom_gt_mask[i, 0] = True
+                else:
+                    # Polymer: multiple atoms per token
+                    for j in range(min(atom_num, M)):
+                        a_idx = atom_idx + j
+                        if a_idx < len(data.structure.atoms):
+                            atom = data.structure.atoms[a_idx]
+                            if bool(atom["is_present"]):
+                                atom_gt_positions[i, j] = [float(atom["x"]), float(atom["y"]), float(atom["z"])]
+                                atom_gt_mask[i, j] = True
+
+            result["atom_gt_positions"] = torch.from_numpy(atom_gt_positions)
+            result["atom_gt_mask"] = torch.from_numpy(atom_gt_mask)
+
         # Bond matrix: only allocated when ligand bonds exist (polymer-only → skip)
         if len(data.bonds) > 0:
             bond_matrix = torch.zeros(N, N, 1)
@@ -573,7 +606,15 @@ class Featurizer:
 
         Each chain's templates fill only that chain's region of the [T, N] tensors.
         """
-        T = min(self.max_templates, max(len(v) for v in template_feats_per_chain.values()))
+        T = min(self.max_templates, max((len(v) for v in template_feats_per_chain.values()), default=0))
+        if T == 0:
+            return {
+                "template_aatype": torch.zeros((0, N), dtype=torch.long),
+                "template_pseudo_beta": torch.zeros((0, N, 3)),
+                "template_pseudo_beta_mask": torch.zeros((0, N), dtype=torch.bool),
+                "template_backbone_frame": torch.zeros((0, N, 3, 3)),
+                "template_backbone_mask": torch.zeros((0, N), dtype=torch.bool),
+            }
         t_aatype = np.zeros((T, N), dtype=np.int64)
         t_pb = np.zeros((T, N, 3), dtype=np.float32)
         t_pb_mask = np.zeros((T, N), dtype=bool)
