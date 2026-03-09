@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 from deepfold3.model.attention import GridSelfAttention
 from deepfold3.model.config import TemplateEmbeddingConfig
+from deepfold3.model.embedders import dgram_from_positions as _dgram_from_positions
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, TransitionBlock
 
@@ -124,16 +125,17 @@ def backbone_frames_from_positions(
     return frames, frame_mask
 
 
-def dgram_from_positions(
+def dgram_from_positions_masked(
     positions: torch.Tensor,
     mask: torch.Tensor,
     min_bin: float = 3.25,
     max_bin: float = 50.75,
     num_bins: int = 39,
 ) -> torch.Tensor:
-    """Compute pairwise distance histogram from positions.
+    """Compute masked pairwise distance histogram from positions.
 
-    Bins are defined by squared-distance boundaries, following AF3 convention.
+    Thin wrapper around :func:`~deepfold3.model.confidence.dgram_from_positions`
+    that additionally zeros out bins where either position is missing.
 
     Args:
         positions: [N, 3] atom positions.
@@ -145,23 +147,9 @@ def dgram_from_positions(
     Returns:
         Distance histogram [N, N, num_bins] float32.
     """
-    # Squared distance boundaries
-    lower_breaks = torch.linspace(min_bin, max_bin, num_bins, device=positions.device)
-    lower_breaks = lower_breaks * lower_breaks  # squared
-    upper_breaks = torch.cat([lower_breaks[1:], torch.tensor([1e8], device=positions.device)])
-
-    # Pairwise squared distances
-    diff = positions.unsqueeze(-2) - positions.unsqueeze(-3)  # [N, N, 3]
-    dist2 = (diff * diff).sum(dim=-1, keepdim=True)  # [N, N, 1]
-
-    # One-hot binning
-    dgram = ((dist2 > lower_breaks) & (dist2 < upper_breaks)).float()  # [N, N, num_bins]
-
-    # Mask: zero out where either position is missing
+    dgram = _dgram_from_positions(positions, min_bin=min_bin, max_bin=max_bin, num_bins=num_bins)
     pair_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)  # [N, N]
-    dgram = dgram * pair_mask.unsqueeze(-1)
-
-    return dgram
+    return dgram * pair_mask.unsqueeze(-1)
 
 
 def _unit_vectors_from_frames(
@@ -341,7 +329,7 @@ class SingleTemplateEmbedding(nn.Module):
         N = query_pair.shape[0]
 
         # Pseudo-beta pairwise distance histogram
-        dgram = dgram_from_positions(
+        dgram = dgram_from_positions_masked(
             template_pseudo_beta,
             template_pseudo_beta_mask,
             min_bin=3.25,

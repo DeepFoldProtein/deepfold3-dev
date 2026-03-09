@@ -10,6 +10,11 @@ import torch
 import torch.nn.functional as F
 
 
+def compute_rel_feat_dim(max_relative_idx: int = 32, max_relative_chain: int = 2) -> int:
+    """Compute the output dimension of :func:`create_relative_encoding`."""
+    return 2 * (2 * max_relative_idx + 2) + 1 + (2 * max_relative_chain + 2)
+
+
 def create_relative_encoding(
     token_index: torch.Tensor,  # [N]  int64
     residue_index: torch.Tensor,  # [N]  int64
@@ -60,3 +65,37 @@ def create_relative_encoding(
     rel_chain = F.one_hot(final_rel_chain, n_chain_bins).float()  # [..., N, N, 6]
 
     return torch.cat([rel_pos, rel_token, entity_same_feat, rel_chain], dim=-1)  # [..., N, N, 139]
+
+
+# Distogram config (matches AF3 DistogramFeaturesConfig defaults)
+DGRAM_MIN_BIN: float = 3.25
+DGRAM_MAX_BIN: float = 50.75
+DGRAM_NUM_BINS: int = 39
+
+
+def dgram_from_positions(
+    positions: torch.Tensor,
+    min_bin: float = DGRAM_MIN_BIN,
+    max_bin: float = DGRAM_MAX_BIN,
+    num_bins: int = DGRAM_NUM_BINS,
+) -> torch.Tensor:
+    """Compute pairwise distance histogram from positions.
+
+    Bins are defined by squared-distance boundaries, following AF3 convention.
+    Supports both unbatched ``[N, 3]`` and batched ``[..., N, 3]`` inputs.
+
+    Args:
+        positions: ``[..., N, 3]`` atom positions.
+        min_bin: Left edge of first distance bin (Angstroms).
+        max_bin: Left edge of last distance bin (Angstroms).
+        num_bins: Number of histogram bins.
+
+    Returns:
+        Distance histogram ``[..., N, N, num_bins]`` float32.
+    """
+    lower_breaks = torch.linspace(min_bin, max_bin, num_bins, device=positions.device)
+    lower_breaks = lower_breaks**2
+    upper_breaks = torch.cat([lower_breaks[1:], lower_breaks.new_tensor([1e8])])
+
+    dist2 = ((positions.unsqueeze(-2) - positions.unsqueeze(-3)) ** 2).sum(-1, keepdim=True)
+    return ((dist2 > lower_breaks) & (dist2 < upper_breaks)).float()

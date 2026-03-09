@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from deepfold3.model.config import ConfidenceConfig
-from deepfold3.model.model import DeepFold3Output, DistogramHead
+from deepfold3.model.config import ConfidenceConfig, DistogramConfig
+from deepfold3.model.model import DeepFold3Output
 
 _DEFAULT_CFG = ConfidenceConfig()
 
@@ -407,9 +407,9 @@ def compute_ranking_score(
 def compute_contact_probs(
     distogram_logits: torch.Tensor,
     threshold: float = 8.0,
-    first_break: float = DistogramHead.FIRST_BREAK,
-    last_break: float = DistogramHead.LAST_BREAK,
-    num_bins: int = DistogramHead.NUM_BINS,
+    first_break: float = DistogramConfig.first_break,
+    last_break: float = DistogramConfig.last_break,
+    num_bins: int = DistogramConfig.num_bins,
 ) -> torch.Tensor:
     """Compute contact probability map from distogram logits.
 

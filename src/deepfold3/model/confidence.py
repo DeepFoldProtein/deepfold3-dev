@@ -24,38 +24,9 @@ import torch
 import torch.nn as nn
 
 from deepfold3.model.config import ConfidenceConfig
+from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
-
-# Distogram config (matches AF3 DistogramFeaturesConfig defaults)
-_DGRAM_MIN_BIN = 3.25
-_DGRAM_MAX_BIN = 50.75
-_DGRAM_NUM_BINS = 39
-
-
-def dgram_from_positions(
-    positions: torch.Tensor,
-    min_bin: float = _DGRAM_MIN_BIN,
-    max_bin: float = _DGRAM_MAX_BIN,
-    num_bins: int = _DGRAM_NUM_BINS,
-) -> torch.Tensor:
-    """Compute distogram from positions.
-
-    Args:
-        positions: [N, 3] representative atom positions.
-
-    Returns:
-        [N, N, num_bins] one-hot distance histogram.
-    """
-    lower_breaks = torch.linspace(min_bin, max_bin, num_bins, device=positions.device)
-    lower_breaks = lower_breaks**2
-    upper_breaks = torch.cat([lower_breaks[1:], lower_breaks.new_tensor([1e8])])
-
-    # Squared pairwise distances [..., N, N, 1] — uses negative indices for batch support
-    dist2 = ((positions.unsqueeze(-2) - positions.unsqueeze(-3)) ** 2).sum(-1, keepdim=True)
-
-    dgram = ((dist2 > lower_breaks) & (dist2 < upper_breaks)).float()
-    return dgram  # [..., N, N, num_bins]
 
 
 class ConfidenceHead(nn.Module):
@@ -90,7 +61,7 @@ class ConfidenceHead(nn.Module):
         # _embed_features: target_feat outer-sum + distogram from positions
         self.left_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
         self.right_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
-        self.distogram_feat_project = LinearNoBias(_DGRAM_NUM_BINS, c_pair)
+        self.distogram_feat_project = LinearNoBias(DGRAM_NUM_BINS, c_pair)
 
         # 4-layer PairFormer with single track (same as trunk)
         self.layers = nn.ModuleList(
@@ -98,8 +69,8 @@ class ConfidenceHead(nn.Module):
                 PairFormerBlock(
                     c_pair=c_pair,
                     c_single=c_single,
-                    num_pair_heads=4,
-                    num_single_heads=16,
+                    num_pair_heads=cfg.pair_attention_num_head,
+                    num_single_heads=cfg.single_attention_num_head,
                     single_key_dim=c_single,
                     single_value_dim=c_single,
                 )

@@ -211,15 +211,24 @@ class AtomPerAtomConditioning(nn.Module):
     cross-token pair construction (matching AF3's Haiku parameter sharing).
     """
 
-    def __init__(self, per_atom_channels: int, per_atom_pair_channels: int):
+    def __init__(
+        self,
+        per_atom_channels: int,
+        per_atom_pair_channels: int,
+        num_element_classes: int = 128,
+        num_atom_name_chars: int = 64,
+        atom_name_length: int = 4,
+    ):
         super().__init__()
         c = per_atom_channels
         cp = per_atom_pair_channels
+        self.num_element_classes = num_element_classes
+        self.num_atom_name_chars = num_atom_name_chars
         self.embed_ref_pos = LinearNoBias(3, c)
         self.embed_ref_mask = LinearNoBias(1, c)
-        self.embed_ref_element = LinearNoBias(128, c)
+        self.embed_ref_element = LinearNoBias(num_element_classes, c)
         self.embed_ref_charge = LinearNoBias(1, c)
-        self.embed_ref_atom_name = LinearNoBias(64 * 4, c)
+        self.embed_ref_atom_name = LinearNoBias(num_atom_name_chars * atom_name_length, c)
         # pair conditioning from single (accessible from encoder for cross-token pairs)
         self.single_to_pair_row = LinearNoBias(c, cp)
         self.single_to_pair_col = LinearNoBias(c, cp)
@@ -242,10 +251,10 @@ class AtomPerAtomConditioning(nn.Module):
         N, M, _ = ref_pos.shape
         act = self.embed_ref_pos(ref_pos)
         act = act + self.embed_ref_mask(ref_mask.unsqueeze(-1))
-        elem_1hot = F.one_hot(ref_element, 128).float()
+        elem_1hot = F.one_hot(ref_element, self.num_element_classes).float()
         act = act + self.embed_ref_element(elem_1hot)
         act = act + self.embed_ref_charge(torch.arcsinh(ref_charge).unsqueeze(-1))
-        name_1hot = F.one_hot(ref_atom_name_chars, 64).float().reshape(N, M, -1)
+        name_1hot = F.one_hot(ref_atom_name_chars, self.num_atom_name_chars).float().reshape(N, M, -1)
         act = act + self.embed_ref_atom_name(name_1hot)
         act = act * ref_mask.unsqueeze(-1)
         return act
@@ -494,6 +503,9 @@ class EvoformerConditioningEncoder(nn.Module):
         num_blocks: int = 3,
         Q: int = 32,
         K: int = 128,
+        num_element_classes: int = 128,
+        num_atom_name_chars: int = 64,
+        atom_name_length: int = 4,
     ):
         super().__init__()
         c = per_atom_channels
@@ -502,7 +514,7 @@ class EvoformerConditioningEncoder(nn.Module):
         self.Q = Q
         self.K = K
 
-        self.per_atom = AtomPerAtomConditioning(c, cp)
+        self.per_atom = AtomPerAtomConditioning(c, cp, num_element_classes, num_atom_name_chars, atom_name_length)
 
         # Encoder-specific additional pair conditioning (_1 variants in AF3)
         self.single_to_pair_row_enc = LinearNoBias(c, cp)
@@ -618,6 +630,9 @@ class AtomEncoder(nn.Module):
         atom_transformer_num_blocks: int = 3,
         Q: int = 32,
         K: int = 128,
+        num_element_classes: int = 128,
+        num_atom_name_chars: int = 64,
+        atom_name_length: int = 4,
     ):
         super().__init__()
         c = per_atom_channels
@@ -626,7 +641,7 @@ class AtomEncoder(nn.Module):
         self.Q = Q
         self.K = K
 
-        self.per_atom = AtomPerAtomConditioning(c, cp)
+        self.per_atom = AtomPerAtomConditioning(c, cp, num_element_classes, num_atom_name_chars, atom_name_length)
 
         # Trunk single conditioning
         self.lnorm_trunk_single_w = nn.Parameter(torch.ones(384))

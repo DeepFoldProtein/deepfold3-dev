@@ -59,11 +59,12 @@ class EvoformerBlock(nn.Module):
         c_pair: int,
         num_msa_heads: int = 8,
         num_pair_heads: int = 4,
+        outer_product_hidden: int = 32,
         optim: OptimConfig | None = None,
     ):
         super().__init__()
         self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads, optim=optim)
-        self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=32)
+        self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=outer_product_hidden)
         self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
         self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
         self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
@@ -207,7 +208,17 @@ class Evoformer(nn.Module):
 
         # MSA stack
         self.msa_stack = nn.ModuleList(
-            [EvoformerBlock(c_msa, c_pair, num_msa_heads=8, num_pair_heads=4, optim=optim) for _ in range(cfg.num_layer)]
+            [
+                EvoformerBlock(
+                    c_msa,
+                    c_pair,
+                    num_msa_heads=cfg.msa_attention.num_head,
+                    num_pair_heads=cfg.pair_attention.num_head,
+                    outer_product_hidden=cfg.outer_product_num_channel,
+                    optim=optim,
+                )
+                for _ in range(cfg.num_layer)
+            ]
         )
 
         # PairFormer stack
@@ -216,7 +227,7 @@ class Evoformer(nn.Module):
                 PairFormerBlock(
                     c_pair,
                     c_single,
-                    num_pair_heads=4,
+                    num_pair_heads=pf_cfg.pair_attention.num_head,
                     num_single_heads=pf_cfg.single_attention_num_head,
                     single_key_dim=pf_cfg.single_key_dim,
                     single_value_dim=pf_cfg.single_value_dim,
