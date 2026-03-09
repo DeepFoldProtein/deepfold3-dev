@@ -1,6 +1,6 @@
 """Training loss functions for DeepFold3.
 
-Implements the multi-component loss from AF3 SS3.7::
+Implements the multi-component loss from AF3 §5.3 (eq. 15)::
 
     L = alpha_diffusion * L_diff + alpha_distogram * L_disto
       + alpha_confidence * (L_plddt + L_pde + L_resolved + alpha_pae * L_pae)

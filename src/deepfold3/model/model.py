@@ -164,7 +164,7 @@ class DeepFold3(nn.Module):
 
         For each recycle, a fresh random subset of MSA rows is sampled
         (``msa_crop_size`` rows, always including the query row 0).
-        This follows AF3 paper (S2.3).
+        This follows AF3 §3.3 (Algorithm 8, line 2).
 
         Returns:
             (embeddings, rel_feat, target_feat, seq_mask, pair_mask)
@@ -267,7 +267,7 @@ class DeepFold3(nn.Module):
         asym_id_tensor = features["asym_id"].to(device)
         multichain_mask = (asym_id_tensor.unsqueeze(-1) == asym_id_tensor.unsqueeze(-2)).float()
 
-        # Per-recycle MSA subsampling (AF3 §2.5.4)
+        # Per-recycle MSA subsampling (AF3 §3.3, Algorithm 8)
         S_full = full_msa.shape[-2]  # MSA rows dimension
         crop = self.cfg.msa_crop_size
         rng = torch.Generator(device="cpu").manual_seed(seed)

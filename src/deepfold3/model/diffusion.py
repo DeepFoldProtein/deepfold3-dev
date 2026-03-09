@@ -761,7 +761,7 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
         num_samples: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Training forward: augment GT, add noise, denoise once (AF3 §3.7.3).
+        """Training forward: augment GT, add noise, denoise once (AF3 §3.7.1).
 
         Returns:
             gt_augmented: Augmented ground truth [B?, S, N, M, 3].
