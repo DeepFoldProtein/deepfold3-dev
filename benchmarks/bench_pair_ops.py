@@ -102,6 +102,25 @@ def bench_triangle_mul(shapes, warmup, rep):
             except Exception as e:
                 print(f"  [skip] Integrated compile {name} failed (N={N}): {e}")
 
+            # --- Triton fused triangle mul gate ---
+            try:
+                optim_tri = OptimConfig(use_fused_triangle_mul=True)
+                mod_tri = cls(C, optim=optim_tri).to(DEVICE, DTYPE).eval()
+                mod_tri.load_state_dict(mod.state_dict(), strict=False)
+                z_tri = z.detach().clone().requires_grad_(True)
+
+                def fwd_tri(mod_tri=mod_tri, z_tri=z_tri, mask=mask):
+                    return mod_tri(z_tri, mask)
+
+                def full_tri(mod_tri=mod_tri, z_tri=z_tri, mask=mask, do=do):
+                    o = mod_tri(z_tri, mask)
+                    o.backward(do, retain_graph=True)
+
+                results.extend(bench_fwd_full(name, "triton", shape, fwd_tri, full_tri, warmup=warmup, rep=rep, grad_to_none=[z_tri]))
+                del mod_tri, z_tri
+            except Exception as e:
+                print(f"  [skip] Triton fused {name} failed (N={N}): {e}")
+
             print(f"  {name} N={N} C={C} done")
 
     return results

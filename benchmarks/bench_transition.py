@@ -116,6 +116,10 @@ def bench_transition_block(shapes: list[dict], warmup: int, rep: int) -> list:
 def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> list:
     from deepfold3.model.primitives import AdaTransitionBlock
 
+    FusedAdaTransitionBlock = try_import(  # noqa: N806
+        "deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock"
+    )
+
     results = []
     for shape in shapes:
         N, C = shape["N"], shape["C"]
@@ -135,6 +139,16 @@ def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> lis
             x_c = x.detach().clone().requires_grad_(True)
             results.extend(_bench_ada_module("AdaTransitionBlock", "compile", shape, atb_c, x_c, cond, do, warmup, rep))
             del atb_c, x_c
+
+        # Triton fused
+        if FusedAdaTransitionBlock is not None:
+            ft = FusedAdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
+            ft.load_state_dict(atb.state_dict(), strict=False)
+            x2 = x.detach().clone().requires_grad_(True)
+            results.extend(_bench_ada_module("AdaTransitionBlock", "triton", shape, ft, x2, cond, do, warmup, rep))
+            del ft, x2
+        else:
+            print(f"  [skip] Triton FusedAdaTransitionBlock not available (N={N}, C={C})")
 
         del atb, x, cond, do
         print(f"  AdaTransitionBlock N={N} C={C} done")

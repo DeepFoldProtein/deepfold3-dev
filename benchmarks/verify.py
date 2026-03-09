@@ -272,6 +272,164 @@ def verify_grid_evo_attention(verbose: bool = False) -> bool:
     return ok
 
 
+def verify_ada_layernorm_linear(verbose: bool = False) -> bool:
+    """Verify FusedAdaLayerNormLinear against sequential AdaLN + Linear."""
+    FusedAdaLayerNormLinear = try_import(  # noqa: N806
+        "deepfold3.model.triton.ada_layernorm_linear", "FusedAdaLayerNormLinear"
+    )
+    if FusedAdaLayerNormLinear is None:
+        print("  [skip] Triton FusedAdaLayerNormLinear not available")
+        return True
+
+    N, K, out = 128, 64, 256
+    x = torch.randn(N, K, device=DEVICE, dtype=DTYPE)
+    scale = torch.randn(N, K, device=DEVICE, dtype=DTYPE).sigmoid()
+    bias = torch.randn(N, K, device=DEVICE, dtype=DTYPE) * 0.1
+    do = torch.randn(N, out, device=DEVICE, dtype=DTYPE)
+
+    # Baseline: LN(no affine) + scale * xn + bias + Linear(no bias)
+    linear_w = torch.randn(out, K, device=DEVICE, dtype=DTYPE)
+    x1 = x.clone().requires_grad_(True)
+    s1 = scale.clone().requires_grad_(True)
+    b1 = bias.clone().requires_grad_(True)
+    xn = F.layer_norm(x1, [K])
+    xn = s1 * xn + b1
+    o1 = F.linear(xn, linear_w)
+    o1.backward(do)
+
+    # Fused
+    fused = FusedAdaLayerNormLinear(K, out).to(DEVICE, DTYPE)
+    with torch.no_grad():
+        fused.linear_weight.copy_(linear_w.T)
+    x2 = x.clone().requires_grad_(True)
+    s2 = scale.clone().requires_grad_(True)
+    b2 = bias.clone().requires_grad_(True)
+    o2 = fused(x2, s2, b2)
+    o2.backward(do)
+
+    ok = _allclose(o1, o2, "AdaLayerNormLinear fwd", verbose)
+    ok &= _allclose(x1.grad, x2.grad, "AdaLayerNormLinear grad_x", verbose)
+    ok &= _allclose(s1.grad, s2.grad, "AdaLayerNormLinear grad_scale", verbose)
+    ok &= _allclose(b1.grad, b2.grad, "AdaLayerNormLinear grad_bias", verbose)
+    return ok
+
+
+def verify_ada_transition(verbose: bool = False) -> bool:
+    """Verify FusedAdaTransitionBlock against baseline AdaTransitionBlock."""
+    FusedAdaTransitionBlock = try_import(  # noqa: N806
+        "deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock"
+    )
+    if FusedAdaTransitionBlock is None:
+        print("  [skip] Triton FusedAdaTransitionBlock not available")
+        return True
+
+    from deepfold3.model.primitives import AdaTransitionBlock
+
+    N, C = 128, 64
+    cond_dim = C
+    x = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    cond = torch.randn(N, cond_dim, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+
+    # Baseline
+    atb = AdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
+    x1 = x.clone().requires_grad_(True)
+    o1 = atb(x1, cond)
+    o1.backward(do)
+
+    # Fused
+    ft = FusedAdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
+    ft.load_state_dict(atb.state_dict(), strict=False)
+    x2 = x.clone().requires_grad_(True)
+    o2 = ft(x2, cond)
+    o2.backward(do)
+
+    ok = _allclose(o1, o2, "AdaTransitionBlock fwd", verbose)
+    ok &= _allclose(x1.grad, x2.grad, "AdaTransitionBlock grad", verbose)
+    return ok
+
+
+def verify_triangle_mul_gate(verbose: bool = False) -> bool:
+    """Verify FusedTriangleMulGate against baseline pre-einsum ops."""
+    FusedTriangleMulGate = try_import(  # noqa: N806
+        "deepfold3.model.triton.triangle_mul_gate", "FusedTriangleMulGate"
+    )
+    if FusedTriangleMulGate is None:
+        print("  [skip] Triton FusedTriangleMulGate not available")
+        return True
+
+    from deepfold3.model.primitives import LayerNorm, LinearNoBias
+
+    N, C = 64, 128
+    z = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    do_a = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    do_b = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    do_g = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+
+    # Baseline
+    norm = LayerNorm(C).to(DEVICE, DTYPE)
+    proj = LinearNoBias(C, C * 2).to(DEVICE, DTYPE)
+    gate_l = LinearNoBias(C, C * 2).to(DEVICE, DTYPE)
+    out_gate_l = LinearNoBias(C, C).to(DEVICE, DTYPE)
+
+    z1 = z.clone().requires_grad_(True)
+    z0 = norm(z1)
+    p = proj(z0)
+    g = torch.sigmoid(gate_l(z0))
+    og = torch.sigmoid(out_gate_l(z0))
+    p = p * g
+    a1 = p[..., 0::2]
+    b1 = p[..., 1::2]
+    loss1 = (a1 * do_a).sum() + (b1 * do_b).sum() + (og * do_g).sum()
+    loss1.backward()
+
+    # Fused
+    fused = FusedTriangleMulGate(C).to(DEVICE, DTYPE)
+    with torch.no_grad():
+        fused.norm_left.weight.copy_(norm.weight)
+        fused.norm_left.bias.copy_(norm.bias)
+        fused.proj.weight.copy_(proj.weight)
+        fused.gate.weight.copy_(gate_l.weight)
+        fused.out_gate.weight.copy_(out_gate_l.weight)
+    fused._sync_to_fused()
+
+    z2 = z.clone().requires_grad_(True)
+    a2, b2, og2 = fused(z2)
+    loss2 = (a2 * do_a).sum() + (b2 * do_b).sum() + (og2 * do_g).sum()
+    loss2.backward()
+
+    ok = _allclose(a1, a2, "TriMulGate a fwd", verbose)
+    ok &= _allclose(b1, b2, "TriMulGate b fwd", verbose)
+    ok &= _allclose(og, og2, "TriMulGate out_gate fwd", verbose)
+    ok &= _allclose(z1.grad, z2.grad, "TriMulGate grad", verbose)
+    return ok
+
+
+def verify_triangle_mul_e2e(verbose: bool = False) -> bool:
+    """Verify full TriangleMul (outgoing) with fused gate matches baseline at inference scale."""
+    from deepfold3.model.config import OptimConfig
+    from deepfold3.model.ops import TriangleMulOutgoing
+
+    N, C = 256, 128  # larger scale to stress-test
+    z = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
+    mask = torch.ones(1, N, N, device=DEVICE, dtype=DTYPE)
+
+    # Baseline (no fused)
+    base = TriangleMulOutgoing(C, optim=OptimConfig()).to(DEVICE, DTYPE)
+    with torch.inference_mode():
+        out_base = base(z, mask)
+
+    # Fused gate only (no torch.compile)
+    fused = TriangleMulOutgoing(C, optim=OptimConfig(use_fused_triangle_mul=True)).to(DEVICE, DTYPE)
+    with torch.no_grad():
+        fused.load_state_dict(base.state_dict(), strict=False)
+    with torch.inference_mode():
+        out_fused = fused(z, mask)
+
+    ok = _allclose(out_base, out_fused, "TriMulOutgoing e2e fused vs baseline", verbose)
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify optimized kernels match baseline")
     parser.add_argument("--verbose", action="store_true")
@@ -299,6 +457,18 @@ def main():
 
     print("=== GridSelfAttention + EvoAttention (Triton) ===")
     all_ok &= verify_grid_evo_attention(args.verbose)
+
+    print("=== AdaLayerNormLinear (Triton) ===")
+    all_ok &= verify_ada_layernorm_linear(args.verbose)
+
+    print("=== AdaTransitionBlock (Triton) ===")
+    all_ok &= verify_ada_transition(args.verbose)
+
+    print("=== TriangleMulGate (Triton) ===")
+    all_ok &= verify_triangle_mul_gate(args.verbose)
+
+    print("=== TriangleMul E2E (fused gate) ===")
+    all_ok &= verify_triangle_mul_e2e(args.verbose)
 
     print()
     if all_ok:
