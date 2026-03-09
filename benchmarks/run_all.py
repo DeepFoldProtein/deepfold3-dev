@@ -84,6 +84,8 @@ def main():
     if not args.no_plot and passed > 0:
         print("\nGenerating plots...")
         subprocess.run([sys.executable, "-m", "benchmarks.plot_results"], cwd=Path(__file__).parent.parent)
+        print("\nGenerating recommended PDF report...")
+        subprocess.run([sys.executable, "-m", "benchmarks.plot_recommended"], cwd=Path(__file__).parent.parent)
 
     sys.exit(1 if failed > 0 else 0)
 
