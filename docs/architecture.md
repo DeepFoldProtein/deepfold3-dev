@@ -80,6 +80,8 @@ Key constants (`model/model.py`):
 | `TemplateEmbeddingConfig` | `num_channels=64`, `pair_channel=128`, `dgram_num_bins=39`, `dgram_min_bin=3.25`, `dgram_max_bin=50.75`, `aatype_num_classes=31` |
 | `TemplatePairFormerConfig` | `num_layer=2`, `num_channels=64`, `num_heads=4`, `num_intermediate_factor=2` |
 | `ConfidenceConfig` | `num_layer=4`, `num_plddt_bins=50`, `num_distogram_bins=64`, `max_error_bin=31.0`, `max_atoms_per_token=24` |
+| `OptimConfig` | Fused kernel toggles; `FUSED_STATE_DICT_MARKERS` (tuple of key substrings for derived params) |
+| `DistogramConfig` | `num_bins=64`, `first_break=2.3125`, `last_break=21.6875` |
 
 ### `embedders.py` -- Relative Encoding
 
@@ -296,6 +298,26 @@ All core model modules support both unbatched and batched (leading B dim) inputs
 - Pattern: `has_batch = x.dim() == expected_batched_dim; if not: unsqueeze(0) -> compute -> squeeze(0)`
 - Supported: attention, ops, evoformer, diffusion, confidence, embedders
 - **Not yet batched**: `atom_cross_attn.py` (subset building is per-sample)
+
+## Training
+
+Training infrastructure is in `src/deepfold3/training/`. See [training.md](training.md) for full details.
+
+- **Loss**: Multi-component (diffusion MSE + smooth LDDT + distogram + confidence)
+- **DDP**: Native PyTorch `DistributedDataParallel` (no Lightning)
+- **Optimizer**: Adam with AF3-style LR schedule (warmup → plateau → step decay)
+- **EMA**: Exponential Moving Average with warm-start ramp
+- **Config**: All hyperparameters in `TrainingConfig` dataclass — nothing hardcoded
+
+## Fused Kernel Checkpoint Portability
+
+When fused Triton kernels are enabled (via `OptimConfig`), modules create derived parameter copies (e.g. `_fused_gate.*`, `_fused_ada_ln_linear.*`). These are **excluded** from checkpoints and EMA:
+
+- **`DeepFold3.state_dict()`** filters out keys matching `OptimConfig.FUSED_STATE_DICT_MARKERS`
+- **`DeepFold3.load_state_dict()`** relaxes `strict=True` when fused keys are absent, then calls `_sync_fused_kernels()` to rebuild derived params from base weights
+- **`EMA`** skips fused parameters during shadow initialization, and calls `_sync_fused_kernels()` after `apply()`/`restore()` to keep fused params consistent
+
+This ensures checkpoints are portable — the same `.pt` file loads correctly whether fused kernels are enabled or not. The marker list is defined once in `OptimConfig.FUSED_STATE_DICT_MARKERS`.
 
 ## Weight Compatibility
 
