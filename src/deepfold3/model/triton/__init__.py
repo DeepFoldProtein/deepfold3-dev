@@ -28,6 +28,9 @@ def _try_import(attr: str):
         "FusedLayerNormLinear": ("deepfold3.model.triton.layernorm_linear", "FusedLayerNormLinear"),
         "FusedTransitionBlock": ("deepfold3.model.triton.fused_transition", "FusedTransitionBlock"),
         "fused_evo_attention": ("deepfold3.model.triton.evo_attention", "fused_evo_attention"),
+        "FusedAdaLayerNormLinear": ("deepfold3.model.triton.ada_layernorm_linear", "FusedAdaLayerNormLinear"),
+        "FusedAdaTransitionBlock": ("deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock"),
+        "FusedTriangleMulGate": ("deepfold3.model.triton.triangle_mul_gate", "FusedTriangleMulGate"),
     }
     if attr not in _map:
         return None

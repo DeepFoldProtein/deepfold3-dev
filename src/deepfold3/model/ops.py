@@ -46,18 +46,56 @@ class _TriangleMulBase(nn.Module):
         self.norm_center = LayerNorm(c_z)
         self.out_proj = LinearNoBias(c_z, c_z)
         self.out_gate = LinearNoBias(c_z, c_z)
-        if optim is not None and optim.use_torch_compile:
+
+        self._fused_gate = None
+        if optim is not None and optim.use_fused_triangle_mul:
+            try:
+                from deepfold3.model.triton.triangle_mul_gate import FusedTriangleMulGate
+
+                self._fused_gate = FusedTriangleMulGate(c_z)
+                self._sync_to_fused_gate()
+            except ImportError:
+                pass
+
+        if optim is not None and optim.use_torch_compile and self._fused_gate is None:
+            # Don't combine torch.compile with fused Triton gate — the compiled
+            # graph can mishandle nested Triton kernel launches.
             self._compute = torch.compile(self._compute)
 
+    def _sync_to_fused_gate(self):
+        """Copy norm/proj/gate/out_gate weights to FusedTriangleMulGate."""
+        if self._fused_gate is not None:
+            with torch.no_grad():
+                self._fused_gate.norm_left.weight.data.copy_(self.norm_left.weight.data)
+                self._fused_gate.norm_left.bias.data.copy_(self.norm_left.bias.data)
+                self._fused_gate.proj.weight.data.copy_(self.proj.weight.data)
+                self._fused_gate.gate.weight.data.copy_(self.gate.weight.data)
+                self._fused_gate.out_gate.weight.data.copy_(self.out_gate.weight.data)
+                self._fused_gate._sync_to_fused()
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load state dict then sync to fused parameters if present."""
+        if self._fused_gate is not None and strict:
+            # Relax strict if incoming state_dict lacks fused-gate keys (they are derived).
+            if not any(k.startswith("_fused_gate.") for k in state_dict):
+                strict = False
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if self._fused_gate is not None:
+            self._sync_to_fused_gate()
+        return result
+
     def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        z0 = self.norm_left(z)
-        proj = self.proj(z0)
-        gate = torch.sigmoid(self.gate(z0))
-        out_gate = torch.sigmoid(self.out_gate(z0))
-        del z0
-        proj = proj * gate
-        a = proj[..., 0::2]
-        b = proj[..., 1::2]
+        if self._fused_gate is not None and z.is_cuda:
+            a, b, out_gate = self._fused_gate(z)
+        else:
+            z0 = self.norm_left(z)
+            proj = self.proj(z0)
+            gate = torch.sigmoid(self.gate(z0))
+            out_gate = torch.sigmoid(self.out_gate(z0))
+            del z0
+            proj = proj * gate
+            a = proj[..., 0::2]
+            b = proj[..., 1::2]
         m = mask.unsqueeze(-1)
         a = a * m
         b = b * m

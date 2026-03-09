@@ -167,8 +167,39 @@ class DiffusionTransformerBlock(nn.Module):
         nn.init.zeros_(self.ffn_zero_cond.weight)
         nn.init.constant_(self.ffn_zero_cond.bias, -2.0)
 
+        # Fused FFN kernels (optional)
+        self._fused_ada_ln_linear = None
+        self._fused_swiglu = None
+        if optim is not None and optim.use_fused_ada_transition:
+            try:
+                from deepfold3.model.triton.ada_layernorm_linear import FusedAdaLayerNormLinear
+                from deepfold3.model.triton.swiglu import FusedSwiGLU
+
+                self._fused_ada_ln_linear = FusedAdaLayerNormLinear(c, num_int * 2)
+                self._fused_swiglu = FusedSwiGLU()
+                self._sync_ffn_to_fused()
+            except ImportError:
+                pass
+
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load state dict then sync to fused FFN parameters if present."""
+        if self._fused_ada_ln_linear is not None and strict:
+            # Relax strict if incoming state_dict lacks fused keys (they are derived).
+            if not any(k.startswith(("_fused_ada_ln_linear.", "_fused_swiglu.")) for k in state_dict):
+                strict = False
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if self._fused_ada_ln_linear is not None:
+            self._sync_ffn_to_fused()
+        return result
+
+    def _sync_ffn_to_fused(self):
+        """Copy ffn_linear1 weights to fused AdaLN+Linear."""
+        if self._fused_ada_ln_linear is not None:
+            with torch.no_grad():
+                self._fused_ada_ln_linear.linear_weight.data.copy_(self.ffn_linear1.weight.data.T)
 
     def _compute(
         self,
@@ -212,14 +243,19 @@ class DiffusionTransformerBlock(nn.Module):
         x = x + gate * out
 
         # AdaLN-zero FFN
-        xn = F.layer_norm(x, [C])
         cn = F.layer_norm(single_cond, [Cs]) * self.ffn_cond_norm_w
         scale = torch.sigmoid(self.ffn_cond_scale(cn))
         bias = self.ffn_cond_bias(cn)
-        xn = scale * xn + bias
 
-        a, b = self.ffn_linear1(xn).chunk(2, dim=-1)
-        ff = F.silu(a) * b
+        if self._fused_ada_ln_linear is not None and x.is_cuda:
+            h = self._fused_ada_ln_linear(x, scale, bias)
+            ff = self._fused_swiglu(h)
+        else:
+            xn = F.layer_norm(x, [C])
+            xn = scale * xn + bias
+            a, b = self.ffn_linear1(xn).chunk(2, dim=-1)
+            ff = F.silu(a) * b
+
         ff_out = self.ffn_linear2(ff)
         gate = torch.sigmoid(self.ffn_zero_cond(single_cond))
         return x + gate * ff_out
@@ -358,6 +394,8 @@ class DiffusionConditioningBlock(nn.Module):
         c_single_out: int,
         target_feat_dim: int = 447,
         sigma_data: float = 16.0,
+        fourier_dim: int = 256,
+        num_intermediate_factor: int = 2,
         optim: OptimConfig | None = None,
     ):
         super().__init__()
@@ -366,8 +404,12 @@ class DiffusionConditioningBlock(nn.Module):
         pair_in = c_pair_in + rel_feat_dim
         self.pair_cond_norm_w = nn.Parameter(torch.ones(pair_in))
         self.pair_cond_proj = LinearNoBias(pair_in, c_pair_out)
-        self.pair_trans0 = make_transition_block(c_pair_out, num_intermediate_factor=2, config=optim)
-        self.pair_trans1 = make_transition_block(c_pair_out, num_intermediate_factor=2, config=optim)
+        self.pair_trans0 = make_transition_block(
+            c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
+        )
+        self.pair_trans1 = make_transition_block(
+            c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
+        )
 
         # Single conditioning: concat(single_embedding, target_feat)
         single_in = c_single_in + target_feat_dim  # 384 + 447 = 831
@@ -375,20 +417,23 @@ class DiffusionConditioningBlock(nn.Module):
         self.single_cond_proj = LinearNoBias(single_in, c_single_out)
 
         # Noise embedding conditioning (Fourier weights loaded from safetensors)
-        fourier_dim = 256
         self.register_buffer("fourier_weight", torch.zeros(fourier_dim))
         self.register_buffer("fourier_bias", torch.zeros(fourier_dim))
         self.noise_emb_norm_w = nn.Parameter(torch.ones(fourier_dim))
         self.noise_emb_proj = LinearNoBias(fourier_dim, c_single_out)
 
-        self.single_trans0 = make_transition_block(c_single_out, num_intermediate_factor=2, config=optim)
-        self.single_trans1 = make_transition_block(c_single_out, num_intermediate_factor=2, config=optim)
+        self.single_trans0 = make_transition_block(
+            c_single_out, num_intermediate_factor=num_intermediate_factor, config=optim
+        )
+        self.single_trans1 = make_transition_block(
+            c_single_out, num_intermediate_factor=num_intermediate_factor, config=optim
+        )
 
     def _fourier_noise_embedding(self, sigma: torch.Tensor) -> torch.Tensor:
         """Fixed Fourier embedding of noise level using registered buffers.
 
         sigma: scalar or batch of noise levels.
-        Returns: [..., 256]
+        Returns: [..., fourier_dim]
         """
         x = (1 / 4) * torch.log(sigma)
         emb = x.unsqueeze(-1) * self.fourier_weight + self.fourier_bias
@@ -458,6 +503,8 @@ class DiffusionHead(nn.Module):
             c_pair_out=cfg.conditioning_pair_channel,
             c_single_out=cfg.conditioning_seq_channel,
             sigma_data=cfg.sigma_data,
+            fourier_dim=cfg.fourier_dim,
+            num_intermediate_factor=cfg.conditioning_num_intermediate_factor,
             optim=optim,
         )
 
@@ -469,6 +516,9 @@ class DiffusionHead(nn.Module):
             atom_transformer_num_blocks=cfg.atom_cross_att.atom_transformer.num_blocks,
             Q=cfg.atom_cross_att.queries_subset_size,
             K=cfg.atom_cross_att.keys_subset_size,
+            num_element_classes=cfg.atom_cross_att.num_element_classes,
+            num_atom_name_chars=cfg.atom_cross_att.num_atom_name_chars,
+            atom_name_length=cfg.atom_cross_att.atom_name_length,
         )
 
         # Project trunk single to diffusion act (scale-only LN + no-bias projection)
@@ -543,19 +593,27 @@ class DiffusionHead(nn.Module):
             enc_list = []
             for b in range(B):
                 enc_b = self.atom_encoder(
-                    ref_pos=ref_pos[b], ref_mask=ref_mask[b], ref_element=ref_element[b],
-                    ref_charge=ref_charge[b], ref_atom_name_chars=ref_atom_name_chars[b],
+                    ref_pos=ref_pos[b],
+                    ref_mask=ref_mask[b],
+                    ref_element=ref_element[b],
+                    ref_charge=ref_charge[b],
+                    ref_atom_name_chars=ref_atom_name_chars[b],
                     noisy_atom_pos=act_pos[b],
-                    trunk_single=embeddings["single"][b], trunk_pair=pair_cond[b],
+                    trunk_single=embeddings["single"][b],
+                    trunk_pair=pair_cond[b],
                 )
                 enc_list.append(enc_b)
             act = torch.stack([e.token_act for e in enc_list]).float()
         else:
             enc = self.atom_encoder(
-                ref_pos=ref_pos, ref_mask=ref_mask, ref_element=ref_element,
-                ref_charge=ref_charge, ref_atom_name_chars=ref_atom_name_chars,
+                ref_pos=ref_pos,
+                ref_mask=ref_mask,
+                ref_element=ref_element,
+                ref_charge=ref_charge,
+                ref_atom_name_chars=ref_atom_name_chars,
                 noisy_atom_pos=act_pos,
-                trunk_single=embeddings["single"], trunk_pair=pair_cond,
+                trunk_single=embeddings["single"],
+                trunk_pair=pair_cond,
             )
             act = enc.token_act.float()
 
@@ -669,9 +727,16 @@ class DiffusionHead(nn.Module):
 
             # Denoise + Euler step
             denoised = self._denoise_samples(
-                positions_hat, sigma_hat, embeddings,
-                ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars,
-                seq_mask, rel_feat,
+                positions_hat,
+                sigma_hat,
+                embeddings,
+                ref_pos,
+                ref_mask,
+                ref_element,
+                ref_charge,
+                ref_atom_name_chars,
+                seq_mask,
+                rel_feat,
             )
             d_t = sigma_next - sigma_hat
             positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
@@ -724,9 +789,16 @@ class DiffusionHead(nn.Module):
 
         # Denoise
         denoised = self._denoise_samples(
-            noisy_pos, noise_levels, embeddings,
-            ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars,
-            seq_mask, rel_feat,
+            noisy_pos,
+            noise_levels,
+            embeddings,
+            ref_pos,
+            ref_mask,
+            ref_element,
+            ref_charge,
+            ref_atom_name_chars,
+            seq_mask,
+            rel_feat,
         )
 
         return gt_aug, denoised, noise_levels
