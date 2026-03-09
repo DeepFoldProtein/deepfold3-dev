@@ -98,7 +98,7 @@ class TestBatchedEvoformer:
         batch = collate_fn([_make_features(8, seed=i) for i in range(2)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 batch, num_recycles=0
             )
 
@@ -119,7 +119,7 @@ class TestBatchedEvoformer:
         N_max = 10
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 batch, num_recycles=0
             )
 
@@ -135,7 +135,7 @@ class TestBatchedEvoformer:
         feats = _make_features(8)
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 feats, num_recycles=0
             )
 
@@ -156,7 +156,7 @@ class TestBatchedDenoise:
         batch = collate_fn([_make_features(N, seed=i) for i in range(B)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 batch, num_recycles=0
             )
 
@@ -190,7 +190,7 @@ class TestBatchedDenoise:
         batch = collate_fn([_make_features(N, seed=i) for i in range(B)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 batch, num_recycles=0
             )
 
@@ -223,7 +223,7 @@ class TestBatchedDenoise:
         feats = _make_features(N)
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model._run_evoformer(
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
                 feats, num_recycles=0
             )
 
@@ -259,7 +259,7 @@ class TestBatchedDistogram:
         batch = collate_fn([_make_features(N, seed=i) for i in range(B)])
 
         with torch.no_grad():
-            embeddings, *_ = model._run_evoformer(batch, num_recycles=0)
+            embeddings, *_ = model.run_evoformer(batch, num_recycles=0)
             disto = model.distogram_head(embeddings["pair"])
 
         assert disto.shape == (B, N, N, 64)
