@@ -489,69 +489,66 @@ def _search_monomer(
     db_dir: Path,
     work_dir: Path,
     use_env: bool,
+    use_templates: bool,
     filter: bool,
     threads: int,
+    gpu: bool,
+    gpu_server: bool,
 ) -> None:
-    """Run the monomer unpaired search pipeline."""
-    uniref_db = db_dir / "uniref30_2302_db"
-    env_db = db_dir / "colabfold_envdb_202108_db"
+    """Run the monomer unpaired search pipeline.
+
+    Args:
+        gpu: Use GPU acceleration (requires MMseqs2 with GPU support).
+        gpu_server: Use dedicated GPU server for reduced per-request overhead.
+    """
+    uniref_db = "uniref30_2302_db"
+    env_db = "colabfold_envdb_202108_db"
+    template_db = "pdb100_230517"
     qdb = work_dir / "qdb"
 
-    # Check index availability
+    # Check index availability — determines db_load_mode and suffix convention
     db_load_mode = "2"
-    db_suffix = ".idx"
-    if not (db_dir / "uniref30_2302_db.idx").is_file() and not (db_dir / "uniref30_2302_db.idx.index").is_file():
+    db_suffix_seq = ".idx"  # suffix for sequence DB in expandaln
+    db_suffix_aln = ".idx"  # suffix for alignment DB in expandaln
+    db_suffix_tpl = ".idx"  # suffix for template DB in convertalis
+    if not (db_dir / f"{uniref_db}.idx").is_file() and not (db_dir / f"{uniref_db}.idx.index").is_file():
         db_load_mode = "0"
-        db_suffix = "_seq"
+        db_suffix_seq = "_seq"
+        db_suffix_aln = "_aln"
+        db_suffix_tpl = ""
 
     if filter:
         align_eval, qsc, max_accept = "10", "0.8", "100000"
     else:
         align_eval, qsc, max_accept = "10", "-20.0", "1000000"
 
-    search_param = [
-        "--num-iterations",
-        "3",
-        "--db-load-mode",
-        db_load_mode,
-        "-a",
-        "-e",
-        "0.1",
-        "--max-seqs",
-        "10000",
-        "-s",
-        "8.0",
+    search_param: list[str | Path] = [
+        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", "10000",
     ]
-    filter_param = [
-        "--filter-msa",
-        str(int(filter)),
-        "--filter-min-enable",
-        "1000",
-        "--diff",
-        "3000",
-        "--qid",
-        "0.0,0.2,0.4,0.6,0.8,1.0",
-        "--qsc",
-        "0",
-        "--max-seq-id",
-        "0.95",
-    ]
-    expand_param = [
-        "--expansion-mode",
-        "0",
-        "-e",
-        "inf",
-        "--expand-filter-clusters",
-        str(int(filter)),
-        "--max-seq-id",
-        "0.95",
-    ]
+    template_search_param: list[str | Path] = []
+    if gpu:
+        # GPU version only supports ungapped prefilter; runs at max sensitivity automatically
+        search_param += ["--gpu", "1", "--prefilter-mode", "1"]
+        template_search_param += ["--gpu", "1", "--prefilter-mode", "1"]
+    else:
+        search_param += ["--prefilter-mode", "0", "-s", "8.0"]
+        template_search_param += ["-s", "7.5", "--prefilter-mode", "0"]
+    if gpu_server:
+        search_param += ["--gpu-server", "1"]
 
-    uniref_suffix = db_suffix
+    filter_param: list[str | Path] = [
+        "--filter-msa", str(int(filter)), "--filter-min-enable", "1000", "--diff", "3000",
+        "--qid", "0.0,0.2,0.4,0.6,0.8,1.0", "--qsc", "0", "--max-seq-id", "0.95",
+    ]
+    expand_param: list[str | Path] = [
+        "--expansion-mode", "0", "-e", "inf", "--expand-filter-clusters", str(int(filter)), "--max-seq-id", "0.95",
+    ]
 
     # 1. Search UniRef
     _run_mmseqs(
-        binary, ["search", qdb, uniref_db, work_dir / "res", work_dir / "tmp", "--threads", str(threads)] + search_param
+        binary,
+        ["search", qdb, db_dir / uniref_db, work_dir / "res", work_dir / "tmp", "--threads", str(threads)]
+        + search_param,
     )
     # 2. Extract profile
     _run_mmseqs(binary, ["mvdb", work_dir / "tmp/latest/profile_1", work_dir / "prof_res"])
@@ -561,16 +558,10 @@ def _search_monomer(
     _run_mmseqs(
         binary,
         [
-            "expandaln",
-            qdb,
-            db_dir / f"uniref30_2302_db{uniref_suffix}",
-            work_dir / "res",
-            db_dir / f"uniref30_2302_db{uniref_suffix}",
+            "expandaln", qdb, db_dir / f"{uniref_db}{db_suffix_seq}",
+            work_dir / "res", db_dir / f"{uniref_db}{db_suffix_aln}",
             work_dir / "res_exp",
-            "--db-load-mode",
-            db_load_mode,
-            "--threads",
-            str(threads),
+            "--db-load-mode", db_load_mode, "--threads", str(threads),
         ]
         + expand_param,
     )
@@ -578,184 +569,147 @@ def _search_monomer(
     _run_mmseqs(
         binary,
         [
-            "align",
-            work_dir / "prof_res",
-            db_dir / f"uniref30_2302_db{uniref_suffix}",
-            work_dir / "res_exp",
-            work_dir / "res_exp_realign",
-            "--db-load-mode",
-            db_load_mode,
-            "-e",
-            align_eval,
-            "--max-accept",
-            max_accept,
-            "--threads",
-            str(threads),
-            "--alt-ali",
-            "10",
-            "-a",
+            "align", work_dir / "prof_res", db_dir / f"{uniref_db}{db_suffix_seq}",
+            work_dir / "res_exp", work_dir / "res_exp_realign",
+            "--db-load-mode", db_load_mode, "-e", align_eval, "--max-accept", max_accept,
+            "--threads", str(threads), "--alt-ali", "10", "-a",
         ],
     )
     # 6. Filter
     _run_mmseqs(
         binary,
         [
-            "filterresult",
-            qdb,
-            db_dir / f"uniref30_2302_db{uniref_suffix}",
-            work_dir / "res_exp_realign",
-            work_dir / "res_exp_realign_filter",
-            "--db-load-mode",
-            db_load_mode,
-            "--qid",
-            "0",
-            "--qsc",
-            qsc,
-            "--diff",
-            "0",
-            "--threads",
-            str(threads),
-            "--max-seq-id",
-            "1.0",
-            "--filter-min-enable",
-            "100",
+            "filterresult", qdb, db_dir / f"{uniref_db}{db_suffix_seq}",
+            work_dir / "res_exp_realign", work_dir / "res_exp_realign_filter",
+            "--db-load-mode", db_load_mode, "--qid", "0", "--qsc", qsc,
+            "--diff", "0", "--threads", str(threads), "--max-seq-id", "1.0", "--filter-min-enable", "100",
         ],
     )
     # 7. Result to MSA
     _run_mmseqs(
         binary,
         [
-            "result2msa",
-            qdb,
-            db_dir / f"uniref30_2302_db{uniref_suffix}",
-            work_dir / "res_exp_realign_filter",
-            work_dir / "uniref.a3m",
-            "--msa-format-mode",
-            "6",
-            "--db-load-mode",
-            db_load_mode,
-            "--threads",
-            str(threads),
+            "result2msa", qdb, db_dir / f"{uniref_db}{db_suffix_seq}",
+            work_dir / "res_exp_realign_filter", work_dir / "uniref.a3m",
+            "--msa-format-mode", "6", "--db-load-mode", db_load_mode, "--threads", str(threads),
         ]
         + filter_param,
     )
+    # Cleanup intermediate results
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp_realign_filter"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp_realign"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res"])
 
     # 8. Env search (optional)
     if use_env:
         _run_mmseqs(
             binary,
             [
-                "search",
-                work_dir / "prof_res",
-                env_db,
-                work_dir / "res_env",
-                work_dir / "tmp3",
-                "--threads",
-                str(threads),
+                "search", work_dir / "prof_res", db_dir / env_db,
+                work_dir / "res_env", work_dir / "tmp3", "--threads", str(threads),
             ]
             + search_param,
         )
         _run_mmseqs(
             binary,
             [
-                "expandaln",
-                work_dir / "prof_res",
-                db_dir / f"colabfold_envdb_202108_db{db_suffix}",
-                work_dir / "res_env",
-                db_dir / f"colabfold_envdb_202108_db{db_suffix}",
+                "expandaln", work_dir / "prof_res", db_dir / f"{env_db}{db_suffix_seq}",
+                work_dir / "res_env", db_dir / f"{env_db}{db_suffix_aln}",
                 work_dir / "res_env_exp",
-                "-e",
-                "inf",
-                "--expansion-mode",
-                "0",
-                "--db-load-mode",
-                db_load_mode,
-                "--threads",
-                str(threads),
+                "-e", "inf", "--expansion-mode", "0",
+                "--db-load-mode", db_load_mode, "--threads", str(threads),
             ],
         )
         _run_mmseqs(
             binary,
             [
-                "align",
-                work_dir / "tmp3/latest/profile_1",
-                db_dir / f"colabfold_envdb_202108_db{db_suffix}",
-                work_dir / "res_env_exp",
-                work_dir / "res_env_exp_realign",
-                "--db-load-mode",
-                db_load_mode,
-                "-e",
-                align_eval,
-                "--max-accept",
-                max_accept,
-                "--threads",
-                str(threads),
-                "--alt-ali",
-                "10",
-                "-a",
+                "align", work_dir / "tmp3/latest/profile_1", db_dir / f"{env_db}{db_suffix_seq}",
+                work_dir / "res_env_exp", work_dir / "res_env_exp_realign",
+                "--db-load-mode", db_load_mode, "-e", align_eval, "--max-accept", max_accept,
+                "--threads", str(threads), "--alt-ali", "10", "-a",
             ],
         )
         _run_mmseqs(
             binary,
             [
-                "filterresult",
-                qdb,
-                db_dir / f"colabfold_envdb_202108_db{db_suffix}",
-                work_dir / "res_env_exp_realign",
-                work_dir / "res_env_exp_realign_filter",
-                "--db-load-mode",
-                db_load_mode,
-                "--qid",
-                "0",
-                "--qsc",
-                qsc,
-                "--diff",
-                "0",
-                "--max-seq-id",
-                "1.0",
-                "--threads",
-                str(threads),
-                "--filter-min-enable",
-                "100",
+                "filterresult", qdb, db_dir / f"{env_db}{db_suffix_seq}",
+                work_dir / "res_env_exp_realign", work_dir / "res_env_exp_realign_filter",
+                "--db-load-mode", db_load_mode, "--qid", "0", "--qsc", qsc,
+                "--diff", "0", "--max-seq-id", "1.0", "--threads", str(threads), "--filter-min-enable", "100",
             ],
         )
         _run_mmseqs(
             binary,
             [
-                "result2msa",
-                qdb,
-                db_dir / f"colabfold_envdb_202108_db{db_suffix}",
-                work_dir / "res_env_exp_realign_filter",
-                work_dir / "bfd.mgnify30.metaeuk30.smag30.a3m",
-                "--msa-format-mode",
-                "6",
-                "--db-load-mode",
-                db_load_mode,
-                "--threads",
-                str(threads),
+                "result2msa", qdb, db_dir / f"{env_db}{db_suffix_seq}",
+                work_dir / "res_env_exp_realign_filter", work_dir / "bfd.mgnify30.metaeuk30.smag30.a3m",
+                "--msa-format-mode", "6", "--db-load-mode", db_load_mode, "--threads", str(threads),
             ]
             + filter_param,
         )
+        _run_mmseqs(binary, ["rmdb", work_dir / "res_env_exp_realign_filter"])
+        _run_mmseqs(binary, ["rmdb", work_dir / "res_env_exp_realign"])
+        _run_mmseqs(binary, ["rmdb", work_dir / "res_env_exp"])
+        _run_mmseqs(binary, ["rmdb", work_dir / "res_env"])
 
-    # 9. Merge or move
-    if use_env:
+    # 9. Template search (optional)
+    if use_templates and (db_dir / f"{template_db}.dbtype").is_file():
         _run_mmseqs(
             binary,
             [
-                "mergedbs",
-                qdb,
-                work_dir / "final.a3m",
-                work_dir / "uniref.a3m",
-                work_dir / "bfd.mgnify30.metaeuk30.smag30.a3m",
+                "search", work_dir / "prof_res", db_dir / template_db,
+                work_dir / "res_pdb", work_dir / "tmp2",
+                "--db-load-mode", db_load_mode, "--threads", str(threads), "-a", "-e", "0.1",
+            ]
+            + template_search_param,
+        )
+        _run_mmseqs(
+            binary,
+            [
+                "convertalis", work_dir / "prof_res", db_dir / f"{template_db}{db_suffix_tpl}",
+                work_dir / "res_pdb", work_dir / template_db,
+                "--format-output", "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,cigar",
+                "--db-output", "1", "--db-load-mode", db_load_mode, "--threads", str(threads),
             ],
         )
+        _run_mmseqs(binary, ["rmdb", work_dir / "res_pdb"])
+    elif use_templates:
+        logger.info("Skipping template search: %s not found in %s", template_db, db_dir)
+
+    # 10. Merge or move
+    if use_env:
+        _run_mmseqs(
+            binary,
+            ["mergedbs", qdb, work_dir / "final.a3m", work_dir / "uniref.a3m",
+             work_dir / "bfd.mgnify30.metaeuk30.smag30.a3m"],
+        )
+        _run_mmseqs(binary, ["rmdb", work_dir / "bfd.mgnify30.metaeuk30.smag30.a3m"])
+        _run_mmseqs(binary, ["rmdb", work_dir / "uniref.a3m"])
     else:
         _run_mmseqs(binary, ["mvdb", work_dir / "uniref.a3m", work_dir / "final.a3m"])
 
-    # 10. Unpack
+    # 11. Unpack
     _run_mmseqs(
         binary, ["unpackdb", work_dir / "final.a3m", work_dir, "--unpack-name-mode", "0", "--unpack-suffix", ".a3m"]
     )
+    _run_mmseqs(binary, ["rmdb", work_dir / "final.a3m"])
+
+    if use_templates and (work_dir / template_db).with_suffix(".dbtype").is_file():
+        _run_mmseqs(
+            binary,
+            ["unpackdb", work_dir / template_db, work_dir, "--unpack-name-mode", "0", "--unpack-suffix", ".m8"],
+        )
+        _run_mmseqs(binary, ["rmdb", work_dir / template_db])
+
+    # Cleanup profiles and tmp dirs
+    _run_mmseqs(binary, ["rmdb", work_dir / "prof_res"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "prof_res_h"])
+    shutil.rmtree(work_dir / "tmp", ignore_errors=True)
+    if use_templates:
+        shutil.rmtree(work_dir / "tmp2", ignore_errors=True)
+    if use_env:
+        shutil.rmtree(work_dir / "tmp3", ignore_errors=True)
 
 
 def _search_pair(
@@ -764,160 +718,134 @@ def _search_pair(
     work_dir: Path,
     pairing_strategy: int,
     threads: int,
+    gpu: bool,
+    gpu_server: bool,
+    pair_env: bool = False,
 ) -> None:
-    """Run the paired MSA search pipeline."""
-    uniref_db = db_dir / "uniref30_2302_db"
+    """Run the paired MSA search pipeline.
+
+    Args:
+        pair_env: If True, use SPIRE environmental pairing database instead of UniRef30.
+        gpu: Use GPU acceleration.
+        gpu_server: Use dedicated GPU server.
+    """
+    uniref_db = "uniref30_2302_db"
+    spire_db = "spire_ctg10_2401_db"
     qdb = work_dir / "qdb"
 
-    db_load_mode = "2"
-    db_suffix = ".idx"
-    if not (db_dir / "uniref30_2302_db.idx").is_file() and not (db_dir / "uniref30_2302_db.idx.index").is_file():
-        db_load_mode = "0"
-        db_suffix = "_seq"
+    # Select pairing database
+    if pair_env:
+        db = spire_db
+        output_suffix = ".env.paired.a3m"
+    else:
+        db = uniref_db
+        output_suffix = ".paired.a3m"
 
-    search_param = [
-        "--num-iterations",
-        "3",
-        "--db-load-mode",
-        db_load_mode,
-        "-a",
-        "-e",
-        "0.1",
-        "--max-seqs",
-        "10000",
-        "-s",
-        "8.0",
+    db_load_mode = "2"
+    db_suffix_seq = ".idx"
+    db_suffix_aln = ".idx"
+    if not (db_dir / f"{uniref_db}.idx").is_file() and not (db_dir / f"{uniref_db}.idx.index").is_file():
+        db_load_mode = "0"
+        db_suffix_seq = "_seq"
+        db_suffix_aln = "_aln"
+
+    search_param: list[str | Path] = [
+        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", "10000",
     ]
-    expand_param = ["--expansion-mode", "0", "-e", "inf", "--expand-filter-clusters", "0", "--max-seq-id", "0.95"]
+    if gpu:
+        search_param += ["--gpu", "1", "--prefilter-mode", "1"]
+    else:
+        search_param += ["--prefilter-mode", "0", "-s", "8.0"]
+    if gpu_server:
+        search_param += ["--gpu-server", "1"]
+
+    expand_param: list[str | Path] = [
+        "--expansion-mode", "0", "-e", "inf", "--expand-filter-clusters", "0", "--max-seq-id", "0.95",
+    ]
 
     _run_mmseqs(
         binary,
-        ["search", qdb, uniref_db, work_dir / "res_pair", work_dir / "tmp_pair", "--threads", str(threads)]
-        + search_param,
+        ["search", qdb, db_dir / db, work_dir / "res", work_dir / "tmp", "--threads", str(threads)] + search_param,
     )
-    _run_mmseqs(binary, ["mvdb", work_dir / "tmp_pair/latest/profile_1", work_dir / "prof_res_pair"])
-    _run_mmseqs(binary, ["lndb", work_dir / "qdb_h", work_dir / "prof_res_pair_h"])
+    _run_mmseqs(binary, ["mvdb", work_dir / "tmp/latest/profile_1", work_dir / "prof_res"])
+    _run_mmseqs(binary, ["lndb", work_dir / "qdb_h", work_dir / "prof_res_h"])
     _run_mmseqs(
         binary,
         [
-            "expandaln",
-            qdb,
-            db_dir / f"uniref30_2302_db{db_suffix}",
-            work_dir / "res_pair",
-            db_dir / f"uniref30_2302_db{db_suffix}",
-            work_dir / "res_pair_exp",
-            "--db-load-mode",
-            db_load_mode,
-            "--threads",
-            str(threads),
+            "expandaln", qdb, db_dir / f"{db}{db_suffix_seq}",
+            work_dir / "res", db_dir / f"{db}{db_suffix_aln}",
+            work_dir / "res_exp",
+            "--db-load-mode", db_load_mode, "--threads", str(threads),
         ]
         + expand_param,
     )
     _run_mmseqs(
         binary,
         [
-            "align",
-            work_dir / "prof_res_pair",
-            db_dir / f"uniref30_2302_db{db_suffix}",
-            work_dir / "res_pair_exp",
-            work_dir / "res_pair_exp_realign",
-            "--db-load-mode",
-            db_load_mode,
-            "-e",
-            "0.001",
-            "--max-accept",
-            "1000000",
-            "--threads",
-            str(threads),
+            "align", work_dir / "prof_res", db_dir / f"{db}{db_suffix_seq}",
+            work_dir / "res_exp", work_dir / "res_exp_realign",
+            "--db-load-mode", db_load_mode, "-e", "0.001", "--max-accept", "1000000",
+            "--threads", str(threads),
         ],
     )
     _run_mmseqs(
         binary,
         [
-            "pairaln",
-            qdb,
-            uniref_db,
-            work_dir / "res_pair_exp_realign",
-            work_dir / "res_pair_exp_realign_pair",
-            "--db-load-mode",
-            db_load_mode,
-            "--pairing-mode",
-            str(pairing_strategy),
-            "--pairing-dummy-mode",
-            "0",
-            "--threads",
-            str(threads),
+            "pairaln", qdb, db_dir / db,
+            work_dir / "res_exp_realign", work_dir / "res_exp_realign_pair",
+            "--db-load-mode", db_load_mode, "--pairing-mode", str(pairing_strategy),
+            "--pairing-dummy-mode", "0", "--threads", str(threads),
         ],
     )
     _run_mmseqs(
         binary,
         [
-            "align",
-            work_dir / "prof_res_pair",
-            db_dir / f"uniref30_2302_db{db_suffix}",
-            work_dir / "res_pair_exp_realign_pair",
-            work_dir / "res_pair_exp_realign_pair_bt",
-            "--db-load-mode",
-            db_load_mode,
-            "-e",
-            "inf",
-            "-a",
-            "--threads",
-            str(threads),
+            "align", work_dir / "prof_res", db_dir / f"{db}{db_suffix_seq}",
+            work_dir / "res_exp_realign_pair", work_dir / "res_exp_realign_pair_bt",
+            "--db-load-mode", db_load_mode, "-e", "inf", "-a", "--threads", str(threads),
         ],
     )
     _run_mmseqs(
         binary,
         [
-            "pairaln",
-            qdb,
-            uniref_db,
-            work_dir / "res_pair_exp_realign_pair_bt",
-            work_dir / "res_pair_final",
-            "--db-load-mode",
-            db_load_mode,
-            "--pairing-mode",
-            str(pairing_strategy),
-            "--pairing-dummy-mode",
-            "1",
-            "--threads",
-            str(threads),
+            "pairaln", qdb, db_dir / db,
+            work_dir / "res_exp_realign_pair_bt", work_dir / "res_final",
+            "--db-load-mode", db_load_mode, "--pairing-mode", str(pairing_strategy),
+            "--pairing-dummy-mode", "1", "--threads", str(threads),
         ],
     )
     _run_mmseqs(
         binary,
         [
-            "result2msa",
-            qdb,
-            db_dir / f"uniref30_2302_db{db_suffix}",
-            work_dir / "res_pair_final",
-            work_dir / "pair.a3m",
-            "--db-load-mode",
-            db_load_mode,
-            "--msa-format-mode",
-            "5",
-            "--threads",
-            str(threads),
+            "result2msa", qdb, db_dir / f"{db}{db_suffix_seq}",
+            work_dir / "res_final", work_dir / "pair.a3m",
+            "--db-load-mode", db_load_mode, "--msa-format-mode", "5", "--threads", str(threads),
         ],
     )
     _run_mmseqs(
         binary,
-        [
-            "unpackdb",
-            work_dir / "pair.a3m",
-            work_dir,
-            "--unpack-name-mode",
-            "0",
-            "--unpack-suffix",
-            ".paired.a3m",
-        ],
+        ["unpackdb", work_dir / "pair.a3m", work_dir, "--unpack-name-mode", "0", "--unpack-suffix", output_suffix],
     )
+    # Cleanup
+    _run_mmseqs(binary, ["rmdb", work_dir / "pair.a3m"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp_realign"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp_realign_pair"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_exp_realign_pair_bt"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "res_final"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "prof_res"])
+    _run_mmseqs(binary, ["rmdb", work_dir / "prof_res_h"])
+    shutil.rmtree(work_dir / "tmp", ignore_errors=True)
 
 
-def _unpack_results(work_dir: Path, n_chains: int, use_pairing: bool) -> MsaResult:
+def _unpack_results(
+    work_dir: Path, n_chains: int, use_pairing: bool, use_env_pairing: bool = False
+) -> MsaResult:
     """Read unpacked A3M files into MsaResult."""
     unpaired: dict[int, str] = {}
     paired: dict[int, str] = {}
+    m8_parts: list[str] = []
     for i in range(n_chains):
         a3m_path = work_dir / f"{i}.a3m"
         if a3m_path.is_file():
@@ -926,11 +854,24 @@ def _unpack_results(work_dir: Path, n_chains: int, use_pairing: bool) -> MsaResu
             unpaired[i] = ""
         if use_pairing:
             pair_path = work_dir / f"{i}.paired.a3m"
+            # Merge env paired MSA into paired if present
+            if use_env_pairing:
+                env_pair_path = work_dir / f"{i}.env.paired.a3m"
+                if env_pair_path.is_file() and pair_path.is_file():
+                    with pair_path.open("a") as fp:
+                        fp.write(env_pair_path.read_text())
+                elif env_pair_path.is_file():
+                    env_pair_path.rename(pair_path)
             if pair_path.is_file():
                 paired[i] = pair_path.read_text()
             else:
                 paired[i] = ""
-    return MsaResult(unpaired=unpaired, paired=paired)
+        # Collect template m8 hits
+        m8_path = work_dir / f"{i}.m8"
+        if m8_path.is_file():
+            m8_parts.append(m8_path.read_text())
+    m8_text = "".join(m8_parts)
+    return MsaResult(unpaired=unpaired, paired=paired, m8_text=m8_text)
 
 
 def search_local(
@@ -940,9 +881,13 @@ def search_local(
     db_dir: str | Path,
     use_env: bool = True,
     use_pairing: bool = False,
+    use_env_pairing: bool = False,
+    use_templates: bool = False,
     pairing_strategy: int = 0,
     filter: bool = True,
     threads: int = 8,
+    gpu: bool = False,
+    gpu_server: bool = False,
     tmpdir: str | Path | None = None,
     cache_dir: Path | None = None,
 ) -> MsaResult:
@@ -951,17 +896,23 @@ def search_local(
     Args:
         sequences: List of amino acid sequences (one per chain).
         mmseqs: Path to the ``mmseqs`` binary.
-        db_dir: Directory containing MMseqs2 databases (uniref30, envdb).
+        db_dir: Directory containing MMseqs2 databases (uniref30, envdb, pdb100).
         use_env: Search environmental database.
         use_pairing: Enable cross-chain pairing (multimer).
+        use_env_pairing: Use SPIRE environmental pairing database.
+        use_templates: Search PDB100 template database.
         pairing_strategy: Pairing mode (0=greedy, 1=complete).
         filter: Apply MSA filtering (qsc=0.8).
         threads: Number of threads.
+        gpu: Use GPU acceleration (requires MMseqs2 with GPU support).
+            Control which GPUs via ``CUDA_VISIBLE_DEVICES`` env var.
+        gpu_server: Use dedicated GPU server for reduced per-request overhead
+            (~1.5s savings). Requires a running ``mmseqs gpuserver`` process.
         tmpdir: Working directory (temporary if None).
         cache_dir: Optional directory for caching results.
 
     Returns:
-        MsaResult with per-chain A3M text.
+        MsaResult with per-chain A3M text (and m8_text if use_templates).
     """
     db_dir = Path(db_dir)
     n_chains = len(sequences)
@@ -998,13 +949,19 @@ def search_local(
                 f.write(f"{i}\t{101 + i}\t0\n")
 
         # Run monomer search
-        _search_monomer(mmseqs, db_dir, work_dir, use_env, filter, threads)
+        _search_monomer(mmseqs, db_dir, work_dir, use_env, use_templates, filter, threads, gpu, gpu_server)
 
         # Run pairing search (if multimer)
         if use_pairing and n_chains > 1:
-            _search_pair(mmseqs, db_dir, work_dir, pairing_strategy, threads)
+            _search_pair(mmseqs, db_dir, work_dir, pairing_strategy, threads, gpu, gpu_server, pair_env=False)
+            if use_env_pairing:
+                _search_pair(mmseqs, db_dir, work_dir, pairing_strategy, threads, gpu, gpu_server, pair_env=True)
 
-        result = _unpack_results(work_dir, n_chains, use_pairing and n_chains > 1)
+        result = _unpack_results(work_dir, n_chains, use_pairing and n_chains > 1, use_env_pairing)
+
+        # Cleanup query DB
+        _run_mmseqs(mmseqs, ["rmdb", work_dir / "qdb"])
+        _run_mmseqs(mmseqs, ["rmdb", work_dir / "qdb_h"])
 
     finally:
         if cleanup:

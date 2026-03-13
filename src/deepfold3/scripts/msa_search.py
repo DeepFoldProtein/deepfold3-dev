@@ -74,6 +74,21 @@ _MAX_TEMPLATES_PER_CHAIN = 20
     "--db-dir", default=None, type=click.Path(exists=True, path_type=Path), help="Database directory (local mode)"
 )
 @click.option("--threads", default=8, type=int, help="Threads for local mode")
+@click.option(
+    "--gpu/--no-gpu",
+    default=False,
+    help="Use GPU acceleration (local mode, requires MMseqs2 with GPU support). Control GPUs with CUDA_VISIBLE_DEVICES.",
+)
+@click.option(
+    "--gpu-server/--no-gpu-server",
+    default=False,
+    help="Use dedicated GPU server for reduced overhead (local mode, requires running mmseqs gpuserver)",
+)
+@click.option(
+    "--use-env-pairing/--no-env-pairing",
+    default=False,
+    help="Use SPIRE environmental pairing database (local mode)",
+)
 @click.option("--cache-dir", default=None, type=click.Path(path_type=Path), help="MSA cache directory")
 @click.option(
     "--json/--no-json", "write_json", default=False, help="Write a skeleton JSON input file for deepfold3 inference"
@@ -119,6 +134,9 @@ def msa_search(
     mmseqs: str,
     db_dir: Path | None,
     threads: int,
+    gpu: bool,
+    gpu_server: bool,
+    use_env_pairing: bool,
     cache_dir: Path | None,
     write_json: bool,
     name: str | None,
@@ -159,12 +177,13 @@ def msa_search(
     # Map each chain to its unique sequence index
     chain_to_unique = [seqs_unique.index(s) for s in sequences]
 
+    gpu_info = f", gpu={gpu}" if mode == "local" and gpu else ""
     if len(seqs_unique) < n_chains:
         click.echo(
-            f"MSA search: {n_chains} chain(s) ({len(seqs_unique)} unique), mode={mode}, env={use_env}, pairing={use_pairing}"
+            f"MSA search: {n_chains} chain(s) ({len(seqs_unique)} unique), mode={mode}, env={use_env}, pairing={use_pairing}{gpu_info}"
         )
     else:
-        click.echo(f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, pairing={use_pairing}")
+        click.echo(f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, pairing={use_pairing}{gpu_info}")
     for i, seq in enumerate(sequences):
         dup_note = f" (same as chain {chain_to_unique[i]})" if chain_to_unique[i] != i else ""
         click.echo(f"  Chain {i}: {len(seq)} residues{dup_note}")
@@ -189,8 +208,12 @@ def msa_search(
             db_dir=db_dir,
             use_env=use_env,
             use_pairing=use_pairing,
+            use_env_pairing=use_env_pairing,
+            use_templates=use_templates,
             pairing_strategy=pairing_strategy_int,
             threads=threads,
+            gpu=gpu,
+            gpu_server=gpu_server,
             cache_dir=cache_dir,
         )
 

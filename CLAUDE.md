@@ -11,7 +11,7 @@ The project has a working inference pipeline and a core training pipeline — mo
 **Not yet implemented:** sequence clustering, MSA generation/processing for training, multimeric template pipeline.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
-- **Python version**: 3.12 (pinned in `.python-version`)
+- **Python version**: 3.11+ (pinned in `.python-version`)
 - **Source layout**: `src/deepfold3/` (packages found under `src/` via setuptools)
 
 ## Commands
@@ -35,6 +35,9 @@ uv run ruff format src/
 deepfold3 msa       --sequence MKTII --output msa_out/ --json
 deepfold3 msa       --sequence SEQ1:SEQ2:SEQ1 --output msa_out/ --use-pairing --json
 deepfold3 msa       --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --json
+deepfold3 msa       --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --gpu --json
+deepfold3 msa       --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --gpu --gpu-server
+deepfold3 msa       --sequence MKTII --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --use-templates --json
 deepfold3 msa       --sequence MKTII --output msa_out/ --link-templates --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensors
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache

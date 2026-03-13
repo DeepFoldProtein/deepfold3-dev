@@ -167,17 +167,111 @@ Uses the ColabFold MMseqs2 server API (`https://api.colabfold.com`). Submits seq
 ### Local Mode
 
 ```bash
+# CPU search
 deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/
+
+# GPU-accelerated search
+deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --gpu
+
+# GPU with dedicated server (lower per-request overhead)
+deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --gpu --gpu-server
+
+# With template search against PDB100
+deepfold3 msa --fasta query.fasta --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --use-templates --json
+
+# GPU + templates + env pairing
+deepfold3 msa --sequence SEQ1:SEQ2 --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ \
+    --gpu --use-templates --use-env-pairing --json
 ```
 
 Requires a local `mmseqs` binary and pre-built databases:
 
 - `{db_dir}/uniref30_2302_db` (required)
 - `{db_dir}/colabfold_envdb_202108_db` (optional, for `--use-env`)
+- `{db_dir}/pdb100_230517` (optional, for `--use-templates`)
+- `{db_dir}/spire_ctg10_2401_db` (optional, for `--use-env-pairing`)
 
-Database setup: download from [ColabFold databases](https://colabfold.mmseqs.com/).
+#### Database Setup
 
-Pipeline: `createdb` → `search` (3 iterations, sensitivity 8) → `mvdb` (profile) → `expandaln` → `align` → `filterresult` → `result2msa` → `mergedbs` → `unpackdb`. For pairing: additional `pairaln` + `result2msa` with `msa-format-mode 5`.
+Download and prepare databases using `scripts/setup_databases.sh`:
+
+```bash
+# CPU-only databases
+./scripts/setup_databases.sh /data/mmseqs_dbs/
+
+# GPU+CPU compatible databases (recommended if you have a GPU)
+GPU=1 ./scripts/setup_databases.sh /data/mmseqs_dbs/
+```
+
+The script downloads and indexes:
+
+1. **UniRef30** (`uniref30_2302_db`) — primary sequence database (~100 GB)
+2. **ColabFold EnvDB** (`colabfold_envdb_202108_db`) — environmental sequences (~200 GB)
+3. **PDB100** (`pdb100_230517`) — PDB sequences for template search
+4. **PDB100 FoldSeek** (`pdb100_foldseek_230517`) — structural template profiles
+5. **SPIRE** (`spire_ctg10_2401_db`) — environmental pairing database
+
+GPU databases use pre-built format (`FAST_PREBUILT_DATABASES=1`) that supports both GPU and CPU. GPU indexing uses `--split 1 --index-subset 2`.
+
+**Manual database preparation** (without setup script):
+
+```bash
+# Download pre-built GPU+CPU databases
+wget https://opendata.mmseqs.org/colabfold/uniref30_2302.db.tar.gz
+tar xzf uniref30_2302.db.tar.gz
+mmseqs createindex uniref30_2302_db tmp --remove-tmp-files 1 --split 1 --index-subset 2  # GPU
+# For CPU-only, omit --split and --index-subset
+
+# PDB100 for templates (GPU-compatible)
+wget https://opendata.mmseqs.org/colabfold/pdb100_230517.fasta.gz
+mmseqs createdb pdb100_230517.fasta.gz pdb100_230517_tmp
+mmseqs makepaddedseqdb pdb100_230517_tmp pdb100_230517  # GPU-compatible
+mmseqs rmdb pdb100_230517_tmp
+mmseqs createindex pdb100_230517 tmp --remove-tmp-files 1 --split 1 --index-subset 2
+```
+
+#### GPU Search
+
+GPU acceleration requires MMseqs2 release 16+ with GPU support. Key constraints:
+
+- GPU uses ungapped prefilter mode (`--prefilter-mode 1`) exclusively
+- Sensitivity parameter (`-s`) cannot be set — GPU runs at maximum sensitivity automatically
+- Control which GPUs via `CUDA_VISIBLE_DEVICES` environment variable
+
+**GPU server mode** (`--gpu-server`) reduces per-request overhead by ~1.5s. Requires pre-starting `mmseqs gpuserver` processes:
+
+```bash
+# Start GPU servers for each database (run in background)
+mmseqs gpuserver /data/mmseqs_dbs/uniref30_2302_db --max-seqs 10000 --db-load-mode 0 --prefilter-mode 1 &
+mmseqs gpuserver /data/mmseqs_dbs/colabfold_envdb_202108_db --max-seqs 10000 --db-load-mode 0 --prefilter-mode 1 &
+
+# Then run searches with --gpu --gpu-server
+deepfold3 msa --sequence MKTII... --output msa_out/ --mode local --db-dir /data/mmseqs_dbs/ --gpu --gpu-server
+```
+
+#### Search Pipeline
+
+Pipeline follows the [ColabFold search](https://github.com/soedinglab/MMseqs2/blob/master/data/workflow/colabfold_search.sh) workflow:
+
+```
+createdb → search (UniRef30, 3 iterations, -s 8.0 or GPU max sensitivity)
+         → expandaln (-e inf, --expand-filter-clusters 1, --max-seq-id 0.95)
+         → mvdb (extract profile from tmp/latest/profile_1)
+         → lndb (link query headers to profile)
+         → align (profile vs expanded hits, -e 10, --max-accept 100000, --alt-ali 10)
+         → filterresult (--qsc 0.8, --filter-min-enable 100)
+         → result2msa (--filter-msa 1, --diff 3000, --filter-min-enable 1000, --max-seq-id 0.95)
+         → [env] search (profile vs envdb, same params)
+         → [env] expandaln → align → filterresult → result2msa
+         → [templates] search (profile vs pdb100, -s 7.5 or GPU)
+         → [templates] convertalis → m8 format
+         → mergedbs (uniref + env) → unpackdb
+         → [pairing] search → expandaln → align → pairaln → align → pairaln → result2msa
+```
+
+Search parameters (filter=True): `SEARCH_PARAM="--num-iterations 3 --db-load-mode 2 -a -s 8.0 -e 0.1 --max-seqs 10000"`. With GPU: `--gpu 1 --prefilter-mode 1` replaces `-s 8.0`. Template search uses `-s 7.5` (CPU) or `--gpu 1` (GPU). For pairing: additional `pairaln` + `result2msa` with `msa-format-mode 5`.
+
+**ColabFold DB structure**: the database has four components per DB — `_db` (cluster reps), `_db_seq` (member sequences), `_db_aln` (rep→member alignment), `_db.idx` (precomputed index). `search` targets cluster reps; `expandaln` uses `_db_seq` + `_db_aln` to expand cluster rep hits to member sequences; `align`/`result2msa` use `_db_seq` (or `_db.idx` for indexed mode) for final member-level alignment.
 
 ### Output
 
@@ -200,6 +294,10 @@ result = search_server(["MKTII..."], use_env=True)
 
 result = search_local(["SEQ1", "SEQ2"], db_dir="/data/dbs/", use_pairing=True)
 # result.paired[0], result.paired[1] → paired A3M text
+
+# GPU-accelerated local search with templates
+result = search_local(["MKTII..."], db_dir="/data/dbs/", gpu=True, use_templates=True)
+# result.m8_text → template hits in BLAST tabular format
 
 # Parse template hits from m8
 hits = parse_m8(result.m8_text)
