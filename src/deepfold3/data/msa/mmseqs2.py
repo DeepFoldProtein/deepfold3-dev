@@ -350,15 +350,16 @@ def _extract_a3m(tar_bytes: bytes, n_chains: int, use_env: bool, use_pairing: bo
         if i in uniref_blocks:
             parts.append(uniref_blocks[i])
         if i in env_blocks:
-            # Append env sequences (skip the query header line which duplicates)
+            # Append env sequences (skip the query entry which duplicates uniref)
             env_lines = env_blocks[i].splitlines(keepends=True)
-            # Skip the first header + sequence (query row) since it's already in uniref
-            in_query = True
+            # Skip lines until the second header (first header + its sequence = query)
+            past_query = False
             for line in env_lines:
-                if line.startswith(">") and in_query:
-                    in_query = False
-                    continue
-                if in_query:
+                if line.startswith(">"):
+                    if not past_query:
+                        past_query = True
+                        continue
+                elif not past_query:
                     continue
                 parts.append(line)
         unpaired[i] = "".join(parts) if parts else ""
