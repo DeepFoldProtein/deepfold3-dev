@@ -16,7 +16,7 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 
 ## Installation
 
-Requires Python 3.12+. Uses [uv](https://docs.astral.sh/uv/) for dependency management.
+Requires Python 3.11+. Uses [uv](https://docs.astral.sh/uv/) for dependency management.
 
 ```bash
 # Clone and install

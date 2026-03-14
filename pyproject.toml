@@ -3,7 +3,7 @@ name = "deepfold3"
 version = "0.1.0"
 description = "DeepFold 3: Biomolecular Complex Structure Prediction"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "click>=8.3.1",
     "gemmi>=0.7.4",

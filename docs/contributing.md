@@ -13,7 +13,7 @@ uv run ruff check src/           # lint
 uv run ruff format src/          # format
 ```
 
-Requirements: Python 3.12 (pinned in `.python-version`), `uv` package manager.
+Requirements: Python 3.11+ (pinned in `.python-version`), `uv` package manager.
 
 ## Code Style
 
