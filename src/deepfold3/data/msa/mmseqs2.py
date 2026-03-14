@@ -379,6 +379,7 @@ def search_server(
     *,
     server_url: str = _DEFAULT_SERVER,
     use_env: bool = True,
+    use_filter: bool = True,
     use_pairing: bool = False,
     pairing_strategy: str = "greedy",
     timeout: float = 600,
@@ -390,6 +391,7 @@ def search_server(
         sequences: List of amino acid sequences (one per chain).
         server_url: ColabFold API base URL.
         use_env: Include environmental database hits.
+        use_filter: Apply server-side MSA filtering.
         use_pairing: Enable cross-chain MSA pairing (multimer).
         pairing_strategy: ``"greedy"`` or ``"complete"`` pairing.
         timeout: Maximum time to wait for server results (seconds).
@@ -418,7 +420,10 @@ def search_server(
             pair_mode = "pairgreedy"
         if use_env:
             pair_mode += "-env"
-    unpaired_mode = "env" if use_env else "all"
+    if use_filter:
+        unpaired_mode = "env" if use_env else "all"
+    else:
+        unpaired_mode = "env-nofilter" if use_env else "nofilter"
 
     # --- Unpaired search ---
     logger.info("Submitting unpaired MSA search (%d chains, mode=%s)", n_chains, unpaired_mode)
@@ -522,16 +527,21 @@ def _search_monomer(
     else:
         align_eval, qsc, max_accept = "10", "-20.0", "1000000"
 
+    # GPU ungapped prefilter uses a different prioritization method than CPU k-mer prefilter,
+    # which can miss hits at default --max-seqs 10000. Increase to 100000 to recover
+    # CPU-equivalent results (MMseqs2 #995/#999).
+    max_seqs = "100000" if gpu else "10000"
     search_param: list[str | Path] = [
-        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", "10000",
+        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", max_seqs,
     ]
     template_search_param: list[str | Path] = []
     if gpu:
-        # GPU version only supports ungapped prefilter; runs at max sensitivity automatically
         search_param += ["--gpu", "1", "--prefilter-mode", "1"]
         template_search_param += ["--gpu", "1", "--prefilter-mode", "1"]
     else:
-        search_param += ["--prefilter-mode", "0", "-s", "8.0"]
+        # Use direct k-mer threshold instead of -s sensitivity to match ColabFold server.
+        # Note: no quotes around the value — ColabFold #804 shows quoted form is silently ignored.
+        search_param += ["--prefilter-mode", "0", "--k-score", "seq:96,prof:80"]
         template_search_param += ["-s", "7.5", "--prefilter-mode", "0"]
     if gpu_server:
         search_param += ["--gpu-server", "1"]
@@ -749,13 +759,15 @@ def _search_pair(
         db_suffix_seq = "_seq"
         db_suffix_aln = "_aln"
 
+    max_seqs = "100000" if gpu else "10000"
     search_param: list[str | Path] = [
-        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", "10000",
+        "--num-iterations", "3", "--db-load-mode", db_load_mode, "-a", "-e", "0.1", "--max-seqs", max_seqs,
     ]
     if gpu:
         search_param += ["--gpu", "1", "--prefilter-mode", "1"]
     else:
-        search_param += ["--prefilter-mode", "0", "-s", "8.0"]
+        # Direct k-mer threshold to match ColabFold server (no quotes — see ColabFold #804)
+        search_param += ["--prefilter-mode", "0", "--k-score", "seq:96,prof:80"]
     if gpu_server:
         search_param += ["--gpu-server", "1"]
 

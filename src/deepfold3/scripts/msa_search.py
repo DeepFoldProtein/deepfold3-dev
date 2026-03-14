@@ -89,6 +89,7 @@ _MAX_TEMPLATES_PER_CHAIN = 20
     default=False,
     help="Use SPIRE environmental pairing database (local mode)",
 )
+@click.option("--filter/--no-filter", "use_filter", default=True, help="Apply MSA filtering (server: server-side; local: qsc=0.8)")
 @click.option("--cache-dir", default=None, type=click.Path(path_type=Path), help="MSA cache directory")
 @click.option(
     "--json/--no-json", "write_json", default=False, help="Write a skeleton JSON input file for deepfold3 inference"
@@ -137,6 +138,7 @@ def msa_search(
     gpu: bool,
     gpu_server: bool,
     use_env_pairing: bool,
+    use_filter: bool,
     cache_dir: Path | None,
     write_json: bool,
     name: str | None,
@@ -180,10 +182,10 @@ def msa_search(
     gpu_info = f", gpu={gpu}" if mode == "local" and gpu else ""
     if len(seqs_unique) < n_chains:
         click.echo(
-            f"MSA search: {n_chains} chain(s) ({len(seqs_unique)} unique), mode={mode}, env={use_env}, pairing={use_pairing}{gpu_info}"
+            f"MSA search: {n_chains} chain(s) ({len(seqs_unique)} unique), mode={mode}, env={use_env}, filter={use_filter}, pairing={use_pairing}{gpu_info}"
         )
     else:
-        click.echo(f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, pairing={use_pairing}{gpu_info}")
+        click.echo(f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, filter={use_filter}, pairing={use_pairing}{gpu_info}")
     for i, seq in enumerate(sequences):
         dup_note = f" (same as chain {chain_to_unique[i]})" if chain_to_unique[i] != i else ""
         click.echo(f"  Chain {i}: {len(seq)} residues{dup_note}")
@@ -194,6 +196,7 @@ def msa_search(
             seqs_unique,
             server_url=server_url,
             use_env=use_env,
+            use_filter=use_filter,
             use_pairing=use_pairing,
             pairing_strategy=pairing_strategy,
             cache_dir=cache_dir,
@@ -211,6 +214,7 @@ def msa_search(
             use_env_pairing=use_env_pairing,
             use_templates=use_templates,
             pairing_strategy=pairing_strategy_int,
+            filter=use_filter,
             threads=threads,
             gpu=gpu,
             gpu_server=gpu_server,
