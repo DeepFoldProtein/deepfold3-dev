@@ -125,6 +125,26 @@ def test_extract_a3m_env():
     assert ">ehit" in text
     # Query should appear only from uniref, not duplicated from env
     assert text.count(">101") == 1
+    # Env query sequence must not leak as a bare (headerless) line
+    lines = text.strip().splitlines()
+    for j, line in enumerate(lines):
+        if not line.startswith(">"):
+            assert j > 0 and lines[j - 1].startswith(">"), f"bare sequence at line {j}: {line!r}"
+
+
+def test_extract_a3m_env_query_only():
+    """Env block with only the query entry (no hits) should contribute nothing."""
+    uniref_a3m = ">101\nACDE\n>uhit\nACDE\n"
+    env_a3m = ">101\nACDE\n"
+    tar_bytes = _make_tar_gz(
+        {
+            "uniref.a3m": uniref_a3m,
+            "bfd.mgnify30.metaeuk30.smag30.a3m": env_a3m,
+        }
+    )
+    result = _extract_a3m(tar_bytes, n_chains=1, use_env=True, use_pairing=False)
+    # Output should be identical to uniref-only
+    assert result.unpaired[0] == uniref_a3m
 
 
 def test_extract_a3m_paired():
@@ -148,6 +168,7 @@ def test_cache_round_trip():
         result = MsaResult(
             unpaired={0: ">101\nACDE\n", 1: ">102\nFGHI\n"},
             paired={},
+            m8_text="101\t1abc_A\t95.0\t100\t5\t0\t1\t100\t10\t109\t1e-50\t500\n",
         )
         _save_cache(cache_dir, key, result)
 
@@ -155,6 +176,17 @@ def test_cache_round_trip():
         assert loaded is not None
         assert loaded.unpaired[0] == result.unpaired[0]
         assert loaded.unpaired[1] == result.unpaired[1]
+        assert loaded.m8_text == result.m8_text
+
+
+def test_cache_key_includes_result_shaping_flags():
+    sequences = ["ACDE", "FGHI"]
+
+    base = _cache_key(sequences, use_env=True, use_pairing=True)
+    assert _cache_key(sequences, use_env=True, use_pairing=True, use_filter=False) != base
+    assert _cache_key(sequences, use_env=True, use_pairing=True, use_templates=True) != base
+    assert _cache_key(sequences, use_env=True, use_pairing=True, use_env_pairing=True) != base
+    assert _cache_key(sequences, use_env=True, use_pairing=True, pairing_strategy="complete") != base
 
 
 def test_cache_miss():
@@ -212,7 +244,9 @@ def test_local_command_sequence():
             _run_mmseqs("mmseqs", ["createdb", query_file, work / "qdb", "--shuffle", "0", "--dbtype", "1"])
 
             commands.clear()
-            _search_monomer("mmseqs", db_dir, work, use_env=False, filter=True, threads=4)
+            _search_monomer(
+                "mmseqs", db_dir, work, use_env=False, use_templates=False, filter=True, threads=4, gpu=False, gpu_server=False
+            )
 
             # Verify key commands in order
             modules = [cmd[1] for cmd in commands]

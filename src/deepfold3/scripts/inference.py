@@ -169,7 +169,11 @@ def inference(
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     # Fused kernel parameters are derived from base weights via _sync_to_fused — not real misses
-    real_missing = [k for k in missing if not any(p in k for p in ("_fused_gate.", "_fused_ada_ln_linear.", "_fused_swiglu.", "_ln_linear.", "_swiglu."))]
+    real_missing = [
+        k
+        for k in missing
+        if not any(p in k for p in OptimConfig.FUSED_STATE_DICT_MARKERS)
+    ]
     if real_missing:
         click.echo(f"  [WARN] missing keys   : {len(real_missing)}")
     if unexpected:
