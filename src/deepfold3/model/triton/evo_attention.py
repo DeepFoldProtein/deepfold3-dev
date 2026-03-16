@@ -121,6 +121,20 @@ if HAS_TRITON:
 
         return O_block, l_i, m_i
 
+    # Autotune over tile sizes for the forward attention kernel.
+    # Key insight: optimal BLOCK_SIZE_Q/KV depend on SEQ_LEN (N=128..768).
+    # Small N benefits from larger Q blocks; large N needs smaller blocks
+    # to avoid register pressure. cuEQ uses fixed tiles per architecture;
+    # we autotune at runtime for maximum portability.
+    _ATTN_FWD_CONFIGS = [
+        triton.Config({"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw)
+        for bq in (16, 32, 64)
+        for bkv in (32, 64, 128)
+        for ns in (2, 3)
+        for nw in (4, 8)
+    ]
+
+    @triton.autotune(configs=_ATTN_FWD_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
         {
             "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
@@ -762,10 +776,6 @@ class _EvoformerAttention(torch.autograd.Function):
             SEQ_LEN=SEQ_LEN,
             DIM=DIM,
             BLOCK_DIM=BLOCK_DIM,
-            BLOCK_SIZE_Q=16,
-            BLOCK_SIZE_KV=64,
-            num_stages=3,
-            num_warps=4,
             **extra_kern_args,
         )
 

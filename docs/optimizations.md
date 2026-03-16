@@ -5,16 +5,40 @@ operations. All Triton kernels are self-contained under `src/deepfold3/model/tri
 
 Optimizations are toggled via `OptimConfig` — each can be independently enabled or disabled.
 
-## Benchmark Results (RTX 5090, bf16, 2026-03-07)
+## Benchmark Results (RTX 5090, bf16, 2026-03-16)
 
 ### Winners (enabled by `--optim recommended`)
 
-| Optimization | Speedup (full) | Memory Savings (full) | Where Used | Count |
+| Optimization | Speedup (fwd) | Memory Savings | Where Used | Count |
 |---|---|---|---|---|
-| **Triton EvoAttention (Grid)** | **2-3x** (raw kernel 4-9x) | **2-5x** (raw 3-10x) | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
-| **torch.compile (TriangleMul)** | 1.25-1.55x | ~1.0x | EvoformerBlock + PairFormerBlock | 104 modules |
+| **Triton EvoAttention (Grid)** | **2.9-3.3x** | **3.4-4.6x** | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
+| **Triton FusedPairBias** | **+25-30%** on top of evo | tl.dot GEMM (5-10x vs scalar loop) | GridSelfAttention pair bias | 104 attn |
+| **Combined evo+pair_bias** | **3.7-4.6x** | **3.4-4.6x** | GridSelfAttention (row + col) | 104 attn |
+| **Triton FusedTriangleMul (L3)** | 1.24-1.32x | Eliminates In/Out memory asymmetry | TriangleMul outgoing + incoming | 96 modules |
 | **torch.compile (MSAAttention)** | 1.5-2.3x | 1.6-2.3x | EvoformerBlock (×4) | 4 modules |
+| **torch.compile (TriangleMul)** | 1.25-1.55x | ~1.0x | EvoformerBlock + PairFormerBlock | 104 modules |
 | **torch.compile (SingleAttention)** | 1.3-1.4x | ~1.0x | PairFormerBlock (×48) | 48 modules |
+
+### TriangleMul Memory Asymmetry (fixed by triton_l3)
+
+Without fusion, TriangleMulIncoming uses **1.2-1.5x more memory** than Outgoing due to
+cuBLAS workspace allocation for different contraction stride patterns. The fused dual GEMM
+(triton_l3) eliminates this completely:
+
+| N | pytorch Incoming excess | triton_l3 Incoming excess |
+|---|---|---|
+| 384 | +326 MB (1.52x) | +0 MB |
+| 512 | +252 MB (1.18x) | +0 MB |
+| 640 | +1128 MB (1.49x) | +0 MB |
+| 768 | +1553 MB (1.46x) | +0 MB |
+
+### Grid Column Attention (evo + pair bias)
+
+| N | pytorch | evo | evo+pb | Speedup | Mem reduction |
+|---|---|---|---|---|---|
+| 384 | 5.8ms / 2.8GB | 2.0ms / 0.9GB | **1.6ms / 1.0GB** | **3.7x / 2.9x** |
+| 512 | 13.3ms / 6.5GB | 4.3ms / 1.6GB | **3.2ms / 1.7GB** | **4.1x / 3.8x** |
+| 640 | 25.4ms / 12.3GB | 7.7ms / 2.5GB | **5.5ms / 2.6GB** | **4.6x / 4.7x** |
 
 ### Conditional winners (enabled by `--optim all`)
 
@@ -22,6 +46,7 @@ Optimizations are toggled via `OptimConfig` — each can be independently enable
 |---|---|---|
 | **Triton FusedTransition (C=384)** | 1.2-1.3x full | Only beneficial at C≥256 and N≥1024; smaller shapes are slower |
 | **Triton LayerNormLinear (C=384)** | 1.1-1.2x full | Composited inside FusedTransitionBlock; marginal standalone |
+| **Triton FusedLNTranspose** | 1.7-2.3x fwd | Column attention LN+transpose; inference only |
 
 ### Not recommended (removed from config)
 
@@ -38,13 +63,17 @@ Optimizations are toggled via `OptimConfig` — each can be independently enable
 
 ### Key Insight
 
-The **dominant optimization** is Triton EvoAttention for GridSelfAttention — the integrated
-module is 2-3x faster with 2-5x less memory (raw kernel: 4-9x time, 3-10x memory). This
-covers 104 pair attention modules (the N² bottleneck). Everything else is marginal.
+The **dominant optimizations** are:
+
+1. **Triton EvoAttention + FusedPairBias** for GridSelfAttention — **3.7-4.6x faster** with
+   **3-5x less memory**. This covers 104 pair attention modules (the N² bottleneck).
+   FusedPairBias now supports training (autograd backward) in addition to inference.
+
+2. **Triton FusedTriangleMul (L3)** for TriangleMul — **1.2-1.3x faster** and eliminates
+   the Incoming/Outgoing **memory asymmetry** (1553 MB excess at N=768 → 0 MB).
 
 `torch.compile` helps for MSAAttention (1.5-2.3x), TriangleMul (1.3-1.6x), and
 SingleAttention (1.3-1.4x) but hurts for small primitives (LN, Linear) and transitions.
-It is applied selectively at the module level.
 
 **Important**: Triton EvoAttention is NOT beneficial for SingleAttention (N_seq=1 makes
 the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
@@ -53,9 +82,14 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 
 | Backend | Module | Replaces | Source |
 | ------- | ------ | -------- | ------ |
-| Triton FusedEvoAttention | `_EvoformerAttention` | Flash-attention with pair bias | `deepfold3.model.triton.evo_attention` |
-| Triton FusedTransitionBlock | `FusedTransitionBlock` | `TransitionBlock` (LN + Linear + SwiGLU + Linear) | `deepfold3.model.triton.fused_transition` |
-| Triton FusedLayerNormLinear | `FusedLayerNormLinear` | Fused LayerNorm + Linear | `deepfold3.model.triton.layernorm_linear` |
+| Triton FusedEvoAttention | `_EvoformerAttention` | Flash-attention with pair bias | `triton/evo_attention.py` |
+| Triton FusedPairBias | `FusedPairBias` | LN + Linear + permute for pair bias (tl.dot GEMM) | `triton/fused_pair_bias.py` |
+| Triton FusedGatedDualGEMM | `FusedGatedDualGEMM` | Dual GEMM + sigmoid gate (TWO_INPUTS, mask, bias) | `triton/fused_gated_dual_gemm.py` |
+| Triton FusedTransitionBlock | `FusedTransitionBlock` | `TransitionBlock` (LN + Linear + SwiGLU + Linear) | `triton/fused_transition.py` |
+| Triton FusedLayerNormLinear | `FusedLayerNormLinear` | Fused LayerNorm + Linear | `triton/layernorm_linear.py` |
+| Triton FusedLayerNormTranspose | `FusedLayerNormTranspose` | LN + dim transpose (col attention) | `triton/layernorm_transpose.py` |
+| Triton FusedTriangleMulGate | `FusedTriangleMulGate` | LN + packed 3-projection GEMM + sigmoid | `triton/triangle_mul_gate.py` |
+| Persistent Autotune Cache | `CacheManager` | GPU-fingerprinted JSON cache for Triton configs | `triton/cache.py` |
 | torch.compile | — | Wraps TriangleMul, MSAAttention, SingleAttention | PyTorch built-in |
 
 ## Configuration
@@ -65,9 +99,12 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 ```python
 @dataclass
 class OptimConfig:
-    use_fused_evo_attention: bool = False  # Triton flash-attn for Grid/SingleAttention
-    use_fused_transition: bool = False     # Triton FusedTransitionBlock (C>=256 only)
-    use_torch_compile: bool = False        # torch.compile for attention + TriangleMul
+    use_fused_evo_attention: bool = False   # Triton flash-attn for GridSelfAttention
+    use_fused_pair_bias: bool = False       # Triton fused LN+Linear+permute (tl.dot GEMM)
+    use_fused_transition_pair: bool = False # Triton fused transition for pair (M=N², C=128)
+    use_fused_triangle_mul: bool = False    # Triton dual GEMM + gate fusion for TriangleMul
+    use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
+    use_torch_compile: bool = False         # torch.compile for attention + TriangleMul
 ```
 
 ### Python API
@@ -162,13 +199,79 @@ wrapper stays outside the compiled region.
 
 ```
 src/deepfold3/model/triton/
-├── __init__.py            # Lazy imports
-├── swiglu.py              # FusedSwiGLU (silu(a)*b convention)
-├── layernorm_linear.py    # FusedLayerNormLinear (4 Triton JIT kernels)
-├── fused_transition.py    # FusedTransitionBlock (compose LN+Linear+SwiGLU+Linear)
-├── evo_attention.py       # Flash-attention with pair bias (5 Triton JIT kernels)
-└── tuning.py              # Pre-tuned block size configs for CUDA/HIP
+├── __init__.py               # Precision enum, cvt_tf32_rn, precision_dot, lazy imports
+├── evo_attention.py          # Flash-attention with pair bias (5 Triton JIT kernels)
+├── fused_pair_bias.py        # Fused LN + tl.dot projection + permute + mask (cuEQ pattern)
+├── fused_gated_dual_gemm.py  # Dual GEMM + sigmoid gate (TWO_INPUTS, bias, mask, TF32)
+├── fused_transition.py       # FusedTransitionBlock (compose LN+Linear+SwiGLU+Linear)
+├── fused_ada_transition.py   # FusedAdaTransitionBlock (AdaLN + SwiGLU + Linear)
+├── layernorm_linear.py       # FusedLayerNormLinear (4 Triton JIT kernels)
+├── ada_layernorm_linear.py   # FusedAdaLayerNormLinear (AdaLN + Linear)
+├── layernorm_transpose.py    # FusedLayerNormTranspose (LN + dim transpose)
+├── triangle_mul_gate.py      # FusedTriangleMulGate (LN + packed 3-GEMM + sigmoid)
+├── swiglu.py                 # FusedSwiGLU (silu(a)*b convention)
+├── tuning.py                 # Pre-tuned block size configs for CUDA/HIP
+└── cache.py                  # Persistent autotuning cache (GPU fingerprint + JSON)
 ```
+
+### TF32 Precision Control
+
+All GEMM-based Triton kernels support configurable precision via the `Precision` enum
+(adapted from NVIDIA cuEquivariance):
+
+| Mode | Value | Behavior |
+|------|-------|----------|
+| `DEFAULT` | 0 | Hardware default (fastest, least precise) |
+| `TF32` | 1 | Explicit TF32 rounding via `cvt_tf32_rn` (deterministic 19-bit mantissa) |
+| `TF32x3` | 2 | Triton's built-in tf32x3 accumulation (higher precision than TF32) |
+| `IEEE` | 3 | Full IEEE754 float32 (slowest, most precise) |
+
+The `precision_dot(a, b, acc, PRECISION)` JIT helper dispatches `tl.dot` with the
+requested precision mode. The pair bias kernel defaults to `TF32x3` for best
+accuracy/speed tradeoff.
+
+### Persistent Autotuning Cache
+
+Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (or
+`DEEPFOLD3_TRITON_CACHE_DIR`). The cache:
+
+- **GPU fingerprinting**: Uses `torch.cuda.get_device_properties` (compute capability, memory, SM count)
+- **Fuzzy matching**: When switching GPUs within the same architecture family, cached configs
+  transfer if memory/SM count are within 20% tolerance
+- **Atomic writes**: Thread-safe JSON persistence via temp files + `os.replace`
+
+Environment variables:
+- `DEEPFOLD3_TRITON_CACHE_DIR`: Override cache directory
+- `DEEPFOLD3_TRITON_NO_CACHE=1`: Disable caching (re-tune every run)
+
+### Fused Pair Bias Design (cuEQ pattern)
+
+The pair bias kernel fuses LayerNorm + Linear projection + layout permute into a single
+kernel using NVIDIA cuEquivariance's 3D grid pattern:
+
+```
+Grid: (cdiv(V, TILE_V), U, cdiv(H, HEADS_PER_BLK) × B)
+
+Phase 1: LN statistics (mean, rstd) over C in TILE_K tiles
+Phase 2: Normalize + project via tl.dot([TILE_V, TILE_K] × [TILE_K, H_BLK])
+Phase 3: Optional mask fusion + write to [B, H, U, V] layout
+```
+
+Key improvement: The old kernel used a scalar dot-product loop per head
+(`tl.sum(xn * w_h)` × H). The new kernel uses `tl.dot` tensor core GEMM,
+which is 5-10x faster for C=128, H=4. Supports both training (autograd with
+PyTorch backward) and inference (fully fused, no intermediates).
+
+### Fused Gated Dual GEMM Design (cuEQ pattern)
+
+The dual GEMM kernel computes `sigmoid(x₁ @ W₁ᵀ + b₁) × (x₂ @ W₂ᵀ + b₂) × mask`
+in a single kernel pass:
+
+- **TWO_INPUTS**: Separate x₁, x₂ for gate and projection paths
+- **Bias**: Optional b₁, b₂ added after GEMM accumulation
+- **Mask fusion**: Per-row mask (AdaLN-zero gate) applied in epilogue
+- **L2 grouping**: GROUP_SIZE_M linearized grid for cache locality (our advantage over cuEQ)
+- **Backward**: Pre-GEMM kernel recomputes sigmoid + derives grad factors, then cuBLAS for weight/input gradients
 
 ## Attention Tuning Notes
 

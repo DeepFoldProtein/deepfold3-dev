@@ -155,19 +155,41 @@ class OptimConfig:
     corresponding Triton/fused kernel if available; silently falls back
     to baseline if the backend is not installed.
 
-    Benchmark results (RTX 5090, bf16, 2026-03-07):
-    - use_fused_evo_attention: 2-3x faster, 2-5x less memory for GridSelfAttention (104 modules)
-    - use_torch_compile: 1.3-2.3x faster for MSAAttention/SingleAttention/TriangleMul (156 modules)
-    - use_fused_transition: 1.2-1.3x faster for C>=256 + N>=1024 transitions only
-    - use_fused_ada_transition: fused AdaLN+Linear+SwiGLU for diffusion FFN; ~1x at N>=512, overhead at small N
-    - use_fused_triangle_mul: fused LN+proj+gate for TriangleMul pre-einsum; 1.15-1.18x at N>=256
+    Benchmark results (RTX 5090, bf16, N=384-768):
+    ──────────────────────────────────────────────────────────────────
+    ATTENTION (104 GridSelfAttention modules per forward):
+    - use_fused_evo_attention: 2.9-3.3x faster (autotuned Triton flash-attn with pair bias)
+    - use_fused_pair_bias: +30% on top of evo_attn (fused LN + tl.dot projection + permute)
+      Now supports training (autograd backward via PyTorch ops) + inference (fully fused).
+    - Combined evo+pair_bias: 3.7-4.6x faster vs pytorch baseline
+    - use_torch_compile: 1.3-2.3x for MSAAttention/SingleAttention (SDPA backend)
     Note: Triton EvoAttention is NOT used for SingleAttention (N_seq=1 overhead dominates).
+
+    TRIANGLE MULTIPLY (96 TriangleMul modules per forward):
+    - use_fused_triangle_mul: enables three fusion levels:
+      Level 3 (dual GEMM): 1.24-1.32x fwd, 1.18-1.20x full
+        Supports TWO_INPUTS, bias, mask fusion, TF32 precision control.
+      Level 2 (center proj): fused LN+Linear for post-einsum norm_center+out_proj
+      Level 1 (gate): fallback fused LN+packed GEMM+sigmoid postprocess
+    - MEMORY: triton_l3 eliminates the Incoming/Outgoing memory asymmetry
+      (cuBLAS workspace causes Incoming to use 1.2-1.5x more memory without fusion;
+      triton_l3 reduces diff to ~0).
+    - Einsum replaced with torch.matmul on permuted views (zero-copy) for both variants.
+
+    TRANSITION (context-sensitive — M size determines whether Triton wins):
+    - use_fused_transition_pair: 1.2-1.3x for pair transitions (M=N², C=128) where M is large
+    - use_fused_transition_single: SLOWER at M=N, C=384 — DO NOT enable (PyTorch 0.8x)
+    - use_fused_ada_transition: SLOWER at M=N, C=768 — DO NOT enable (PyTorch 0.8x)
+    - use_fused_ln_transpose: 1.7-2.3x fwd for LN+transpose (column attn, inference only)
     """
 
     use_fused_evo_attention: bool = False
-    use_fused_transition: bool = False
-    use_fused_ada_transition: bool = False
+    use_fused_pair_bias: bool = False
+    use_fused_transition_pair: bool = False  # pair transitions (M=N², C=128) — Triton wins
+    use_fused_transition_single: bool = False  # single transitions (M=N, C=384) — PyTorch wins, DO NOT enable
+    use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
+    use_fused_ln_transpose: bool = False
     use_torch_compile: bool = False
 
     # Substrings that identify derived fused-kernel parameters in state dicts.
@@ -175,35 +197,64 @@ class OptimConfig:
     # weights on load) and from EMA shadow copies.
     FUSED_STATE_DICT_MARKERS: tuple[str, ...] = (
         "_fused_gate.",
+        "_fused_center_proj.",
+        "_fused_dual_gemm.",
+        "_fused_pair_bias.",
         "_fused_ada_ln_linear.",
         "_fused_swiglu.",
         "_ln_linear.",
+        "_ln_transpose.",
         "_swiglu.",
     )
 
     @classmethod
     def recommended(cls) -> OptimConfig:
-        """Fused evo attention + torch.compile — the biggest wins."""
-        return cls(use_fused_evo_attention=True, use_torch_compile=True)
+        """Best overall: evo_attn + pair_bias + triangle_mul + pair_transition + compile.
+
+        Only enables Triton kernels where they demonstrably outperform PyTorch.
+        Single/diffusion transitions are left to PyTorch/compile (they're faster at small M).
+        """
+        return cls(
+            use_fused_evo_attention=True,
+            use_fused_pair_bias=True,
+            use_fused_triangle_mul=True,
+            use_fused_transition_pair=True,
+            use_torch_compile=True,
+        )
+
+    @classmethod
+    def inference(cls) -> OptimConfig:
+        """Maximum inference speed (all beneficial Triton + forward-only kernels)."""
+        return cls(
+            use_fused_evo_attention=True,
+            use_fused_pair_bias=True,
+            use_fused_triangle_mul=True,
+            use_fused_transition_pair=True,
+            use_fused_ln_transpose=True,
+        )
 
     @classmethod
     def triton_only(cls) -> OptimConfig:
-        """Triton fused kernels only (no torch.compile)."""
+        """All beneficial Triton kernels (no torch.compile)."""
         return cls(
             use_fused_evo_attention=True,
-            use_fused_transition=True,
-            use_fused_ada_transition=True,
+            use_fused_pair_bias=True,
+            use_fused_transition_pair=True,
             use_fused_triangle_mul=True,
+            use_fused_ln_transpose=True,
         )
 
     @classmethod
     def all_enabled(cls) -> OptimConfig:
-        """Enable all optimizations."""
+        """Enable ALL optimizations including slow ones (for testing)."""
         return cls(
             use_fused_evo_attention=True,
-            use_fused_transition=True,
+            use_fused_pair_bias=True,
+            use_fused_transition_pair=True,
+            use_fused_transition_single=True,
             use_fused_ada_transition=True,
             use_fused_triangle_mul=True,
+            use_fused_ln_transpose=True,
             use_torch_compile=True,
         )
 

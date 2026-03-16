@@ -3,528 +3,16 @@
     "op_name": "TriangleMulOutgoing",
     "provider": "pytorch",
     "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.17936000227928162,
-    "peak_memory_mb": 84.91015625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002601353318788383,
-    "time_p25_ms": 0.1781120002269745,
-    "time_p75_ms": 0.18051199615001678,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "pytorch",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.647711992263794,
-    "peak_memory_mb": 153.16015625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0071795786347976735,
-    "time_p25_ms": 0.6452159881591797,
-    "time_p75_ms": 0.6495680212974548,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.14364799857139587,
-    "peak_memory_mb": 85.2890625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02854245026515587,
-    "time_p25_ms": 0.14188799262046814,
-    "time_p75_ms": 0.14636799693107605,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.4203520119190216,
-    "peak_memory_mb": 165.6650390625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.04006052553309147,
-    "time_p25_ms": 0.41596800088882446,
-    "time_p75_ms": 0.43884798884391785,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.14287999272346497,
-    "peak_memory_mb": 93.66796875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002633510967806783,
-    "time_p25_ms": 0.14156800508499146,
-    "time_p75_ms": 0.14476799964904785,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.4235199987888336,
-    "peak_memory_mb": 174.0439453125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.03994946295933942,
-    "time_p25_ms": 0.4201279878616333,
-    "time_p75_ms": 0.4392319917678833,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.17609600722789764,
-    "peak_memory_mb": 106.361328125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02337208338869772,
-    "time_p25_ms": 0.1746560037136078,
-    "time_p75_ms": 0.17801600694656372,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.6227840185165405,
-    "peak_memory_mb": 198.611328125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.03207748133434758,
-    "time_p25_ms": 0.617792010307312,
-    "time_p75_ms": 0.6378560066223145,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "pytorch",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.178847998380661,
-    "peak_memory_mb": 114.392578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002567191819299036,
-    "time_p25_ms": 0.17785599827766418,
-    "time_p75_ms": 0.18086400628089905,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "pytorch",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.6404799818992615,
-    "peak_memory_mb": 182.642578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.025966283044172134,
-    "time_p25_ms": 0.6375679969787598,
-    "time_p75_ms": 0.6454399824142456,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.14035199582576752,
-    "peak_memory_mb": 106.392578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0030254005220593802,
-    "time_p25_ms": 0.13884800672531128,
-    "time_p75_ms": 0.14259199798107147,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.42451199889183044,
-    "peak_memory_mb": 186.7685546875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.041440004933412565,
-    "time_p25_ms": 0.41923201084136963,
-    "time_p75_ms": 0.44790399074554443,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.14051200449466705,
-    "peak_memory_mb": 106.771484375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003453413989975469,
-    "time_p25_ms": 0.1385280042886734,
-    "time_p75_ms": 0.14291200041770935,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.4175359904766083,
-    "peak_memory_mb": 187.1474609375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.04008146336955459,
-    "time_p25_ms": 0.4132159948348999,
-    "time_p75_ms": 0.4366079866886139,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "triton",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.17590400576591492,
-    "peak_memory_mb": 106.740234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0035264679800876848,
-    "time_p25_ms": 0.17449599504470825,
-    "time_p75_ms": 0.17843200266361237,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "triton",
-    "shape": {
-      "N": 128,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.616703987121582,
-    "peak_memory_mb": 198.990234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.020490403121602375,
-    "time_p25_ms": 0.6138240098953247,
-    "time_p75_ms": 0.6200960278511047,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "pytorch",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.6496639847755432,
-    "peak_memory_mb": 319.615234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0021996170405559536,
-    "time_p25_ms": 0.6484479904174805,
-    "time_p75_ms": 0.6506879925727844,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "pytorch",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 2.3310399055480957,
-    "peak_memory_mb": 592.615234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.006336514542169917,
-    "time_p25_ms": 2.3287360668182373,
-    "time_p75_ms": 2.333440065383911,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.47760000824928284,
-    "peak_memory_mb": 311.236328125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003153161342459372,
-    "time_p25_ms": 0.47600001096725464,
-    "time_p75_ms": 0.4790399968624115,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 1.693600058555603,
-    "peak_memory_mb": 632.3623046875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.010078723414765567,
-    "time_p25_ms": 1.690783977508545,
-    "time_p75_ms": 1.697759985923767,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.4826880097389221,
-    "peak_memory_mb": 335.615234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002973728483882798,
-    "time_p25_ms": 0.4811199903488159,
-    "time_p75_ms": 0.4840640127658844,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 1.6924480199813843,
-    "peak_memory_mb": 656.7412109375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.020541068332515254,
-    "time_p25_ms": 1.6901439428329468,
-    "time_p75_ms": 1.6974079608917236,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.5922240018844604,
-    "peak_memory_mb": 355.333984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.007989770025220397,
-    "time_p25_ms": 0.5907840132713318,
-    "time_p75_ms": 0.593887984752655,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 1.994879961013794,
-    "peak_memory_mb": 708.083984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.005711692139380196,
-    "time_p25_ms": 1.9924160242080688,
-    "time_p75_ms": 1.9982399940490723,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "pytorch",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.648576021194458,
-    "peak_memory_mb": 403.708984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002287851972355608,
-    "time_p25_ms": 0.6474559903144836,
-    "time_p75_ms": 0.6504639983177185,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "pytorch",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 2.3310720920562744,
-    "peak_memory_mb": 676.708984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.004134680620963714,
-    "time_p25_ms": 2.3290560245513916,
-    "time_p75_ms": 2.333087921142578,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.4933120012283325,
-    "peak_memory_mb": 371.708984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0027595522998174605,
-    "time_p25_ms": 0.4920960068702698,
-    "time_p75_ms": 0.4952639937400818,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 1.72707200050354,
-    "peak_memory_mb": 692.7724609375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.010099474368497195,
-    "time_p25_ms": 1.724287986755371,
-    "time_p75_ms": 1.731328010559082,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.5007680058479309,
-    "peak_memory_mb": 372.087890625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0038563207848583136,
-    "time_p25_ms": 0.4986239969730377,
-    "time_p75_ms": 0.502560019493103,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "compile_integrated",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 1.7328640222549438,
-    "peak_memory_mb": 693.1513671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.012745731584676324,
-    "time_p25_ms": 1.7294080257415771,
-    "time_p75_ms": 1.7371200323104858,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "triton",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.5935999751091003,
-    "peak_memory_mb": 355.712890625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.004688332691256899,
-    "time_p25_ms": 0.591871976852417,
-    "time_p75_ms": 0.5951679944992065,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulIncoming",
-    "provider": "triton",
-    "shape": {
-      "N": 256,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 2.0103681087493896,
-    "peak_memory_mb": 708.462890625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.005026316476364468,
-    "time_p25_ms": 2.0078399181365967,
-    "time_p75_ms": 2.0133440494537354,
-    "extra": {}
-  },
-  {
-    "op_name": "TriangleMulOutgoing",
-    "provider": "pytorch",
-    "shape": {
       "N": 384,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.6564799547195435,
-    "peak_memory_mb": 745.494140625,
+    "time_ms": 1.6431360244750977,
+    "peak_memory_mb": 631.16015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004508068579404848,
-    "time_p25_ms": 1.6534719467163086,
-    "time_p75_ms": 1.660032033920288,
+    "time_std_ms": 0.00364552265308111,
+    "time_p25_ms": 1.6418880224227905,
+    "time_p75_ms": 1.6461759805679321,
     "extra": {}
   },
   {
@@ -535,12 +23,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 5.122079849243164,
-    "peak_memory_mb": 1359.744140625,
+    "time_ms": 5.132383823394775,
+    "peak_memory_mb": 1245.41015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.012814550778834043,
-    "time_p25_ms": 5.118015766143799,
-    "time_p75_ms": 5.127295970916748,
+    "time_std_ms": 0.009339362171733256,
+    "time_p25_ms": 5.129792213439941,
+    "time_p75_ms": 5.136767864227295,
     "extra": {}
   },
   {
@@ -551,12 +39,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.13811194896698,
-    "peak_memory_mb": 713.494140625,
+    "time_ms": 1.1533440351486206,
+    "peak_memory_mb": 631.5390625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004672901005768138,
-    "time_p25_ms": 1.13481605052948,
-    "time_p75_ms": 1.1412479877471924,
+    "time_std_ms": 0.003356539988992192,
+    "time_p25_ms": 1.1517119407653809,
+    "time_p75_ms": 1.1558719873428345,
     "extra": {}
   },
   {
@@ -567,12 +55,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 3.994688034057617,
-    "peak_memory_mb": 1435.8701171875,
+    "time_ms": 3.315551996231079,
+    "peak_memory_mb": 1353.9150390625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.011879519436989908,
-    "time_p25_ms": 3.990880012512207,
-    "time_p75_ms": 3.9997758865356445,
+    "time_std_ms": 0.018655410467369377,
+    "time_p25_ms": 3.3089919090270996,
+    "time_p75_ms": 3.327712059020996,
     "extra": {}
   },
   {
@@ -583,12 +71,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.1626880168914795,
-    "peak_memory_mb": 753.873046875,
+    "time_ms": 1.1356159448623657,
+    "peak_memory_mb": 703.91796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004274021995532183,
-    "time_p25_ms": 1.1597440242767334,
-    "time_p75_ms": 1.165727972984314,
+    "time_std_ms": 0.003149727523495005,
+    "time_p25_ms": 1.133471965789795,
+    "time_p75_ms": 1.1375999450683594,
     "extra": {}
   },
   {
@@ -599,44 +87,76 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 4.017951965332031,
-    "peak_memory_mb": 1476.2490234375,
+    "time_ms": 3.2825279235839844,
+    "peak_memory_mb": 1426.2939453125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.012218159822359353,
-    "time_p25_ms": 4.012767791748047,
-    "time_p75_ms": 4.02726411819458,
+    "time_std_ms": 0.022891097124700457,
+    "time_p25_ms": 3.2771201133728027,
+    "time_p75_ms": 3.294111967086792,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 384,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.4612480401992798,
-    "peak_memory_mb": 777.185546875,
+    "time_ms": 1.5931520462036133,
+    "peak_memory_mb": 811.7666015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005483832799951468,
-    "time_p25_ms": 1.4597439765930176,
-    "time_p75_ms": 1.4636479616165161,
+    "time_std_ms": 0.006011579522498807,
+    "time_p25_ms": 1.5913599729537964,
+    "time_p75_ms": 1.5941439867019653,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 384,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 4.429503917694092,
-    "peak_memory_mb": 1570.873046875,
+    "time_ms": 4.842048168182373,
+    "peak_memory_mb": 1389.4541015625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01051744498862034,
-    "time_p25_ms": 4.426080226898193,
-    "time_p75_ms": 4.433728218078613,
+    "time_std_ms": 0.005467633206707802,
+    "time_p25_ms": 4.839360237121582,
+    "time_p75_ms": 4.845600128173828,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.2740479707717896,
+    "peak_memory_mb": 740.302734375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.002860144864433219,
+    "time_p25_ms": 1.2723519802093506,
+    "time_p75_ms": 1.275231957435608,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 4.320000171661377,
+    "peak_memory_mb": 1281.990234375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00648233477458652,
+    "time_p25_ms": 4.3163838386535645,
+    "time_p75_ms": 4.323552131652832,
     "extra": {}
   },
   {
@@ -647,12 +167,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.6578559875488281,
-    "peak_memory_mb": 886.029296875,
+    "time_ms": 1.6431360244750977,
+    "peak_memory_mb": 957.146484375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005987344785220206,
-    "time_p25_ms": 1.653823971748352,
-    "time_p75_ms": 1.6618560552597046,
+    "time_std_ms": 0.004478702821359572,
+    "time_p25_ms": 1.6392639875411987,
+    "time_p75_ms": 1.646399974822998,
     "extra": {}
   },
   {
@@ -663,12 +183,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 5.121952056884766,
-    "peak_memory_mb": 1500.279296875,
+    "time_ms": 5.113759994506836,
+    "peak_memory_mb": 1571.396484375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007156494815903558,
-    "time_p25_ms": 5.1179518699646,
-    "time_p75_ms": 5.126175880432129,
+    "time_std_ms": 0.00706284446375626,
+    "time_p25_ms": 5.11030387878418,
+    "time_p75_ms": 5.119455814361572,
     "extra": {}
   },
   {
@@ -679,12 +199,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.169376015663147,
-    "peak_memory_mb": 814.029296875,
+    "time_ms": 1.215391993522644,
+    "peak_memory_mb": 885.146484375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0043595071422737,
-    "time_p25_ms": 1.1660799980163574,
-    "time_p75_ms": 1.1727999448776245,
+    "time_std_ms": 0.003043544508843069,
+    "time_p25_ms": 1.2135039567947388,
+    "time_p75_ms": 1.2165440320968628,
     "extra": {}
   },
   {
@@ -695,12 +215,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 4.090432167053223,
-    "peak_memory_mb": 1536.3427734375,
+    "time_ms": 3.545759916305542,
+    "peak_memory_mb": 1607.5224609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.011304407661622365,
-    "time_p25_ms": 4.085567951202393,
-    "time_p75_ms": 4.097951889038086,
+    "time_std_ms": 0.004377590206880628,
+    "time_p25_ms": 3.5424320697784424,
+    "time_p75_ms": 3.5488319396972656,
     "extra": {}
   },
   {
@@ -711,12 +231,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.172927975654602,
-    "peak_memory_mb": 814.408203125,
+    "time_ms": 1.2245440483093262,
+    "peak_memory_mb": 885.525390625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.006107110740833897,
-    "time_p25_ms": 1.169600009918213,
-    "time_p75_ms": 1.1776959896087646,
+    "time_std_ms": 0.0031276466480295202,
+    "time_p25_ms": 1.2227519750595093,
+    "time_p75_ms": 1.225823998451233,
     "extra": {}
   },
   {
@@ -727,44 +247,76 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 4.109216213226318,
-    "peak_memory_mb": 1536.7216796875,
+    "time_ms": 3.571199893951416,
+    "peak_memory_mb": 1607.9013671875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01188094098875828,
-    "time_p25_ms": 4.104608058929443,
-    "time_p75_ms": 4.116447925567627,
+    "time_std_ms": 0.006265205015837689,
+    "time_p25_ms": 3.5663681030273438,
+    "time_p75_ms": 3.57423996925354,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 384,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 1.4722239971160889,
-    "peak_memory_mb": 777.564453125,
+    "time_ms": 1.5956480503082275,
+    "peak_memory_mb": 920.962890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004668820918085145,
-    "time_p25_ms": 1.470304012298584,
-    "time_p75_ms": 1.4743679761886597,
+    "time_std_ms": 0.0028340827991322893,
+    "time_p25_ms": 1.5945600271224976,
+    "time_p75_ms": 1.5977920293807983,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 384,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 4.441152095794678,
-    "peak_memory_mb": 1571.251953125,
+    "time_ms": 4.879327774047852,
+    "peak_memory_mb": 1498.650390625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.011667651817666878,
-    "time_p25_ms": 4.4383039474487305,
-    "time_p75_ms": 4.444672107696533,
+    "time_std_ms": 0.006021138027964886,
+    "time_p25_ms": 4.875967979431152,
+    "time_p75_ms": 4.883327960968018,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 1.273535966873169,
+    "peak_memory_mb": 740.681640625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0026730286619561275,
+    "time_p25_ms": 1.2719680070877075,
+    "time_p75_ms": 1.2747199535369873,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 4.320256233215332,
+    "peak_memory_mb": 1282.369140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005918192822251817,
+    "time_p25_ms": 4.316832065582275,
+    "time_p75_ms": 4.323584079742432,
     "extra": {}
   },
   {
@@ -775,12 +327,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 3.184448003768921,
-    "peak_memory_mb": 1364.376953125,
+    "time_ms": 3.1638400554656982,
+    "peak_memory_mb": 1435.494140625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.009061719469626774,
-    "time_p25_ms": 3.1766719818115234,
-    "time_p75_ms": 3.1898880004882812,
+    "time_std_ms": 0.008630565614552312,
+    "time_p25_ms": 3.1574079990386963,
+    "time_p75_ms": 3.171072006225586,
     "extra": {}
   },
   {
@@ -791,12 +343,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 9.598527908325195,
-    "peak_memory_mb": 2456.376953125,
+    "time_ms": 9.612159729003906,
+    "peak_memory_mb": 2527.494140625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.009519528350778959,
-    "time_p25_ms": 9.592672348022461,
-    "time_p75_ms": 9.604063987731934,
+    "time_std_ms": 0.00865671733670482,
+    "time_p25_ms": 9.606656074523926,
+    "time_p75_ms": 9.617504119873047,
     "extra": {}
   },
   {
@@ -807,12 +359,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.1805760860443115,
-    "peak_memory_mb": 1292.376953125,
+    "time_ms": 2.1697919368743896,
+    "peak_memory_mb": 1363.494140625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.008806355964311154,
-    "time_p25_ms": 2.1756160259246826,
-    "time_p75_ms": 2.1845760345458984,
+    "time_std_ms": 0.004541231166733471,
+    "time_p25_ms": 2.1667520999908447,
+    "time_p75_ms": 2.1734719276428223,
     "extra": {}
   },
   {
@@ -823,12 +375,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 7.479519844055176,
-    "peak_memory_mb": 2576.5029296875,
+    "time_ms": 7.4451518058776855,
+    "peak_memory_mb": 2647.6201171875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.015148029748366282,
-    "time_p25_ms": 7.472352027893066,
-    "time_p75_ms": 7.486656188964844,
+    "time_std_ms": 0.011305931276877531,
+    "time_p25_ms": 7.439839839935303,
+    "time_p75_ms": 7.4501118659973145,
     "extra": {}
   },
   {
@@ -839,12 +391,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.179487943649292,
-    "peak_memory_mb": 1348.755859375,
+    "time_ms": 2.162463903427124,
+    "peak_memory_mb": 1419.115234375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005411580570542076,
-    "time_p25_ms": 2.1754560470581055,
-    "time_p75_ms": 2.1825599670410156,
+    "time_std_ms": 0.005528877426517114,
+    "time_p25_ms": 2.1587839126586914,
+    "time_p75_ms": 2.166304111480713,
     "extra": {}
   },
   {
@@ -855,44 +407,76 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 7.480800151824951,
-    "peak_memory_mb": 2632.8818359375,
+    "time_ms": 7.424736022949219,
+    "peak_memory_mb": 2703.2412109375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01433445204143026,
-    "time_p25_ms": 7.474783897399902,
-    "time_p75_ms": 7.489247798919678,
+    "time_std_ms": 0.011410418442909668,
+    "time_p25_ms": 7.420703887939453,
+    "time_p75_ms": 7.430047988891602,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 512,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.7262399196624756,
-    "peak_memory_mb": 1367.474609375,
+    "time_ms": 3.0434560775756836,
+    "peak_memory_mb": 1538.115234375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005396375098094029,
-    "time_p25_ms": 2.722752094268799,
-    "time_p75_ms": 2.7300798892974854,
+    "time_std_ms": 0.0034053185217107476,
+    "time_p25_ms": 3.0412158966064453,
+    "time_p75_ms": 3.0461440086364746,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 512,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 8.113183975219727,
-    "peak_memory_mb": 2778.474609375,
+    "time_ms": 9.138527870178223,
+    "peak_memory_mb": 2565.115234375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.009570084461894746,
-    "time_p25_ms": 8.1080961227417,
-    "time_p75_ms": 8.118240356445312,
+    "time_std_ms": 0.026405609609907232,
+    "time_p25_ms": 9.132415771484375,
+    "time_p75_ms": 9.1428804397583,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.4019200801849365,
+    "peak_memory_mb": 1815.958984375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0047129794384535816,
+    "time_p25_ms": 2.3984320163726807,
+    "time_p75_ms": 2.40499210357666,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 8.040063858032227,
+    "peak_memory_mb": 2778.958984375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0056127952767118915,
+    "time_p25_ms": 8.036864280700684,
+    "time_p75_ms": 8.044416427612305,
     "extra": {}
   },
   {
@@ -903,12 +487,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 3.207263946533203,
-    "peak_memory_mb": 1560.974609375,
+    "time_ms": 3.205888032913208,
+    "peak_memory_mb": 2201.458984375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.00416465324159753,
-    "time_p25_ms": 3.204576015472412,
-    "time_p75_ms": 3.2104320526123047,
+    "time_std_ms": 0.007173600088095707,
+    "time_p25_ms": 3.2007999420166016,
+    "time_p75_ms": 3.2101120948791504,
     "extra": {}
   },
   {
@@ -919,12 +503,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 9.612768173217773,
-    "peak_memory_mb": 2652.974609375,
+    "time_ms": 9.681695938110352,
+    "peak_memory_mb": 3293.458984375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.011079625821721294,
-    "time_p25_ms": 9.606176376342773,
-    "time_p75_ms": 9.619872093200684,
+    "time_std_ms": 0.009434374408560566,
+    "time_p25_ms": 9.675904273986816,
+    "time_p75_ms": 9.68716812133789,
     "extra": {}
   },
   {
@@ -935,12 +519,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.206943988800049,
-    "peak_memory_mb": 1432.974609375,
+    "time_ms": 2.5645439624786377,
+    "peak_memory_mb": 1559.333984375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005433604047207076,
-    "time_p25_ms": 2.2026240825653076,
-    "time_p75_ms": 2.2109758853912354,
+    "time_std_ms": 0.004978375065208169,
+    "time_p25_ms": 2.561471939086914,
+    "time_p75_ms": 2.567903995513916,
     "extra": {}
   },
   {
@@ -951,12 +535,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 7.674272060394287,
-    "peak_memory_mb": 2717.0380859375,
+    "time_ms": 8.069024085998535,
+    "peak_memory_mb": 2843.3974609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01178609345632204,
-    "time_p25_ms": 7.668191909790039,
-    "time_p75_ms": 7.682400226593018,
+    "time_std_ms": 0.008863926393878384,
+    "time_p25_ms": 8.064319610595703,
+    "time_p75_ms": 8.0764799118042,
     "extra": {}
   },
   {
@@ -967,12 +551,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.220736026763916,
-    "peak_memory_mb": 1433.353515625,
+    "time_ms": 2.5690879821777344,
+    "peak_memory_mb": 1559.712890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007060184543058378,
-    "time_p25_ms": 2.2150399684906006,
-    "time_p75_ms": 2.2257919311523438,
+    "time_std_ms": 0.004807161891346943,
+    "time_p25_ms": 2.5655999183654785,
+    "time_p75_ms": 2.572000026702881,
     "extra": {}
   },
   {
@@ -983,44 +567,396 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 7.6976637840271,
-    "peak_memory_mb": 2717.4169921875,
+    "time_ms": 8.08198356628418,
+    "peak_memory_mb": 2843.7763671875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.014597795261721109,
-    "time_p25_ms": 7.690847873687744,
-    "time_p75_ms": 7.706208229064941,
+    "time_std_ms": 0.01045884813945953,
+    "time_p25_ms": 8.076543807983398,
+    "time_p75_ms": 8.088895797729492,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 512,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 2.7459840774536133,
-    "peak_memory_mb": 1367.853515625,
+    "time_ms": 3.0815999507904053,
+    "peak_memory_mb": 1622.712890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0038561601789292364,
-    "time_p25_ms": 2.7440319061279297,
-    "time_p75_ms": 2.7482240200042725,
+    "time_std_ms": 0.003720021251274355,
+    "time_p25_ms": 3.0790719985961914,
+    "time_p75_ms": 3.0840959548950195,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 512,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 8.135519981384277,
-    "peak_memory_mb": 2778.853515625,
+    "time_ms": 9.167008399963379,
+    "peak_memory_mb": 2649.712890625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.009222333511573465,
-    "time_p25_ms": 8.13043212890625,
-    "time_p75_ms": 8.140864372253418,
+    "time_std_ms": 0.006043439690379828,
+    "time_p25_ms": 9.163104057312012,
+    "time_p75_ms": 9.172320365905762,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 2.4307520389556885,
+    "peak_memory_mb": 1302.212890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005195235242648409,
+    "time_p25_ms": 2.4251201152801514,
+    "time_p75_ms": 2.4344639778137207,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 8.097984313964844,
+    "peak_memory_mb": 2265.212890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0076613391544471665,
+    "time_p25_ms": 8.094143867492676,
+    "time_p75_ms": 8.10319995880127,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 5.097856044769287,
+    "peak_memory_mb": 2302.869140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004644325110593515,
+    "time_p25_ms": 5.095071792602539,
+    "time_p75_ms": 5.101088047027588,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 15.908767700195312,
+    "peak_memory_mb": 4009.119140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006654271801149712,
+    "time_p25_ms": 15.90499210357666,
+    "time_p75_ms": 15.912416458129883,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 3.5074880123138428,
+    "peak_memory_mb": 2174.869140625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004485579552354069,
+    "time_p25_ms": 3.5040318965911865,
+    "time_p75_ms": 3.510143995285034,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 12.6113920211792,
+    "peak_memory_mb": 4181.2451171875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009928980204951574,
+    "time_p25_ms": 12.607808113098145,
+    "time_p75_ms": 12.617152214050293,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 3.5030078887939453,
+    "peak_memory_mb": 2247.248046875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005517544254158979,
+    "time_p25_ms": 3.4987199306488037,
+    "time_p75_ms": 3.5071680545806885,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 12.60159969329834,
+    "peak_memory_mb": 4253.6240234375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01139135005579485,
+    "time_p25_ms": 12.59705638885498,
+    "time_p75_ms": 12.60694408416748,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l1+l2",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.900896072387695,
+    "peak_memory_mb": 2417.685546875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0037187806099635624,
+    "time_p25_ms": 4.898464202880859,
+    "time_p75_ms": 4.903711795806885,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l1+l2",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 15.085472106933594,
+    "peak_memory_mb": 4022.373046875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006554546468345259,
+    "time_p25_ms": 15.08191967010498,
+    "time_p75_ms": 15.090432167053223,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.112095832824707,
+    "peak_memory_mb": 2828.435546875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0037462011602651577,
+    "time_p25_ms": 4.109087944030762,
+    "time_p75_ms": 4.114975929260254,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 13.539039611816406,
+    "peak_memory_mb": 4333.123046875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.020459179649275617,
+    "time_p25_ms": 13.535072326660156,
+    "time_p75_ms": 13.542752265930176,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 5.153696060180664,
+    "peak_memory_mb": 3430.779296875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.007572567313278843,
+    "time_p25_ms": 5.145823955535889,
+    "time_p75_ms": 5.158559799194336,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 16.22844886779785,
+    "peak_memory_mb": 5137.029296875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006399131334265128,
+    "time_p25_ms": 16.225120544433594,
+    "time_p75_ms": 16.2325439453125,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.128767967224121,
+    "peak_memory_mb": 3230.779296875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004399896216940905,
+    "time_p25_ms": 4.126751899719238,
+    "time_p75_ms": 4.132575988769531,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 13.960639953613281,
+    "peak_memory_mb": 5237.0927734375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008692660123007819,
+    "time_p25_ms": 13.955007553100586,
+    "time_p75_ms": 13.965760231018066,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.131360054016113,
+    "peak_memory_mb": 2427.908203125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0040866468233790145,
+    "time_p25_ms": 4.128543853759766,
+    "time_p75_ms": 4.133567810058594,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "compile_integrated",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 14.005599975585938,
+    "peak_memory_mb": 4434.2216796875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.02782637919056095,
+    "time_p25_ms": 14.000800132751465,
+    "time_p75_ms": 14.012800216674805,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l1+l2",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.964320182800293,
+    "peak_memory_mb": 2526.345703125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0035848432300252093,
+    "time_p25_ms": 4.963200092315674,
+    "time_p75_ms": 4.967135906219482,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l1+l2",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 15.305824279785156,
+    "peak_memory_mb": 4131.033203125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006265641851693506,
+    "time_p25_ms": 15.301888465881348,
+    "time_p75_ms": 15.311615943908691,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 4.167327880859375,
+    "peak_memory_mb": 2025.564453125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005345112878905431,
+    "time_p25_ms": 4.163424015045166,
+    "time_p75_ms": 4.171487808227539,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 13.791487693786621,
+    "peak_memory_mb": 3530.251953125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004889053152855221,
+    "time_p25_ms": 13.78816032409668,
+    "time_p75_ms": 13.794560432434082,
     "extra": {}
   },
   {
@@ -1031,12 +967,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 7.0502400398254395,
-    "peak_memory_mb": 2927.103515625,
+    "time_ms": 7.058080196380615,
+    "peak_memory_mb": 3378.751953125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005989672619622618,
-    "time_p25_ms": 7.046112060546875,
-    "time_p75_ms": 7.055136203765869,
+    "time_std_ms": 0.02186755264620921,
+    "time_p25_ms": 7.05452823638916,
+    "time_p75_ms": 7.060351848602295,
     "extra": {}
   },
   {
@@ -1047,12 +983,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 22.198368072509766,
-    "peak_memory_mb": 5384.103515625,
+    "time_ms": 22.15692710876465,
+    "peak_memory_mb": 5835.751953125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.019578914360672293,
-    "time_p25_ms": 22.19273567199707,
-    "time_p75_ms": 22.205184936523438,
+    "time_std_ms": 0.010155324272800246,
+    "time_p25_ms": 22.14908790588379,
+    "time_p75_ms": 22.163936614990234,
     "extra": {}
   },
   {
@@ -1063,12 +999,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 4.493728160858154,
-    "peak_memory_mb": 2799.103515625,
+    "time_ms": 4.501503944396973,
+    "peak_memory_mb": 3178.751953125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.010783387578995026,
-    "time_p25_ms": 4.4885759353637695,
-    "time_p75_ms": 4.497951984405518,
+    "time_std_ms": 0.005113393345271808,
+    "time_p25_ms": 4.498688220977783,
+    "time_p75_ms": 4.503744125366211,
     "extra": {}
   },
   {
@@ -1079,12 +1015,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 16.83776092529297,
-    "peak_memory_mb": 5688.2294921875,
+    "time_ms": 16.636991500854492,
+    "peak_memory_mb": 6067.8779296875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.022214985876168384,
-    "time_p25_ms": 16.830944061279297,
-    "time_p75_ms": 16.84726333618164,
+    "time_std_ms": 0.014838329548228245,
+    "time_p25_ms": 16.628448486328125,
+    "time_p75_ms": 16.64569664001465,
     "extra": {}
   },
   {
@@ -1095,12 +1031,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 4.495935916900635,
-    "peak_memory_mb": 2959.482421875,
+    "time_ms": 4.499328136444092,
+    "peak_memory_mb": 3267.130859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007961391305812361,
-    "time_p25_ms": 4.491583824157715,
-    "time_p75_ms": 4.500192165374756,
+    "time_std_ms": 0.006624822797408413,
+    "time_p25_ms": 4.495584011077881,
+    "time_p75_ms": 4.5032639503479,
     "extra": {}
   },
   {
@@ -1111,44 +1047,76 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 16.784320831298828,
-    "peak_memory_mb": 5849.2333984375,
+    "time_ms": 16.70560073852539,
+    "peak_memory_mb": 6156.2568359375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.028878822984722777,
-    "time_p25_ms": 16.7772159576416,
-    "time_p75_ms": 16.793472290039062,
+    "time_std_ms": 0.023643818432525825,
+    "time_p25_ms": 16.696640014648438,
+    "time_p75_ms": 16.712928771972656,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 768,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 6.253407955169678,
-    "peak_memory_mb": 3052.732421875,
+    "time_ms": 6.839680194854736,
+    "peak_memory_mb": 3496.880859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004530215609618255,
-    "time_p25_ms": 6.250912189483643,
-    "time_p75_ms": 6.256127834320068,
+    "time_std_ms": 0.005253274343223901,
+    "time_p25_ms": 6.8370561599731445,
+    "time_p75_ms": 6.843808174133301,
     "extra": {}
   },
   {
     "op_name": "TriangleMulOutgoing",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 768,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 18.678911209106445,
-    "peak_memory_mb": 6227.482421875,
+    "time_ms": 20.719839096069336,
+    "peak_memory_mb": 5807.630859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0174221724582967,
-    "time_p25_ms": 18.672319412231445,
-    "time_p75_ms": 18.685152053833008,
+    "time_std_ms": 0.012469047910156364,
+    "time_p25_ms": 20.71228790283203,
+    "time_p75_ms": 20.727519989013672,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 5.653151988983154,
+    "peak_memory_mb": 5367.474609375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006534227634375437,
+    "time_p25_ms": 5.64796781539917,
+    "time_p75_ms": 5.656799793243408,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulOutgoing",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 18.439008712768555,
+    "peak_memory_mb": 7535.099609375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.016687169434859726,
+    "time_p25_ms": 18.43027114868164,
+    "time_p75_ms": 18.448543548583984,
     "extra": {}
   },
   {
@@ -1159,12 +1127,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 7.108960151672363,
-    "peak_memory_mb": 3487.982421875,
+    "time_ms": 6.8573760986328125,
+    "peak_memory_mb": 6235.724609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.10214505234590207,
-    "time_p25_ms": 7.104608058929443,
-    "time_p75_ms": 7.114719867706299,
+    "time_std_ms": 0.010030966573389373,
+    "time_p25_ms": 6.853280067443848,
+    "time_p75_ms": 6.862527847290039,
     "extra": {}
   },
   {
@@ -1175,12 +1143,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 22.21571159362793,
-    "peak_memory_mb": 5945.607421875,
+    "time_ms": 22.015647888183594,
+    "peak_memory_mb": 8692.724609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.08384987100754157,
-    "time_p25_ms": 22.20966339111328,
-    "time_p75_ms": 22.228511810302734,
+    "time_std_ms": 0.027761245065849496,
+    "time_p25_ms": 22.009824752807617,
+    "time_p75_ms": 22.023008346557617,
     "extra": {}
   },
   {
@@ -1191,12 +1159,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 4.524191856384277,
-    "peak_memory_mb": 3199.982421875,
+    "time_ms": 5.387328147888184,
+    "peak_memory_mb": 3487.474609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01915084913801703,
-    "time_p25_ms": 4.519807815551758,
-    "time_p75_ms": 4.527904033660889,
+    "time_std_ms": 0.0075763026799232705,
+    "time_p25_ms": 5.38262414932251,
+    "time_p75_ms": 5.393087863922119,
     "extra": {}
   },
   {
@@ -1207,12 +1175,12 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 17.253023147583008,
-    "peak_memory_mb": 6089.6708984375,
+    "time_ms": 18.49305534362793,
+    "peak_memory_mb": 6377.4130859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.025864845277251403,
-    "time_p25_ms": 17.246400833129883,
-    "time_p75_ms": 17.262304306030273,
+    "time_std_ms": 0.01096654555526262,
+    "time_p25_ms": 18.48636817932129,
+    "time_p75_ms": 18.499935150146484,
     "extra": {}
   },
   {
@@ -1223,12 +1191,12 @@
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 4.527008056640625,
-    "peak_memory_mb": 3200.361328125,
+    "time_ms": 5.383423805236816,
+    "peak_memory_mb": 3487.853515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01400219117426674,
-    "time_p25_ms": 4.521759986877441,
-    "time_p75_ms": 4.532063961029053,
+    "time_std_ms": 0.006355368663475938,
+    "time_p25_ms": 5.379680156707764,
+    "time_p75_ms": 5.387968063354492,
     "extra": {}
   },
   {
@@ -1239,44 +1207,76 @@
       "C": 128
     },
     "mode": "full",
-    "time_ms": 17.242687225341797,
-    "peak_memory_mb": 6090.0498046875,
+    "time_ms": 18.464927673339844,
+    "peak_memory_mb": 6377.7919921875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.02206354902327121,
-    "time_p25_ms": 17.233728408813477,
-    "time_p75_ms": 17.251136779785156,
+    "time_std_ms": 0.03366139649786156,
+    "time_p25_ms": 18.455232620239258,
+    "time_p75_ms": 18.4736328125,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 768,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 6.274208068847656,
-    "peak_memory_mb": 3051.091796875,
+    "time_ms": 6.650015830993652,
+    "peak_memory_mb": 3629.603515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0057819219526389475,
-    "time_p25_ms": 6.27180814743042,
-    "time_p75_ms": 6.277152061462402,
+    "time_std_ms": 0.012818990632698049,
+    "time_p25_ms": 6.645023822784424,
+    "time_p75_ms": 6.655488014221191,
     "extra": {}
   },
   {
     "op_name": "TriangleMulIncoming",
-    "provider": "triton",
+    "provider": "triton_l1+l2",
     "shape": {
       "N": 768,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 18.684223175048828,
-    "peak_memory_mb": 6225.966796875,
+    "time_ms": 20.743871688842773,
+    "peak_memory_mb": 5940.353515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.017767778224542112,
-    "time_p25_ms": 18.677791595458984,
-    "time_p75_ms": 18.691423416137695,
+    "time_std_ms": 0.010264653025261847,
+    "time_p25_ms": 20.736799240112305,
+    "time_p75_ms": 20.7511043548584,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 5.4547200202941895,
+    "peak_memory_mb": 2908.478515625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.014622706005970406,
+    "time_p25_ms": 5.449952125549316,
+    "time_p75_ms": 5.461599826812744,
+    "extra": {}
+  },
+  {
+    "op_name": "TriangleMulIncoming",
+    "provider": "triton_l3",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 18.487071990966797,
+    "peak_memory_mb": 5075.228515625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.026076839230810625,
+    "time_p25_ms": 18.47987174987793,
+    "time_p75_ms": 18.493663787841797,
     "extra": {}
   },
   {
@@ -1289,12 +1289,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.1510400027036667,
-    "peak_memory_mb": 100.4638671875,
+    "time_ms": 0.16060799360275269,
+    "peak_memory_mb": 101.2216796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0025915343571712122,
-    "time_p25_ms": 0.15027199685573578,
-    "time_p75_ms": 0.15251199901103973,
+    "time_std_ms": 0.002346628986012537,
+    "time_p25_ms": 0.15910400450229645,
+    "time_p75_ms": 0.1618880033493042,
     "extra": {}
   },
   {
@@ -1307,12 +1307,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 0.4283519983291626,
-    "peak_memory_mb": 177.4794921875,
+    "time_ms": 0.4368320107460022,
+    "peak_memory_mb": 178.2373046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.04318836075852678,
-    "time_p25_ms": 0.4264639914035797,
-    "time_p75_ms": 0.43193599581718445,
+    "time_std_ms": 0.00849320133653591,
+    "time_p25_ms": 0.435263991355896,
+    "time_p75_ms": 0.4397119879722595,
     "extra": {}
   },
   {
@@ -1325,12 +1325,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.12425599992275238,
-    "peak_memory_mb": 89.841796875,
+    "time_ms": 0.13420799374580383,
+    "peak_memory_mb": 89.083984375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0028835452905835806,
-    "time_p25_ms": 0.1231359988451004,
-    "time_p75_ms": 0.12534399330615997,
+    "time_std_ms": 0.00268812638255984,
+    "time_p25_ms": 0.13264000415802002,
+    "time_p75_ms": 0.13571199774742126,
     "extra": {}
   },
   {
@@ -1343,12 +1343,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 0.34307199716567993,
-    "peak_memory_mb": 179.24853515625,
+    "time_ms": 0.3571839928627014,
+    "peak_memory_mb": 178.49072265625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.040680452797667285,
-    "time_p25_ms": 0.34064000844955444,
-    "time_p75_ms": 0.3479360044002533,
+    "time_std_ms": 0.004205411854661799,
+    "time_p25_ms": 0.35491201281547546,
+    "time_p75_ms": 0.3595519959926605,
     "extra": {}
   },
   {
@@ -1361,12 +1361,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.5525760054588318,
-    "peak_memory_mb": 348.419921875,
+    "time_ms": 0.5615040063858032,
+    "peak_memory_mb": 347.662109375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007351343274606465,
-    "time_p25_ms": 0.5517119765281677,
-    "time_p75_ms": 0.5535039901733398,
+    "time_std_ms": 0.0072091255674708145,
+    "time_p25_ms": 0.5604159832000732,
+    "time_p75_ms": 0.5633280277252197,
     "extra": {}
   },
   {
@@ -1379,12 +1379,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 1.4642239809036255,
-    "peak_memory_mb": 654.451171875,
+    "time_ms": 1.4600000381469727,
+    "peak_memory_mb": 653.693359375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.019705455603914557,
-    "time_p25_ms": 1.4583040475845337,
-    "time_p75_ms": 1.4733760356903076,
+    "time_std_ms": 0.0043536206474520354,
+    "time_p25_ms": 1.4574079513549805,
+    "time_p75_ms": 1.4629759788513184,
     "extra": {}
   },
   {
@@ -1397,12 +1397,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 0.5129920244216919,
-    "peak_memory_mb": 296.880859375,
+    "time_ms": 0.5235199928283691,
+    "peak_memory_mb": 296.123046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0038312039181338836,
-    "time_p25_ms": 0.5114560127258301,
-    "time_p75_ms": 0.5155199766159058,
+    "time_std_ms": 0.002613800451701479,
+    "time_p25_ms": 0.5224639773368835,
+    "time_p75_ms": 0.5251200199127197,
     "extra": {}
   },
   {
@@ -1415,12 +1415,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 1.3720639944076538,
-    "peak_memory_mb": 651.69384765625,
+    "time_ms": 1.3795520067214966,
+    "peak_memory_mb": 650.93603515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01633900767207131,
-    "time_p25_ms": 1.3690240383148193,
-    "time_p75_ms": 1.3767999410629272,
+    "time_std_ms": 0.003172063778041754,
+    "time_p25_ms": 1.3777600526809692,
+    "time_p75_ms": 1.3816640377044678,
     "extra": {}
   },
   {
@@ -1433,12 +1433,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 1.110144019126892,
-    "peak_memory_mb": 764.107421875,
+    "time_ms": 1.1162240505218506,
+    "peak_memory_mb": 764.099609375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007957615693700813,
-    "time_p25_ms": 1.1078720092773438,
-    "time_p75_ms": 1.1133760213851929,
+    "time_std_ms": 0.002755582610624688,
+    "time_p25_ms": 1.1150720119476318,
+    "time_p75_ms": 1.1190400123596191,
     "extra": {}
   },
   {
@@ -1451,12 +1451,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 2.9345600605010986,
-    "peak_memory_mb": 1451.154296875,
+    "time_ms": 2.9417920112609863,
+    "peak_memory_mb": 1452.146484375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01723288974195922,
-    "time_p25_ms": 2.930464029312134,
-    "time_p75_ms": 2.9403200149536133,
+    "time_std_ms": 0.006496699423907379,
+    "time_p25_ms": 2.9375040531158447,
+    "time_p75_ms": 2.945472002029419,
     "extra": {}
   },
   {
@@ -1469,12 +1469,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 1.0378880500793457,
-    "peak_memory_mb": 639.919921875,
+    "time_ms": 1.0458879470825195,
+    "peak_memory_mb": 639.912109375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.005943624718340111,
-    "time_p25_ms": 1.0356160402297974,
-    "time_p75_ms": 1.0402560234069824,
+    "time_std_ms": 0.004597742438890806,
+    "time_p25_ms": 1.043455958366394,
+    "time_p75_ms": 1.0496000051498413,
     "extra": {}
   },
   {
@@ -1487,12 +1487,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 2.7279679775238037,
-    "peak_memory_mb": 1436.38916015625,
+    "time_ms": 2.7485439777374268,
+    "peak_memory_mb": 1436.38134765625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01893451176848314,
-    "time_p25_ms": 2.7239038944244385,
-    "time_p75_ms": 2.737600088119507,
+    "time_std_ms": 0.006512618103360814,
+    "time_p25_ms": 2.7444159984588623,
+    "time_p75_ms": 2.7524800300598145,
     "extra": {}
   },
   {
@@ -1505,12 +1505,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 1.9893120527267456,
-    "peak_memory_mb": 1343.935546875,
+    "time_ms": 1.9878720045089722,
+    "peak_memory_mb": 1343.927734375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0100164471727734,
-    "time_p25_ms": 1.9844800233840942,
-    "time_p75_ms": 1.9922239780426025,
+    "time_std_ms": 0.007185280662129537,
+    "time_p25_ms": 1.982591986656189,
+    "time_p75_ms": 1.9918400049209595,
     "extra": {}
   },
   {
@@ -1523,12 +1523,12 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 5.109087944030762,
-    "peak_memory_mb": 2561.966796875,
+    "time_ms": 5.102528095245361,
+    "peak_memory_mb": 2561.958984375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.026809666052216633,
-    "time_p25_ms": 5.103616237640381,
-    "time_p75_ms": 5.115071773529053,
+    "time_std_ms": 0.022003428224422365,
+    "time_p25_ms": 5.096960067749023,
+    "time_p75_ms": 5.107999801635742,
     "extra": {}
   },
   {
@@ -1541,12 +1541,12 @@
       "C_pair": 128
     },
     "mode": "fwd",
-    "time_ms": 1.8341120481491089,
-    "peak_memory_mb": 1111.365234375,
+    "time_ms": 1.8376319408416748,
+    "peak_memory_mb": 1112.123046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.006431323660903555,
-    "time_p25_ms": 1.8304640054702759,
-    "time_p75_ms": 1.8375999927520752,
+    "time_std_ms": 0.0030646812134747375,
+    "time_p25_ms": 1.8359040021896362,
+    "time_p75_ms": 1.8400959968566895,
     "extra": {}
   },
   {
@@ -1559,12 +1559,676 @@
       "C_pair": 128
     },
     "mode": "full",
-    "time_ms": 4.758815765380859,
-    "peak_memory_mb": 2523.67822265625,
+    "time_ms": 4.765535831451416,
+    "peak_memory_mb": 2524.43603515625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.023019832692969998,
-    "time_p25_ms": 4.7551679611206055,
-    "time_p75_ms": 4.770400047302246,
+    "time_std_ms": 0.006468914268356891,
+    "time_p25_ms": 4.761888027191162,
+    "time_p75_ms": 4.769248008728027,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.1539199948310852,
+    "peak_memory_mb": 197.376953125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0016348846132198957,
+    "time_p25_ms": 0.15222400426864624,
+    "time_p75_ms": 0.15423999726772308,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 0.35702401399612427,
+    "peak_memory_mb": 277.25390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005291207128768434,
+    "time_p25_ms": 0.3561600148677826,
+    "time_p75_ms": 0.3588480055332184,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.09052799642086029,
+    "peak_memory_mb": 233.37890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.001944173979625402,
+    "time_p25_ms": 0.08985599875450134,
+    "time_p75_ms": 0.0910400003194809,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 384,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 0.8356800079345703,
+    "peak_memory_mb": 614.50537109375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005553233298584502,
+    "time_p25_ms": 0.8327680230140686,
+    "time_p75_ms": 0.8385599851608276,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.29760000109672546,
+    "peak_memory_mb": 446.25390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0015026384985118069,
+    "time_p25_ms": 0.2963840067386627,
+    "time_p75_ms": 0.29820799827575684,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 0.6785920262336731,
+    "peak_memory_mb": 588.255859375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.001245933062400311,
+    "time_p25_ms": 0.6777600049972534,
+    "time_p75_ms": 0.6797760128974915,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.1457280069589615,
+    "peak_memory_mb": 402.25390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0017828226560428998,
+    "time_p25_ms": 0.1454399973154068,
+    "time_p75_ms": 0.14659200608730316,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 512,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.4719040393829346,
+    "peak_memory_mb": 980.25537109375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004870898827951843,
+    "time_p25_ms": 1.469472050666809,
+    "time_p75_ms": 1.4764480590820312,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.47567999362945557,
+    "peak_memory_mb": 712.00390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0014494512901041406,
+    "time_p25_ms": 0.47539201378822327,
+    "time_p75_ms": 0.4758079946041107,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.0512959957122803,
+    "peak_memory_mb": 927.130859375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0017361305206739358,
+    "time_p25_ms": 1.050495982170105,
+    "time_p75_ms": 1.0524799823760986,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.2152319997549057,
+    "peak_memory_mb": 620.00390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.001631017593660403,
+    "time_p25_ms": 0.2144320011138916,
+    "time_p75_ms": 0.215488001704216,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 640,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 2.2385919094085693,
+    "peak_memory_mb": 1523.12890625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008582302668811409,
+    "time_p25_ms": 2.234528064727783,
+    "time_p75_ms": 2.2431039810180664,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.6865280270576477,
+    "peak_memory_mb": 1040.75390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.001399673035630688,
+    "time_p25_ms": 0.6856319904327393,
+    "time_p75_ms": 0.6866559982299805,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "pytorch",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 1.4931199550628662,
+    "peak_memory_mb": 1345.255859375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004934469854492169,
+    "time_p25_ms": 1.4918080568313599,
+    "time_p75_ms": 1.494879961013794,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "fwd",
+    "time_ms": 0.2993920147418976,
+    "peak_memory_mb": 884.75390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.001886820434191488,
+    "time_p25_ms": 0.2991360127925873,
+    "time_p75_ms": 0.3003840148448944,
+    "extra": {}
+  },
+  {
+    "op_name": "LNTranspose",
+    "provider": "triton",
+    "shape": {
+      "N": 768,
+      "C": 128
+    },
+    "mode": "full",
+    "time_ms": 3.150496006011963,
+    "peak_memory_mb": 2185.25390625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.008947884105564519,
+    "time_p25_ms": 3.145888090133667,
+    "time_p75_ms": 3.1567039489746094,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 5.823264122009277,
+    "peak_memory_mb": 2827.09765625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.005893021510118285,
+    "time_p25_ms": 5.819263935089111,
+    "time_p75_ms": 5.8258562088012695,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 14.571871757507324,
+    "peak_memory_mb": 6247.09765625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00906326955936752,
+    "time_p25_ms": 14.565567970275879,
+    "time_p75_ms": 14.577983856201172,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 5.726079940795898,
+    "peak_memory_mb": 2792.541015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.006890972403398669,
+    "time_p25_ms": 5.722271919250488,
+    "time_p75_ms": 5.730112075805664,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 15.166560173034668,
+    "peak_memory_mb": 6105.666015625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.010058896780096993,
+    "time_p25_ms": 15.1626558303833,
+    "time_p75_ms": 15.172608375549316,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 1.8600640296936035,
+    "peak_memory_mb": 745.169921875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0037745436698824915,
+    "time_p25_ms": 1.8570560216903687,
+    "time_p75_ms": 1.8622080087661743,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 5.425504207611084,
+    "peak_memory_mb": 1186.732421875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.00739941120986289,
+    "time_p25_ms": 5.41974401473999,
+    "time_p75_ms": 5.429599761962891,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 1.4411519765853882,
+    "peak_memory_mb": 854.0517578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.013725848578646557,
+    "time_p25_ms": 1.4172799587249756,
+    "time_p75_ms": 1.4444160461425781,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 384,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 5.589824199676514,
+    "peak_memory_mb": 1529.4296875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.015047685440590354,
+    "time_p25_ms": 5.583295822143555,
+    "time_p75_ms": 5.600096225738525,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 13.301631927490234,
+    "peak_memory_mb": 6546.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.02409771530941551,
+    "time_p25_ms": 13.295552253723145,
+    "time_p75_ms": 13.30668830871582,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 33.48588943481445,
+    "peak_memory_mb": 14418.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.02092319243913876,
+    "time_p25_ms": 33.470462799072266,
+    "time_p75_ms": 33.49718475341797,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 13.069984436035156,
+    "peak_memory_mb": 6412.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.011164335158567015,
+    "time_p25_ms": 13.063648223876953,
+    "time_p75_ms": 13.077376365661621,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 34.47353744506836,
+    "peak_memory_mb": 14094.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.020883819152720272,
+    "time_p25_ms": 34.4562873840332,
+    "time_p75_ms": 34.48384094238281,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 3.9933760166168213,
+    "peak_memory_mb": 1419.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01069182999767263,
+    "time_p25_ms": 3.985919952392578,
+    "time_p75_ms": 4.002719879150391,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 11.763936042785645,
+    "peak_memory_mb": 2204.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009756057398943982,
+    "time_p25_ms": 11.758496284484863,
+    "time_p75_ms": 11.77280044555664,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 2.9632320404052734,
+    "peak_memory_mb": 1504.0205078125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0049158480115954134,
+    "time_p25_ms": 2.9617919921875,
+    "time_p75_ms": 2.9659841060638428,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 512,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 11.365407943725586,
+    "peak_memory_mb": 2608.0234375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.015122463079908631,
+    "time_p25_ms": 11.357855796813965,
+    "time_p75_ms": 11.376447677612305,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 25.532255172729492,
+    "peak_memory_mb": 12273.6767578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.02345333581002397,
+    "time_p25_ms": 25.517824172973633,
+    "time_p75_ms": 25.559648513793945,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "pytorch",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 64.328125,
+    "peak_memory_mb": 27373.6767578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.040816289544360805,
+    "time_p25_ms": 64.31072235107422,
+    "time_p75_ms": 64.351806640625,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 25.223712921142578,
+    "peak_memory_mb": 12048.8017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.03311950028933935,
+    "time_p25_ms": 25.20742416381836,
+    "time_p75_ms": 25.25062370300293,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_ln_transpose",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 65.92617797851562,
+    "peak_memory_mb": 26851.9267578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.042875686763072504,
+    "time_p25_ms": 65.897216796875,
+    "time_p75_ms": 65.94854736328125,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 7.341087818145752,
+    "peak_memory_mb": 2231.7392578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.023729301306601582,
+    "time_p25_ms": 7.311999797821045,
+    "time_p75_ms": 7.35203218460083,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 22.44870376586914,
+    "peak_memory_mb": 3458.3017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.009175967090166983,
+    "time_p25_ms": 22.443552017211914,
+    "time_p75_ms": 22.457311630249023,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "fwd",
+    "time_ms": 5.098112106323242,
+    "peak_memory_mb": 2340.8017578125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004729925063792593,
+    "time_p25_ms": 5.09552001953125,
+    "time_p75_ms": 5.100800037384033,
+    "extra": {}
+  },
+  {
+    "op_name": "GridColAttn",
+    "provider": "triton_evo+pb",
+    "shape": {
+      "N": 640,
+      "C": 128,
+      "H": 4
+    },
+    "mode": "full",
+    "time_ms": 20.318496704101562,
+    "peak_memory_mb": 4065.8046875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.01598323181210147,
+    "time_p25_ms": 20.31180763244629,
+    "time_p75_ms": 20.327007293701172,
     "extra": {}
   }
 ]

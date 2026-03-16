@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** sequence clustering, MSA generation/processing for training, multimeric template pipeline.
+**Not yet implemented:** sequence clustering, MSA processing for training (A3M→NPZ), training-time template pipeline (HMM-based search with date cutoff).
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.11+ (pinned in `.python-version`)
@@ -104,12 +104,27 @@ src/deepfold3/
 │   ├── atom_cross_attn.py # AtomCrossAttEncoder/Decoder, EvoformerConditioningEncoder
 │   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training noise/denoise)
 │   ├── confidence.py     # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
-│   └── model.py          # DeepFold3 (top-level, forward + forward_training), DeepFold3Output, DistogramHead
+│   ├── bucket.py         # Bucket-based sequence length padding for training
+│   ├── model.py          # DeepFold3 (top-level, forward + forward_training), DeepFold3Output, DistogramHead
+│   └── triton/           # Triton fused kernels (optional GPU acceleration)
+│       ├── __init__.py            # Precision enum, cvt_tf32_rn, precision_dot
+│       ├── evo_attention.py       # Fused evoformer attention with pair bias
+│       ├── fused_pair_bias.py     # Fused LN + tl.dot projection + permute + mask
+│       ├── fused_gated_dual_gemm.py # Dual GEMM + sigmoid (TWO_INPUTS, bias, mask)
+│       ├── layernorm_linear.py    # Fused LayerNorm + Linear
+│       ├── ada_layernorm_linear.py # Fused AdaLN + Linear
+│       ├── layernorm_transpose.py # Fused LayerNorm + dim transpose
+│       ├── triangle_mul_gate.py   # Fused TriangleMul gate (LN + packed GEMM)
+│       ├── fused_ada_transition.py # Fused AdaTransition (diffusion FFN)
+│       ├── fused_transition.py    # Fused TransitionBlock
+│       ├── swiglu.py              # Fused SwiGLU
+│       ├── tuning.py              # Pre-tuned block size configs (CUDA/HIP)
+│       └── cache.py               # Persistent autotuning cache (GPU fingerprint)
 ├── data/            # Data pipeline
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS, element_name_to_int(), get_res_type()
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
-│   ├── msa/             # mmseqs2.py (server API + local binary MSA search + template m8 parsing)
+│   ├── msa/             # mmseqs2.py (server API + local binary + GPU-accelerated MSA search + template m8 parsing)
 │   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), hhr.py, json_input.py (4 dialects)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial)
@@ -135,6 +150,12 @@ src/deepfold3/
 │   ├── prepare.py        # `deepfold3 prepare`
 │   └── train.py          # `deepfold3 train`
 └── params.py        # read_af3_params() (zstd decompression)
+
+scripts/                     # Shell scripts for database setup and GPU server
+├── setup_databases.sh       # Download and index UniRef30, ColabFoldDB, PDB100
+├── mmseqs_gpuserver.sh      # Start persistent MMseqs2 GPU server processes
+├── mmseqs_msa.sh            # Verbatim ColabFold server-side MSA search
+└── mmseqs_pair.sh           # Verbatim ColabFold server-side paired MSA search
 ```
 
 ## Key Dependencies
@@ -188,7 +209,7 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py` (rea
 
 ### Data Preprocessing Pipeline
 
-Implemented: `deepfold3 prepare` (step 1 + 5). Remaining steps need implementation.
+Implemented: `deepfold3 prepare` (steps 1 + 6), `deepfold3 msa` (step 3 for inference). Remaining steps (2, 4, 5) need implementation for training.
 
 ```bash
 # Process specific PDB IDs
@@ -205,7 +226,7 @@ Steps:
 
 1. **Structure processing** (implemented): PDB mmCIF → `gemmi.make_assembly()` (assembly 1) → quality filters → Structure NPZ. Filters: min/max residue count, all-unknown, consecutive CA distance, chain clashing.
 2. **Sequence clustering** (not yet): MMseqs2 at 40% identity → cluster_id per chain
-3. **MSA generation** (not yet): MMseqs2 against UniRef30/ColabFoldDB → A3M per unique sequence
+3. **MSA generation** (inference: implemented via `deepfold3 msa`; training batch: not yet): MMseqs2 against UniRef30/ColabFoldDB → A3M per unique sequence
 4. **Template search** (not yet): `pdb_seqres.txt` → HMM database (hmmpress) → hmmsearch per query → template hits with date cutoff
 5. **MSA processing** (not yet): A3M → MSA NPZ (sequences + deletion matrix)
 6. **Manifest creation** (implemented): collect records/ → `manifest.json`

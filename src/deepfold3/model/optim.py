@@ -14,9 +14,10 @@ import torch.nn as nn
 
 from deepfold3.model.config import OptimConfig
 
-# Minimum channel dim for FusedTransitionBlock to outperform PyTorch baseline.
-# Benchmarks show Triton overhead dominates at C=64 (MSA) and C=128 (pair).
-_FUSED_TRANSITION_MIN_CHANNELS = 256
+# Pair channel dim where fused transition is used (C=128 pair, M=N² → Triton wins).
+_PAIR_TRANSITION_CHANNELS = (64, 128)
+# Single/MSA channel dims where fused transition is slow (M=N, small → PyTorch wins).
+_SINGLE_TRANSITION_CHANNELS = (384,)
 
 
 @lru_cache(maxsize=16)
@@ -49,13 +50,21 @@ def make_transition_block(
 ) -> nn.Module:
     """Create a TransitionBlock, optionally using fused Triton kernels.
 
-    Only uses FusedTransitionBlock when channels >= _FUSED_TRANSITION_MIN_CHANNELS,
-    since Triton overhead dominates at smaller channel dimensions (C=64, C=128).
+    Uses separate flags for pair vs single transitions because they operate
+    at vastly different M sizes:
+    - Pair transitions: M = N² (up to 590k) — Triton wins at 1.2-1.3x
+    - Single transitions: M = N (384-768) — PyTorch wins (Triton overhead dominates)
     """
-    if config and config.use_fused_transition and channels >= _FUSED_TRANSITION_MIN_CHANNELS:
-        cls = _try_import("deepfold3.model.triton.fused_transition", "FusedTransitionBlock")
-        if cls is not None:
-            return cls(channels, num_intermediate_factor=num_intermediate_factor)
+    if config is not None:
+        use_fused = False
+        if config.use_fused_transition_pair and channels in _PAIR_TRANSITION_CHANNELS:
+            use_fused = True
+        elif config.use_fused_transition_single and channels in _SINGLE_TRANSITION_CHANNELS:
+            use_fused = True
+        if use_fused:
+            cls = _try_import("deepfold3.model.triton.fused_transition", "FusedTransitionBlock")
+            if cls is not None:
+                return cls(channels, num_intermediate_factor=num_intermediate_factor)
     from deepfold3.model.primitives import TransitionBlock
 
     return TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor)

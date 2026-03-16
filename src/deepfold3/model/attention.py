@@ -74,10 +74,68 @@ class GridSelfAttention(nn.Module):
         self.out_proj = LinearNoBias(num_heads * self.head_dim, c)
 
         self._evo_attn = None
+        self._ln_transpose = None
+        self._fused_pair_bias = None
         if optim is not None and optim.use_fused_evo_attention:
             self._evo_attn = _load_evo_attn()
+        if optim is not None and optim.use_fused_pair_bias:
+            try:
+                from deepfold3.model.triton.fused_pair_bias import FusedPairBias
+
+                self._fused_pair_bias = FusedPairBias(c, num_heads)
+                self._sync_pair_bias()
+            except ImportError:
+                pass
+        if optim is not None and optim.use_fused_ln_transpose and transpose:
+            try:
+                from deepfold3.model.triton.layernorm_transpose import FusedLayerNormTranspose
+
+                self._ln_transpose = FusedLayerNormTranspose(c, do_transpose=True)
+                self._sync_ln_transpose()
+            except ImportError:
+                pass
         if self._evo_attn is None and optim is not None and optim.use_torch_compile:
-            self._compute_baseline = torch.compile(self._compute_baseline)
+            # Use SDPA path with torch.compile — cuDNN/FlashAttention backends
+            # are faster than our manual matmul+softmax+matmul for large N.
+            self._compute_sdpa = torch.compile(self._compute_sdpa)
+            self._compute_baseline = self._compute_sdpa
+
+    def _compute_sdpa(
+        self, z_flat: torch.Tensor, pb: torch.Tensor, mask: torch.Tensor, B: int, N_rows: int, N_cols: int
+    ) -> torch.Tensor:
+        """Attention using PyTorch's scaled_dot_product_attention (cuDNN/FlashAttention backend).
+
+        Memory optimization: pair_bias [B, H, N, N] is shared across all N_rows.
+        We pack rows into the head dimension: Q/K/V become [B, N_rows*H, N, D] and
+        the bias [B, H, N, N] is repeat-interleaved to [B, N_rows*H, N, N] via
+        expand (zero-copy virtual broadcast). The mask [B, N_rows, N] is reshaped
+        to [B, N_rows*1, 1, N] and broadcast over H heads. The combined bias is
+        assembled via addition of expanded views — one N_rows*H*N² allocation
+        total, vs the old approach that called .contiguous() creating a full copy.
+
+        dtype fix: cast attn_bias to q.dtype to avoid SDPA bf16/fp32 mismatch.
+        """
+        H, D = self.num_heads, self.head_dim
+        # Q/K/V: [B*N_rows, N_cols, H*D] → [B, N_rows*H, N_cols, D]
+        q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D).permute(0, 1, 3, 2, 4).reshape(B, N_rows * H, N_cols, D)
+        k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D).permute(0, 1, 3, 2, 4).reshape(B, N_rows * H, N_cols, D)
+        v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D).permute(0, 1, 3, 2, 4).reshape(B, N_rows * H, N_cols, D)
+
+        # Apply mask into pb first as [B, H, 1, N] + [B, H, N, N] = [B, H, N, N] (cheap, N²H)
+        # Then expand to [B, N_rows*H, N, N] via reshape (one copy, unavoidable for SDPA).
+        # This avoids the previous approach of broadcasting a [B, N_rows, 1, 1, N] mask_bias
+        # against [B, 1, H, N, N] pb, which materialized a full [B, N_rows, H, N, N] intermediate.
+        col_mask, _ = mask.reshape(B, N_rows, N_cols).max(dim=1)  # [B, N] — any-row mask
+        pb_masked = pb + 1e9 * (col_mask[:, None, None, :] - 1.0)  # [B, H, N, N] + [B, 1, 1, N]
+        attn_bias = pb_masked.unsqueeze(1).expand(B, N_rows, H, N_cols, N_cols)
+        attn_bias = attn_bias.reshape(B, N_rows * H, N_cols, N_cols).to(q.dtype)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, scale=self.scale)
+        # [B, N_rows*H, N_cols, D] → [B, N_rows, H, N_cols, D] → [B*N_rows, N_cols, H*D]
+        out = out.view(B, N_rows, H, N_cols, D).permute(0, 1, 3, 2, 4).reshape(B * N_rows, N_cols, H * D)
+
+        g = torch.sigmoid(self.to_g(z_flat))
+        return self.out_proj(out * g)
 
     def _compute_baseline(
         self, z_flat: torch.Tensor, pb: torch.Tensor, mask: torch.Tensor, B: int, N_rows: int, N_cols: int
@@ -103,6 +161,34 @@ class GridSelfAttention(nn.Module):
         g = torch.sigmoid(self.to_g(z_flat))
         return self.out_proj(out * g)
 
+    def _sync_pair_bias(self):
+        """Copy norm + pair_bias weights to fused pair bias module."""
+        if self._fused_pair_bias is not None:
+            with torch.no_grad():
+                self._fused_pair_bias.ln_weight.data.copy_(self.norm.weight.data)
+                self._fused_pair_bias.ln_bias.data.copy_(self.norm.bias.data)
+                self._fused_pair_bias.proj_weight.data.copy_(self.pair_bias.weight.data)
+
+    def _sync_ln_transpose(self):
+        """Copy norm weights to the fused LN+transpose module."""
+        if self._ln_transpose is not None:
+            with torch.no_grad():
+                self._ln_transpose.weight.data.copy_(self.norm.weight.data)
+                self._ln_transpose.bias.data.copy_(self.norm.bias.data)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        fused_prefixes = ("_ln_transpose.", "_fused_pair_bias.")
+        has_fused = self._ln_transpose is not None or self._fused_pair_bias is not None
+        if has_fused and strict:
+            if not any(k.startswith(p) for k in state_dict for p in fused_prefixes):
+                strict = False
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if self._fused_pair_bias is not None:
+            self._sync_pair_bias()
+        if self._ln_transpose is not None:
+            self._sync_ln_transpose()
+        return result
+
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -117,16 +203,30 @@ class GridSelfAttention(nn.Module):
             mask = mask.unsqueeze(0)
 
         B = z.shape[0]
-        z = self.norm(z)
+        N = z.shape[1]  # == z.shape[2] (pair matrix is square)
 
-        # pair_bias: [B, N, N, H] → [B, H, N, N]
-        pb = self.pair_bias(z).permute(0, 3, 1, 2)
+        # ── Pair bias + LayerNorm ──
+        # Compute pair bias and normalize z. For column attention with evo_attn,
+        # DEFER the transpose to avoid the N²C .contiguous() copy (see below).
+        _defer_transpose = self.transpose and self._evo_attn is not None and z.is_cuda
 
-        if self.transpose:
-            # Column-wise: transpose act so we iterate over columns
-            # AF3: pair_bias is NOT transposed (same [B, H, N, N] for row and col)
-            z = z.permute(0, 2, 1, 3)  # [B, N_col, N_row, C]
+        if self._fused_pair_bias is not None and z.is_cuda:
+            pb = self._fused_pair_bias(z)  # [B, H, N, N] — fused LN+proj+permute
+            z = self.norm(z)
+            if self.transpose and not _defer_transpose:
+                z = z.permute(0, 2, 1, 3)
+                mask = mask.permute(0, 2, 1)
+        elif self._ln_transpose is not None and z.is_cuda:
+            z_normed = self.norm(z)
+            pb = self.pair_bias(z_normed).permute(0, 3, 1, 2)
+            z = self._ln_transpose(z)  # [B, N2, N1, C] — fused LN + transpose
             mask = mask.permute(0, 2, 1)
+        else:
+            z = self.norm(z)
+            pb = self.pair_bias(z).permute(0, 3, 1, 2)
+            if self.transpose and not _defer_transpose:
+                z = z.permute(0, 2, 1, 3)
+                mask = mask.permute(0, 2, 1)
 
         _, N_rows, N_cols, C = z.shape
         H = self.num_heads
@@ -135,16 +235,38 @@ class GridSelfAttention(nn.Module):
         # Fold batch and row dims for per-row attention
         z_flat = z.reshape(B * N_rows, N_cols, C)
 
-        if self._evo_attn is not None and z.is_cuda:
-            # Fused Triton path: kernel expects [B, N_seq, N_res, H, D]
+        if _defer_transpose:
+            # Column attention fast path with evo_attn: skip the data transpose.
+            #
+            # to_q/to_k/to_v are LinearNoBias on the last dim C — they produce the
+            # same values regardless of dim 1/2 ordering. We project QKV from the
+            # ORIGINAL z layout [B, N1, N2, C] (contiguous, no copy needed), then
+            # permute dims 1↔2 on the 5D QKV tensors (views, zero-copy). The
+            # evo_attn kernel's internal .contiguous() on the [B,N_seq,H,N_res,D]
+            # tensor is the ONLY copy. This saves one N²C copy vs transposing z first.
+            q = self.to_q(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)  # [B, N2, N1, H, D]
+            k = self.to_k(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)
+            v = self.to_v(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)
+            # Mask: column-wise → permute rows/cols
+            col_mask = mask.permute(0, 2, 1)
+            res_mask = torch.where(col_mask > 0.5, 0.0, -1e9).view(B, N, 1, 1, N)
+            # Pair bias: pb[b,h,n1,n2] from z[B,N1,N2,C]. For col attention attending
+            # over N1 (rows) for each N2 (column), query=row_i, key=row_j → bias is
+            # pb[b,h,i,j]. No transpose needed — the original pb indexes match.
+            pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N]
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, N2, N1, H, D]
+            # Un-transpose back to [B, N1, N2, H*D]
+            out = out.permute(0, 2, 1, 3, 4).reshape(B * N, N, H * D)
+            g = torch.sigmoid(self.to_g(z_flat))
+            out = self.out_proj(out * g)
+        elif self._evo_attn is not None and z.is_cuda:
+            # Row attention: standard evo_attn path
             q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D)
             k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D)
             v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D)
-            # Use -1e9 instead of -inf: when ALL keys are masked (bucket-padded rows),
-            # softmax(-inf,...,-inf) = NaN, but softmax(-1e9,...,-1e9) = 1/N (safe).
             res_mask = torch.where(mask > 0.5, 0.0, -1e9).view(B, N_rows, 1, 1, N_cols)
-            pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N] — kernel requires fp32 bias
-            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, N_rows, N_cols, H, D]
+            pair_bias = pb.unsqueeze(1).float()
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)
             out = out.reshape(B * N_rows, N_cols, H * D)
             g = torch.sigmoid(self.to_g(z_flat))
             out = self.out_proj(out * g)
@@ -154,7 +276,7 @@ class GridSelfAttention(nn.Module):
         # Unfold back to [B, N_rows, N_cols, C_out]
         out = out.view(B, N_rows, N_cols, -1)
 
-        if self.transpose:
+        if self.transpose and not _defer_transpose:
             out = out.permute(0, 2, 1, 3)
 
         if not has_batch:

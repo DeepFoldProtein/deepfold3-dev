@@ -19,6 +19,27 @@ OuterProductMean Haiku → PyTorch mapping:
     output_b          → out_b     (parameter [c_z])
 
 All modules support both unbatched and batched (leading B dim) inputs.
+
+Triangle multiply optimization design (cf. NVIDIA cuEquivariance):
+─────────────────────────────────────────────────────────────────
+cuEQ fuses the entire triangle multiply into a pipeline of 3 fused ops:
+
+  1. layer_norm_transpose(x, layout="bijd->bijd")        # fused LN
+  2. fused_sigmoid_gated_dual_gemm(x, W_gate, W_proj,    # two GEMMs + sigmoid
+         mask, transpose_out=True)                         # + layout transpose
+     → a, b = chunk(ab, 2, dim=0)                        # split in D-first layout
+  3. einsum("dbik,dbjk->dbij", a, b)                     # contraction
+  4. layer_norm_transpose(x, layout="dbij->bijd")        # fused LN + transpose
+  5. fused_sigmoid_gated_dual_gemm_dual_x(x_in, x_out,   # output gating
+         W_g_out, W_p_out)
+
+Our current optimization stack:
+  Level 1: FusedTriangleMulGate — LN + packed GEMM (3 projections) + sigmoid postprocess
+  Level 2: FusedLayerNormLinear for norm_center + out_proj (post-einsum)
+  Level 3: FusedGatedDualGEMM — two GEMMs + sigmoid gate in one kernel (cuEQ pattern)
+
+Future: D-first layout for einsum (transpose_out=True → "dbik,dbjk->dbij"),
+fused LN+transpose on output, output gating via second dual GEMM.
 """
 
 from __future__ import annotations
@@ -28,6 +49,48 @@ import torch.nn as nn
 
 from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
+
+
+def _triangle_matmul_outgoing(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``bikc,bjkc->bijc`` via matmul on permuted views (zero-copy).
+
+    Equivalent to ``torch.einsum('bikc,bjkc->bijc', a, b)`` but uses cuBLAS
+    strided batch GEMM on non-contiguous views, avoiding the internal
+    ``.contiguous()`` copies that ``torch.einsum`` creates.
+
+    Args:
+        a: Tensor ``[B, N, N, C]`` (interpreted as ``[B, i, k, C]``).
+        b: Tensor ``[B, N, N, C]`` (interpreted as ``[B, j, k, C]``).
+
+    Returns:
+        Tensor ``[B, N, N, C]`` — contraction over k.
+    """
+    return torch.matmul(a.permute(0, 3, 1, 2), b.permute(0, 3, 2, 1)).permute(0, 2, 3, 1)
+
+
+def _triangle_matmul_incoming(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``bkjc,bkic->bijc`` via matmul on permuted views (zero-copy).
+
+    Equivalent to ``torch.einsum('bkjc,bkic->bijc', a, b)`` but uses cuBLAS
+    strided batch GEMM on non-contiguous views. Critical for incoming
+    triangle multiply — ``torch.einsum`` for this contraction pattern creates
+    ~10 extra ``[N², C]`` contiguous copies (1.5x memory overhead), while
+    ``torch.matmul`` on views creates zero.
+
+    Args:
+        a: Tensor ``[B, N, N, C]`` (interpreted as ``[B, k, j, C]``).
+        b: Tensor ``[B, N, N, C]`` (interpreted as ``[B, k, i, C]``).
+
+    Returns:
+        Tensor ``[B, N, N, C]`` — contraction over k.
+    """
+    return torch.matmul(a.permute(0, 3, 2, 1), b.permute(0, 3, 1, 2)).permute(0, 3, 2, 1)
+
+
+_TRIANGLE_MATMUL = {
+    "bikc,bjkc->bijc": _triangle_matmul_outgoing,
+    "bkjc,bkic->bijc": _triangle_matmul_incoming,
+}
 
 
 class _TriangleMulBase(nn.Module):
@@ -48,12 +111,34 @@ class _TriangleMulBase(nn.Module):
         self.out_gate = LinearNoBias(c_z, c_z)
 
         self._fused_gate = None
+        self._fused_dual_gemm = None
+        self._fused_center_proj = None
         if optim is not None and optim.use_fused_triangle_mul:
+            # Level 3: Fused dual GEMM for proj+gate (cuEQ pattern — two GEMMs
+            # share input tile loads, sigmoid+multiply fused in epilogue).
+            # Falls back to Level 1 (FusedTriangleMulGate) if unavailable.
             try:
-                from deepfold3.model.triton.triangle_mul_gate import FusedTriangleMulGate
+                from deepfold3.model.triton.fused_gated_dual_gemm import FusedGatedDualGEMM
 
-                self._fused_gate = FusedTriangleMulGate(c_z)
-                self._sync_to_fused_gate()
+                self._fused_dual_gemm = FusedGatedDualGEMM(c_z, c_z * 2)
+                self._sync_dual_gemm()
+            except ImportError:
+                pass
+            if self._fused_dual_gemm is None:
+                # Level 1: LN + packed GEMM + sigmoid postprocess
+                try:
+                    from deepfold3.model.triton.triangle_mul_gate import FusedTriangleMulGate
+
+                    self._fused_gate = FusedTriangleMulGate(c_z)
+                    self._sync_to_fused_gate()
+                except ImportError:
+                    pass
+            # Level 2: Fused LN+Linear for post-einsum norm_center + out_proj
+            try:
+                from deepfold3.model.triton.layernorm_linear import FusedLayerNormLinear
+
+                self._fused_center_proj = FusedLayerNormLinear(c_z, c_z, has_linear_bias=False)
+                self._sync_center_proj()
             except ImportError:
                 pass
 
@@ -61,6 +146,13 @@ class _TriangleMulBase(nn.Module):
             # Don't combine torch.compile with fused Triton gate — the compiled
             # graph can mishandle nested Triton kernel launches.
             self._compute = torch.compile(self._compute)
+
+    def _sync_dual_gemm(self):
+        """Copy proj/gate weights to the fused dual GEMM module."""
+        if self._fused_dual_gemm is not None:
+            with torch.no_grad():
+                self._fused_dual_gemm.w_gate.data.copy_(self.gate.weight.data)
+                self._fused_dual_gemm.w_proj.data.copy_(self.proj.weight.data)
 
     def _sync_to_fused_gate(self):
         """Copy norm/proj/gate/out_gate weights to FusedTriangleMulGate."""
@@ -73,19 +165,41 @@ class _TriangleMulBase(nn.Module):
                 self._fused_gate.out_gate.weight.data.copy_(self.out_gate.weight.data)
                 self._fused_gate._sync_to_fused()
 
+    def _sync_center_proj(self):
+        """Copy norm_center/out_proj weights to fused LN+Linear."""
+        if self._fused_center_proj is not None:
+            with torch.no_grad():
+                self._fused_center_proj.weight.data.copy_(self.norm_center.weight.data)
+                self._fused_center_proj.bias.data.copy_(self.norm_center.bias.data)
+                self._fused_center_proj.linear_weight.data.copy_(self.out_proj.weight.data.T)
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load state dict then sync to fused parameters if present."""
-        if self._fused_gate is not None and strict:
-            # Relax strict if incoming state_dict lacks fused-gate keys (they are derived).
-            if not any(k.startswith("_fused_gate.") for k in state_dict):
+        fused_prefixes = ("_fused_gate.", "_fused_center_proj.", "_fused_dual_gemm.")
+        has_fused = any(
+            getattr(self, attr) is not None for attr in ("_fused_gate", "_fused_center_proj", "_fused_dual_gemm")
+        )
+        if has_fused and strict:
+            if not any(k.startswith(p) for k in state_dict for p in fused_prefixes):
                 strict = False
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        if self._fused_gate is not None:
-            self._sync_to_fused_gate()
+        # Each _sync method guards on `is not None` internally
+        self._sync_dual_gemm()
+        self._sync_to_fused_gate()
+        self._sync_center_proj()
         return result
 
     def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        if self._fused_gate is not None and z.is_cuda:
+        if self._fused_dual_gemm is not None and z.is_cuda:
+            # Level 3: Fused dual GEMM (cuEQ pattern) — two GEMMs share input
+            # tile loads, sigmoid + multiply fused in GEMM epilogue.
+            z0 = self.norm_left(z)
+            gated_proj = self._fused_dual_gemm(z0)  # sigmoid(z0@Wg.T) * (z0@Wp.T)
+            out_gate = torch.sigmoid(self.out_gate(z0))
+            a = gated_proj[..., 0::2]
+            b = gated_proj[..., 1::2]
+        elif self._fused_gate is not None and z.is_cuda:
+            # Level 1: LN + packed GEMM + sigmoid postprocess
             a, b, out_gate = self._fused_gate(z)
         else:
             z0 = self.norm_left(z)
@@ -99,9 +213,12 @@ class _TriangleMulBase(nn.Module):
         m = mask.unsqueeze(-1)
         a = a * m
         b = b * m
-        act = torch.einsum(self._equation, a, b)
-        act = self.norm_center(act)
-        act = self.out_proj(act)
+        act = _TRIANGLE_MATMUL[self._equation](a, b)
+        if self._fused_center_proj is not None and act.is_cuda:
+            act = self._fused_center_proj(act)
+        else:
+            act = self.norm_center(act)
+            act = self.out_proj(act)
         return act * out_gate
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

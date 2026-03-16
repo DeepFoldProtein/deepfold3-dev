@@ -20,13 +20,13 @@ from benchmarks.utils import (
     dry_run_shapes,
     save_results,
     try_compile,
+    try_import,
 )
 
 TRI_SHAPES = [
-    {"N": 128, "C": 128},
-    {"N": 256, "C": 128},
     {"N": 384, "C": 128},
     {"N": 512, "C": 128},
+    {"N": 640, "C": 128},
     {"N": 768, "C": 128},
 ]
 
@@ -117,11 +117,13 @@ def bench_triangle_mul(shapes, warmup, rep):
             except Exception as e:
                 print(f"  [skip] Integrated compile {name} failed (N={N}): {e}")
 
-            # --- Triton fused triangle mul gate ---
+            # --- Triton fused triangle mul (Level 1+2: gate + center_proj) ---
             try:
                 optim_tri = OptimConfig(use_fused_triangle_mul=True)
                 mod_tri = cls(C, optim=optim_tri).to(DEVICE, DTYPE).eval()
                 mod_tri.load_state_dict(mod.state_dict(), strict=False)
+                # Disable dual GEMM to isolate Level 1+2 performance
+                mod_tri._fused_dual_gemm = None
                 z_tri = z.detach().clone().requires_grad_(True)
 
                 def fwd_tri(mod_tri=mod_tri, z_tri=z_tri, mask=mask):
@@ -133,12 +135,35 @@ def bench_triangle_mul(shapes, warmup, rep):
 
                 results.extend(
                     bench_fwd_full(
-                        name, "triton", shape, fwd_tri, full_tri, warmup=warmup, rep=rep, grad_to_none=[z_tri]
+                        name, "triton_l1+l2", shape, fwd_tri, full_tri, warmup=warmup, rep=rep, grad_to_none=[z_tri]
                     )
                 )
                 del mod_tri, z_tri
             except Exception as e:
-                print(f"  [skip] Triton fused {name} failed (N={N}): {e}")
+                print(f"  [skip] Triton L1+L2 {name} failed (N={N}): {e}")
+
+            # --- Triton fused triangle mul (Level 3: dual GEMM + center_proj) ---
+            try:
+                optim_full = OptimConfig(use_fused_triangle_mul=True)
+                mod_full = cls(C, optim=optim_full).to(DEVICE, DTYPE).eval()
+                mod_full.load_state_dict(mod.state_dict(), strict=False)
+                z_full = z.detach().clone().requires_grad_(True)
+
+                def fwd_full(mod_full=mod_full, z_full=z_full, mask=mask):
+                    return mod_full(z_full, mask)
+
+                def full_full(mod_full=mod_full, z_full=z_full, mask=mask, do=do):
+                    o = mod_full(z_full, mask)
+                    o.backward(do, retain_graph=True)
+
+                results.extend(
+                    bench_fwd_full(
+                        name, "triton_l3", shape, fwd_full, full_full, warmup=warmup, rep=rep, grad_to_none=[z_full]
+                    )
+                )
+                del mod_full, z_full
+            except Exception as e:
+                print(f"  [skip] Triton L3 {name} failed (N={N}): {e}")
 
             print(f"  {name} N={N} C={C} done")
 
@@ -203,6 +228,200 @@ def bench_outer_product_mean(shapes, warmup, rep):
     return results
 
 
+LN_TRANSPOSE_SHAPES = [
+    {"N": 384, "C": 128},
+    {"N": 512, "C": 128},
+    {"N": 640, "C": 128},
+    {"N": 768, "C": 128},
+]
+
+GRID_COL_SHAPES = [
+    {"N": 384, "C": 128, "H": 4},
+    {"N": 512, "C": 128, "H": 4},
+    {"N": 640, "C": 128, "H": 4},
+]
+
+
+def bench_layernorm_transpose(shapes, warmup, rep):
+    """Benchmark fused LN+transpose vs sequential LN + permute."""
+    import gc
+
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    FusedLayerNormTranspose = try_import(  # noqa: N806
+        "deepfold3.model.triton.layernorm_transpose", "FusedLayerNormTranspose"
+    )
+
+    results = []
+    for shape in shapes:
+        N, C = shape["N"], shape["C"]
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        x = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        do = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
+
+        # Baseline: LN + permute
+        ln = nn.LayerNorm(C).to(DEVICE, DTYPE)
+
+        def fwd_base(x=x, ln=ln):
+            return F.layer_norm(x, (C,), ln.weight, ln.bias).permute(0, 2, 1, 3).contiguous()
+
+        def full_base(x=x, ln=ln, do=do):
+            o = F.layer_norm(x, (C,), ln.weight, ln.bias).permute(0, 2, 1, 3).contiguous()
+            o.backward(do, retain_graph=True)
+
+        results.extend(
+            bench_fwd_full("LNTranspose", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[x])
+        )
+
+        # Triton fused
+        if FusedLayerNormTranspose is not None:
+            fused = FusedLayerNormTranspose(C, do_transpose=True).to(DEVICE, DTYPE)
+            with torch.no_grad():
+                fused.weight.copy_(ln.weight)
+                fused.bias.copy_(ln.bias)
+            x2 = x.detach().clone().requires_grad_(True)
+
+            def fwd_fused(x2=x2, fused=fused):
+                return fused(x2)
+
+            def full_fused(x2=x2, fused=fused, do=do):
+                o = fused(x2)
+                o.backward(do, retain_graph=True)
+
+            try:
+                results.extend(
+                    bench_fwd_full(
+                        "LNTranspose", "triton", shape, fwd_fused, full_fused, warmup=warmup, rep=rep, grad_to_none=[x2]
+                    )
+                )
+            except Exception as e:
+                print(f"  [skip] Triton LNTranspose failed (N={N}): {e}")
+            del fused, x2
+        else:
+            print(f"  [skip] Triton FusedLayerNormTranspose not available (N={N})")
+
+        print(f"  LNTranspose N={N} C={C} done")
+
+    return results
+
+
+def bench_grid_col_attention(shapes, warmup, rep):
+    """Benchmark column GridSelfAttention: baseline vs fused LN+transpose."""
+    import gc
+
+    from deepfold3.model.attention import GridSelfAttention
+    from deepfold3.model.config import OptimConfig
+
+    results = []
+    for shape in shapes:
+        N, C, H = shape["N"], shape["C"], shape["H"]
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        z = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        mask = torch.ones(1, N, N, device=DEVICE, dtype=DTYPE)
+        do = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
+
+        # Baseline column attention (no optim)
+        base = GridSelfAttention(C, num_heads=H, transpose=True).to(DEVICE, DTYPE).eval()
+
+        def fwd_base(z=z, base=base, mask=mask):
+            return base(z, mask)
+
+        def full_base(z=z, base=base, mask=mask, do=do):
+            o = base(z, mask)
+            o.backward(do, retain_graph=True)
+
+        results.extend(
+            bench_fwd_full(
+                "GridColAttn", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[z]
+            )
+        )
+
+        # With fused LN+transpose
+        try:
+            optim = OptimConfig(use_fused_ln_transpose=True)
+            fused = GridSelfAttention(C, num_heads=H, transpose=True, optim=optim).to(DEVICE, DTYPE).eval()
+            fused.load_state_dict(base.state_dict(), strict=False)
+            z2 = z.detach().clone().requires_grad_(True)
+
+            def fwd_fused(z2=z2, fused=fused, mask=mask):
+                return fused(z2, mask)
+
+            def full_fused(z2=z2, fused=fused, mask=mask, do=do):
+                o = fused(z2, mask)
+                o.backward(do, retain_graph=True)
+
+            results.extend(
+                bench_fwd_full(
+                    "GridColAttn", "triton_ln_transpose", shape, fwd_fused, full_fused,
+                    warmup=warmup, rep=rep, grad_to_none=[z2]
+                )
+            )
+            del fused, z2
+        except Exception as e:
+            print(f"  [skip] Fused LN+transpose GridColAttn failed (N={N}): {e}")
+
+        # With fused evo attention (for comparison)
+        try:
+            optim_evo = OptimConfig(use_fused_evo_attention=True)
+            evo = GridSelfAttention(C, num_heads=H, transpose=True, optim=optim_evo).to(DEVICE, DTYPE).eval()
+            evo.load_state_dict(base.state_dict(), strict=False)
+            z3 = z.detach().clone().requires_grad_(True)
+
+            def fwd_evo(z3=z3, evo=evo, mask=mask):
+                return evo(z3, mask)
+
+            def full_evo(z3=z3, evo=evo, mask=mask, do=do):
+                o = evo(z3, mask)
+                o.backward(do, retain_graph=True)
+
+            results.extend(
+                bench_fwd_full(
+                    "GridColAttn", "triton_evo", shape, fwd_evo, full_evo,
+                    warmup=warmup, rep=rep, grad_to_none=[z3]
+                )
+            )
+            del evo, z3
+        except Exception as e:
+            print(f"  [skip] EvoAttn GridColAttn failed (N={N}): {e}")
+
+        # With fused evo + pair_bias (training: fwd+bwd)
+        try:
+            optim_pb = OptimConfig(use_fused_evo_attention=True, use_fused_pair_bias=True)
+            fused_pb = GridSelfAttention(C, num_heads=H, transpose=True, optim=optim_pb).to(DEVICE, DTYPE).eval()
+            fused_pb.load_state_dict(base.state_dict(), strict=False)
+            z4 = z.detach().clone().requires_grad_(True)
+
+            def fwd_pb(z4=z4, fused_pb=fused_pb, mask=mask):
+                return fused_pb(z4, mask)
+
+            def full_pb(z4=z4, fused_pb=fused_pb, mask=mask, do=do):
+                o = fused_pb(z4, mask)
+                o.backward(do, retain_graph=True)
+
+            results.extend(
+                bench_fwd_full(
+                    "GridColAttn", "triton_evo+pb", shape, fwd_pb, full_pb,
+                    warmup=warmup, rep=rep, grad_to_none=[z4]
+                )
+            )
+            del fused_pb, z4
+        except Exception as e:
+            print(f"  [skip] Fused pair bias GridColAttn failed (N={N}): {e}")
+
+        # Note: SDPA+compile benchmark removed — dtype mismatch between
+        # pair_bias (bf16) and SDPA's internal fp32 logits needs a separate fix.
+
+        del base, z, do
+        print(f"  GridColAttn N={N} C={C} H={H} done")
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark pair operations")
     parser.add_argument("--dry-run", action="store_true", help="Smoke test with tiny shapes")
@@ -225,6 +444,14 @@ def main():
     print("=== Outer Product Mean ===")
     shapes = dry_run_shapes(OPM_SHAPES, args.dry_run)
     all_results.extend(bench_outer_product_mean(shapes, warmup, rep))
+
+    print("=== LayerNorm + Transpose ===")
+    shapes = dry_run_shapes(LN_TRANSPOSE_SHAPES, args.dry_run)
+    all_results.extend(bench_layernorm_transpose(shapes, warmup, rep))
+
+    print("=== Grid Column Attention ===")
+    shapes = dry_run_shapes(GRID_COL_SHAPES, args.dry_run)
+    all_results.extend(bench_grid_col_attention(shapes, warmup, rep))
 
     save_results(all_results, "pair_ops.json")
     print(f"Done. {len(all_results)} measurements.")

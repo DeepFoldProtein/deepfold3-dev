@@ -111,10 +111,17 @@ def gpu_timer_stats(
     )
 
 
-def peak_memory_mb(fn: callable) -> tuple[float, any]:
-    """Run fn once and return (peak_memory_MB, result)."""
-    torch.cuda.reset_peak_memory_stats()
+def peak_memory_mb(fn: callable, warmup: int = 3) -> tuple[float, any]:
+    """Run fn and return (peak_memory_MB, result).
+
+    Runs warmup calls first to ensure JIT compilation and triton.autotune
+    are complete before measuring — otherwise the autotuner's temporary
+    allocations inflate the reported peak.
+    """
+    for _ in range(warmup):
+        fn()
     torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
     result = fn()
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() / (1024 * 1024)

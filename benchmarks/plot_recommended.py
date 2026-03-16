@@ -27,6 +27,13 @@ PROVIDER_COLORS = {
     "compile_integrated": "#A5A5A5",
     "triton": "#70AD47",
     "triton_raw": "#FFC000",
+    "triton_l1+l2": "#A9D18E",
+    "triton_l3": "#2E7D32",
+    "triton_evo": "#70AD47",
+    "triton_ln_transpose": "#C5E0B4",
+    "triton_evo+pb": "#1B5E20",
+    "triton_evo+ln_t": "#4CAF50",
+    "sdpa+compile+pb": "#FF9800",
 }
 PROVIDER_LABELS = {
     "pytorch": "PyTorch",
@@ -34,6 +41,13 @@ PROVIDER_LABELS = {
     "compile_integrated": "compile (integrated)",
     "triton": "Triton fused",
     "triton_raw": "Triton raw kernel",
+    "triton_l1+l2": "Triton L1+L2 (gate+center)",
+    "triton_l3": "Triton L3 (dual GEMM)",
+    "triton_evo": "EvoAttention",
+    "triton_ln_transpose": "LN+Transpose",
+    "triton_evo+pb": "EvoAttn + PairBias",
+    "triton_evo+ln_t": "EvoAttn + LN+T",
+    "sdpa+compile+pb": "SDPA+compile+PairBias",
 }
 
 # Op-specific provider label overrides
@@ -154,6 +168,73 @@ def generate_pdf(output_path: Path | None = None):
             fontsize=11,
             color="#888888",
         )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # --- Optimization Strategy Overview ---
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.text(0.5, 0.94, "Optimization Strategy", ha="center", fontsize=18, fontweight="bold")
+        strategy_text = (
+            "DeepFold3 Triton Kernel Optimization Stack\n"
+            "(adapted from NVIDIA cuEquivariance design patterns)\n"
+            "\n"
+            "ATTENTION (104 modules, 3.7-4.6x speedup)\n"
+            "  1. Fused EvoformerAttention \u2014 Triton FlashAttention with pair bias\n"
+            "     \u2022 Autotuned tile sizes (BLOCK_Q/KV x num_stages x num_warps)\n"
+            "  2. Fused Pair Bias \u2014 LN + tl.dot GEMM(128\u21924) + permute + mask\n"
+            "     \u2022 5-10x faster than old scalar loop; supports training backward\n"
+            "  3. Deferred Col Transpose \u2014 skip N\u00b2C copy for column attention\n"
+            "     \u2022 Col overhead: 52% \u2192 8% vs row attention\n"
+            "\n"
+            "TRIANGLE MULTIPLY (96 modules, 1.2-1.3x speedup)\n"
+            "  Level 3: Fused Dual GEMM \u2014 sigmoid(x@W1+b1) * (x2@W2+b2) * mask\n"
+            "     \u2022 TWO_INPUTS mode, bias, mask fusion, TF32 precision control\n"
+            "     \u2022 Eliminates Incoming/Outgoing memory asymmetry (+1.5GB \u2192 0)\n"
+            "     \u2022 Backward: pre-GEMM kernel + cuBLAS (split pattern from cuEQ)\n"
+            "  Level 2: Fused LN+Linear for post-einsum norm_center + out_proj\n"
+            "  Level 1: Fused LN+packed GEMM+sigmoid for pre-einsum gate\n"
+            "  \u2022 einsum replaced with torch.matmul on permuted views (zero-copy)\n"
+            "\n"
+            "TRANSITIONS (context-sensitive)\n"
+            "  Pair transitions (M=N\u00b2, C=128): Triton fused \u2192 1.2-1.3x\n"
+            "  Single transitions (M=N, C=384): PyTorch baseline faster (M too small)\n"
+            "\n"
+            "INFRASTRUCTURE\n"
+            "  \u2022 Precision enum: DEFAULT / TF32 / TF32x3 / IEEE\n"
+            "  \u2022 Persistent autotuning cache: ~/.cache/deepfold3-triton/\n"
+            "  \u2022 GPU fingerprinting with fuzzy matching (20% tolerance)"
+        )
+        fig.text(0.08, 0.85, strategy_text, va="top", fontsize=10, fontfamily="monospace", linespacing=1.5)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # --- Preset Configurations ---
+        fig = plt.figure(figsize=(11, 8.5))
+        fig.text(0.5, 0.94, "OptimConfig Presets", ha="center", fontsize=18, fontweight="bold")
+        presets_text = (
+            "OptimConfig.recommended()  \u2014  Best overall (training + inference)\n"
+            "  \u2714 use_fused_evo_attention      2.9-3.3x attention speedup\n"
+            "  \u2714 use_fused_pair_bias           +25-30% on top (training + inference)\n"
+            "  \u2714 use_fused_triangle_mul        1.2-1.3x TriMul + fixes mem asymmetry\n"
+            "  \u2714 use_fused_transition_pair      1.2-1.3x pair transitions (M=N\u00b2)\n"
+            "  \u2714 use_torch_compile              1.3-2.3x for MSA/Single attention\n"
+            "\n"
+            "OptimConfig.inference()  \u2014  Maximum inference speed\n"
+            "  \u2714 Same as recommended, minus torch.compile\n"
+            "  \u2714 use_fused_ln_transpose         1.7-2.3x LN+transpose (forward only)\n"
+            "\n"
+            "OptimConfig.triton_only()  \u2014  All beneficial Triton kernels\n"
+            "  \u2714 All fused kernels that demonstrably outperform PyTorch\n"
+            "  \u2718 No torch.compile (avoids compilation overhead)\n"
+            "\n"
+            "OptimConfig.all_enabled()  \u2014  For testing only\n"
+            "  \u2714 Everything including slow single/ada transitions\n"
+            "\n"
+            "Flags NOT in recommended (benchmarked slower than PyTorch):\n"
+            "  \u2718 use_fused_transition_single    0.8x at M=N, C=384\n"
+            "  \u2718 use_fused_ada_transition       0.8x at M=N, C=768"
+        )
+        fig.text(0.08, 0.85, presets_text, va="top", fontsize=10, fontfamily="monospace", linespacing=1.6)
         pdf.savefig(fig)
         plt.close(fig)
 

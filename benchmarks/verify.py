@@ -430,6 +430,139 @@ def verify_triangle_mul_e2e(verbose: bool = False) -> bool:
     return ok
 
 
+def verify_layernorm_transpose(verbose: bool = False) -> bool:
+    """Verify FusedLayerNormTranspose against sequential LN + permute."""
+    FusedLayerNormTranspose = try_import(  # noqa: N806
+        "deepfold3.model.triton.layernorm_transpose", "FusedLayerNormTranspose"
+    )
+    if FusedLayerNormTranspose is None:
+        print("  [skip] Triton FusedLayerNormTranspose not available")
+        return True
+
+    B, N1, N2, C = 2, 64, 48, 128
+    x = torch.randn(B, N1, N2, C, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(B, N2, N1, C, device=DEVICE, dtype=DTYPE)
+
+    # Baseline: LN + permute
+    ln = nn.LayerNorm(C).to(DEVICE, DTYPE)
+    x1 = x.clone().requires_grad_(True)
+    o1 = F.layer_norm(x1, [C], ln.weight, ln.bias).permute(0, 2, 1, 3).contiguous()
+    o1.backward(do)
+
+    # Fused
+    fused = FusedLayerNormTranspose(C, do_transpose=True).to(DEVICE, DTYPE)
+    with torch.no_grad():
+        fused.weight.copy_(ln.weight)
+        fused.bias.copy_(ln.bias)
+    x2 = x.clone().requires_grad_(True)
+    o2 = fused(x2)
+    o2.backward(do)
+
+    ok = _allclose(o1, o2, "LNTranspose fwd", verbose)
+    ok &= _allclose(x1.grad, x2.grad, "LNTranspose grad_x", verbose)
+    return ok
+
+
+def verify_fused_dual_gemm(verbose: bool = False) -> bool:
+    """Verify FusedGatedDualGEMM against separate proj + sigmoid(gate) + multiply."""
+    FusedGatedDualGEMM = try_import(  # noqa: N806
+        "deepfold3.model.triton.fused_gated_dual_gemm", "FusedGatedDualGEMM"
+    )
+    if FusedGatedDualGEMM is None:
+        print("  [skip] Triton FusedGatedDualGEMM not available")
+        return True
+
+    M, K, N = 512, 128, 256
+    x = torch.randn(M, K, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(M, N, device=DEVICE, dtype=DTYPE)
+
+    fused = FusedGatedDualGEMM(K, N).to(DEVICE, DTYPE)
+
+    # Baseline
+    x1 = x.clone().requires_grad_(True)
+    o1 = torch.sigmoid(x1 @ fused.w_gate.T) * (x1 @ fused.w_proj.T)
+    o1.backward(do)
+
+    # Fused
+    x2 = x.clone().requires_grad_(True)
+    o2 = fused(x2)
+    o2.backward(do)
+
+    ok = _allclose(o1, o2, "DualGEMM fwd", verbose)
+    ok &= _allclose(x1.grad, x2.grad, "DualGEMM grad_x", verbose)
+    return ok
+
+
+def verify_triangle_mul_center_proj(verbose: bool = False) -> bool:
+    """Verify TriangleMul with fused center norm+projection matches baseline."""
+    from deepfold3.model.config import OptimConfig
+    from deepfold3.model.ops import TriangleMulOutgoing
+
+    FusedLayerNormLinear = try_import(  # noqa: N806
+        "deepfold3.model.triton.layernorm_linear", "FusedLayerNormLinear"
+    )
+    if FusedLayerNormLinear is None:
+        print("  [skip] Triton FusedLayerNormLinear not available")
+        return True
+
+    N, C = 64, 128
+    z = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE)
+    mask = torch.ones(N, N, device=DEVICE, dtype=DTYPE)
+
+    # Baseline
+    base = TriangleMulOutgoing(C).to(DEVICE, DTYPE).eval()
+    with torch.inference_mode():
+        out_base = base(z, mask)
+
+    # Fused center proj
+    fused = TriangleMulOutgoing(C, optim=OptimConfig(use_fused_triangle_mul=True)).to(DEVICE, DTYPE).eval()
+    with torch.no_grad():
+        fused.load_state_dict(base.state_dict(), strict=False)
+    with torch.inference_mode():
+        out_fused = fused(z, mask)
+
+    ok = _allclose(out_base, out_fused, "TriMul center proj fwd", verbose)
+    return ok
+
+
+def verify_grid_attn_ln_transpose(verbose: bool = False) -> bool:
+    """Verify GridSelfAttention with fused LN+transpose matches baseline."""
+    FusedLayerNormTranspose = try_import(  # noqa: N806
+        "deepfold3.model.triton.layernorm_transpose", "FusedLayerNormTranspose"
+    )
+    if FusedLayerNormTranspose is None:
+        print("  [skip] Triton FusedLayerNormTranspose not available")
+        return True
+
+    from deepfold3.model.attention import GridSelfAttention
+    from deepfold3.model.config import OptimConfig
+
+    N, C, H = 32, 128, 4
+    z = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE)
+    mask = torch.ones(N, N, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE)
+
+    # Baseline column attention
+    base = GridSelfAttention(C, num_heads=H, transpose=True).to(DEVICE, DTYPE).eval()
+
+    # Fused
+    optim = OptimConfig(use_fused_ln_transpose=True)
+    fused = GridSelfAttention(C, num_heads=H, transpose=True, optim=optim).to(DEVICE, DTYPE).eval()
+    fused.load_state_dict(base.state_dict(), strict=False)
+
+    z1 = z.clone().requires_grad_(True)
+    o1 = base(z1, mask)
+    o1.backward(do)
+
+    z2 = z.clone().requires_grad_(True)
+    o2 = fused(z2, mask)
+    o2.backward(do)
+
+    ok = _allclose(o1, o2, "GridAttn LN+transpose fwd", verbose)
+    ok &= _allclose(z1.grad, z2.grad, "GridAttn LN+transpose grad", verbose)
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify optimized kernels match baseline")
     parser.add_argument("--verbose", action="store_true")
@@ -469,6 +602,18 @@ def main():
 
     print("=== TriangleMul E2E (fused gate) ===")
     all_ok &= verify_triangle_mul_e2e(args.verbose)
+
+    print("=== LayerNormTranspose (Triton) ===")
+    all_ok &= verify_layernorm_transpose(args.verbose)
+
+    print("=== Fused Dual GEMM (Triton) ===")
+    all_ok &= verify_fused_dual_gemm(args.verbose)
+
+    print("=== TriangleMul center proj (Triton) ===")
+    all_ok &= verify_triangle_mul_center_proj(args.verbose)
+
+    print("=== GridSelfAttention LN+transpose (Triton) ===")
+    all_ok &= verify_grid_attn_ln_transpose(args.verbose)
 
     print()
     if all_ok:
