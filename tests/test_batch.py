@@ -6,7 +6,6 @@ producing outputs with the expected batch dimension.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from deepfold3.data.module.collate import collate_fn
@@ -98,9 +97,7 @@ class TestBatchedEvoformer:
         batch = collate_fn([_make_features(8, seed=i) for i in range(2)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                batch, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(batch, num_recycles=0)
 
         B, N = 2, 8
         assert embeddings["single"].shape == (B, N, cfg.evoformer.seq_channel)
@@ -119,9 +116,7 @@ class TestBatchedEvoformer:
         N_max = 10
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                batch, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(batch, num_recycles=0)
 
         assert embeddings["single"].shape == (2, N_max, cfg.evoformer.seq_channel)
         assert embeddings["pair"].shape == (2, N_max, N_max, cfg.evoformer.pair_channel)
@@ -135,9 +130,7 @@ class TestBatchedEvoformer:
         feats = _make_features(8)
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                feats, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(feats, num_recycles=0)
 
         N = 8
         assert embeddings["single"].shape == (N, cfg.evoformer.seq_channel)
@@ -156,9 +149,7 @@ class TestBatchedDenoise:
         batch = collate_fn([_make_features(N, seed=i) for i in range(B)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                batch, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(batch, num_recycles=0)
 
             # Create noisy positions
             noisy_pos = torch.randn(B, N, M, 3)
@@ -190,9 +181,7 @@ class TestBatchedDenoise:
         batch = collate_fn([_make_features(N, seed=i) for i in range(B)])
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                batch, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(batch, num_recycles=0)
 
             noisy_pos = torch.randn(B, N, M, 3)
             noise_level = torch.tensor([1.0, 0.5])  # per-sample
@@ -223,9 +212,7 @@ class TestBatchedDenoise:
         feats = _make_features(N)
 
         with torch.no_grad():
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(
-                feats, num_recycles=0
-            )
+            embeddings, rel_feat, target_feat, seq_mask, pair_mask = model.run_evoformer(feats, num_recycles=0)
 
             noisy_pos = torch.randn(N, M, 3)
             noise_level = torch.tensor(1.0)

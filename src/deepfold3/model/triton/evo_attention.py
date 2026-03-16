@@ -200,7 +200,9 @@ if HAS_TRITON:
         )
         O_block_ptr = O + qvk_offset + (offs_q[:, None] * stride_O_seq + offs_d[None, :])
         res_mask_block_ptr = (
-            res_mask + (index_batch * stride_mask_batch + index_msa * stride_mask_msa) + (offs_kv[None, :] * stride_mask_seq)
+            res_mask
+            + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+            + (offs_kv[None, :] * stride_mask_seq)
         )
 
         m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
@@ -302,16 +304,44 @@ if HAS_TRITON:
     )
     @triton.jit
     def _attn_bwd_dq(
-        Q, K, V, res_mask, pair_bias, softmax_scale,
-        dO, dQ, dK, dV, d_pair_bias, M, D,
-        stride_batch, stride_head, stride_msa, stride_seq,
-        stride_pair_bias_batch, stride_pair_bias_head, stride_pair_bias_seq1, stride_pair_bias_seq2,
-        stride_mask_batch, stride_mask_msa, stride_mask_seq,
-        stride_d_pair_bias_batch, stride_d_pair_bias_head, stride_d_pair_bias_seq1, stride_d_pair_bias_seq2,
-        HEAD, N_SEQ, SEQ_LEN,
-        BLOCK_DIM: tl.constexpr, DIM: tl.constexpr,
-        EVEN_Q: tl.constexpr, EVEN_KV: tl.constexpr, EVEN_DIM: tl.constexpr,
-        BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr,
+        Q,
+        K,
+        V,
+        res_mask,
+        pair_bias,
+        softmax_scale,
+        dO,
+        dQ,
+        dK,
+        dV,
+        d_pair_bias,
+        M,
+        D,
+        stride_batch,
+        stride_head,
+        stride_msa,
+        stride_seq,
+        stride_pair_bias_batch,
+        stride_pair_bias_head,
+        stride_pair_bias_seq1,
+        stride_pair_bias_seq2,
+        stride_mask_batch,
+        stride_mask_msa,
+        stride_mask_seq,
+        stride_d_pair_bias_batch,
+        stride_d_pair_bias_head,
+        stride_d_pair_bias_seq1,
+        stride_d_pair_bias_seq2,
+        HEAD,
+        N_SEQ,
+        SEQ_LEN,
+        BLOCK_DIM: tl.constexpr,
+        DIM: tl.constexpr,
+        EVEN_Q: tl.constexpr,
+        EVEN_KV: tl.constexpr,
+        EVEN_DIM: tl.constexpr,
+        BLOCK_SIZE_Q: tl.constexpr,
+        BLOCK_SIZE_KV: tl.constexpr,
     ):
         index_batch_msa_head = tl.program_id(1).to(tl.int64)
         index_batch_msa = index_batch_msa_head // HEAD
@@ -322,8 +352,15 @@ if HAS_TRITON:
         offset = (index_batch * stride_batch + index_head * stride_head + index_msa * stride_msa).to(tl.int64)
         offset_seq = (index_batch_msa_head * SEQ_LEN).to(tl.int64)
 
-        Q += offset; K += offset; V += offset; dO += offset; dQ += offset; dK += offset; dV += offset
-        M += offset_seq; D += offset_seq
+        Q += offset
+        K += offset
+        V += offset
+        dO += offset
+        dQ += offset
+        dK += offset
+        dV += offset
+        M += offset_seq
+        D += offset_seq
 
         offs_dim = tl.arange(0, BLOCK_DIM)
         index_block_kv = tl.program_id(0).to(tl.int64)
@@ -338,23 +375,53 @@ if HAS_TRITON:
                 Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :])
                 dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :])
             else:
-                Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0)
-                dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0)
+                Q_block = tl.load(
+                    Q + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0
+                )
+                dO_block = tl.load(
+                    dO + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0
+                )
         else:
             M_block = tl.load(M + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
             Di = tl.load(D + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
             if EVEN_DIM:
-                Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_q[:, None] < SEQ_LEN, other=0.0)
-                dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_q[:, None] < SEQ_LEN, other=0.0)
+                Q_block = tl.load(
+                    Q + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_q[:, None] < SEQ_LEN, other=0.0
+                )
+                dO_block = tl.load(
+                    dO + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=offs_q[:, None] < SEQ_LEN, other=0.0
+                )
             else:
-                Q_block = tl.load(Q + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM), other=0.0)
-                dO_block = tl.load(dO + offs_q[:, None] * stride_seq + offs_dim[None, :], mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM), other=0.0)
+                Q_block = tl.load(
+                    Q + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                    mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                    other=0.0,
+                )
+                dO_block = tl.load(
+                    dO + offs_q[:, None] * stride_seq + offs_dim[None, :],
+                    mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                    other=0.0,
+                )
 
         M_block = M_block[:, None]
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
-        pair_bias_block_ptr = pair_bias + (index_batch * stride_pair_bias_batch + index_head * stride_pair_bias_head) + offs_q[:, None] * stride_pair_bias_seq1 + offs_kv[None, :] * stride_pair_bias_seq2
-        d_pair_bias_block_ptr = d_pair_bias + (index_batch * stride_d_pair_bias_batch + index_head * stride_d_pair_bias_head).to(tl.int64) + (offs_q[:, None] * stride_d_pair_bias_seq1) + (offs_kv[None, :] * stride_d_pair_bias_seq2)
-        res_mask_block_ptr = res_mask + (index_batch * stride_mask_batch + index_msa * stride_mask_msa) + (offs_kv[None, :] * stride_mask_seq)
+        pair_bias_block_ptr = (
+            pair_bias
+            + (index_batch * stride_pair_bias_batch + index_head * stride_pair_bias_head)
+            + offs_q[:, None] * stride_pair_bias_seq1
+            + offs_kv[None, :] * stride_pair_bias_seq2
+        )
+        d_pair_bias_block_ptr = (
+            d_pair_bias
+            + (index_batch * stride_d_pair_bias_batch + index_head * stride_d_pair_bias_head).to(tl.int64)
+            + (offs_q[:, None] * stride_d_pair_bias_seq1)
+            + (offs_kv[None, :] * stride_d_pair_bias_seq2)
+        )
+        res_mask_block_ptr = (
+            res_mask
+            + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+            + (offs_kv[None, :] * stride_mask_seq)
+        )
 
         kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None]
         vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None]
@@ -367,19 +434,34 @@ if HAS_TRITON:
                 pb = tl.load(pair_bias_block_ptr)
                 rm = tl.load(res_mask_block_ptr).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
                 if EVEN_DIM:
-                    K_T_block = tl.load(kT_ptrs); V_T_block = tl.load(vT_ptrs)
+                    K_T_block = tl.load(kT_ptrs)
+                    V_T_block = tl.load(vT_ptrs)
                 else:
                     K_T_block = tl.load(kT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
                     V_T_block = tl.load(vT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
             else:
-                pb = tl.load(pair_bias_block_ptr, mask=(offs_q[:, None] < SEQ_LEN) & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN), other=float("-inf"))
-                rm = tl.load(res_mask_block_ptr, mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, other=float("-inf")).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
+                pb = tl.load(
+                    pair_bias_block_ptr,
+                    mask=(offs_q[:, None] < SEQ_LEN) & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN),
+                    other=float("-inf"),
+                )
+                rm = tl.load(
+                    res_mask_block_ptr, mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, other=float("-inf")
+                ).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
                 if EVEN_DIM:
                     K_T_block = tl.load(kT_ptrs, mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, other=0.0)
                     V_T_block = tl.load(vT_ptrs, mask=(blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, other=0.0)
                 else:
-                    K_T_block = tl.load(kT_ptrs, mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM), other=0.0)
-                    V_T_block = tl.load(vT_ptrs, mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM), other=0.0)
+                    K_T_block = tl.load(
+                        kT_ptrs,
+                        mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM),
+                        other=0.0,
+                    )
+                    V_T_block = tl.load(
+                        vT_ptrs,
+                        mask=((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM),
+                        other=0.0,
+                    )
 
             QK_block = tl.dot(Q_block, K_T_block) + pb + rm
             if not EVEN_KV:
@@ -389,7 +471,12 @@ if HAS_TRITON:
             dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
             dS_block = P_block * (dP_block - Di[:, None])
 
-            tl.atomic_add(d_pair_bias_block_ptr, dS_block, mask=(offs_q[:, None] < SEQ_LEN) & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN), sem="relaxed")
+            tl.atomic_add(
+                d_pair_bias_block_ptr,
+                dS_block,
+                mask=(offs_q[:, None] < SEQ_LEN) & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN),
+                sem="relaxed",
+            )
             dS_block = dS_block.to(K_T_block.dtype)
 
             dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
@@ -421,15 +508,39 @@ if HAS_TRITON:
     )
     @triton.jit
     def _attn_bwd_dk_dv(
-        Q, K, V, res_mask, pair_bias, softmax_scale,
-        dO, dQ, dK, dV, M, D,
-        stride_batch, stride_head, stride_msa, stride_seq,
-        stride_pair_bias_batch, stride_pair_bias_head, stride_pair_bias_seq1, stride_pair_bias_seq2,
-        stride_mask_batch, stride_mask_msa, stride_mask_seq,
-        HEAD, N_SEQ, SEQ_LEN,
-        BLOCK_DIM: tl.constexpr, DIM: tl.constexpr,
-        EVEN_Q: tl.constexpr, EVEN_KV: tl.constexpr, EVEN_DIM: tl.constexpr,
-        BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr,
+        Q,
+        K,
+        V,
+        res_mask,
+        pair_bias,
+        softmax_scale,
+        dO,
+        dQ,
+        dK,
+        dV,
+        M,
+        D,
+        stride_batch,
+        stride_head,
+        stride_msa,
+        stride_seq,
+        stride_pair_bias_batch,
+        stride_pair_bias_head,
+        stride_pair_bias_seq1,
+        stride_pair_bias_seq2,
+        stride_mask_batch,
+        stride_mask_msa,
+        stride_mask_seq,
+        HEAD,
+        N_SEQ,
+        SEQ_LEN,
+        BLOCK_DIM: tl.constexpr,
+        DIM: tl.constexpr,
+        EVEN_Q: tl.constexpr,
+        EVEN_KV: tl.constexpr,
+        EVEN_DIM: tl.constexpr,
+        BLOCK_SIZE_Q: tl.constexpr,
+        BLOCK_SIZE_KV: tl.constexpr,
     ):
         index_batch_msa_head = tl.program_id(1).to(tl.int64)
         index_batch_msa = index_batch_msa_head // HEAD
@@ -440,8 +551,15 @@ if HAS_TRITON:
         offset = (index_batch * stride_batch + index_msa * stride_msa + index_head * stride_head).to(tl.int64)
         offset_seq = (index_batch_msa_head * SEQ_LEN).to(tl.int64)
 
-        Q += offset; K += offset; V += offset; dO += offset; dQ += offset; dK += offset; dV += offset
-        M += offset_seq; D += offset_seq
+        Q += offset
+        K += offset
+        V += offset
+        dO += offset
+        dQ += offset
+        dK += offset
+        dV += offset
+        M += offset_seq
+        D += offset_seq
 
         offs_dim = tl.arange(0, BLOCK_DIM)
         index_block_kv = tl.program_id(0).to(tl.int64)
@@ -451,7 +569,11 @@ if HAS_TRITON:
         dK_block = tl.zeros([BLOCK_SIZE_KV, BLOCK_DIM], dtype=tl.float32)
         dV_block = tl.zeros([BLOCK_SIZE_KV, BLOCK_DIM], dtype=tl.float32)
 
-        res_mask_block_ptr = res_mask + (index_batch * stride_mask_batch + index_msa * stride_mask_msa) + offs_kv[None, :] * stride_mask_seq
+        res_mask_block_ptr = (
+            res_mask
+            + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+            + offs_kv[None, :] * stride_mask_seq
+        )
 
         if EVEN_Q & EVEN_KV:
             res_mask_T_block = tl.trans(tl.load(res_mask_block_ptr)).broadcast_to((BLOCK_SIZE_KV, BLOCK_SIZE_Q))
@@ -459,18 +581,41 @@ if HAS_TRITON:
                 K_block = tl.load(K + offs_kv[:, None] * stride_seq + offs_dim[None, :])
                 V_block = tl.load(V + offs_kv[:, None] * stride_seq + offs_dim[None, :])
             else:
-                K_block = tl.load(K + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0)
-                V_block = tl.load(V + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0)
+                K_block = tl.load(
+                    K + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0
+                )
+                V_block = tl.load(
+                    V + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_dim[None, :] < DIM, other=0.0
+                )
         else:
-            res_mask_T_block = tl.trans(tl.load(res_mask_block_ptr, mask=offs_kv[None, :] < SEQ_LEN, other=float("-inf"))).broadcast_to((BLOCK_SIZE_KV, BLOCK_SIZE_Q))
+            res_mask_T_block = tl.trans(
+                tl.load(res_mask_block_ptr, mask=offs_kv[None, :] < SEQ_LEN, other=float("-inf"))
+            ).broadcast_to((BLOCK_SIZE_KV, BLOCK_SIZE_Q))
             if EVEN_DIM:
-                K_block = tl.load(K + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_kv[:, None] < SEQ_LEN, other=0.0)
-                V_block = tl.load(V + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_kv[:, None] < SEQ_LEN, other=0.0)
+                K_block = tl.load(
+                    K + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_kv[:, None] < SEQ_LEN, other=0.0
+                )
+                V_block = tl.load(
+                    V + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=offs_kv[:, None] < SEQ_LEN, other=0.0
+                )
             else:
-                K_block = tl.load(K + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM), other=0.0)
-                V_block = tl.load(V + offs_kv[:, None] * stride_seq + offs_dim[None, :], mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM), other=0.0)
+                K_block = tl.load(
+                    K + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                    mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                    other=0.0,
+                )
+                V_block = tl.load(
+                    V + offs_kv[:, None] * stride_seq + offs_dim[None, :],
+                    mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                    other=0.0,
+                )
 
-        pair_bias_T_ptr = pair_bias + (index_batch.to(tl.int64) * stride_pair_bias_batch + index_head.to(tl.int64) * stride_pair_bias_head) + offs_q[None, :] * stride_pair_bias_seq1 + offs_kv[:, None] * stride_pair_bias_seq2
+        pair_bias_T_ptr = (
+            pair_bias
+            + (index_batch.to(tl.int64) * stride_pair_bias_batch + index_head.to(tl.int64) * stride_pair_bias_head)
+            + offs_q[None, :] * stride_pair_bias_seq1
+            + offs_kv[:, None] * stride_pair_bias_seq2
+        )
         qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None]
         dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :]
 
@@ -486,13 +631,18 @@ if HAS_TRITON:
                 pb_T = tl.load(pair_bias_T_ptr)
                 Di = tl.load(D + offs_q)
                 if EVEN_DIM:
-                    qT_block = tl.load(qT_ptrs); dO_block = tl.load(dO_ptrs)
+                    qT_block = tl.load(qT_ptrs)
+                    dO_block = tl.load(dO_ptrs)
                 else:
                     qT_block = tl.load(qT_ptrs, mask=offs_dim[:, None] < DIM, other=0.0)
                     dO_block = tl.load(dO_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
             else:
                 m = tl.load(M + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
-                pb_T = tl.load(pair_bias_T_ptr, mask=(offs_q[None, :] < SEQ_LEN) & (offs_kv[:, None] < SEQ_LEN), other=float("-inf"))
+                pb_T = tl.load(
+                    pair_bias_T_ptr,
+                    mask=(offs_q[None, :] < SEQ_LEN) & (offs_kv[:, None] < SEQ_LEN),
+                    other=float("-inf"),
+                )
                 Di = tl.load(D + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
                 if EVEN_DIM:
                     qT_block = tl.load(qT_ptrs, mask=offs_q[None, :] < SEQ_LEN, other=0.0)
@@ -524,7 +674,8 @@ if HAS_TRITON:
 
         if EVEN_Q & EVEN_KV:
             if EVEN_DIM:
-                tl.store(dV_ptrs, dV_block); tl.store(dK_ptrs, dK_block)
+                tl.store(dV_ptrs, dV_block)
+                tl.store(dK_ptrs, dK_block)
             else:
                 tl.store(dV_ptrs, dV_block, mask=offs_dim[None, :] < DIM)
                 tl.store(dK_ptrs, dK_block, mask=offs_dim[None, :] < DIM)
@@ -570,23 +721,51 @@ class _EvoformerAttention(torch.autograd.Function):
         M = torch.empty((BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN), device=Q.device, dtype=torch.float32)
 
         _attn_fwd[grid](
-            Q=Q, K=K, V=V, res_mask=res_mask, pair_bias=pair_bias,
-            softmax_scale=softmax_scale, M=M, O=O,
-            stride_Q_batch=Q.stride(0), stride_Q_msa=Q.stride(1), stride_Q_head=Q.stride(2),
-            stride_Q_seq=Q.stride(3), stride_Q_dim=Q.stride(4),
-            stride_K_batch=K.stride(0), stride_K_msa=K.stride(1), stride_K_head=K.stride(2),
-            stride_K_seq=K.stride(3), stride_K_dim=K.stride(4),
-            stride_V_batch=V.stride(0), stride_V_msa=V.stride(1), stride_V_head=V.stride(2),
-            stride_V_seq=V.stride(3), stride_V_dim=V.stride(4),
-            stride_O_batch=O.stride(0), stride_O_msa=O.stride(1), stride_O_head=O.stride(2),
-            stride_O_seq=O.stride(3), stride_O_dim=O.stride(4),
-            stride_pair_bias_batch=pair_bias.stride(0), stride_pair_bias_head=pair_bias.stride(2),
-            stride_pair_bias_seq1=pair_bias.stride(3), stride_pair_bias_seq2=pair_bias.stride(4),
-            stride_mask_batch=res_mask.stride(0), stride_mask_msa=res_mask.stride(1),
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=softmax_scale,
+            M=M,
+            O=O,
+            stride_Q_batch=Q.stride(0),
+            stride_Q_msa=Q.stride(1),
+            stride_Q_head=Q.stride(2),
+            stride_Q_seq=Q.stride(3),
+            stride_Q_dim=Q.stride(4),
+            stride_K_batch=K.stride(0),
+            stride_K_msa=K.stride(1),
+            stride_K_head=K.stride(2),
+            stride_K_seq=K.stride(3),
+            stride_K_dim=K.stride(4),
+            stride_V_batch=V.stride(0),
+            stride_V_msa=V.stride(1),
+            stride_V_head=V.stride(2),
+            stride_V_seq=V.stride(3),
+            stride_V_dim=V.stride(4),
+            stride_O_batch=O.stride(0),
+            stride_O_msa=O.stride(1),
+            stride_O_head=O.stride(2),
+            stride_O_seq=O.stride(3),
+            stride_O_dim=O.stride(4),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(2),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(1),
             stride_mask_seq=res_mask.stride(4),
-            BATCH_SIZE=BATCH_SIZE, HEAD=HEAD, N_SEQ=N_SEQ, SEQ_LEN=SEQ_LEN,
-            DIM=DIM, BLOCK_DIM=BLOCK_DIM,
-            BLOCK_SIZE_Q=16, BLOCK_SIZE_KV=64, num_stages=3, num_warps=4,
+            BATCH_SIZE=BATCH_SIZE,
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            DIM=DIM,
+            BLOCK_DIM=BLOCK_DIM,
+            BLOCK_SIZE_Q=16,
+            BLOCK_SIZE_KV=64,
+            num_stages=3,
+            num_warps=4,
             **extra_kern_args,
         )
 
@@ -616,35 +795,92 @@ class _EvoformerAttention(torch.autograd.Function):
 
         preprocess_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_preprocess[preprocess_grid](
-            O=O, dO=dO, D=D_diag, SEQ_LEN=SEQ_LEN, DIM=DIM, BLOCK_DIM=BLOCK_DIM,
-            BLOCK_SIZE_Q=32, num_stages=2, num_warps=4,
+            O=O,
+            dO=dO,
+            D=D_diag,
+            SEQ_LEN=SEQ_LEN,
+            DIM=DIM,
+            BLOCK_DIM=BLOCK_DIM,
+            BLOCK_SIZE_Q=32,
+            num_stages=2,
+            num_warps=4,
         )
 
         bwd_dk_dv_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_dk_dv[bwd_dk_dv_grid](
-            Q=Q, K=K, V=V, res_mask=res_mask, pair_bias=pair_bias,
-            softmax_scale=ctx.softmax_scale, dO=dO, dQ=dQ, dK=dK, dV=dV, M=M, D=D_diag,
-            stride_batch=Q.stride(0), stride_msa=Q.stride(1), stride_head=Q.stride(2), stride_seq=Q.stride(3),
-            stride_pair_bias_batch=pair_bias.stride(0), stride_pair_bias_head=pair_bias.stride(2),
-            stride_pair_bias_seq1=pair_bias.stride(3), stride_pair_bias_seq2=pair_bias.stride(4),
-            stride_mask_batch=res_mask.stride(0), stride_mask_msa=res_mask.stride(1), stride_mask_seq=res_mask.stride(4),
-            HEAD=HEAD, N_SEQ=N_SEQ, SEQ_LEN=SEQ_LEN, BLOCK_DIM=BLOCK_DIM, DIM=ctx.DIM,
-            BLOCK_SIZE_Q=64, BLOCK_SIZE_KV=16, num_stages=3, num_warps=4,
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            M=M,
+            D=D_diag,
+            stride_batch=Q.stride(0),
+            stride_msa=Q.stride(1),
+            stride_head=Q.stride(2),
+            stride_seq=Q.stride(3),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(2),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(1),
+            stride_mask_seq=res_mask.stride(4),
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_DIM=BLOCK_DIM,
+            DIM=ctx.DIM,
+            BLOCK_SIZE_Q=64,
+            BLOCK_SIZE_KV=16,
+            num_stages=3,
+            num_warps=4,
         )
 
         bwd_dq_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_dq[bwd_dq_grid](
-            Q=Q, K=K, V=V, res_mask=res_mask, pair_bias=pair_bias,
-            softmax_scale=ctx.softmax_scale, dO=dO, dQ=dQ, dK=dK, dV=dV,
-            d_pair_bias=d_pair_bias, M=M, D=D_diag,
-            stride_batch=Q.stride(0), stride_msa=Q.stride(1), stride_head=Q.stride(2), stride_seq=Q.stride(3),
-            stride_pair_bias_batch=pair_bias.stride(0), stride_pair_bias_head=pair_bias.stride(2),
-            stride_pair_bias_seq1=pair_bias.stride(3), stride_pair_bias_seq2=pair_bias.stride(4),
-            stride_mask_batch=res_mask.stride(0), stride_mask_msa=res_mask.stride(1), stride_mask_seq=res_mask.stride(4),
-            stride_d_pair_bias_batch=d_pair_bias.stride(0), stride_d_pair_bias_head=d_pair_bias.stride(2),
-            stride_d_pair_bias_seq1=d_pair_bias.stride(3), stride_d_pair_bias_seq2=d_pair_bias.stride(4),
-            HEAD=HEAD, N_SEQ=N_SEQ, SEQ_LEN=SEQ_LEN, BLOCK_DIM=BLOCK_DIM, DIM=ctx.DIM,
-            BLOCK_SIZE_Q=16, BLOCK_SIZE_KV=64, num_stages=3, num_warps=4,
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
+            dQ=dQ,
+            dK=dK,
+            dV=dV,
+            d_pair_bias=d_pair_bias,
+            M=M,
+            D=D_diag,
+            stride_batch=Q.stride(0),
+            stride_msa=Q.stride(1),
+            stride_head=Q.stride(2),
+            stride_seq=Q.stride(3),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(2),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(1),
+            stride_mask_seq=res_mask.stride(4),
+            stride_d_pair_bias_batch=d_pair_bias.stride(0),
+            stride_d_pair_bias_head=d_pair_bias.stride(2),
+            stride_d_pair_bias_seq1=d_pair_bias.stride(3),
+            stride_d_pair_bias_seq2=d_pair_bias.stride(4),
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_DIM=BLOCK_DIM,
+            DIM=ctx.DIM,
+            BLOCK_SIZE_Q=16,
+            BLOCK_SIZE_KV=64,
+            num_stages=3,
+            num_warps=4,
         )
 
         dQ = dQ.transpose(-2, -3).contiguous()

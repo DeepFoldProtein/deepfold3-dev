@@ -94,8 +94,14 @@ def plot_benchmark(results: list[dict], title: str, output_path: Path):
             yerr_hi = [max(hi - t, 0) for t, hi in zip(times, p75, strict=True)]
             has_err = any(lo > 0 or hi > 0 for lo, hi in zip(yerr_lo, yerr_hi, strict=True))
             ax_time.bar(
-                x + i * width - 0.4 + width / 2, times, width, label=prov, color=provider_colors[prov],
-                yerr=[yerr_lo, yerr_hi] if has_err else None, capsize=2, error_kw={"linewidth": 0.8},
+                x + i * width - 0.4 + width / 2,
+                times,
+                width,
+                label=prov,
+                color=provider_colors[prov],
+                yerr=[yerr_lo, yerr_hi] if has_err else None,
+                capsize=2,
+                error_kw={"linewidth": 0.8},
             )
         ax_time.set_ylabel("Time (ms)")
         ax_time.set_title(f"{op_name} [{mode}] — Time")

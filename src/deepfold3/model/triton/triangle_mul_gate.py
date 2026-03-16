@@ -257,9 +257,7 @@ class FusedTriangleMulGate(nn.Module):
             self._ln_linear.bias.data.copy_(self.norm_left.bias.data)
             # Pack [proj(2K) | gate(2K) | out_gate(K)] = 5K output features
             # linear_weight is [K, 5K] for Triton
-            packed = torch.cat(
-                [self.proj.weight.T, self.gate.weight.T, self.out_gate.weight.T], dim=1
-            )
+            packed = torch.cat([self.proj.weight.T, self.gate.weight.T, self.out_gate.weight.T], dim=1)
             self._ln_linear.linear_weight.data.copy_(packed)
 
     def _sync_from_fused(self):
@@ -271,7 +269,7 @@ class FusedTriangleMulGate(nn.Module):
             self.norm_left.weight.data.copy_(self._ln_linear.weight.data)
             self.norm_left.bias.data.copy_(self._ln_linear.bias.data)
             packed = self._ln_linear.linear_weight.data
-            self.proj.weight.data.copy_(packed[:, :2 * K].T)
+            self.proj.weight.data.copy_(packed[:, : 2 * K].T)
             self.gate.weight.data.copy_(packed[:, 2 * K : 4 * K].T)
             self.out_gate.weight.data.copy_(packed[:, 4 * K :].T)
 

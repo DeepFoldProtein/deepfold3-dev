@@ -127,7 +127,9 @@ def prediction_to_structure(
             # Use actual residue name from feature if available (needed for ligands
             # where res_type=20 maps to "UNK" but actual name is e.g. "PCG")
             if token_res_name is not None:
-                res_name = bytes(int(b) for b in token_res_name[token_i] if int(b) != 0).decode("ascii", errors="replace")
+                res_name = bytes(int(b) for b in token_res_name[token_i] if int(b) != 0).decode(
+                    "ascii", errors="replace"
+                )
                 if not res_name:
                     res_name = RES_TYPE_INDEX_TO_NAME.get(rt, "UNK")
             else:

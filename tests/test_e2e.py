@@ -57,9 +57,7 @@ class TestDistogram:
         N = disto.shape[0]
         for i in range(N):
             short_range_prob = probs[i, i, :10].sum().item()  # first 10 bins
-            assert short_range_prob > 0.1, (
-                f"Self-contact at ({i},{i}) has low short-range prob: {short_range_prob:.3f}"
-            )
+            assert short_range_prob > 0.1, f"Self-contact at ({i},{i}) has low short-range prob: {short_range_prob:.3f}"
 
     def test_recycle_improves_sharpness(self, model, small_features):
         """More recycles should produce sharper (lower entropy) distograms."""
@@ -158,9 +156,7 @@ class TestFullInference:
         """Distogram from full forward should also be symmetric."""
         with torch.no_grad():
             out = model(small_features, seed=42, num_recycles=0, num_samples=1)
-        torch.testing.assert_close(
-            out.distogram, out.distogram.transpose(0, 1), atol=1e-5, rtol=1e-5
-        )
+        torch.testing.assert_close(out.distogram, out.distogram.transpose(0, 1), atol=1e-5, rtol=1e-5)
 
 
 class TestDataPipeline:

@@ -389,9 +389,7 @@ def fraction_disordered(
     return float(disordered.sum().item()) / n_polymer
 
 
-def compute_ranking_score(
-    ptm: float, iptm: float, frac_disordered: float = 0.0, clash: bool = False
-) -> float:
+def compute_ranking_score(ptm: float, iptm: float, frac_disordered: float = 0.0, clash: bool = False) -> float:
     """Compute AF3 ranking score.
 
     Formula: 0.8*ipTM + 0.2*pTM + 0.5*fraction_disordered - 100*has_clash.

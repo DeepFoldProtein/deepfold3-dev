@@ -227,9 +227,7 @@ def _is_cuda_backend() -> bool:
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
-def calculate_config_layernorm_linear(
-    M: int, N: int, K: int, mode: int
-) -> tuple[tuple, tuple] | tuple | None:
+def calculate_config_layernorm_linear(M: int, N: int, K: int, mode: int) -> tuple[tuple, tuple] | tuple | None:
     """Look up optimal Triton block config for given (M, N, K) shape.
 
     Args:

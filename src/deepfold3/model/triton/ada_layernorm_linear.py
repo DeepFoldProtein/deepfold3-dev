@@ -300,6 +300,7 @@ def ada_layernorm_linear_forward(
     # Pass 2: fused AdaLN + GEMM
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
+
     BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_stages, num_warps_gemm, extra = forward_config
 
     kernel_kwargs = {

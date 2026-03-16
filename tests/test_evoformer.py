@@ -111,14 +111,19 @@ class TestFullEvoformer:
         from deepfold3.model.embedders import create_relative_encoding
 
         rel_feat = create_relative_encoding(
-            feats["token_index"], feats["residue_index"],
-            feats["asym_id"], feats["entity_id"], feats["sym_id"],
+            feats["token_index"],
+            feats["residue_index"],
+            feats["asym_id"],
+            feats["entity_id"],
+            feats["sym_id"],
         )
 
         target_feat = model._build_raw_target_feat(feats)
         evo_cond_act = model.evo_cond_encoder(
-            ref_pos=feats["ref_pos"], ref_mask=feats["ref_mask"].float(),
-            ref_element=feats["ref_element"], ref_charge=feats["ref_charge"],
+            ref_pos=feats["ref_pos"],
+            ref_mask=feats["ref_mask"].float(),
+            ref_element=feats["ref_element"],
+            ref_charge=feats["ref_charge"],
             ref_atom_name_chars=feats["ref_atom_name_chars"],
         )
         target_feat = torch.cat([target_feat, evo_cond_act], dim=-1)
@@ -131,10 +136,14 @@ class TestFullEvoformer:
 
         with torch.no_grad():
             out = evo(
-                target_feat=target_feat, msa_feat=msa_feat, rel_feat=rel_feat,
-                pair_mask=feats["pair_mask"].float(), seq_mask=feats["seq_mask"].float(),
+                target_feat=target_feat,
+                msa_feat=msa_feat,
+                rel_feat=rel_feat,
+                pair_mask=feats["pair_mask"].float(),
+                seq_mask=feats["seq_mask"].float(),
                 msa_mask=feats["msa_mask"].float(),
-                prev_pair=prev_pair, prev_single=prev_single,
+                prev_pair=prev_pair,
+                prev_single=prev_single,
             )
 
         assert out["pair"].shape == (N, N, c_pair)
@@ -155,14 +164,19 @@ class TestFullEvoformer:
         from deepfold3.model.embedders import create_relative_encoding
 
         rel_feat = create_relative_encoding(
-            feats["token_index"], feats["residue_index"],
-            feats["asym_id"], feats["entity_id"], feats["sym_id"],
+            feats["token_index"],
+            feats["residue_index"],
+            feats["asym_id"],
+            feats["entity_id"],
+            feats["sym_id"],
         )
 
         target_feat = model._build_raw_target_feat(feats)
         evo_cond_act = model.evo_cond_encoder(
-            ref_pos=feats["ref_pos"], ref_mask=feats["ref_mask"].float(),
-            ref_element=feats["ref_element"], ref_charge=feats["ref_charge"],
+            ref_pos=feats["ref_pos"],
+            ref_mask=feats["ref_mask"].float(),
+            ref_element=feats["ref_element"],
+            ref_charge=feats["ref_charge"],
             ref_atom_name_chars=feats["ref_atom_name_chars"],
         )
         target_feat = torch.cat([target_feat, evo_cond_act], dim=-1)
@@ -177,7 +191,9 @@ class TestFullEvoformer:
             pair = pair + evo.position_activations(rel_feat)
 
             single = evo.single_activations(target_feat)
-            single = single + evo.prev_single_embedding(evo.prev_single_embedding_layer_norm(torch.zeros(N, 384, device=device)))
+            single = single + evo.prev_single_embedding(
+                evo.prev_single_embedding_layer_norm(torch.zeros(N, 384, device=device))
+            )
 
             msa_act = evo.msa_activations(msa_feat)
             msa_act = msa_act + evo.extra_msa_target_feat(target_feat).unsqueeze(-3)
@@ -328,9 +344,7 @@ class TestFloat32VsFloat64:
 
         pair_diff = (pair_out32.double() - pair_out64).abs()
         single_diff = (single_out32.double() - single_out64).abs()
-        print(
-            f"PairFormer f32/f64: pair_max_diff={pair_diff.max():.2e}, single_max_diff={single_diff.max():.2e}"
-        )
+        print(f"PairFormer f32/f64: pair_max_diff={pair_diff.max():.2e}, single_max_diff={single_diff.max():.2e}")
         assert pair_diff.max() < 0.1
         assert single_diff.max() < 0.1
 
@@ -358,6 +372,4 @@ class TestRecycling:
 
         # Later recycles should have smaller deltas (convergence)
         # Allow some noise but the trend should be decreasing
-        assert deltas[-1] < deltas[0] * 10, (
-            f"Recycling not converging: deltas={[f'{d:.4f}' for d in deltas]}"
-        )
+        assert deltas[-1] < deltas[0] * 10, f"Recycling not converging: deltas={[f'{d:.4f}' for d in deltas]}"

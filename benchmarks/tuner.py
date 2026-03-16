@@ -117,13 +117,23 @@ def _bench_transition(config: OptimConfig, N: int, C: int, mode: str, warmup: in
         time_ms = gpu_timer(fwd, warmup=warmup, rep=rep)
         mem, _ = peak_memory_mb(fwd)
     else:
+
         def full():
             o = mod(x)
             o.backward(do, retain_graph=True)
+
         time_ms = gpu_timer(full, warmup=warmup, rep=rep, grad_to_none=[x])
         mem, _ = peak_memory_mb(full)
 
-    return BenchResult("transition_block", "tuner", shape, mode, time_ms, mem, extra={"config": {k: v for k, v in config.__dict__.items() if isinstance(v, bool)}})
+    return BenchResult(
+        "transition_block",
+        "tuner",
+        shape,
+        mode,
+        time_ms,
+        mem,
+        extra={"config": {k: v for k, v in config.__dict__.items() if isinstance(v, bool)}},
+    )
 
 
 def _bench_attention(config: OptimConfig, N: int, C: int, H: int, mode: str, warmup: int, rep: int) -> BenchResult:
@@ -143,13 +153,23 @@ def _bench_attention(config: OptimConfig, N: int, C: int, H: int, mode: str, war
         time_ms = gpu_timer(fwd, warmup=warmup, rep=rep)
         mem, _ = peak_memory_mb(fwd)
     else:
+
         def full():
             o = attn(z, mask)
             o.backward(do, retain_graph=True)
+
         time_ms = gpu_timer(full, warmup=warmup, rep=rep, grad_to_none=[z])
         mem, _ = peak_memory_mb(full)
 
-    return BenchResult("attention", "tuner", shape, mode, time_ms, mem, extra={"config": {k: v for k, v in config.__dict__.items() if isinstance(v, bool)}})
+    return BenchResult(
+        "attention",
+        "tuner",
+        shape,
+        mode,
+        time_ms,
+        mem,
+        extra={"config": {k: v for k, v in config.__dict__.items() if isinstance(v, bool)}},
+    )
 
 
 def tune(op: str, N: int, C: int, mode: str = "full", warmup: int = 50, rep: int = 200, H: int = 4) -> dict:

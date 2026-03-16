@@ -176,8 +176,28 @@ def bench_fwd_full(
     fwd_mem, _ = peak_memory_mb(fwd_fn)
     full_mem, _ = peak_memory_mb(full_fn)
     return [
-        BenchResult(op_name, provider, shape, "fwd", fwd_s.median, fwd_mem, time_std_ms=fwd_s.std, time_p25_ms=fwd_s.p25, time_p75_ms=fwd_s.p75),
-        BenchResult(op_name, provider, shape, "full", full_s.median, full_mem, time_std_ms=full_s.std, time_p25_ms=full_s.p25, time_p75_ms=full_s.p75),
+        BenchResult(
+            op_name,
+            provider,
+            shape,
+            "fwd",
+            fwd_s.median,
+            fwd_mem,
+            time_std_ms=fwd_s.std,
+            time_p25_ms=fwd_s.p25,
+            time_p75_ms=fwd_s.p75,
+        ),
+        BenchResult(
+            op_name,
+            provider,
+            shape,
+            "full",
+            full_s.median,
+            full_mem,
+            time_std_ms=full_s.std,
+            time_p25_ms=full_s.p25,
+            time_p75_ms=full_s.p75,
+        ),
     ]
 
 

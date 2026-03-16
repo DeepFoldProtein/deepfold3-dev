@@ -108,8 +108,7 @@ class TestTriangleMulJax:
         }
 
     @staticmethod
-    def _jax_ref(act, mask, equation, ln_s, ln_o, proj_w, gate_w,
-                 cn_s, cn_o, out_w, gate_out_w):
+    def _jax_ref(act, mask, equation, ln_s, ln_o, proj_w, gate_w, cn_s, cn_o, out_w, gate_out_w):
         """AF3 TriangleMultiplication — faithful JAX reference.
 
         Key: reshape(c, 2, N, N) then split on axis=1 = INTERLEAVED split.
@@ -120,12 +119,12 @@ class TestTriangleMulJax:
         input_act = jax_layer_norm(act, ln_s, ln_o)
 
         # Projection + gating (non-GLU path, mathematically equivalent to GLU)
-        projection = jax_linear(input_act, proj_w)            # [N, N, 2c]
-        projection = jnp.transpose(projection, (2, 0, 1))     # [2c, N, N]
+        projection = jax_linear(input_act, proj_w)  # [N, N, 2c]
+        projection = jnp.transpose(projection, (2, 0, 1))  # [2c, N, N]
         projection *= mask[None, :, :]
 
-        gate = jax_linear(input_act, gate_w)                   # [N, N, 2c]
-        gate = jnp.transpose(gate, (2, 0, 1))                 # [2c, N, N]
+        gate = jax_linear(input_act, gate_w)  # [N, N, 2c]
+        gate = jnp.transpose(gate, (2, 0, 1))  # [2c, N, N]
         projection *= jax.nn.sigmoid(gate)
 
         # INTERLEAVED split: reshape [2c, N, N] -> [c, 2, N, N] -> split axis=1
@@ -179,10 +178,16 @@ class TestTriangleMulJax:
 
         w = self._extract_weights(mod)
         out_jax = self._jax_ref(
-            jnp.array(_np(z)), jnp.array(_np(mask)), "cik,cjk->cij", **w,
+            jnp.array(_np(z)),
+            jnp.array(_np(mask)),
+            "cik,cjk->cij",
+            **w,
         )
         np.testing.assert_allclose(
-            _np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4,
+            _np(out_pt),
+            np.array(out_jax),
+            atol=1e-4,
+            rtol=1e-4,
             err_msg="TriangleMulOutgoing does not match AF3 interleaved-split reference",
         )
 
@@ -203,10 +208,16 @@ class TestTriangleMulJax:
 
         w = self._extract_weights(mod)
         out_jax = self._jax_ref(
-            jnp.array(_np(z)), jnp.array(_np(mask)), "ckj,cki->cij", **w,
+            jnp.array(_np(z)),
+            jnp.array(_np(mask)),
+            "ckj,cki->cij",
+            **w,
         )
         np.testing.assert_allclose(
-            _np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4,
+            _np(out_pt),
+            np.array(out_jax),
+            atol=1e-4,
+            rtol=1e-4,
             err_msg="TriangleMulIncoming does not match AF3 interleaved-split reference",
         )
 
@@ -222,10 +233,16 @@ class TestTriangleMulJax:
 
         w = self._extract_weights(mod)
         out_jax = self._jax_ref(
-            jnp.array(_np(z)), jnp.array(_np(mask)), "cik,cjk->cij", **w,
+            jnp.array(_np(z)),
+            jnp.array(_np(mask)),
+            "cik,cjk->cij",
+            **w,
         )
         np.testing.assert_allclose(
-            _np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4,
+            _np(out_pt),
+            np.array(out_jax),
+            atol=1e-4,
+            rtol=1e-4,
             err_msg="TriangleMulOutgoing (AF3 weights) mismatch",
         )
 
@@ -241,10 +258,16 @@ class TestTriangleMulJax:
 
         w = self._extract_weights(mod)
         out_jax = self._jax_ref(
-            jnp.array(_np(z)), jnp.array(_np(mask)), "ckj,cki->cij", **w,
+            jnp.array(_np(z)),
+            jnp.array(_np(mask)),
+            "ckj,cki->cij",
+            **w,
         )
         np.testing.assert_allclose(
-            _np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4,
+            _np(out_pt),
+            np.array(out_jax),
+            atol=1e-4,
+            rtol=1e-4,
             err_msg="TriangleMulIncoming (AF3 weights) mismatch",
         )
 
@@ -279,11 +302,14 @@ class TestOuterProductMeanJax:
             out_pt = mod(msa, mask)
 
         out_jax = self._jax_ref(
-            jnp.array(_np(msa)), jnp.array(_np(mask)),
-            jnp.array(_np(mod.norm.weight)), jnp.array(_np(mod.norm.bias)),
+            jnp.array(_np(msa)),
+            jnp.array(_np(mask)),
+            jnp.array(_np(mod.norm.weight)),
+            jnp.array(_np(mod.norm.bias)),
             jnp.array(_haiku_w(mod.proj_a.weight)),
             jnp.array(_haiku_w(mod.proj_b.weight)),
-            jnp.array(_np(mod.out_w)), jnp.array(_np(mod.out_b)),
+            jnp.array(_np(mod.out_w)),
+            jnp.array(_np(mod.out_b)),
         )
         np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4)
 
@@ -298,11 +324,14 @@ class TestOuterProductMeanJax:
             out_pt = mod(msa, mask)
 
         out_jax = self._jax_ref(
-            jnp.array(_np(msa)), jnp.array(_np(mask)),
-            jnp.array(_np(mod.norm.weight)), jnp.array(_np(mod.norm.bias)),
+            jnp.array(_np(msa)),
+            jnp.array(_np(mask)),
+            jnp.array(_np(mod.norm.weight)),
+            jnp.array(_np(mod.norm.bias)),
             jnp.array(_haiku_w(mod.proj_a.weight)),
             jnp.array(_haiku_w(mod.proj_b.weight)),
-            jnp.array(_np(mod.out_w)), jnp.array(_np(mod.out_b)),
+            jnp.array(_np(mod.out_w)),
+            jnp.array(_np(mod.out_b)),
         )
         np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=1e-4, rtol=1e-4)
 
@@ -322,8 +351,7 @@ class TestGridSelfAttentionJax:
         }
 
     @staticmethod
-    def _jax_ref(act, mask, ln_s, ln_o, pb_w, q_w, k_w, v_w, g_w, out_w,
-                 transpose=False):
+    def _jax_ref(act, mask, ln_s, ln_o, pb_w, q_w, k_w, v_w, g_w, out_w, transpose=False):
         """AF3 GridSelfAttention: modules.py lines 131-242.
 
         All weights in Haiku [in, out] layout.
@@ -355,7 +383,7 @@ class TestGridSelfAttentionJax:
             k = jnp.transpose(k, [1, 0, 2])
             v = jnp.transpose(v, [1, 0, 2])
 
-            logits = jnp.einsum("hqd,hkd->hqk", q, k) * (D ** -0.5)
+            logits = jnp.einsum("hqd,hkd->hqk", q, k) * (D**-0.5)
             logits = logits + bias  # non-batched [H, N, N]
 
             m = 1e9 * (mask[r].astype(jnp.float32) - 1.0)
@@ -471,9 +499,13 @@ class TestMSAAttentionJax:
             out_pt = mod(msa, mask, pair)
 
         out_jax = self._jax_ref(
-            jnp.array(_np(msa)), jnp.array(_np(mask)), jnp.array(_np(pair)),
-            jnp.array(_np(mod.norm.weight)), jnp.array(_np(mod.norm.bias)),
-            jnp.array(_np(mod.pair_norm.weight)), jnp.array(_np(mod.pair_norm.bias)),
+            jnp.array(_np(msa)),
+            jnp.array(_np(mask)),
+            jnp.array(_np(pair)),
+            jnp.array(_np(mod.norm.weight)),
+            jnp.array(_np(mod.norm.bias)),
+            jnp.array(_np(mod.pair_norm.weight)),
+            jnp.array(_np(mod.pair_norm.bias)),
             jnp.array(_haiku_w(mod.pair_logits.weight)),
             jnp.array(_haiku_w(mod.to_v.weight)),
             jnp.array(_haiku_w(mod.to_g.weight)),
@@ -501,7 +533,7 @@ class TestSingleAttentionJax:
 
         q = q.astype(jnp.float32)
         k = k.astype(jnp.float32)
-        logits = jnp.einsum("qhc,khc->hqk", q * (Dk ** -0.5), k)
+        logits = jnp.einsum("qhc,khc->hqk", q * (Dk**-0.5), k)
         logits = logits + pair_logits.astype(jnp.float32)
         bias = 1e9 * (mask.astype(jnp.float32) - 1.0)
         logits = logits + bias[None, None, :]
@@ -532,9 +564,13 @@ class TestSingleAttentionJax:
             out_pt = mod(x, mask, pair_logits)
 
         out_jax = self._jax_ref(
-            jnp.array(_np(x)), jnp.array(_np(mask)), jnp.array(_np(pair_logits)),
-            jnp.array(_np(mod.norm.weight)), jnp.array(_np(mod.norm.bias)),
-            jnp.array(_haiku_w(mod.to_q.weight)), jnp.array(_np(mod.to_q.bias)),
+            jnp.array(_np(x)),
+            jnp.array(_np(mask)),
+            jnp.array(_np(pair_logits)),
+            jnp.array(_np(mod.norm.weight)),
+            jnp.array(_np(mod.norm.bias)),
+            jnp.array(_haiku_w(mod.to_q.weight)),
+            jnp.array(_np(mod.to_q.bias)),
             jnp.array(_haiku_w(mod.to_k.weight)),
             jnp.array(_haiku_w(mod.to_v.weight)),
             jnp.array(_haiku_w(mod.to_g.weight)),
@@ -598,7 +634,8 @@ class TestPairFormerLayer0Jax:
         tb = layer.pair_transition
         p = p + self._jax_transition(
             p,
-            jnp.array(_np(tb.norm.weight)), jnp.array(_np(tb.norm.bias)),
+            jnp.array(_np(tb.norm.weight)),
+            jnp.array(_np(tb.norm.bias)),
             jnp.array(_haiku_w(tb.linear1.weight)),
             jnp.array(_haiku_w(tb.linear2.weight)),
         )
@@ -617,9 +654,13 @@ class TestPairFormerLayer0Jax:
         # 7) single_attention
         sa = layer.single_attn
         s = s + TestSingleAttentionJax._jax_ref(
-            s, sm, pair_logits,
-            jnp.array(_np(sa.norm.weight)), jnp.array(_np(sa.norm.bias)),
-            jnp.array(_haiku_w(sa.to_q.weight)), jnp.array(_np(sa.to_q.bias)),
+            s,
+            sm,
+            pair_logits,
+            jnp.array(_np(sa.norm.weight)),
+            jnp.array(_np(sa.norm.bias)),
+            jnp.array(_haiku_w(sa.to_q.weight)),
+            jnp.array(_np(sa.to_q.bias)),
             jnp.array(_haiku_w(sa.to_k.weight)),
             jnp.array(_haiku_w(sa.to_v.weight)),
             jnp.array(_haiku_w(sa.to_g.weight)),
@@ -630,17 +671,24 @@ class TestPairFormerLayer0Jax:
         st = layer.single_transition
         s = s + self._jax_transition(
             s,
-            jnp.array(_np(st.norm.weight)), jnp.array(_np(st.norm.bias)),
+            jnp.array(_np(st.norm.weight)),
+            jnp.array(_np(st.norm.bias)),
             jnp.array(_haiku_w(st.linear1.weight)),
             jnp.array(_haiku_w(st.linear2.weight)),
         )
 
         # Tolerance loosened for composed layer: f32 accumulation across 8 sub-modules
         np.testing.assert_allclose(
-            _np(pair_out), np.array(p), atol=5e-3, rtol=5e-3,
+            _np(pair_out),
+            np.array(p),
+            atol=5e-3,
+            rtol=5e-3,
             err_msg="PairFormer layer 0: pair output mismatch",
         )
         np.testing.assert_allclose(
-            _np(single_out), np.array(s), atol=5e-3, rtol=5e-3,
+            _np(single_out),
+            np.array(s),
+            atol=5e-3,
+            rtol=5e-3,
             err_msg="PairFormer layer 0: single output mismatch",
         )

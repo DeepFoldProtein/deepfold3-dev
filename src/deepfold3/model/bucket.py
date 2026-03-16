@@ -20,19 +20,50 @@ if TYPE_CHECKING:
     from deepfold3.model.model import DeepFold3Output
 
 BUCKET_SIZES = [
-    128, 160, 192, 224, 256,
-    320, 384, 448, 512,
-    640, 768, 896, 1024,
-    1280, 1536, 1792, 2048,
-    2560, 3072, 3584, 4096,
+    128,
+    160,
+    192,
+    224,
+    256,
+    320,
+    384,
+    448,
+    512,
+    640,
+    768,
+    896,
+    1024,
+    1280,
+    1536,
+    1792,
+    2048,
+    2560,
+    3072,
+    3584,
+    4096,
 ]
 
 # Features where dim 0 = N
 _DIM0_KEYS = {
-    "res_type", "residue_index", "token_index", "asym_id", "entity_id", "sym_id",
-    "mol_type", "token_res_name", "seq_mask", "frames_mask", "token_to_rep_atom",
-    "ref_pos", "ref_mask", "ref_element", "ref_charge", "ref_atom_name_chars", "ref_space_uid",
-    "profile", "deletion_mean",
+    "res_type",
+    "residue_index",
+    "token_index",
+    "asym_id",
+    "entity_id",
+    "sym_id",
+    "mol_type",
+    "token_res_name",
+    "seq_mask",
+    "frames_mask",
+    "token_to_rep_atom",
+    "ref_pos",
+    "ref_mask",
+    "ref_element",
+    "ref_charge",
+    "ref_atom_name_chars",
+    "ref_space_uid",
+    "profile",
+    "deletion_mean",
 }
 
 # Features where dims 0 and 1 = N, N
@@ -40,9 +71,14 @@ _DIM01_KEYS = {"pair_mask", "bond_matrix"}
 
 # Features where dim 1 = N
 _DIM1_KEYS = {
-    "msa", "msa_mask", "deletion_matrix",
-    "template_aatype", "template_pseudo_beta", "template_pseudo_beta_mask",
-    "template_backbone_frame", "template_backbone_mask",
+    "msa",
+    "msa_mask",
+    "deletion_matrix",
+    "template_aatype",
+    "template_pseudo_beta",
+    "template_pseudo_beta_mask",
+    "template_backbone_frame",
+    "template_backbone_mask",
 }
 
 

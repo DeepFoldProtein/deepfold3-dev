@@ -195,7 +195,12 @@ def _add_entity_descriptions(text: str, entity_descriptions: dict[str, str]) -> 
             result.append("_entity.pdbx_description")
             id_col = next((j for j, c in enumerate(col_names) if c == "_entity.id"), 0)
             # Process data rows until blank line, loop_, or #
-            while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith("loop_") and not lines[i].strip().startswith("#"):
+            while (
+                i < len(lines)
+                and lines[i].strip()
+                and not lines[i].strip().startswith("loop_")
+                and not lines[i].strip().startswith("#")
+            ):
                 parts = lines[i].split()
                 if len(parts) > id_col:
                     entity_id = parts[id_col]
@@ -292,15 +297,11 @@ def save_mmcif(
         structure = prediction_to_structure(
             output, features, sample_idx=0, name=path.stem, num_plddt_bins=num_plddt_bins
         )
-        save_structure_mmcif(
-            path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title
-        )
+        save_structure_mmcif(path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title)
     else:
         # For backward compatibility: write multi-model mmCIF using legacy path
         # for multi-sample outputs, since Structure only holds one model.
-        _save_mmcif_legacy(
-            path, output, features, num_plddt_bins, entity_descriptions=entity_descriptions, title=title
-        )
+        _save_mmcif_legacy(path, output, features, num_plddt_bins, entity_descriptions=entity_descriptions, title=title)
 
 
 def _save_mmcif_legacy(
@@ -379,7 +380,9 @@ def _save_mmcif_legacy(
                 # fall back to _CHEM_COMP_TYPE lookup
                 if mol_type_feat is not None:
                     mt = int(mol_type_feat[token_i])
-                    residue.entity_type = gemmi.EntityType.NonPolymer if mt == MOL_NONPOLYMER else gemmi.EntityType.Polymer
+                    residue.entity_type = (
+                        gemmi.EntityType.NonPolymer if mt == MOL_NONPOLYMER else gemmi.EntityType.Polymer
+                    )
                 elif res_name not in _CHEM_COMP_TYPE:
                     residue.entity_type = gemmi.EntityType.NonPolymer
                 else:

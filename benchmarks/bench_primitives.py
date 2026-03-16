@@ -65,14 +65,18 @@ def bench_layernorm(shapes: list[dict], warmup: int, rep: int) -> list:
 
         ln = nn.LayerNorm(C).to(DEVICE, DTYPE)
         fwd, full = _make_fwd_full(ln, x, do)
-        results.extend(bench_fwd_full("LayerNorm", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x]))
+        results.extend(
+            bench_fwd_full("LayerNorm", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x])
+        )
 
         # torch.compile (known to be slower at these sizes, included for reference)
         ln_c = try_compile(nn.LayerNorm(C).to(DEVICE, DTYPE))
         if ln_c is not None:
             x_c = x.detach().clone().requires_grad_(True)
             fwd_c, full_c = _make_fwd_full(ln_c, x_c, do)
-            results.extend(bench_fwd_full("LayerNorm", "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[x_c]))
+            results.extend(
+                bench_fwd_full("LayerNorm", "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[x_c])
+            )
 
         print(f"  LayerNorm N={N} C={C} done")
 
@@ -110,7 +114,9 @@ def bench_swiglu(shapes: list[dict], warmup: int, rep: int) -> list:
                 o = swiglu(x2)
                 o.backward(do, retain_graph=True)
 
-            results.extend(bench_fwd_full("SwiGLU", "triton", shape, fwd_t, full_t, warmup=warmup, rep=rep, grad_to_none=[x2]))
+            results.extend(
+                bench_fwd_full("SwiGLU", "triton", shape, fwd_t, full_t, warmup=warmup, rep=rep, grad_to_none=[x2])
+            )
         else:
             print("  [skip] Triton FusedSwiGLU not available")
 
@@ -151,7 +157,11 @@ def bench_layernorm_linear(shapes: list[dict], warmup: int, rep: int) -> list:
             o = linear(ln(x))
             o.backward(do, retain_graph=True)
 
-        results.extend(bench_fwd_full("LayerNormLinear", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[x]))
+        results.extend(
+            bench_fwd_full(
+                "LayerNormLinear", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[x]
+            )
+        )
 
         # torch.compile
         ln_c = nn.LayerNorm(C).to(DEVICE, DTYPE)
@@ -174,7 +184,11 @@ def bench_layernorm_linear(shapes: list[dict], warmup: int, rep: int) -> list:
             o = _lnl_compiled(x_c)
             o.backward(do, retain_graph=True)
 
-        results.extend(bench_fwd_full("LayerNormLinear", "compile", shape, fwd_comp, full_comp, warmup=warmup, rep=rep, grad_to_none=[x_c]))
+        results.extend(
+            bench_fwd_full(
+                "LayerNormLinear", "compile", shape, fwd_comp, full_comp, warmup=warmup, rep=rep, grad_to_none=[x_c]
+            )
+        )
 
         if FusedLayerNormLinear is not None:
             fused = FusedLayerNormLinear(C, C_out, has_linear_bias=False).to(DEVICE, DTYPE)
@@ -193,7 +207,18 @@ def bench_layernorm_linear(shapes: list[dict], warmup: int, rep: int) -> list:
 
             try:
                 fused(x2)  # smoke test
-                results.extend(bench_fwd_full("LayerNormLinear", "triton", shape, fwd_fused, full_fused, warmup=warmup, rep=rep, grad_to_none=[x2]))
+                results.extend(
+                    bench_fwd_full(
+                        "LayerNormLinear",
+                        "triton",
+                        shape,
+                        fwd_fused,
+                        full_fused,
+                        warmup=warmup,
+                        rep=rep,
+                        grad_to_none=[x2],
+                    )
+                )
             except Exception as e:
                 print(f"  [skip] Triton FusedLayerNormLinear failed (N={N}, C={C}->{C_out}): {e}")
         else:
@@ -214,14 +239,20 @@ def bench_linear(shapes: list[dict], warmup: int, rep: int) -> list:
         linear = nn.Linear(C, C, bias=False).to(DEVICE, DTYPE)
 
         fwd, full = _make_fwd_full(linear, x, do)
-        results.extend(bench_fwd_full("LinearNoBias", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x]))
+        results.extend(
+            bench_fwd_full("LinearNoBias", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x])
+        )
 
         # torch.compile (known to be slower — cuBLAS already optimal)
         linear_c = try_compile(nn.Linear(C, C, bias=False).to(DEVICE, DTYPE))
         if linear_c is not None:
             x_c = x.detach().clone().requires_grad_(True)
             fwd_c, full_c = _make_fwd_full(linear_c, x_c, do)
-            results.extend(bench_fwd_full("LinearNoBias", "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[x_c]))
+            results.extend(
+                bench_fwd_full(
+                    "LinearNoBias", "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[x_c]
+                )
+            )
 
         print(f"  LinearNoBias N={N} C={C} done")
 

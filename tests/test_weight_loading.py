@@ -39,10 +39,8 @@ class TestWeightLoadingIntegrity:
         for key in af3_state_dict:
             if key in model_sd:
                 if af3_state_dict[key].shape != model_sd[key].shape:
-                    mismatches.append(
-                        f"{key}: converted={af3_state_dict[key].shape} vs model={model_sd[key].shape}"
-                    )
-        assert not mismatches, f"Shape mismatches:\n" + "\n".join(mismatches)
+                    mismatches.append(f"{key}: converted={af3_state_dict[key].shape} vs model={model_sd[key].shape}")
+        assert not mismatches, "Shape mismatches:\n" + "\n".join(mismatches)
 
     def test_all_weights_finite(self, model):
         """All loaded weights must be finite (no NaN/Inf)."""

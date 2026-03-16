@@ -78,7 +78,11 @@ def bench_triangle_mul(shapes, warmup, rep):
                     o.backward(do, retain_graph=True)
 
                 try:
-                    results.extend(bench_fwd_full(name, "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[z_c]))
+                    results.extend(
+                        bench_fwd_full(
+                            name, "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[z_c]
+                        )
+                    )
                 except Exception as e:
                     print(f"  [skip] torch.compile {name} failed (N={N}): {e}")
                 del mod_c, z_c
@@ -97,7 +101,18 @@ def bench_triangle_mul(shapes, warmup, rep):
                     o = mod_int(z_int, mask)
                     o.backward(do, retain_graph=True)
 
-                results.extend(bench_fwd_full(name, "compile_integrated", shape, fwd_int, full_int, warmup=warmup, rep=rep, grad_to_none=[z_int]))
+                results.extend(
+                    bench_fwd_full(
+                        name,
+                        "compile_integrated",
+                        shape,
+                        fwd_int,
+                        full_int,
+                        warmup=warmup,
+                        rep=rep,
+                        grad_to_none=[z_int],
+                    )
+                )
                 del mod_int, z_int
             except Exception as e:
                 print(f"  [skip] Integrated compile {name} failed (N={N}): {e}")
@@ -116,7 +131,11 @@ def bench_triangle_mul(shapes, warmup, rep):
                     o = mod_tri(z_tri, mask)
                     o.backward(do, retain_graph=True)
 
-                results.extend(bench_fwd_full(name, "triton", shape, fwd_tri, full_tri, warmup=warmup, rep=rep, grad_to_none=[z_tri]))
+                results.extend(
+                    bench_fwd_full(
+                        name, "triton", shape, fwd_tri, full_tri, warmup=warmup, rep=rep, grad_to_none=[z_tri]
+                    )
+                )
                 del mod_tri, z_tri
             except Exception as e:
                 print(f"  [skip] Triton fused {name} failed (N={N}): {e}")
@@ -146,7 +165,9 @@ def bench_outer_product_mean(shapes, warmup, rep):
             o = mod(msa, mask)
             o.backward(do, retain_graph=True)
 
-        results.extend(bench_fwd_full("OuterProductMean", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[msa]))
+        results.extend(
+            bench_fwd_full("OuterProductMean", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[msa])
+        )
 
         # torch.compile
         mod_c = try_compile(OuterProductMean(C_msa, C_pair).to(DEVICE, DTYPE).eval())
@@ -161,7 +182,18 @@ def bench_outer_product_mean(shapes, warmup, rep):
                 o.backward(do, retain_graph=True)
 
             try:
-                results.extend(bench_fwd_full("OuterProductMean", "compile", shape, fwd_c, full_c, warmup=warmup, rep=rep, grad_to_none=[msa_c]))
+                results.extend(
+                    bench_fwd_full(
+                        "OuterProductMean",
+                        "compile",
+                        shape,
+                        fwd_c,
+                        full_c,
+                        warmup=warmup,
+                        rep=rep,
+                        grad_to_none=[msa_c],
+                    )
+                )
             except Exception as e:
                 print(f"  [skip] torch.compile OuterProductMean failed (N={N}): {e}")
             del mod_c, msa_c

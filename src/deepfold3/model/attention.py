@@ -184,9 +184,7 @@ class MSAAttention(nn.Module):
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
 
-    def _compute(
-        self, msa: torch.Tensor, mask: torch.Tensor, pair: torch.Tensor
-    ) -> torch.Tensor:
+    def _compute(self, msa: torch.Tensor, mask: torch.Tensor, pair: torch.Tensor) -> torch.Tensor:
         B, S, N, C = msa.shape
         H, D = self.num_heads, self.head_dim
 
@@ -270,9 +268,7 @@ class SingleAttention(nn.Module):
         if optim is not None and optim.use_torch_compile:
             self._compute_baseline = torch.compile(self._compute_baseline)
 
-    def _compute_baseline(
-        self, xn: torch.Tensor, mask: torch.Tensor, pair_logits: torch.Tensor
-    ) -> torch.Tensor:
+    def _compute_baseline(self, xn: torch.Tensor, mask: torch.Tensor, pair_logits: torch.Tensor) -> torch.Tensor:
         B, N, _ = xn.shape
         H, Dk, Dv = self.num_heads, self.key_dim_per_head, self.val_dim_per_head
         q = self.to_q(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)

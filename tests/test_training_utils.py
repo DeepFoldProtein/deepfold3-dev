@@ -102,7 +102,9 @@ class TestEMA:
             v.zero_()
 
         for _k, v in ema2.shadow.items():
-            assert not torch.equal(v, torch.zeros_like(v)) or torch.equal(original_tensor, torch.zeros_like(original_tensor))
+            assert not torch.equal(v, torch.zeros_like(v)) or torch.equal(
+                original_tensor, torch.zeros_like(original_tensor)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +157,7 @@ class TestAF3LRScheduler:
             scheduler.step()
 
     def test_decay_phase(self):
-        optimizer, scheduler = self._make_scheduler(
-            warmup=10, start_decay=20, decay_every=5, decay_factor=0.5, lr=1e-3
-        )
+        optimizer, scheduler = self._make_scheduler(warmup=10, start_decay=20, decay_every=5, decay_factor=0.5, lr=1e-3)
         # Advance to decay phase
         for _ in range(20):
             optimizer.step()

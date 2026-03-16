@@ -43,6 +43,7 @@ def _compact_json(obj: object) -> str:
     text = _LEAF_ARRAY_RE.sub(lambda m: "[" + re.sub(r"\s*\n\s*", " ", m.group(1)) + "]", text)
     return text
 
+
 logger = logging.getLogger(__name__)
 
 _MAX_TEMPLATES_PER_CHAIN = 20
@@ -89,7 +90,9 @@ _MAX_TEMPLATES_PER_CHAIN = 20
     default=False,
     help="Use SPIRE environmental pairing database (local mode)",
 )
-@click.option("--filter/--no-filter", "use_filter", default=True, help="Apply MSA filtering (server: server-side; local: qsc=0.8)")
+@click.option(
+    "--filter/--no-filter", "use_filter", default=True, help="Apply MSA filtering (server: server-side; local: qsc=0.8)"
+)
 @click.option("--cache-dir", default=None, type=click.Path(path_type=Path), help="MSA cache directory")
 @click.option(
     "--json/--no-json", "write_json", default=False, help="Write a skeleton JSON input file for deepfold3 inference"
@@ -185,7 +188,9 @@ def msa_search(
             f"MSA search: {n_chains} chain(s) ({len(seqs_unique)} unique), mode={mode}, env={use_env}, filter={use_filter}, pairing={use_pairing}{gpu_info}"
         )
     else:
-        click.echo(f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, filter={use_filter}, pairing={use_pairing}{gpu_info}")
+        click.echo(
+            f"MSA search: {n_chains} chain(s), mode={mode}, env={use_env}, filter={use_filter}, pairing={use_pairing}{gpu_info}"
+        )
     for i, seq in enumerate(sequences):
         dup_note = f" (same as chain {chain_to_unique[i]})" if chain_to_unique[i] != i else ""
         click.echo(f"  Chain {i}: {len(seq)} residues{dup_note}")

@@ -84,7 +84,9 @@ def _bench_grid_triton_raw(triton_fn, q, k, v, res_mask, pair_bias, do_triton, s
         o = triton_fn(q, k, v, res_mask, pair_bias)
         o.backward(do_triton, retain_graph=True)
 
-    return bench_fwd_full("GridSelfAttention", "triton_raw", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[q, k, v])
+    return bench_fwd_full(
+        "GridSelfAttention", "triton_raw", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[q, k, v]
+    )
 
 
 def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[BenchResult]:
@@ -130,7 +132,9 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
         if _EvoformerAttention is not None:
             try:
                 optim_evo = OptimConfig(use_fused_evo_attention=True)
-                attn_fused = GridSelfAttention(C, num_heads=H, transpose=False, optim=optim_evo).to(DEVICE, DTYPE).eval()
+                attn_fused = (
+                    GridSelfAttention(C, num_heads=H, transpose=False, optim=optim_evo).to(DEVICE, DTYPE).eval()
+                )
                 attn_fused.load_state_dict(attn.state_dict())
                 z_fused = z.detach().clone().requires_grad_(True)
                 # Smoke test

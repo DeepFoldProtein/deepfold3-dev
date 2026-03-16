@@ -135,17 +135,24 @@ def generate_pdf(output_path: Path | None = None):
     with PdfPages(output_path) as pdf:
         # --- Title page ---
         fig = plt.figure(figsize=(11, 8.5))
-        fig.text(0.5, 0.6, "DeepFold3 Kernel Benchmark Report", ha="center", va="center", fontsize=22, fontweight="bold")
+        fig.text(
+            0.5, 0.6, "DeepFold3 Kernel Benchmark Report", ha="center", va="center", fontsize=22, fontweight="bold"
+        )
         fig.text(0.5, 0.50, "Recommended Optimizations", ha="center", va="center", fontsize=16, color="#555555")
 
         import datetime
+
         import torch
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
         fig.text(
-            0.5, 0.38,
+            0.5,
+            0.38,
             f"GPU: {gpu_name}  |  dtype: bfloat16  |  {datetime.date.today().isoformat()}",
-            ha="center", va="center", fontsize=11, color="#888888",
+            ha="center",
+            va="center",
+            fontsize=11,
+            color="#888888",
         )
         pdf.savefig(fig)
         plt.close(fig)
@@ -185,8 +192,13 @@ def generate_pdf(output_path: Path | None = None):
                 label = _provider_label(prov, op_name)
 
                 ax_time.barh(
-                    y + i * bar_h - 0.4 + bar_h / 2, times, bar_h,
-                    label=label, color=color, edgecolor="white", linewidth=0.5,
+                    y + i * bar_h - 0.4 + bar_h / 2,
+                    times,
+                    bar_h,
+                    label=label,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.5,
                 )
 
                 # Mark the best with speedup annotation
@@ -196,13 +208,21 @@ def generate_pdf(output_path: Path | None = None):
                         ax_time.annotate(
                             f" {speedup:.2f}x",
                             xy=(t, y[j] + i * bar_h - 0.4 + bar_h / 2),
-                            fontsize=7, fontweight="bold", color="#228B22", va="center",
+                            fontsize=7,
+                            fontweight="bold",
+                            color="#228B22",
+                            va="center",
                         )
 
                 mems = [entries_list[j].get(prov, {}).get("peak_memory_mb", 0) for j in range(n_shapes)]
                 ax_mem.barh(
-                    y + i * bar_h - 0.4 + bar_h / 2, mems, bar_h,
-                    label=label, color=color, edgecolor="white", linewidth=0.5,
+                    y + i * bar_h - 0.4 + bar_h / 2,
+                    mems,
+                    bar_h,
+                    label=label,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.5,
                 )
 
             ax_time.set_xlabel("Time (ms)")
@@ -233,13 +253,15 @@ def generate_pdf(output_path: Path | None = None):
             mode = "full" if "full" in modes else next(iter(modes))
             for sl, best_prov, speedup, entries in modes[mode]:
                 best_time = entries[best_prov]["time_ms"]
-                table_data.append([
-                    op_name,
-                    sl.replace("\n", " / "),
-                    _provider_label(best_prov, op_name),
-                    f"{best_time:.3f}",
-                    f"{speedup:.2f}x" if speedup > 1.005 else "baseline",
-                ])
+                table_data.append(
+                    [
+                        op_name,
+                        sl.replace("\n", " / "),
+                        _provider_label(best_prov, op_name),
+                        f"{best_time:.3f}",
+                        f"{speedup:.2f}x" if speedup > 1.005 else "baseline",
+                    ]
+                )
 
         if table_data:
             rows_per_page = 35
@@ -250,7 +272,9 @@ def generate_pdf(output_path: Path | None = None):
                 fig = plt.figure(figsize=(11, fig_h))
 
                 if page_start == 0:
-                    fig.text(0.5, 1 - 0.4 / fig_h, "Recommendation Summary", ha="center", fontsize=16, fontweight="bold")
+                    fig.text(
+                        0.5, 1 - 0.4 / fig_h, "Recommendation Summary", ha="center", fontsize=16, fontweight="bold"
+                    )
 
                 ax = fig.add_axes([0.05, 0.05, 0.9, 0.85 if page_start == 0 else 0.92])
                 ax.axis("off")

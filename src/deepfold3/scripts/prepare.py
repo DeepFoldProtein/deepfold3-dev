@@ -140,7 +140,14 @@ def prepare(
             result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, max_resolution)
             if result is not None:
                 records.append(result)
-                log.info("[%d/%d] %s: %d chains, %d interfaces", i + 1, len(ids), pdb_id, len(result["chains"]), len(result["interfaces"]))
+                log.info(
+                    "[%d/%d] %s: %d chains, %d interfaces",
+                    i + 1,
+                    len(ids),
+                    pdb_id,
+                    len(result["chains"]),
+                    len(result["interfaces"]),
+                )
             else:
                 failed += 1
                 log.info("[%d/%d] %s: skipped", i + 1, len(ids), pdb_id)

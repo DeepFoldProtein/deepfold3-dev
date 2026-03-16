@@ -525,7 +525,16 @@ class LayernormLinearFunction(torch.autograd.Function):
         X, linear_weight, Mean, RSTD, WEIGHT, BIAS = ctx.saved_tensors
         dOUT = dOUT.contiguous()
         dX, dB, dLinearBias, dWEIGHT, dBIAS = layernorm_linear_backward(
-            dOUT, X, linear_weight, Mean, RSTD, WEIGHT, BIAS, ctx.has_layernorm_bias, ctx.has_linear_bias, ctx.backward_config
+            dOUT,
+            X,
+            linear_weight,
+            Mean,
+            RSTD,
+            WEIGHT,
+            BIAS,
+            ctx.has_layernorm_bias,
+            ctx.has_linear_bias,
+            ctx.backward_config,
         )
         return dX, dB, dLinearBias, dWEIGHT, dBIAS, None, None, None
 
@@ -584,8 +593,17 @@ class FusedLayerNormLinear(nn.Module):
                 self.linear_bias,
             )
         return LayernormLinearFunction.apply(
-            X, self.linear_weight, self.linear_bias, self.weight, self.bias, True, self.has_linear_bias, supported_configs
+            X,
+            self.linear_weight,
+            self.linear_bias,
+            self.weight,
+            self.bias,
+            True,
+            self.has_linear_bias,
+            supported_configs,
         )
 
     def extra_repr(self):
-        return f"in_features={self.in_features}, out_features={self.out_features}, has_linear_bias={self.has_linear_bias}"
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, has_linear_bias={self.has_linear_bias}"
+        )

@@ -459,12 +459,14 @@ class Featurizer:
                 continue
             # Rows 1.. (skip query)
             end = min(msa.sequences.shape[0], 1 + max_unpaired)
-            chain_unpaired.append((
-                int(asym_id),
-                msa.sequences[1:end],
-                msa.mask[1:end],
-                msa.deletion_matrix[1:end],
-            ))
+            chain_unpaired.append(
+                (
+                    int(asym_id),
+                    msa.sequences[1:end],
+                    msa.mask[1:end],
+                    msa.deletion_matrix[1:end],
+                )
+            )
             max_S_unpaired = max(max_S_unpaired, end - 1)
 
         if max_S_unpaired > 0:
