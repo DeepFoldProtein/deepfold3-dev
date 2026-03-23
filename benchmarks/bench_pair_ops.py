@@ -18,6 +18,7 @@ from benchmarks.utils import (
     bench_fwd_full,
     check_cuda,
     dry_run_shapes,
+    free_gpu,
     save_results,
     try_compile,
     try_import,
@@ -31,10 +32,10 @@ TRI_SHAPES = [
 ]
 
 OPM_SHAPES = [
-    {"N": 128, "S": 32, "C_msa": 64, "C_pair": 128},
-    {"N": 256, "S": 32, "C_msa": 64, "C_pair": 128},
     {"N": 384, "S": 32, "C_msa": 64, "C_pair": 128},
     {"N": 512, "S": 16, "C_msa": 64, "C_pair": 128},
+    {"N": 640, "S": 16, "C_msa": 64, "C_pair": 128},
+    {"N": 768, "S": 16, "C_msa": 64, "C_pair": 128},
 ]
 
 DEVICE = "cuda"
@@ -50,6 +51,8 @@ def bench_triangle_mul(shapes, warmup, rep):
         N, C = shape["N"], shape["C"]
 
         for cls, name in [(TriangleMulOutgoing, "TriangleMulOutgoing"), (TriangleMulIncoming, "TriangleMulIncoming")]:
+            free_gpu()
+
             # --- Baseline ---
             mod = cls(C).to(DEVICE, DTYPE).eval()
             z = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
@@ -86,6 +89,7 @@ def bench_triangle_mul(shapes, warmup, rep):
                 except Exception as e:
                     print(f"  [skip] torch.compile {name} failed (N={N}): {e}")
                 del mod_c, z_c
+            free_gpu()
 
             # --- Integrated: TriangleMul(optim=OptimConfig(use_torch_compile=True)) ---
             try:
@@ -116,6 +120,7 @@ def bench_triangle_mul(shapes, warmup, rep):
                 del mod_int, z_int
             except Exception as e:
                 print(f"  [skip] Integrated compile {name} failed (N={N}): {e}")
+            free_gpu()
 
             # --- Triton fused triangle mul (Level 1+2: gate + center_proj) ---
             try:
@@ -141,6 +146,7 @@ def bench_triangle_mul(shapes, warmup, rep):
                 del mod_tri, z_tri
             except Exception as e:
                 print(f"  [skip] Triton L1+L2 {name} failed (N={N}): {e}")
+            free_gpu()
 
             # --- Triton fused triangle mul (Level 3: dual GEMM + center_proj) ---
             try:
@@ -177,6 +183,7 @@ def bench_outer_product_mean(shapes, warmup, rep):
     for shape in shapes:
         N, S = shape["N"], shape["S"]
         C_msa, C_pair = shape["C_msa"], shape["C_pair"]
+        free_gpu()
 
         mod = OuterProductMean(C_msa, C_pair).to(DEVICE, DTYPE).eval()
         msa = torch.randn(S, N, C_msa, device=DEVICE, dtype=DTYPE, requires_grad=True)
@@ -244,8 +251,6 @@ GRID_COL_SHAPES = [
 
 def bench_layernorm_transpose(shapes, warmup, rep):
     """Benchmark fused LN+transpose vs sequential LN + permute."""
-    import gc
-
     import torch.nn as nn
     import torch.nn.functional as F
 
@@ -256,8 +261,7 @@ def bench_layernorm_transpose(shapes, warmup, rep):
     results = []
     for shape in shapes:
         N, C = shape["N"], shape["C"]
-        gc.collect()
-        torch.cuda.empty_cache()
+        free_gpu()
 
         x = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
         do = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
@@ -310,7 +314,6 @@ def bench_layernorm_transpose(shapes, warmup, rep):
 
 def bench_grid_col_attention(shapes, warmup, rep):
     """Benchmark column GridSelfAttention: baseline vs fused LN+transpose."""
-    import gc
 
     from deepfold3.model.attention import GridSelfAttention
     from deepfold3.model.config import OptimConfig
@@ -318,8 +321,7 @@ def bench_grid_col_attention(shapes, warmup, rep):
     results = []
     for shape in shapes:
         N, C, H = shape["N"], shape["C"], shape["H"]
-        gc.collect()
-        torch.cuda.empty_cache()
+        free_gpu()
 
         z = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
         mask = torch.ones(1, N, N, device=DEVICE, dtype=DTYPE)

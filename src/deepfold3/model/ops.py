@@ -44,6 +44,8 @@ fused LN+transpose on output, output gating via second dual GEMM.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -142,9 +144,10 @@ class _TriangleMulBase(nn.Module):
             except ImportError:
                 pass
 
-        if optim is not None and optim.use_torch_compile and self._fused_gate is None:
-            # Don't combine torch.compile with fused Triton gate — the compiled
-            # graph can mishandle nested Triton kernel launches.
+        _has_triton_fused = self._fused_gate is not None or self._fused_dual_gemm is not None or self._fused_center_proj is not None
+        if optim is not None and optim.use_torch_compile and not _has_triton_fused:
+            # Don't combine torch.compile with fused Triton kernels — the compiled
+            # graph mishandles nested Triton kernel launches (SymNodeVariable error).
             self._compute = torch.compile(self._compute)
 
     def _sync_dual_gemm(self):
@@ -196,8 +199,10 @@ class _TriangleMulBase(nn.Module):
             z0 = self.norm_left(z)
             gated_proj = self._fused_dual_gemm(z0)  # sigmoid(z0@Wg.T) * (z0@Wp.T)
             out_gate = torch.sigmoid(self.out_gate(z0))
+            del z0  # free normalized input (400 MB at N=1280)
             a = gated_proj[..., 0::2]
             b = gated_proj[..., 1::2]
+            del gated_proj  # free dual GEMM output (800 MB) — a, b are stride-2 views
         elif self._fused_gate is not None and z.is_cuda:
             # Level 1: LN + packed GEMM + sigmoid postprocess
             a, b, out_gate = self._fused_gate(z)
@@ -211,9 +216,14 @@ class _TriangleMulBase(nn.Module):
             a = proj[..., 0::2]
             b = proj[..., 1::2]
         m = mask.unsqueeze(-1)
-        a = a * m
-        b = b * m
+        # Materialize masked a, b as contiguous tensors and free the gated_proj
+        # backing store (800 MB at N=1280). Without this, gated_proj stays alive
+        # through the a/b stride-2 views until the function returns.
+        a = (a * m).contiguous()
+        b = (b * m).contiguous()
+        del m
         act = _TRIANGLE_MATMUL[self._equation](a, b)
+        del a, b  # free masked projections before output gating
         if self._fused_center_proj is not None and act.is_cuda:
             act = self._fused_center_proj(act)
         else:
@@ -278,6 +288,19 @@ class OuterProductMean(nn.Module):
         self.out_w = nn.Parameter(torch.zeros(c_hidden, c_hidden, c_z))
         self.out_b = nn.Parameter(torch.zeros(c_z))
         nn.init.kaiming_uniform_(self.out_w, nonlinearity="linear")
+        self._chunk_size: int = 0  # 0 = disabled, >0 = tiled OPM
+
+    def _outer_product_contract(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Compute outer product mean contraction: (a^T b) @ w + bias.
+
+        Args:
+            a: [B, S, N, c_hidden] left projection.
+            b: [B, S, N, c_hidden] right projection.
+        Returns:
+            [B, N, N, c_z] contracted result.
+        """
+        ab = torch.einsum("bsie,bsjf->bijef", a, b)
+        return torch.einsum("bijef,efc->bijc", ab, self.out_w) + self.out_b
 
     def forward(self, msa: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -296,9 +319,29 @@ class OuterProductMean(nn.Module):
         m = mask.unsqueeze(-1)  # [B, S, N, 1]
         a = self.proj_a(msa) * m  # [B, S, N, c_hidden]
         b = self.proj_b(msa) * m  # [B, S, N, c_hidden]
-        # outer product then mean: [B, S, N, N, c_hidden, c_hidden] → contract
-        ab = torch.einsum("bsie,bsjf->bijef", a, b)  # [B, N, N, c_hidden, c_hidden]
-        act = torch.einsum("bijef,efc->bijc", ab, self.out_w) + self.out_b
+
+        chunk = self._chunk_size
+        N = a.shape[2]
+        if chunk > 0 and chunk < N:
+            from deepfold3.model.tiled_linear import _TiledOPMContractFn
+
+            num_shards = max(1, math.ceil(N / chunk))
+            if self.training and a.requires_grad:
+                act = _TiledOPMContractFn.apply(a, b, self._outer_product_contract, num_shards)
+            else:
+                # Inference: 2D chunked forward — chunk both i and j to keep
+                # intermediate at [B, chunk, chunk, c_h, c_h] (constant in N).
+                c_z = self.out_w.shape[2]
+                act = a.new_empty(a.shape[0], N, N, c_z)
+                for i0 in range(0, N, chunk):
+                    i1 = min(i0 + chunk, N)
+                    a_i = a[:, :, i0:i1, :]
+                    for j0 in range(0, N, chunk):
+                        j1 = min(j0 + chunk, N)
+                        act[:, i0:i1, j0:j1] = self._outer_product_contract(a_i, b[:, :, j0:j1, :])
+        else:
+            act = self._outer_product_contract(a, b)
+
         # normalize by number of valid sequence positions
         eps = 1e-3
         mask_f = mask.float()

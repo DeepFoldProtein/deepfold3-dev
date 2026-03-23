@@ -236,17 +236,14 @@ class GridSelfAttention(nn.Module):
         z_flat = z.reshape(B * N_rows, N_cols, C)
 
         if _defer_transpose:
-            # Column attention fast path with evo_attn: skip the data transpose.
-            #
-            # to_q/to_k/to_v are LinearNoBias on the last dim C — they produce the
-            # same values regardless of dim 1/2 ordering. We project QKV from the
-            # ORIGINAL z layout [B, N1, N2, C] (contiguous, no copy needed), then
-            # permute dims 1↔2 on the 5D QKV tensors (views, zero-copy). The
-            # evo_attn kernel's internal .contiguous() on the [B,N_seq,H,N_res,D]
-            # tensor is the ONLY copy. This saves one N²C copy vs transposing z first.
-            q = self.to_q(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)  # [B, N2, N1, H, D]
-            k = self.to_k(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)
-            v = self.to_v(z_flat).view(B, N, N, H, D).permute(0, 2, 1, 3, 4)
+            # Column attention fast path: pre-transpose QKV to kernel layout
+            # [B, N2, H, N1, D] in one contiguous() call per tensor. The linear
+            # output is freed immediately (no view chain keeps it alive), saving
+            # ~1.2 GB vs the old approach where caller views + kernel copies coexisted.
+            # z_flat is [B*N1, N2, C] from un-transposed z[B, N1, N2, C].
+            q = self.to_q(z_flat).view(B, N, N, H, D).permute(0, 2, 3, 1, 4).contiguous()
+            k = self.to_k(z_flat).view(B, N, N, H, D).permute(0, 2, 3, 1, 4).contiguous()
+            v = self.to_v(z_flat).view(B, N, N, H, D).permute(0, 2, 3, 1, 4).contiguous()
             # Mask: column-wise → permute rows/cols
             col_mask = mask.permute(0, 2, 1)
             res_mask = torch.where(col_mask > 0.5, 0.0, -1e9).view(B, N, 1, 1, N)
@@ -254,20 +251,25 @@ class GridSelfAttention(nn.Module):
             # over N1 (rows) for each N2 (column), query=row_i, key=row_j → bias is
             # pb[b,h,i,j]. No transpose needed — the original pb indexes match.
             pair_bias = pb.unsqueeze(1).float()  # [B, 1, H, N, N]
-            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)  # [B, N2, N1, H, D]
-            # Un-transpose back to [B, N1, N2, H*D]
-            out = out.permute(0, 2, 1, 3, 4).reshape(B * N, N, H * D)
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias, True)  # [B, N2, H, N1, D]
+            del q, k, v
+            # Back to [B, N1, N2, H, D] → [B*N1, N2, H*D]
+            out = out.permute(0, 3, 1, 2, 4).contiguous().view(B * N, N, H * D)
             g = torch.sigmoid(self.to_g(z_flat))
             out = self.out_proj(out * g)
         elif self._evo_attn is not None and z.is_cuda:
-            # Row attention: standard evo_attn path
-            q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D)
-            k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D)
-            v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D)
+            # Row attention: pre-transpose QKV to kernel layout [B, N_rows, H, N_cols, D].
+            # Each .contiguous() replaces the linear output immediately, so only the
+            # transposed copy survives — avoids 3× duplicate N²C allocations.
+            q = self.to_q(z_flat).view(B, N_rows, N_cols, H, D).transpose(-2, -3).contiguous()
+            k = self.to_k(z_flat).view(B, N_rows, N_cols, H, D).transpose(-2, -3).contiguous()
+            v = self.to_v(z_flat).view(B, N_rows, N_cols, H, D).transpose(-2, -3).contiguous()
             res_mask = torch.where(mask > 0.5, 0.0, -1e9).view(B, N_rows, 1, 1, N_cols)
             pair_bias = pb.unsqueeze(1).float()
-            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias)
-            out = out.reshape(B * N_rows, N_cols, H * D)
+            out = self._evo_attn.apply(q, k, v, res_mask, pair_bias, True)
+            del q, k, v
+            # [B, N_rows, H, N_cols, D] → [B*N_rows, N_cols, H*D]
+            out = out.permute(0, 1, 3, 2, 4).contiguous().view(B * N_rows, N_cols, H * D)
             g = torch.sigmoid(self.to_g(z_flat))
             out = self.out_proj(out * g)
         else:

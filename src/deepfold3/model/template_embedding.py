@@ -38,10 +38,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold3.model.attention import GridSelfAttention
-from deepfold3.model.config import TemplateEmbeddingConfig
+from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
 from deepfold3.model.embedders import dgram_from_positions as _dgram_from_positions
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, TransitionBlock
+from deepfold3.model.optim import make_transition_block
+from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 # Dense atom indices for backbone atoms
 _N_IDX = 0
@@ -214,13 +215,19 @@ class TemplatePairFormerBlock(nn.Module):
         pair_transition~/                   → pair_transition
     """
 
-    def __init__(self, num_channels: int, num_heads: int = 4, num_intermediate_factor: int = 2):
+    def __init__(
+        self,
+        num_channels: int,
+        num_heads: int = 4,
+        num_intermediate_factor: int = 2,
+        optim: OptimConfig | None = None,
+    ):
         super().__init__()
-        self.tri_mul_out = TriangleMulOutgoing(num_channels)
-        self.tri_mul_in = TriangleMulIncoming(num_channels)
-        self.pair_attn_row = GridSelfAttention(num_channels, num_heads=num_heads, transpose=False)
-        self.pair_attn_col = GridSelfAttention(num_channels, num_heads=num_heads, transpose=True)
-        self.pair_transition = TransitionBlock(num_channels, num_intermediate_factor=num_intermediate_factor)
+        self.tri_mul_out = TriangleMulOutgoing(num_channels, optim=optim)
+        self.tri_mul_in = TriangleMulIncoming(num_channels, optim=optim)
+        self.pair_attn_row = GridSelfAttention(num_channels, num_heads=num_heads, transpose=False, optim=optim)
+        self.pair_attn_col = GridSelfAttention(num_channels, num_heads=num_heads, transpose=True, optim=optim)
+        self.pair_transition = make_transition_block(num_channels, num_intermediate_factor, config=optim)
 
     def forward(self, pair: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
         """Forward pass through one template PairFormer block.
@@ -264,7 +271,7 @@ class SingleTemplateEmbedding(nn.Module):
         __layer_stack_no_per_layer/...    → pairformer.{i}
     """
 
-    def __init__(self, cfg: TemplateEmbeddingConfig):
+    def __init__(self, cfg: TemplateEmbeddingConfig, optim: OptimConfig | None = None):
         super().__init__()
         c = cfg.num_channels
         pc = cfg.pair_channel
@@ -291,6 +298,7 @@ class SingleTemplateEmbedding(nn.Module):
                     num_channels=pf.num_channels,
                     num_heads=pf.num_heads,
                     num_intermediate_factor=pf.num_intermediate_factor,
+                    optim=optim,
                 )
                 for _ in range(pf.num_layer)
             ]
@@ -390,10 +398,10 @@ class TemplateEmbedding(nn.Module):
         single_template_embedding/ → single_template_emb
     """
 
-    def __init__(self, cfg: TemplateEmbeddingConfig):
+    def __init__(self, cfg: TemplateEmbeddingConfig, optim: OptimConfig | None = None):
         super().__init__()
         self.cfg = cfg
-        self.single_template_emb = SingleTemplateEmbedding(cfg)
+        self.single_template_emb = SingleTemplateEmbedding(cfg, optim=optim)
         self.output_proj = LinearNoBias(cfg.num_channels, cfg.pair_channel)
 
     def forward(

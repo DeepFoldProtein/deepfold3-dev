@@ -65,6 +65,8 @@ class EvoformerBlock(nn.Module):
         super().__init__()
         self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads, optim=optim)
         self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=outer_product_hidden)
+        if optim is not None and optim.tiled_opm_chunk > 0:
+            self.outer_product._chunk_size = optim.tiled_opm_chunk
         self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
         self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
         self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
@@ -177,7 +179,7 @@ class Evoformer(nn.Module):
 
         # Template embedding (optional — None if not using templates)
         if template_cfg is not None:
-            self.template_embedding: TemplateEmbedding | None = TemplateEmbedding(template_cfg)
+            self.template_embedding: TemplateEmbedding | None = TemplateEmbedding(template_cfg, optim=optim)
         else:
             self.template_embedding = None
 

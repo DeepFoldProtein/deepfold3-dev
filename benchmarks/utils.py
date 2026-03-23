@@ -20,6 +20,14 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
+def free_gpu():
+    """Collect garbage and empty CUDA cache between benchmark runs."""
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 @dataclass
 class BenchResult:
     """Result of a single benchmark measurement."""
@@ -117,14 +125,22 @@ def peak_memory_mb(fn: callable, warmup: int = 3) -> tuple[float, any]:
     Runs warmup calls first to ensure JIT compilation and triton.autotune
     are complete before measuring — otherwise the autotuner's temporary
     allocations inflate the reported peak.
+
+    Calls gc.collect() + empty_cache() before measurement to flush stale
+    autograd graphs and CUDA allocator cache from prior iterations.
     """
+    import gc
+
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
     result = fn()
     torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    peak = (torch.cuda.max_memory_allocated() - base) / (1024 * 1024)
     return peak, result
 
 

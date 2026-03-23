@@ -12,7 +12,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import sys
 
 import torch
@@ -22,43 +21,37 @@ from benchmarks.utils import (
     bench_fwd_full,
     check_cuda,
     dry_run_shapes,
+    free_gpu,
     save_results,
     try_import,
 )
 
 # DeepFold3 pair attention shapes (pair_channel=128, num_heads=4)
 GRID_SHAPES = [
-    {"N": 128, "C": 128, "H": 4},
-    {"N": 256, "C": 128, "H": 4},
     {"N": 384, "C": 128, "H": 4},
     {"N": 512, "C": 128, "H": 4},
+    {"N": 640, "C": 128, "H": 4},
     {"N": 768, "C": 128, "H": 4},
 ]
 
 # DeepFold3 MSA attention shapes (msa_channel=64, pair_channel=128, 8 heads)
 MSA_SHAPES = [
-    {"N": 128, "S": 32, "C_msa": 64, "C_pair": 128, "H": 8},
-    {"N": 256, "S": 32, "C_msa": 64, "C_pair": 128, "H": 8},
     {"N": 384, "S": 32, "C_msa": 64, "C_pair": 128, "H": 8},
     {"N": 512, "S": 16, "C_msa": 64, "C_pair": 128, "H": 8},
+    {"N": 640, "S": 16, "C_msa": 64, "C_pair": 128, "H": 8},
+    {"N": 768, "S": 16, "C_msa": 64, "C_pair": 128, "H": 8},
 ]
 
 # DeepFold3 single attention shapes (seq_channel=384, 16 heads)
 SINGLE_SHAPES = [
-    {"N": 128, "C": 384, "H": 16},
-    {"N": 256, "C": 384, "H": 16},
     {"N": 384, "C": 384, "H": 16},
     {"N": 512, "C": 384, "H": 16},
+    {"N": 640, "C": 384, "H": 16},
     {"N": 768, "C": 384, "H": 16},
 ]
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
-
-
-def _free_gpu():
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def _bench_grid_pytorch(attn, z, mask, do, shape, warmup, rep):
@@ -100,7 +93,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
     results = []
     for shape in shapes:
         N, C, H = shape["N"], shape["C"], shape["H"]
-        _free_gpu()
+        free_gpu()
 
         # --- Baseline PyTorch ---
         attn = GridSelfAttention(C, num_heads=H, transpose=False).to(DEVICE, DTYPE).eval()
@@ -112,7 +105,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
             results.extend(_bench_grid_pytorch(attn, z, mask, do, shape, warmup, rep))
         except torch.OutOfMemoryError:
             print(f"  [skip] PyTorch GridSelfAttention OOM (N={N})")
-            _free_gpu()
+            free_gpu()
 
         # --- Integrated: GridSelfAttention(optim=OptimConfig(use_torch_compile=True)) ---
         try:
@@ -126,7 +119,7 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
             del attn_comp, z_comp
         except Exception as e:
             print(f"  [skip] torch.compile GridSelfAttention failed (N={N}): {e}")
-            _free_gpu()
+            free_gpu()
 
         # --- Integrated: GridSelfAttention(optim=OptimConfig(use_fused_evo_attention=True)) ---
         if _EvoformerAttention is not None:
@@ -146,10 +139,10 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
                 del attn_fused, z_fused
             except Exception as e:
                 print(f"  [skip] Triton GridSelfAttention failed (N={N}): {e}")
-                _free_gpu()
+                free_gpu()
 
         del attn, z, mask, do
-        _free_gpu()
+        free_gpu()
 
         # --- Raw kernel benchmark (for kernel-level comparison) ---
         if _EvoformerAttention is not None:
@@ -168,10 +161,10 @@ def bench_grid_attention(shapes: list[dict], warmup: int, rep: int) -> list[Benc
                 )
             except Exception as e:
                 print(f"  [skip] Triton raw FusedEvoAttention failed (N={N}): {e}")
-                _free_gpu()
+                free_gpu()
             del q, k, v, rm, pb, do_t
 
-        _free_gpu()
+        free_gpu()
         print(f"  GridSelfAttention N={N} C={C} done")
 
     return results
@@ -198,7 +191,7 @@ def bench_msa_attention(shapes: list[dict], warmup: int, rep: int) -> list[Bench
     for shape in shapes:
         N, S = shape["N"], shape["S"]
         C_msa, C_pair, H = shape["C_msa"], shape["C_pair"], shape["H"]
-        _free_gpu()
+        free_gpu()
 
         # --- Baseline ---
         attn = MSAAttention(C_msa, C_pair, num_heads=H).to(DEVICE, DTYPE).eval()
@@ -249,7 +242,7 @@ def bench_single_attention(shapes: list[dict], warmup: int, rep: int) -> list[Be
     results = []
     for shape in shapes:
         N, C, H = shape["N"], shape["C"], shape["H"]
-        _free_gpu()
+        free_gpu()
 
         # --- Baseline ---
         attn = SingleAttention(C, num_heads=H).to(DEVICE, DTYPE).eval()
@@ -277,7 +270,7 @@ def bench_single_attention(shapes: list[dict], warmup: int, rep: int) -> list[Be
             print(f"  [skip] torch.compile SingleAttention failed (N={N}): {e}")
 
         del attn, x, mask, pair_logits, do
-        _free_gpu()
+        free_gpu()
         print(f"  SingleAttention N={N} C={C} done")
 
     return results

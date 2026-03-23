@@ -22,21 +22,22 @@ DEFAULT_CONFIG = (16, 16, 16, 8, 1, 8, 255)
 # Each config: (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_stages, num_warps, maxnreg/waves_per_eu)
 
 _CUDA_COMMON: dict[tuple[int, int, int], tuple[tuple, tuple]] = {
+    # Tuned on RTX 5090 (SM 12.0, 101KB shared mem). Max num_stages=3.
     # Pair transitions: N^2 rows, pair_channel=128
-    (147456, 8, 128): ((128, 32, 32, 8, 4, 8, None), (64, 64, 16, 8, 4, 8, None)),
-    (147456, 16, 128): ((128, 32, 32, 4, 4, 8, None), (64, 64, 16, 8, 2, 4, None)),
-    (147456, 64, 128): ((64, 64, 32, 8, 4, 4, None), (128, 64, 32, 8, 4, 4, None)),
-    (147456, 128, 128): ((64, 128, 32, 8, 4, 4, None), (128, 64, 32, 8, 4, 4, None)),
-    (147456, 64, 64): ((64, 64, 16, 4, 2, 4, 255), (128, 16, 16, 8, 4, 4, 168)),
-    (589824, 64, 64): ((64, 64, 32, 8, 2, 4, 96), (128, 16, 16, 8, 4, 4, 168)),
+    (147456, 8, 128): ((256, 8, 32, 4, 3, 8, 128), (64, 64, 16, 8, 2, 8, None)),
+    (147456, 16, 128): ((128, 16, 32, 8, 2, 8, None), (128, 32, 16, 8, 3, 4, 128)),
+    (147456, 64, 128): ((64, 64, 32, 8, 3, 8, None), (256, 32, 16, 8, 3, 4, None)),
+    (147456, 128, 128): ((128, 64, 32, 8, 3, 8, 128), (128, 64, 32, 4, 3, 4, None)),
+    (147456, 64, 64): ((128, 64, 32, 4, 3, 4, None), (256, 32, 32, 8, 2, 4, None)),
+    (589824, 64, 64): ((128, 64, 32, 8, 3, 8, None), (256, 32, 32, 4, 2, 4, None)),
     # Transition blocks: pair(512->128), single(3072->384), MSA(512->64)
-    (147456, 512, 64): ((64, 128, 32, 4, 2, 4, 128), (256, 32, 32, 4, 4, 4, 255)),
-    (147456, 512, 128): ((64, 256, 32, 4, 4, 4, 255), (256, 32, 32, 4, 2, 4, 255)),
-    (147456, 1024, 128): ((128, 128, 32, 8, 4, 8, 128), (256, 64, 32, 4, 2, 8, 128)),
+    (147456, 512, 64): ((64, 128, 32, 4, 3, 4, 255), (128, 64, 32, 4, 3, 4, None)),
+    (147456, 512, 128): ((128, 64, 32, 4, 2, 4, None), (128, 64, 32, 8, 3, 4, None)),
+    (147456, 1024, 128): ((128, 128, 32, 8, 3, 4, 255), (128, 64, 32, 8, 3, 4, None)),
     # TriangleMul
-    (147456, 516, 64): ((128, 64, 16, 8, 4, 4, 128), (128, 64, 16, 4, 4, 8, 128)),
-    (147456, 320, 64): ((64, 128, 32, 4, 2, 4, 128), (256, 32, 16, 4, 4, 8, 128)),
-    (147456, 640, 128): ((64, 128, 32, 8, 4, 4, 128), (256, 32, 32, 4, 4, 4, 255)),
+    (147456, 516, 64): ((128, 128, 32, 4, 2, 4, 255), (256, 32, 32, 4, 2, 4, None)),
+    (147456, 320, 64): ((128, 64, 32, 8, 3, 8, 255), (128, 64, 32, 4, 3, 4, None)),
+    (147456, 640, 128): ((128, 128, 32, 8, 3, 4, 255), (128, 64, 32, 8, 3, 4, None)),
 }
 
 # (N, K) -> sorted list of M values with configs
@@ -227,6 +228,63 @@ def _is_cuda_backend() -> bool:
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
 
 
+def _cap_stages(config: tuple, max_stages: int = 3) -> tuple:
+    """Cap num_stages in a config tuple to avoid shared memory overflow.
+
+    Config format: (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+                     num_stages, num_warps, extra).
+    The num_stages field (index 4) is capped to max_stages. This prevents
+    pre-tuned configs from A100/H100 (164KB shared mem) from exceeding
+    RTX 5090/Blackwell (101KB shared mem) limits.
+    """
+    BM, BN, BK, GSM, ns, nw, extra = config
+    if ns > max_stages:
+        ns = max_stages
+    return (BM, BN, BK, GSM, ns, nw, extra)
+
+
+def _cap_config_pair(res: tuple[tuple, tuple], max_stages: int = 3) -> tuple[tuple, tuple]:
+    """Cap stages in both forward and backward configs."""
+    return (_cap_stages(res[0], max_stages), _cap_stages(res[1], max_stages))
+
+
+# Maximum pipeline stages by GPU architecture.
+# A100/H100 (SM 8.0/9.0): 164KB shared mem → 4+ stages fine
+# RTX 5090 / Blackwell (SM 12.0): 101KB shared mem → max 3 stages
+_MAX_STAGES: int | None = None
+
+
+def _get_max_stages() -> int:
+    """Detect max safe num_stages for this GPU's shared memory.
+
+    Shared memory per SM by architecture:
+      Ampere  (SM 8.x): RTX 3090 = 48KB, A100 = 164KB (opt-in)
+      Ada     (SM 8.9): RTX 4090 = 101KB
+      Hopper  (SM 9.0): H100 = 228KB
+      Blackwell (SM 12.0): RTX 5090 = 101KB, B200 = 228KB
+    """
+    global _MAX_STAGES
+    if _MAX_STAGES is not None:
+        return _MAX_STAGES
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            shared_kb = props.shared_memory_per_multiprocessor // 1024
+            if shared_kb >= 164:
+                _MAX_STAGES = 4  # A100, H100, B200
+            elif shared_kb >= 96:
+                _MAX_STAGES = 3  # RTX 4090, RTX 5090
+            else:
+                _MAX_STAGES = 2  # RTX 3090 (48KB), older GPUs
+        else:
+            _MAX_STAGES = 2  # conservative default
+    except Exception:
+        _MAX_STAGES = 2
+    return _MAX_STAGES
+
+
 def calculate_config_layernorm_linear(M: int, N: int, K: int, mode: int) -> tuple[tuple, tuple] | tuple | None:
     """Look up optimal Triton block config for given (M, N, K) shape.
 
@@ -244,8 +302,11 @@ def calculate_config_layernorm_linear(M: int, N: int, K: int, mode: int) -> tupl
     else:
         common, m_for_nk, structured = _HIP_COMMON, _HIP_M_FOR_NK, _HIP_STRUCTURED
 
+    max_stages = _get_max_stages()
+
     res = common.get((M, N, K))
     if res is not None:
+        res = _cap_config_pair(res, max_stages)
         return res[mode] if mode < 2 else res
 
     m_list = m_for_nk.get((N, K))
@@ -259,6 +320,7 @@ def calculate_config_layernorm_linear(M: int, N: int, K: int, mode: int) -> tupl
     res = structured.get((closest_m, N, K))
     if res is None:
         return None
+    res = _cap_config_pair(res, max_stages)
     return res[mode] if mode < 2 else res
 
 

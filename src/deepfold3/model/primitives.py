@@ -78,7 +78,7 @@ class TransitionBlock(nn.Module):
         transition2      → linear2  (projects back to c)
     """
 
-    def __init__(self, channels: int, num_intermediate_factor: int = 4):
+    def __init__(self, channels: int, num_intermediate_factor: int = 4, optim=None):
         super().__init__()
         num_intermediate = channels * num_intermediate_factor
         self.norm = LayerNorm(channels)
@@ -86,6 +86,13 @@ class TransitionBlock(nn.Module):
         self.linear1 = LinearNoBias(channels, num_intermediate * 2)
         self.linear2 = LinearNoBias(num_intermediate, channels)
         self._act = SwiGLU()
+        if optim is not None and optim.use_fused_swiglu:
+            try:
+                from deepfold3.model.triton.swiglu import FusedSwiGLU
+
+                self._act = FusedSwiGLU()
+            except ImportError:
+                pass
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x)
@@ -106,7 +113,7 @@ class AdaTransitionBlock(nn.Module):
         {name}ffw_adaptive_zero_cond          → zero_cond    (gate, init bias=-2)
     """
 
-    def __init__(self, channels: int, cond_dim: int, num_intermediate_factor: int = 2):
+    def __init__(self, channels: int, cond_dim: int, num_intermediate_factor: int = 2, optim=None):
         super().__init__()
         num_intermediate = channels * num_intermediate_factor
         # AdaLN parts (no offset on base norm, no offset on cond_norm)
@@ -122,6 +129,13 @@ class AdaTransitionBlock(nn.Module):
         nn.init.zeros_(self.zero_cond.weight)
         nn.init.constant_(self.zero_cond.bias, -2.0)
         self._act = SwiGLU()
+        if optim is not None and optim.use_fused_swiglu:
+            try:
+                from deepfold3.model.triton.swiglu import FusedSwiGLU
+
+                self._act = FusedSwiGLU()
+            except ImportError:
+                pass
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # AdaLN

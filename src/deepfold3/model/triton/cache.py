@@ -321,7 +321,18 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
         return triton.autotune(configs=configs, key=key)
 
     def decorator(fn):
-        fn_name = kernel_name or fn.__name__
+        # Extract name from fn — handles JITFunction, Heuristics, or plain functions
+        fn_name = kernel_name
+        if fn_name is None:
+            obj = fn
+            while fn_name is None:
+                if hasattr(obj, "__name__"):
+                    fn_name = obj.__name__
+                elif hasattr(obj, "fn"):
+                    obj = obj.fn
+                else:
+                    fn_name = type(fn).__name__
+                    break
         mgr = CacheManager.get()
 
         # Load any existing cache for this kernel

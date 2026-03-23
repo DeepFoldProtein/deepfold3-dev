@@ -99,18 +99,23 @@ if HAS_TRITON:
         Mean_ptr,
         RSTD_ptr,
         GRAD_X_ptr,
+        PARTIAL_DW_ptr,
+        PARTIAL_DB_ptr,
         N1,
         N2,
         C,
+        NUM_PARTITIONS,
         DO_TRANSPOSE: tl.constexpr,
         HAS_AFFINE: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        """Backward: compute grad_x only (no atomic accumulation).
+        """Backward: compute grad_x and accumulate partial grad_w/grad_b.
 
         Grid: (B * N1 * N2,) — one program per input row.
-        grad_out is in the (possibly transposed) output layout.
-        grad_w/grad_b are computed separately via PyTorch reduction.
+        Each program writes grad_x for its row and atomically accumulates
+        xhat*dy and dy into a partitioned [NUM_PARTITIONS, C] buffer.
+        Partitioning spreads atomic contention: with P partitions and ~680
+        concurrent programs, only ~680/P ≈ 2-3 programs contend per slot.
         """
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK_C)
@@ -146,6 +151,13 @@ if HAS_TRITON:
         dx = (wdy - c1 * xhat - c2) * rstd
 
         tl.store(GRAD_X_ptr + row * C + cols, dx, mask=mask)
+
+        # Accumulate grad_w/grad_b via partitioned atomics
+        if HAS_AFFINE:
+            part_id = tl.program_id(0) % NUM_PARTITIONS
+            part_offset = part_id.to(tl.int64) * C + cols
+            tl.atomic_add(PARTIAL_DW_ptr + part_offset, xhat * dy, mask=mask)
+            tl.atomic_add(PARTIAL_DB_ptr + part_offset, dy, mask=mask)
 
 
 class LayerNormTransposeFunction(torch.autograd.Function):
@@ -206,6 +218,17 @@ class LayerNormTransposeFunction(torch.autograd.Function):
 
         BLOCK_C, num_warps = _calculate_settings(C)
 
+        # Partitioned atomic accumulation for grad_w/grad_b.
+        # Spreads contention: ~680 concurrent programs / 256 partitions ≈ 2-3
+        # programs per slot. Buffer is [256, C] ≈ 128KB (vs ~450MB old way).
+        NUM_PARTITIONS = min(M, 256)
+        if ctx.has_affine:
+            partial_dw = torch.zeros(NUM_PARTITIONS, C, dtype=torch.float32, device=x_flat.device)
+            partial_db = torch.zeros(NUM_PARTITIONS, C, dtype=torch.float32, device=x_flat.device)
+        else:
+            partial_dw = x_flat  # dummy ptr
+            partial_db = x_flat
+
         _ln_transpose_bwd_kernel[(M,)](
             grad_out_flat,
             x_flat,
@@ -213,9 +236,12 @@ class LayerNormTransposeFunction(torch.autograd.Function):
             mean,
             rstd,
             grad_x_flat,
+            partial_dw,
+            partial_db,
             N1,
             N2,
             C,
+            NUM_PARTITIONS,
             DO_TRANSPOSE=ctx.do_transpose,
             HAS_AFFINE=ctx.has_affine,
             BLOCK_C=BLOCK_C,
@@ -225,17 +251,9 @@ class LayerNormTransposeFunction(torch.autograd.Function):
         B = M // (N1 * N2)
         grad_x = grad_x_flat.view(B, N1, N2, C)
 
-        # Compute grad_w/grad_b via PyTorch reduction (avoids atomic contention)
         if ctx.has_affine:
-            # xhat = (x - mean) * rstd, in input layout
-            xhat = (x_flat - mean.unsqueeze(1)) * rstd.unsqueeze(1)
-            # dy in input layout: un-transpose grad_out if needed
-            if ctx.do_transpose:
-                dy_input = grad_out.view(B, N2, N1, C).permute(0, 2, 1, 3).reshape(M, C)
-            else:
-                dy_input = grad_out_flat
-            grad_weight = (dy_input.float() * xhat).sum(dim=0).to(x_flat.dtype)
-            grad_bias = dy_input.float().sum(dim=0).to(x_flat.dtype)
+            grad_weight = partial_dw.sum(dim=0).to(x_flat.dtype)
+            grad_bias = partial_db.sum(dim=0).to(x_flat.dtype)
         else:
             grad_weight = None
             grad_bias = None

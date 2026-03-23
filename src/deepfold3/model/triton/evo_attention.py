@@ -121,20 +121,41 @@ if HAS_TRITON:
 
         return O_block, l_i, m_i
 
+    from deepfold3.model.triton.cache import persistent_autotune
+
     # Autotune over tile sizes for the forward attention kernel.
     # Key insight: optimal BLOCK_SIZE_Q/KV depend on SEQ_LEN (N=128..768).
     # Small N benefits from larger Q blocks; large N needs smaller blocks
     # to avoid register pressure. cuEQ uses fixed tiles per architecture;
     # we autotune at runtime for maximum portability.
+    # num_stages=1 included for RTX 3090/4090 with less shared memory.
     _ATTN_FWD_CONFIGS = [
         triton.Config({"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw)
         for bq in (16, 32, 64)
         for bkv in (32, 64, 128)
-        for ns in (2, 3)
+        for ns in (1, 2, 3)
         for nw in (4, 8)
     ]
 
-    @triton.autotune(configs=_ATTN_FWD_CONFIGS, key=["SEQ_LEN", "DIM"])
+    # Backward kernels: smaller config space (fixed Q/KV roles).
+    # num_stages 1-3: 1 for Ampere (48KB shared), 2-3 for Ada/Hopper/Blackwell.
+    _ATTN_BWD_DK_DV_CONFIGS = [
+        triton.Config({"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw)
+        for bq in (32, 64)
+        for bkv in (16, 32)
+        for ns in (1, 2, 3)
+        for nw in (4, 8)
+    ]
+
+    _ATTN_BWD_DQ_CONFIGS = [
+        triton.Config({"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw)
+        for bq in (16, 32)
+        for bkv in (32, 64)
+        for ns in (1, 2, 3)
+        for nw in (4, 8)
+    ]
+
+    @persistent_autotune(configs=_ATTN_FWD_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
         {
             "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
@@ -309,6 +330,7 @@ if HAS_TRITON:
         D_block_ptrs = D + index_batch_msa_head * SEQ_LEN + offs_q
         tl.store(D_block_ptrs, D_block, mask=offs_q < SEQ_LEN)
 
+    @persistent_autotune(configs=_ATTN_BWD_DQ_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
         {
             "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
@@ -513,6 +535,7 @@ if HAS_TRITON:
             else:
                 tl.store(dQ_block_ptrs, dQ_block, mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM))
 
+    @persistent_autotune(configs=_ATTN_BWD_DK_DV_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
         {
             "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
@@ -704,20 +727,25 @@ if HAS_TRITON:
 
 class _EvoformerAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, res_mask, pair_bias):
+    def forward(ctx, Q, K, V, res_mask, pair_bias, pre_transposed=False):
         """Forward pass.
 
         Args:
-            Q, K, V: [B, N_seq, N_res, H, D]
+            Q, K, V: [B, N_seq, N_res, H, D] (default) or
+                      [B, N_seq, H, N_res, D] (pre_transposed=True, kernel layout).
             res_mask: [B, N_seq, 1, 1, N_res]
             pair_bias: [B, 1, H, N_res, N_res]
+            pre_transposed: If True, inputs are already in kernel layout and
+                contiguous. Skips the internal transpose+contiguous copies,
+                saving ~1.2 GB at N=1280 (3 fewer N²·C allocations).
         """
         DIM_Q, DIM_K, DIM_V = Q.shape[-1], K.shape[-1], V.shape[-1]
         assert DIM_Q == DIM_K and DIM_K == DIM_V
 
-        Q = Q.transpose(-2, -3).contiguous()
-        K = K.transpose(-2, -3).contiguous()
-        V = V.transpose(-2, -3).contiguous()
+        if not pre_transposed:
+            Q = Q.transpose(-2, -3).contiguous()
+            K = K.transpose(-2, -3).contiguous()
+            V = V.transpose(-2, -3).contiguous()
 
         BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN, DIM = Q.shape
         softmax_scale = DIM**-0.5
@@ -782,14 +810,19 @@ class _EvoformerAttention(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, res_mask, pair_bias, O, M)
         ctx.softmax_scale = softmax_scale
         ctx.DIM = DIM
+        ctx.pre_transposed = pre_transposed
 
-        O = O.transpose(-2, -3).contiguous()
+        if not pre_transposed:
+            O = O.transpose(-2, -3).contiguous()
         return O
 
     @staticmethod
     def backward(ctx, dO):
         Q, K, V, res_mask, pair_bias, O, M = ctx.saved_tensors
-        dO = dO.transpose(-2, -3).contiguous()
+        if not ctx.pre_transposed:
+            dO = dO.transpose(-2, -3).contiguous()
+        elif not dO.is_contiguous():
+            dO = dO.contiguous()
 
         assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
         dQ = torch.empty_like(Q)
@@ -812,7 +845,7 @@ class _EvoformerAttention(torch.autograd.Function):
             DIM=DIM,
             BLOCK_DIM=BLOCK_DIM,
             BLOCK_SIZE_Q=32,
-            num_stages=2,
+            num_stages=1,
             num_warps=4,
         )
 
@@ -846,10 +879,6 @@ class _EvoformerAttention(torch.autograd.Function):
             SEQ_LEN=SEQ_LEN,
             BLOCK_DIM=BLOCK_DIM,
             DIM=ctx.DIM,
-            BLOCK_SIZE_Q=64,
-            BLOCK_SIZE_KV=16,
-            num_stages=3,
-            num_warps=4,
         )
 
         bwd_dq_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
@@ -887,17 +916,14 @@ class _EvoformerAttention(torch.autograd.Function):
             SEQ_LEN=SEQ_LEN,
             BLOCK_DIM=BLOCK_DIM,
             DIM=ctx.DIM,
-            BLOCK_SIZE_Q=16,
-            BLOCK_SIZE_KV=64,
-            num_stages=3,
-            num_warps=4,
         )
 
-        dQ = dQ.transpose(-2, -3).contiguous()
-        dK = dK.transpose(-2, -3).contiguous()
-        dV = dV.transpose(-2, -3).contiguous()
+        if not ctx.pre_transposed:
+            dQ = dQ.transpose(-2, -3).contiguous()
+            dK = dK.transpose(-2, -3).contiguous()
+            dV = dV.transpose(-2, -3).contiguous()
 
-        return dQ, dK, dV, None, d_pair_bias.to(dO.dtype)
+        return dQ, dK, dV, None, d_pair_bias.to(dO.dtype), None
 
 
 def fused_evo_attention(

@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import sys
 
 import torch
@@ -22,31 +21,35 @@ from benchmarks.utils import (
     bench_fwd_full,
     check_cuda,
     dry_run_shapes,
+    free_gpu,
     save_results,
     try_compile,
     try_import,
 )
 
-SHAPES = [
-    {"N": 256, "C": 64},
-    {"N": 256, "C": 128},
-    {"N": 256, "C": 384},
-    {"N": 512, "C": 64},
-    {"N": 512, "C": 128},
-    {"N": 512, "C": 384},
-    {"N": 1024, "C": 128},
-    {"N": 1024, "C": 384},
-    {"N": 2048, "C": 128},
-    {"N": 2048, "C": 384},
+# Realistic shapes: pair transitions use M=N² rows, single/diffusion use M=N rows.
+# C=64: MSA transition (M=S*N, S~16-32 — small, similar to single)
+# C=128: pair transition (M=N² — the big one)
+# C=384: single transition in PairFormer (M=N)
+SHAPES_PAIR = [
+    {"M": 384 * 384, "C": 128, "label": "pair N=384"},
+    {"M": 512 * 512, "C": 128, "label": "pair N=512"},
+    {"M": 640 * 640, "C": 128, "label": "pair N=640"},
+    {"M": 768 * 768, "C": 128, "label": "pair N=768"},
+]
+SHAPES_SINGLE = [
+    {"M": 384, "C": 384, "label": "single N=384"},
+    {"M": 768, "C": 384, "label": "single N=768"},
+    {"M": 512 * 16, "C": 64, "label": "MSA N=512 S=16"},
+    {"M": 384 * 32, "C": 64, "label": "MSA N=384 S=32"},
+]
+SHAPES_ADA = [
+    {"M": 384, "C": 384, "label": "diff N=384"},
+    {"M": 768, "C": 384, "label": "diff N=768"},
 ]
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
-
-
-def _free_gpu():
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def _bench_module(op_name, provider, shape, module, x, do, warmup, rep):
@@ -80,35 +83,45 @@ def bench_transition_block(shapes: list[dict], warmup: int, rep: int) -> list:
         "deepfold3.model.triton.fused_transition", "FusedTransitionBlock"
     )
 
-    results = []
-    for shape in shapes:
-        N, C = shape["N"], shape["C"]
-        _free_gpu()
+    all_shapes = SHAPES_PAIR + SHAPES_SINGLE
+    if len(shapes) == 1 and shapes[0].get("N", 0) <= 4:
+        all_shapes = [{"M": 16, "C": 128, "label": "dry"}]
 
-        x = torch.randn(N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        do = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    results = []
+    for shape in all_shapes:
+        M, C = shape["M"], shape["C"]
+        label = shape.get("label", f"M={M}")
+        free_gpu()
+
+        bench_shape = {"M": M, "C": C}
+        # Use label prefix as op name so pair/single/MSA get separate plot rows
+        kind = label.split()[0] if " " in label else "pair"
+        op_name = f"Transition ({kind})"
+
+        x = torch.randn(M, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        do = torch.randn(M, C, device=DEVICE, dtype=DTYPE)
 
         tb = TransitionBlock(C).to(DEVICE, DTYPE).eval()
-        results.extend(_bench_module("TransitionBlock", "pytorch", shape, tb, x, do, warmup, rep))
+        results.extend(_bench_module(op_name, "pytorch", bench_shape, tb, x, do, warmup, rep))
 
         # torch.compile
         tb_c = try_compile(TransitionBlock(C).to(DEVICE, DTYPE).eval())
         if tb_c is not None:
             x_c = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_module("TransitionBlock", "compile", shape, tb_c, x_c, do, warmup, rep))
+            results.extend(_bench_module(op_name, "compile", bench_shape, tb_c, x_c, do, warmup, rep))
             del tb_c, x_c
 
         if FusedTransitionBlock is not None:
             ft = FusedTransitionBlock(C).to(DEVICE, DTYPE).eval()
             ft.load_state_dict(tb.state_dict())
             x2 = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_module("TransitionBlock", "triton", shape, ft, x2, do, warmup, rep))
+            results.extend(_bench_module(op_name, "triton", bench_shape, ft, x2, do, warmup, rep))
             del ft, x2
         else:
-            print(f"  [skip] Triton FusedTransitionBlock not available (N={N}, C={C})")
+            print(f"  [skip] Triton FusedTransitionBlock not available ({label})")
 
         del tb, x, do
-        print(f"  TransitionBlock N={N} C={C} done")
+        print(f"  TransitionBlock {label} C={C} done")
 
     return results
 
@@ -120,24 +133,30 @@ def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> lis
         "deepfold3.model.triton.fused_ada_transition", "FusedAdaTransitionBlock"
     )
 
+    ada_shapes = SHAPES_ADA
+    if len(shapes) == 1 and shapes[0].get("N", 0) <= 4:
+        ada_shapes = [{"M": 16, "C": 64, "label": "dry"}]
+
     results = []
-    for shape in shapes:
-        N, C = shape["N"], shape["C"]
-        _free_gpu()
+    for shape in ada_shapes:
+        M, C = shape["M"], shape["C"]
+        label = shape.get("label", f"M={M}")
+        free_gpu()
 
         cond_dim = C
-        x = torch.randn(N, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        cond = torch.randn(N, cond_dim, device=DEVICE, dtype=DTYPE)
-        do = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+        bench_shape = {"M": M, "C": C}
+        x = torch.randn(M, C, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        cond = torch.randn(M, cond_dim, device=DEVICE, dtype=DTYPE)
+        do = torch.randn(M, C, device=DEVICE, dtype=DTYPE)
 
         atb = AdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
-        results.extend(_bench_ada_module("AdaTransitionBlock", "pytorch", shape, atb, x, cond, do, warmup, rep))
+        results.extend(_bench_ada_module("AdaTransitionBlock", "pytorch", bench_shape, atb, x, cond, do, warmup, rep))
 
         # torch.compile
         atb_c = try_compile(AdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval())
         if atb_c is not None:
             x_c = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_ada_module("AdaTransitionBlock", "compile", shape, atb_c, x_c, cond, do, warmup, rep))
+            results.extend(_bench_ada_module("AdaTransitionBlock", "compile", bench_shape, atb_c, x_c, cond, do, warmup, rep))
             del atb_c, x_c
 
         # Triton fused
@@ -145,13 +164,13 @@ def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> lis
             ft = FusedAdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
             ft.load_state_dict(atb.state_dict(), strict=False)
             x2 = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_ada_module("AdaTransitionBlock", "triton", shape, ft, x2, cond, do, warmup, rep))
+            results.extend(_bench_ada_module("AdaTransitionBlock", "triton", bench_shape, ft, x2, cond, do, warmup, rep))
             del ft, x2
         else:
-            print(f"  [skip] Triton FusedAdaTransitionBlock not available (N={N}, C={C})")
+            print(f"  [skip] Triton FusedAdaTransitionBlock not available ({label})")
 
         del atb, x, cond, do
-        print(f"  AdaTransitionBlock N={N} C={C} done")
+        print(f"  AdaTransitionBlock {label} C={C} done")
 
     return results
 
@@ -166,7 +185,8 @@ def main():
     if not check_cuda():
         sys.exit(1)
 
-    shapes = dry_run_shapes(SHAPES, args.dry_run)
+    # shapes is passed through so functions can detect dry-run mode
+    shapes = dry_run_shapes(SHAPES_PAIR, args.dry_run)
     warmup = 5 if args.dry_run else args.warmup
     rep = 5 if args.dry_run else args.rep
 

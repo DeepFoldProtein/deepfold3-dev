@@ -43,8 +43,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run all benchmarks")
     parser.add_argument("--dry-run", action="store_true", help="Smoke test with tiny shapes")
     parser.add_argument("--only", type=str, default=None, help="Comma-separated list of benchmarks to run")
-    parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--rep", type=int, default=200)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     parser.add_argument("--no-verify", action="store_true", help="Skip numerical verification")
     args = parser.parse_args()
@@ -84,8 +84,8 @@ def main():
     if not args.no_plot and passed > 0:
         print("\nGenerating plots...")
         subprocess.run([sys.executable, "-m", "benchmarks.plot_results"], cwd=Path(__file__).parent.parent)
-        print("\nGenerating recommended PDF report...")
-        subprocess.run([sys.executable, "-m", "benchmarks.plot_recommended"], cwd=Path(__file__).parent.parent)
+        print("\nGenerating optimization report...")
+        subprocess.run([sys.executable, "-m", "benchmarks.optimization_report"], cwd=Path(__file__).parent.parent)
 
     sys.exit(1 if failed > 0 else 0)
 

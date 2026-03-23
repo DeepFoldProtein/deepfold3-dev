@@ -1,1922 +1,962 @@
 [
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.04041599854826927,
-    "peak_memory_mb": 17.09765625,
+    "time_ms": 1.0158720016479492,
+    "peak_memory_mb": 649.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0026739572319131088,
-    "time_p25_ms": 0.039423998445272446,
-    "time_p75_ms": 0.04108799993991852,
+    "time_std_ms": 0.009869639572539498,
+    "time_p25_ms": 1.006432056427002,
+    "time_p75_ms": 1.0218559503555298,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.12489599734544754,
-    "peak_memory_mb": 18.162109375,
+    "time_ms": 3.361056089401245,
+    "peak_memory_mb": 1225.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.03314720971429192,
-    "time_p25_ms": 0.12364800274372101,
-    "time_p75_ms": 0.12726399302482605,
+    "time_std_ms": 0.0055415778754737645,
+    "time_p25_ms": 3.357856035232544,
+    "time_p75_ms": 3.3639678955078125,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.06464000046253204,
-    "peak_memory_mb": 17.224609375,
+    "time_ms": 0.7466239929199219,
+    "peak_memory_mb": 505.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0021180442174740712,
-    "time_p25_ms": 0.06387200206518173,
-    "time_p75_ms": 0.0655680000782013,
+    "time_std_ms": 0.005812840177480753,
+    "time_p25_ms": 0.7446720004081726,
+    "time_p75_ms": 0.7489280104637146,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.3574720025062561,
-    "peak_memory_mb": 18.0703125,
+    "time_ms": 2.267008066177368,
+    "peak_memory_mb": 937.25,
     "dtype": "bfloat16",
-    "time_std_ms": 0.3663076766483178,
-    "time_p25_ms": 0.22310400009155273,
-    "time_p75_ms": 0.4835200011730194,
+    "time_std_ms": 0.02668661334670098,
+    "time_p25_ms": 2.25216007232666,
+    "time_p75_ms": 2.2791359424591064,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.059647999703884125,
-    "peak_memory_mb": 17.2880859375,
+    "time_ms": 0.754144012928009,
+    "peak_memory_mb": 468.5625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0024533147686930682,
-    "time_p25_ms": 0.058848001062870026,
-    "time_p75_ms": 0.06102399900555611,
+    "time_std_ms": 0.002905708691911825,
+    "time_p25_ms": 0.7529919743537903,
+    "time_p75_ms": 0.7560960054397583,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 64
+      "M": 147456,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.1645440012216568,
-    "peak_memory_mb": 17.8837890625,
+    "time_ms": 2.0218560695648193,
+    "peak_memory_mb": 612.6875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.04118952336505745,
-    "time_p25_ms": 0.1626880019903183,
-    "time_p75_ms": 0.17059199512004852,
+    "time_std_ms": 0.007846596078218056,
+    "time_p25_ms": 2.0191359519958496,
+    "time_p75_ms": 2.027679920196533,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.039744000881910324,
-    "peak_memory_mb": 18.31640625,
+    "time_ms": 1.7775360345840454,
+    "peak_memory_mb": 1154.0,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0018634461275026624,
-    "time_p25_ms": 0.03951999917626381,
-    "time_p75_ms": 0.04041599854826927,
+    "time_std_ms": 0.0032270266861281036,
+    "time_p25_ms": 1.7756160497665405,
+    "time_p75_ms": 1.7791039943695068,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 0.1234240010380745,
-    "peak_memory_mb": 20.443359375,
+    "time_ms": 6.006783962249756,
+    "peak_memory_mb": 2178.0,
     "dtype": "bfloat16",
-    "time_std_ms": 0.03123980173427599,
-    "time_p25_ms": 0.1223360002040863,
-    "time_p75_ms": 0.1266240030527115,
+    "time_std_ms": 0.01119125249007751,
+    "time_p25_ms": 6.002048015594482,
+    "time_p75_ms": 6.011231899261475,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.06409599632024765,
-    "peak_memory_mb": 18.943359375,
+    "time_ms": 1.3395839929580688,
+    "peak_memory_mb": 898.0,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0020259107205172723,
-    "time_p25_ms": 0.06364800035953522,
-    "time_p75_ms": 0.06524799764156342,
+    "time_std_ms": 0.004736502579652738,
+    "time_p25_ms": 1.3352960348129272,
+    "time_p75_ms": 1.3423360586166382,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 0.1756799966096878,
-    "peak_memory_mb": 20.7578125,
+    "time_ms": 4.0166401863098145,
+    "peak_memory_mb": 1666.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.01562148957478467,
-    "time_p25_ms": 0.17395199835300446,
-    "time_p75_ms": 0.179967999458313,
+    "time_std_ms": 0.009745262464805117,
+    "time_p25_ms": 4.01254415512085,
+    "time_p75_ms": 4.023808002471924,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.05788800120353699,
-    "peak_memory_mb": 19.1943359375,
+    "time_ms": 1.3293119668960571,
+    "peak_memory_mb": 833.0,
     "dtype": "bfloat16",
-    "time_std_ms": 0.002449904932793374,
-    "time_p25_ms": 0.057472001761198044,
-    "time_p75_ms": 0.059167999774217606,
+    "time_std_ms": 0.002676970754066934,
+    "time_p25_ms": 1.327455997467041,
+    "time_p75_ms": 1.3305920362472534,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 262144,
       "C": 128
     },
     "mode": "full",
-    "time_ms": 0.16208000481128693,
-    "peak_memory_mb": 20.4462890625,
+    "time_ms": 4.104864120483398,
+    "peak_memory_mb": 1089.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.014292427574637596,
-    "time_p25_ms": 0.15996800363063812,
-    "time_p75_ms": 0.16476799547672272,
+    "time_std_ms": 0.0039494123939491236,
+    "time_p25_ms": 4.102848052978516,
+    "time_p75_ms": 4.108479976654053,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.041120000183582306,
-    "peak_memory_mb": 27.318359375,
+    "time_ms": 2.935839891433716,
+    "peak_memory_mb": 1803.75,
     "dtype": "bfloat16",
-    "time_std_ms": 0.002421976270256951,
-    "time_p25_ms": 0.040863998234272,
-    "time_p75_ms": 0.04297599941492081,
+    "time_std_ms": 0.011212134967823495,
+    "time_p25_ms": 2.931936025619507,
+    "time_p75_ms": 2.940095901489258,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.1257600039243698,
-    "peak_memory_mb": 34.6328125,
+    "time_ms": 9.438528060913086,
+    "peak_memory_mb": 3403.125,
     "dtype": "bfloat16",
-    "time_std_ms": 0.028399162875753597,
-    "time_p25_ms": 0.12390399724245071,
-    "time_p75_ms": 0.1311360001564026,
+    "time_std_ms": 0.006999784853732561,
+    "time_p25_ms": 9.43507194519043,
+    "time_p75_ms": 9.442336082458496,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.06412799656391144,
-    "peak_memory_mb": 34.072265625,
+    "time_ms": 2.2112319469451904,
+    "peak_memory_mb": 1403.75,
     "dtype": "bfloat16",
-    "time_std_ms": 0.002169043194803757,
-    "time_p25_ms": 0.06345599889755249,
-    "time_p75_ms": 0.06524799764156342,
+    "time_std_ms": 0.002744544530258595,
+    "time_p25_ms": 2.209376096725464,
+    "time_p75_ms": 2.2122559547424316,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.17708800733089447,
-    "peak_memory_mb": 41.76171875,
+    "time_ms": 6.388063907623291,
+    "peak_memory_mb": 2603.25,
     "dtype": "bfloat16",
-    "time_std_ms": 0.060978831449154315,
-    "time_p25_ms": 0.1746560037136078,
-    "time_p75_ms": 0.18617600202560425,
+    "time_std_ms": 0.029279471362623818,
+    "time_p25_ms": 6.3606719970703125,
+    "time_p75_ms": 6.401440143585205,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.05951999872922897,
-    "peak_memory_mb": 36.32421875,
+    "time_ms": 2.2007999420166016,
+    "peak_memory_mb": 1301.5625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.024229153236622513,
-    "time_p25_ms": 0.05817599967122078,
-    "time_p75_ms": 0.06111999973654747,
+    "time_std_ms": 0.014829045643830707,
+    "time_p25_ms": 2.198944091796875,
+    "time_p75_ms": 2.20249605178833,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 384
+      "M": 409600,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.16275200247764587,
-    "peak_memory_mb": 41.388671875,
+    "time_ms": 6.433248043060303,
+    "peak_memory_mb": 1701.6875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.031524892939681075,
-    "time_p25_ms": 0.16073599457740784,
-    "time_p75_ms": 0.16761599481105804,
+    "time_std_ms": 0.004138367505168357,
+    "time_p25_ms": 6.430047988891602,
+    "time_p75_ms": 6.435904026031494,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.03907199949026108,
-    "peak_memory_mb": 17.755859375,
+    "time_ms": 4.242591857910156,
+    "peak_memory_mb": 2596.5,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0017590814015761684,
-    "time_p25_ms": 0.038816001266241074,
-    "time_p75_ms": 0.03948799893260002,
+    "time_std_ms": 0.019004603438004197,
+    "time_p25_ms": 4.2259202003479,
+    "time_p75_ms": 4.25878381729126,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.12323199957609177,
-    "peak_memory_mb": 19.884765625,
+    "time_ms": 13.58944034576416,
+    "peak_memory_mb": 4900.5,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007985141271989042,
-    "time_p25_ms": 0.12220799922943115,
-    "time_p75_ms": 0.1247360035777092,
+    "time_std_ms": 0.032378160955398035,
+    "time_p25_ms": 13.582176208496094,
+    "time_p75_ms": 13.595647811889648,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.06966400146484375,
-    "peak_memory_mb": 17.8203125,
+    "time_ms": 3.191135883331299,
+    "peak_memory_mb": 2020.5,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0015831119533456992,
-    "time_p25_ms": 0.0689919963479042,
-    "time_p75_ms": 0.07043199986219406,
+    "time_std_ms": 0.004641200883975599,
+    "time_p25_ms": 3.18940806388855,
+    "time_p75_ms": 3.194080114364624,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "compile",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.18371200561523438,
-    "peak_memory_mb": 19.48046875,
+    "time_ms": 9.277888298034668,
+    "peak_memory_mb": 3748.625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.014009483376050362,
-    "time_p25_ms": 0.1817920058965683,
-    "time_p75_ms": 0.18771199882030487,
+    "time_std_ms": 0.047029622267546,
+    "time_p25_ms": 9.224479675292969,
+    "time_p75_ms": 9.29196834564209,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "fwd",
-    "time_ms": 0.058848001062870026,
-    "peak_memory_mb": 17.8837890625,
+    "time_ms": 3.1582400798797607,
+    "peak_memory_mb": 1874.25,
     "dtype": "bfloat16",
-    "time_std_ms": 0.002039698329130284,
-    "time_p25_ms": 0.058079998940229416,
-    "time_p75_ms": 0.05993599817156792,
+    "time_std_ms": 0.0033373082859061145,
+    "time_p25_ms": 3.155359983444214,
+    "time_p75_ms": 3.159359931945801,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (pair)",
     "provider": "triton",
     "shape": {
-      "N": 512,
-      "C": 64
+      "M": 589824,
+      "C": 128
     },
     "mode": "full",
-    "time_ms": 0.16313600540161133,
-    "peak_memory_mb": 19.0439453125,
+    "time_ms": 9.203712463378906,
+    "peak_memory_mb": 2450.75,
     "dtype": "bfloat16",
-    "time_std_ms": 0.034703738546427304,
-    "time_p25_ms": 0.16147199273109436,
-    "time_p75_ms": 0.1671680063009262,
+    "time_std_ms": 0.005518586868303012,
+    "time_p25_ms": 9.200032234191895,
+    "time_p75_ms": 9.20684814453125,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.041120000183582306,
-    "peak_memory_mb": 19.630859375,
+    "time_ms": 0.043776001781225204,
+    "peak_memory_mb": 5.0654296875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.019508306667793567,
-    "time_p25_ms": 0.040511999279260635,
-    "time_p75_ms": 0.04185599833726883,
+    "time_std_ms": 0.002613404449953581,
+    "time_p25_ms": 0.0427200011909008,
+    "time_p75_ms": 0.04483199864625931,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.1250240057706833,
-    "peak_memory_mb": 23.884765625,
+    "time_ms": 0.12883199751377106,
+    "peak_memory_mb": 9.8466796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.025858027000210563,
-    "time_p25_ms": 0.12422399967908859,
-    "time_p75_ms": 0.12668800354003906,
+    "time_std_ms": 0.018478824872503425,
+    "time_p25_ms": 0.12796799838542938,
+    "time_p75_ms": 0.13171200454235077,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "compile",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.06969600170850754,
-    "peak_memory_mb": 20.1328125,
+    "time_ms": 0.06732799857854843,
+    "peak_memory_mb": 3.9404296875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.00204793451907335,
-    "time_p25_ms": 0.06915199756622314,
-    "time_p75_ms": 0.07072000205516815,
+    "time_std_ms": 0.0022460712040065674,
+    "time_p25_ms": 0.06675200164318085,
+    "time_p75_ms": 0.0684799998998642,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "compile",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.1817599982023239,
-    "peak_memory_mb": 23.51171875,
+    "time_ms": 0.18108800053596497,
+    "peak_memory_mb": 10.7216796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.02778989660284973,
-    "time_p25_ms": 0.18041600286960602,
-    "time_p75_ms": 0.18367999792099,
+    "time_std_ms": 0.0025454311922602823,
+    "time_p25_ms": 0.1799360066652298,
+    "time_p75_ms": 0.18220800161361694,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "triton",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.060256000608205795,
-    "peak_memory_mb": 20.3837890625,
+    "time_ms": 0.06470400094985962,
+    "peak_memory_mb": 3.9404296875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0024055773060044816,
-    "time_p25_ms": 0.05967999994754791,
-    "time_p75_ms": 0.061664000153541565,
+    "time_std_ms": 0.003517405808069673,
+    "time_p25_ms": 0.06377600133419037,
+    "time_p75_ms": 0.06656000018119812,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "triton",
     "shape": {
-      "N": 512,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.16448000073432922,
-    "peak_memory_mb": 22.7626953125,
+    "time_ms": 0.16991999745368958,
+    "peak_memory_mb": 7.3466796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.043180186844909055,
-    "time_p25_ms": 0.1619199961423874,
-    "time_p75_ms": 0.16790400445461273,
+    "time_std_ms": 0.012619784144280529,
+    "time_p25_ms": 0.1677439957857132,
+    "time_p75_ms": 0.17129600048065186,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
+      "M": 768,
       "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.052000001072883606,
-    "peak_memory_mb": 32.0078125,
+    "time_ms": 0.05363199859857559,
+    "peak_memory_mb": 11.005859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.006338464990045169,
-    "time_p25_ms": 0.05177599936723709,
-    "time_p75_ms": 0.05315199866890907,
+    "time_std_ms": 0.0424341474357699,
+    "time_p25_ms": 0.05244800075888634,
+    "time_p75_ms": 0.07171200215816498,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "pytorch",
     "shape": {
-      "N": 512,
+      "M": 768,
       "C": 384
     },
     "mode": "full",
-    "time_ms": 0.1425279974937439,
-    "peak_memory_mb": 44.76171875,
+    "time_ms": 0.1534080058336258,
+    "peak_memory_mb": 19.130859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0031192740658830954,
-    "time_p25_ms": 0.14204800128936768,
-    "time_p75_ms": 0.14419199526309967,
+    "time_std_ms": 0.012040343224477407,
+    "time_p25_ms": 0.151296004652977,
+    "time_p75_ms": 0.15753600001335144,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "compile",
     "shape": {
-      "N": 512,
+      "M": 768,
       "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.06956800073385239,
-    "peak_memory_mb": 38.13671875,
+    "time_ms": 0.07065600156784058,
+    "peak_memory_mb": 7.880859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.001881771702614612,
-    "time_p25_ms": 0.06892800331115723,
-    "time_p75_ms": 0.07091200351715088,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.18569600582122803,
-    "peak_memory_mb": 50.140625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.04294847234559767,
-    "time_p25_ms": 0.1839359998703003,
-    "time_p75_ms": 0.18857599794864655,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.060864001512527466,
-    "peak_memory_mb": 40.638671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002432995539925337,
-    "time_p25_ms": 0.060416001826524734,
-    "time_p75_ms": 0.06319999694824219,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.16227200627326965,
-    "peak_memory_mb": 49.017578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002667502704464929,
-    "time_p25_ms": 0.16121600568294525,
-    "time_p75_ms": 0.1642560064792633,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.039455998688936234,
-    "peak_memory_mb": 22.259765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0016816991537765196,
-    "time_p25_ms": 0.03920000046491623,
-    "time_p75_ms": 0.040192000567913055,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.12326399981975555,
-    "peak_memory_mb": 30.767578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02001248725408982,
-    "time_p25_ms": 0.12195199728012085,
-    "time_p75_ms": 0.12534399330615997,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.06998399645090103,
-    "peak_memory_mb": 22.51171875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.001878328584099534,
-    "time_p25_ms": 0.06937599927186966,
-    "time_p75_ms": 0.07116799801588058,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.17961600422859192,
-    "peak_memory_mb": 29.14453125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002632306043127591,
-    "time_p25_ms": 0.17849600315093994,
-    "time_p75_ms": 0.1815039962530136,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.05939200147986412,
-    "peak_memory_mb": 22.7626953125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0021226032102818516,
-    "time_p25_ms": 0.058848001062870026,
-    "time_p75_ms": 0.06035200133919716,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.15887999534606934,
-    "peak_memory_mb": 27.3955078125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0027108211179900205,
-    "time_p25_ms": 0.15769599378108978,
-    "time_p75_ms": 0.160863995552063,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.060256000608205795,
-    "peak_memory_mb": 39.13671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0021371440486208193,
-    "time_p25_ms": 0.06006399914622307,
-    "time_p75_ms": 0.06124800071120262,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.19891199469566345,
-    "peak_memory_mb": 64.64453125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002687585282627718,
-    "time_p25_ms": 0.19833600521087646,
-    "time_p75_ms": 0.19993600249290466,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.07983999699354172,
-    "peak_memory_mb": 45.265625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0021383462783459094,
-    "time_p25_ms": 0.07875200361013412,
-    "time_p75_ms": 0.08079999685287476,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.23228800296783447,
-    "peak_memory_mb": 67.5234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0030361246844653913,
-    "time_p25_ms": 0.23084799945354462,
-    "time_p75_ms": 0.2343360036611557,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.06947200000286102,
-    "peak_memory_mb": 47.517578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.016662163358951546,
-    "time_p25_ms": 0.06860800087451935,
+    "time_std_ms": 0.00197783200114726,
+    "time_p25_ms": 0.07017599791288376,
     "time_p75_ms": 0.07132799923419952,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.24079999327659607,
-    "peak_memory_mb": 62.150390625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.05062971284423193,
-    "time_p25_ms": 0.23600000143051147,
-    "time_p75_ms": 0.24352000653743744,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.03964800015091896,
-    "peak_memory_mb": 27.517578125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002180349963958764,
-    "time_p25_ms": 0.03916800022125244,
-    "time_p75_ms": 0.040511999279260635,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.12566399574279785,
-    "peak_memory_mb": 44.533203125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0022038847451112415,
-    "time_p25_ms": 0.12479999661445618,
-    "time_p75_ms": 0.1271360069513321,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "compile",
     "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.06972800195217133,
-    "peak_memory_mb": 27.26953125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002186432899926423,
-    "time_p25_ms": 0.06915199756622314,
-    "time_p75_ms": 0.07129599899053574,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 128
+      "M": 768,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.18380799889564514,
-    "peak_memory_mb": 40.41015625,
+    "time_ms": 0.19574399292469025,
+    "peak_memory_mb": 16.318359375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0028251215804153576,
-    "time_p25_ms": 0.18278400599956512,
-    "time_p75_ms": 0.1852799952030182,
+    "time_std_ms": 0.002736058679331866,
+    "time_p25_ms": 0.19446399807929993,
+    "time_p75_ms": 0.19753600656986237,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "triton",
     "shape": {
-      "N": 2048,
-      "C": 128
+      "M": 768,
+      "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.058880001306533813,
-    "peak_memory_mb": 27.5205078125,
+    "time_ms": 0.06844799965620041,
+    "peak_memory_mb": 7.880859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0020393440598620617,
-    "time_p25_ms": 0.05830400064587593,
-    "time_p75_ms": 0.060127999633550644,
+    "time_std_ms": 0.0030544495724988386,
+    "time_p25_ms": 0.06739199906587601,
+    "time_p75_ms": 0.070592001080513,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (single)",
     "provider": "triton",
     "shape": {
-      "N": 2048,
-      "C": 128
+      "M": 768,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.16448000073432922,
-    "peak_memory_mb": 36.6611328125,
+    "time_ms": 0.17388799786567688,
+    "peak_memory_mb": 11.255859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.006331185426830892,
-    "time_p25_ms": 0.16313600540161133,
-    "time_p75_ms": 0.1669120043516159,
+    "time_std_ms": 0.06408420200232273,
+    "time_p25_ms": 0.16979199647903442,
+    "time_p75_ms": 0.18777599930763245,
     "extra": {}
   },
   {
-    "op_name": "TransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "pytorch",
     "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.09087999910116196,
-    "peak_memory_mb": 56.26953125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0019067989523310644,
-    "time_p25_ms": 0.09065599739551544,
-    "time_p75_ms": 0.09241600334644318,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.28252801299095154,
-    "peak_memory_mb": 107.78515625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002266780279885269,
-    "time_p25_ms": 0.2823359966278076,
-    "time_p75_ms": 0.2834239900112152,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.10646399855613708,
-    "peak_memory_mb": 60.7734375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.011401758566003143,
-    "time_p25_ms": 0.1053759977221489,
-    "time_p75_ms": 0.1082879975438118,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.289792001247406,
-    "peak_memory_mb": 100.9140625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.029272780977670335,
-    "time_p25_ms": 0.28889599442481995,
-    "time_p75_ms": 0.2916159927845001,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.08726400136947632,
-    "peak_memory_mb": 63.400390625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.011394179392808727,
-    "time_p25_ms": 0.08649600297212601,
-    "time_p75_ms": 0.08816000074148178,
-    "extra": {}
-  },
-  {
-    "op_name": "TransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.2181439995765686,
-    "peak_memory_mb": 92.041015625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02196494189319642,
-    "time_p25_ms": 0.217056006193161,
-    "time_p75_ms": 0.22086399793624878,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "fwd",
-    "time_ms": 0.08825600147247314,
-    "peak_memory_mb": 18.0517578125,
+    "time_ms": 0.04387199878692627,
+    "peak_memory_mb": 18.0625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0023815545702428613,
-    "time_p25_ms": 0.08771199733018875,
-    "time_p75_ms": 0.08979199826717377,
+    "time_std_ms": 0.0031976846516854123,
+    "time_p25_ms": 0.043007999658584595,
+    "time_p75_ms": 0.044576000422239304,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "full",
-    "time_ms": 0.258976012468338,
-    "peak_memory_mb": 18.7724609375,
+    "time_ms": 0.15065599977970123,
+    "peak_memory_mb": 34.0625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.011547765794032635,
-    "time_p25_ms": 0.25785601139068604,
-    "time_p75_ms": 0.2619200050830841,
+    "time_std_ms": 0.03241318545838926,
+    "time_p25_ms": 0.14921599626541138,
+    "time_p75_ms": 0.15321600437164307,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "fwd",
-    "time_ms": 0.1072319969534874,
-    "peak_memory_mb": 18.103515625,
+    "time_ms": 0.07001599669456482,
+    "peak_memory_mb": 14.0625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0025888790965324943,
-    "time_p25_ms": 0.10611200332641602,
-    "time_p75_ms": 0.1098560020327568,
+    "time_std_ms": 0.0026879865327635658,
+    "time_p25_ms": 0.0692799985408783,
+    "time_p75_ms": 0.07116799801588058,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "full",
-    "time_ms": 0.2804799973964691,
-    "peak_memory_mb": 18.69384765625,
+    "time_ms": 0.1839040070772171,
+    "peak_memory_mb": 26.09375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.007057570944147712,
-    "time_p25_ms": 0.2787199914455414,
-    "time_p75_ms": 0.28460800647735596,
+    "time_std_ms": 0.0036145109601714047,
+    "time_p25_ms": 0.18192000687122345,
+    "time_p75_ms": 0.18639999628067017,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "fwd",
-    "time_ms": 0.11907199770212173,
-    "peak_memory_mb": 18.2265625,
+    "time_ms": 0.06275200098752975,
+    "peak_memory_mb": 14.0625,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0034135302447323287,
-    "time_p25_ms": 0.11795199662446976,
-    "time_p75_ms": 0.12083200365304947,
+    "time_std_ms": 0.0032709429836642327,
+    "time_p25_ms": 0.061792001128196716,
+    "time_p75_ms": 0.06374400109052658,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 8192,
       "C": 64
     },
     "mode": "full",
-    "time_ms": 0.31385600566864014,
-    "peak_memory_mb": 18.759765625,
+    "time_ms": 0.18627199530601501,
+    "peak_memory_mb": 18.09375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.03583226594810537,
-    "time_p25_ms": 0.3118720054626465,
-    "time_p75_ms": 0.3171840012073517,
+    "time_std_ms": 0.00971717890656575,
+    "time_p25_ms": 0.18425600230693817,
+    "time_p75_ms": 0.18851199746131897,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 12288,
+      "C": 64
     },
     "mode": "fwd",
-    "time_ms": 0.09328000247478485,
-    "peak_memory_mb": 19.1298828125,
+    "time_ms": 0.05011200159788132,
+    "peak_memory_mb": 27.09375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.008870933038659483,
-    "time_p25_ms": 0.0902400016784668,
-    "time_p75_ms": 0.09382399916648865,
+    "time_std_ms": 0.001421662270399987,
+    "time_p25_ms": 0.0498879998922348,
+    "time_p75_ms": 0.05087999999523163,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 12288,
+      "C": 64
     },
     "mode": "full",
-    "time_ms": 0.2568640112876892,
-    "peak_memory_mb": 20.5693359375,
+    "time_ms": 0.18592000007629395,
+    "peak_memory_mb": 51.59375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0035985060049682615,
-    "time_p25_ms": 0.2556479871273041,
-    "time_p75_ms": 0.25916799902915955,
+    "time_std_ms": 0.003453392830206936,
+    "time_p25_ms": 0.18384000658988953,
+    "time_p75_ms": 0.18876799941062927,
     "extra": {}
   },
   {
-    "op_name": "AdaTransitionBlock",
+    "op_name": "Transition (MSA)",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 12288,
+      "C": 64
     },
     "mode": "fwd",
-    "time_ms": 0.1066880002617836,
-    "peak_memory_mb": 19.509765625,
+    "time_ms": 0.07017599791288376,
+    "peak_memory_mb": 21.09375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0022982493305525936,
-    "time_p25_ms": 0.1058880016207695,
-    "time_p75_ms": 0.10780800133943558,
+    "time_std_ms": 0.007500323045224531,
+    "time_p25_ms": 0.06947200000286102,
+    "time_p75_ms": 0.07267200201749802,
+    "extra": {}
+  },
+  {
+    "op_name": "Transition (MSA)",
+    "provider": "compile",
+    "shape": {
+      "M": 12288,
+      "C": 64
+    },
+    "mode": "full",
+    "time_ms": 0.2008959949016571,
+    "peak_memory_mb": 39.625,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0034397930637077036,
+    "time_p25_ms": 0.19888000190258026,
+    "time_p75_ms": 0.20281599462032318,
+    "extra": {}
+  },
+  {
+    "op_name": "Transition (MSA)",
+    "provider": "triton",
+    "shape": {
+      "M": 12288,
+      "C": 64
+    },
+    "mode": "fwd",
+    "time_ms": 0.06252799928188324,
+    "peak_memory_mb": 21.09375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.002727288457040482,
+    "time_p25_ms": 0.061344001442193985,
+    "time_p75_ms": 0.06537599861621857,
+    "extra": {}
+  },
+  {
+    "op_name": "Transition (MSA)",
+    "provider": "triton",
+    "shape": {
+      "M": 12288,
+      "C": 64
+    },
+    "mode": "full",
+    "time_ms": 0.21007999777793884,
+    "peak_memory_mb": 27.125,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0021293820444992133,
+    "time_p25_ms": 0.2088319957256317,
+    "time_p75_ms": 0.2115200012922287,
+    "extra": {}
+  },
+  {
+    "op_name": "AdaTransitionBlock",
+    "provider": "pytorch",
+    "shape": {
+      "M": 384,
+      "C": 384
+    },
+    "mode": "fwd",
+    "time_ms": 0.09292799979448318,
+    "peak_memory_mb": 4.7841796875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0044694559002731015,
+    "time_p25_ms": 0.09222400188446045,
+    "time_p75_ms": 0.09408000111579895,
+    "extra": {}
+  },
+  {
+    "op_name": "AdaTransitionBlock",
+    "provider": "pytorch",
+    "shape": {
+      "M": 384,
+      "C": 384
+    },
+    "mode": "full",
+    "time_ms": 0.25910401344299316,
+    "peak_memory_mb": 7.4091796875,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.004532001797041279,
+    "time_p25_ms": 0.25731199979782104,
+    "time_p75_ms": 0.26182401180267334,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "compile",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 384,
+      "C": 384
+    },
+    "mode": "fwd",
+    "time_ms": 0.10768000036478043,
+    "peak_memory_mb": 3.380859375,
+    "dtype": "bfloat16",
+    "time_std_ms": 0.0042185864773441805,
+    "time_p25_ms": 0.10662399977445602,
+    "time_p75_ms": 0.10870400071144104,
+    "extra": {}
+  },
+  {
+    "op_name": "AdaTransitionBlock",
+    "provider": "compile",
+    "shape": {
+      "M": 384,
+      "C": 384
     },
     "mode": "full",
     "time_ms": 0.28038400411605835,
-    "peak_memory_mb": 20.79638671875,
+    "peak_memory_mb": 7.41748046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.004393026226805994,
-    "time_p25_ms": 0.27827200293540955,
-    "time_p75_ms": 0.28249600529670715,
+    "time_std_ms": 0.004295021335379702,
+    "time_p25_ms": 0.2784320116043091,
+    "time_p75_ms": 0.2824000120162964,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.12095999717712402,
-    "peak_memory_mb": 19.8203125,
+    "time_ms": 0.1271039992570877,
+    "peak_memory_mb": 4.2216796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.03202355799660554,
-    "time_p25_ms": 0.11977600306272507,
-    "time_p75_ms": 0.12307199835777283,
+    "time_std_ms": 0.035825011551821384,
+    "time_p25_ms": 0.1255359947681427,
+    "time_p75_ms": 0.13100799918174744,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "triton",
     "shape": {
-      "N": 256,
-      "C": 128
+      "M": 384,
+      "C": 384
     },
     "mode": "full",
-    "time_ms": 0.3174079954624176,
-    "peak_memory_mb": 20.884765625,
+    "time_ms": 0.325408011674881,
+    "peak_memory_mb": 5.3466796875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.0027897843346182264,
-    "time_p25_ms": 0.3155840039253235,
-    "time_p75_ms": 0.3192639946937561,
+    "time_std_ms": 0.01016567894198401,
+    "time_p25_ms": 0.32307198643684387,
+    "time_p75_ms": 0.3290559947490692,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.09299200028181076,
-    "peak_memory_mb": 26.2578125,
+    "time_ms": 0.09379199892282486,
+    "peak_memory_mb": 9.943359375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.04147545780683808,
-    "time_p25_ms": 0.09219200164079666,
-    "time_p75_ms": 0.09471999853849411,
+    "time_std_ms": 0.017006237984938957,
+    "time_p25_ms": 0.09177599847316742,
+    "time_p75_ms": 0.09516800194978714,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "pytorch",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "full",
-    "time_ms": 0.26211199164390564,
-    "peak_memory_mb": 31.509765625,
+    "time_ms": 0.28278398513793945,
+    "peak_memory_mb": 13.505859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.06156351539160547,
-    "time_p25_ms": 0.2559039890766144,
-    "time_p75_ms": 0.331712007522583,
+    "time_std_ms": 0.00257623678392333,
+    "time_p25_ms": 0.2808319926261902,
+    "time_p75_ms": 0.2847999930381775,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.1069440022110939,
-    "peak_memory_mb": 31.140625,
+    "time_ms": 0.11372800171375275,
+    "peak_memory_mb": 7.13671875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.003926389594695495,
-    "time_p25_ms": 0.10540799796581268,
-    "time_p75_ms": 0.10931199789047241,
+    "time_std_ms": 0.0032753783401962234,
+    "time_p25_ms": 0.1128000020980835,
+    "time_p75_ms": 0.1167680025100708,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "compile",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "full",
-    "time_ms": 0.282943993806839,
-    "peak_memory_mb": 36.3984375,
+    "time_ms": 0.29440000653266907,
+    "peak_memory_mb": 11.5498046875,
     "dtype": "bfloat16",
-    "time_std_ms": 0.04790045559623385,
-    "time_p25_ms": 0.28035199642181396,
-    "time_p75_ms": 0.28726398944854736,
+    "time_std_ms": 0.004689774489522269,
+    "time_p25_ms": 0.2919999957084656,
+    "time_p75_ms": 0.2983039915561676,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "fwd",
-    "time_ms": 0.12028799951076508,
-    "peak_memory_mb": 32.826171875,
+    "time_ms": 0.12800000607967377,
+    "peak_memory_mb": 8.818359375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.003035843828090019,
-    "time_p25_ms": 0.1191679984331131,
-    "time_p75_ms": 0.12227199971675873,
+    "time_std_ms": 0.00437756366452474,
+    "time_p25_ms": 0.125791996717453,
+    "time_p75_ms": 0.1311360001564026,
     "extra": {}
   },
   {
     "op_name": "AdaTransitionBlock",
     "provider": "triton",
     "shape": {
-      "N": 256,
+      "M": 768,
       "C": 384
     },
     "mode": "full",
-    "time_ms": 0.3144960105419159,
-    "peak_memory_mb": 36.578125,
+    "time_ms": 0.33049601316452026,
+    "peak_memory_mb": 10.130859375,
     "dtype": "bfloat16",
-    "time_std_ms": 0.003875805869944659,
-    "time_p25_ms": 0.31248000264167786,
-    "time_p75_ms": 0.3176319897174835,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "fwd",
-    "time_ms": 0.08780799806118011,
-    "peak_memory_mb": 18.7099609375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002456063928516174,
-    "time_p25_ms": 0.08748800307512283,
-    "time_p75_ms": 0.08854400366544724,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "full",
-    "time_ms": 0.2581759989261627,
-    "peak_memory_mb": 20.1513671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0036449681420158537,
-    "time_p25_ms": 0.2566719949245453,
-    "time_p75_ms": 0.2604160010814667,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "fwd",
-    "time_ms": 0.11523199826478958,
-    "peak_memory_mb": 18.669921875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0028387711492876117,
-    "time_p25_ms": 0.11423999816179276,
-    "time_p75_ms": 0.11686400324106216,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "full",
-    "time_ms": 0.290912002325058,
-    "peak_memory_mb": 19.82666015625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0035597301220682393,
-    "time_p25_ms": 0.2892799973487854,
-    "time_p75_ms": 0.293503999710083,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "fwd",
-    "time_ms": 0.1202239990234375,
-    "peak_memory_mb": 18.884765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002531329343973007,
-    "time_p25_ms": 0.1191679984331131,
-    "time_p75_ms": 0.12150400131940842,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 64
-    },
-    "mode": "full",
-    "time_ms": 0.31436800956726074,
-    "peak_memory_mb": 19.951171875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003085637516270308,
-    "time_p25_ms": 0.3124159872531891,
-    "time_p75_ms": 0.31561601161956787,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.09382399916648865,
-    "peak_memory_mb": 20.4443359375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.006364920719164756,
-    "time_p25_ms": 0.08300799876451492,
-    "time_p75_ms": 0.09481599926948547,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.2568320035934448,
-    "peak_memory_mb": 23.3232421875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003822138483360703,
-    "time_p25_ms": 0.2550719976425171,
-    "time_p75_ms": 0.2592320144176483,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.11497599631547928,
-    "peak_memory_mb": 20.638671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0022139108540842243,
-    "time_p25_ms": 0.11417599767446518,
-    "time_p75_ms": 0.11609599739313126,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.2897599935531616,
-    "peak_memory_mb": 22.99072265625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.004025246365773539,
-    "time_p25_ms": 0.2873919904232025,
-    "time_p75_ms": 0.29334399104118347,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.11964800208806992,
-    "peak_memory_mb": 21.134765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0031300094258210447,
-    "time_p25_ms": 0.11856000125408173,
-    "time_p75_ms": 0.1212799996137619,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.31200000643730164,
-    "peak_memory_mb": 23.263671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003135662050019372,
-    "time_p25_ms": 0.3108159899711609,
-    "time_p75_ms": 0.31459200382232666,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.08870399743318558,
-    "peak_memory_mb": 30.197265625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0092960241955329,
-    "time_p25_ms": 0.08799999952316284,
-    "time_p75_ms": 0.09055999666452408,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.26105600595474243,
-    "peak_memory_mb": 38.826171875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.00297487552974826,
-    "time_p25_ms": 0.25968000292778015,
-    "time_p75_ms": 0.2640959918498993,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.11417599767446518,
-    "peak_memory_mb": 34.51953125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0036986999725070486,
-    "time_p25_ms": 0.11337599903345108,
-    "time_p75_ms": 0.11635199934244156,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.2932479977607727,
-    "peak_memory_mb": 43.0654296875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.004378400234980483,
-    "time_p25_ms": 0.29104000329971313,
-    "time_p75_ms": 0.2951039969921112,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.12089599668979645,
-    "peak_memory_mb": 36.765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.05433671384806079,
-    "time_p25_ms": 0.11903999745845795,
-    "time_p75_ms": 0.12364800274372101,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 512,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.3169279992580414,
-    "peak_memory_mb": 43.33203125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003947239552145261,
-    "time_p25_ms": 0.3149760067462921,
-    "time_p75_ms": 0.3198080062866211,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.08265600353479385,
-    "peak_memory_mb": 23.0732421875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0036137093527400066,
-    "time_p25_ms": 0.08198399841785431,
-    "time_p75_ms": 0.08495999872684479,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.26953598856925964,
-    "peak_memory_mb": 28.86328125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003625286520175326,
-    "time_p25_ms": 0.2680000066757202,
-    "time_p75_ms": 0.27209600806236267,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.1143679991364479,
-    "peak_memory_mb": 22.896484375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02981243977768919,
-    "time_p25_ms": 0.11350400000810623,
-    "time_p75_ms": 0.1159679964184761,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.298911988735199,
-    "peak_memory_mb": 27.50634765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0030071227833906172,
-    "time_p25_ms": 0.2971839904785156,
-    "time_p75_ms": 0.3011839985847473,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.11984000355005264,
-    "peak_memory_mb": 23.763671875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0025958994885126336,
-    "time_p25_ms": 0.11875200271606445,
-    "time_p75_ms": 0.12099199742078781,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.3301439881324768,
-    "peak_memory_mb": 28.8037109375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.01806687899866516,
-    "time_p25_ms": 0.3266560137271881,
-    "time_p75_ms": 0.33347201347351074,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.08912000060081482,
-    "peak_memory_mb": 38.076171875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002109867926028735,
-    "time_p25_ms": 0.08822400122880936,
-    "time_p75_ms": 0.09008000046014786,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.290367990732193,
-    "peak_memory_mb": 55.61669921875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003279151651753019,
-    "time_p25_ms": 0.2892799973487854,
-    "time_p75_ms": 0.29228800535202026,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.1159679964184761,
-    "peak_memory_mb": 41.65234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0025119961000601688,
-    "time_p25_ms": 0.11503999680280685,
-    "time_p75_ms": 0.11798399686813354,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.31065601110458374,
-    "peak_memory_mb": 56.7626953125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003514870828878078,
-    "time_p25_ms": 0.30902400612831116,
-    "time_p75_ms": 0.3128640055656433,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.12086399644613266,
-    "peak_memory_mb": 44.64453125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0033553170741123096,
-    "time_p25_ms": 0.11913599818944931,
-    "time_p75_ms": 0.1226240023970604,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 1024,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.3280960023403168,
-    "peak_memory_mb": 59.93505859375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.05991024223200482,
-    "time_p25_ms": 0.3248319923877716,
-    "time_p75_ms": 0.34281599521636963,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.08937600255012512,
-    "peak_memory_mb": 28.3310546875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.035324212570495034,
-    "time_p25_ms": 0.088639996945858,
-    "time_p75_ms": 0.09151999652385712,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.27084800601005554,
-    "peak_memory_mb": 39.87890625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0029012280374565535,
-    "time_p25_ms": 0.27001601457595825,
-    "time_p75_ms": 0.2728959918022156,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.11500799655914307,
-    "peak_memory_mb": 27.412109375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002299115844800384,
-    "time_p25_ms": 0.1143679991364479,
-    "time_p75_ms": 0.11699199676513672,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.3004480004310608,
-    "peak_memory_mb": 36.53759765625,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.02918224687990185,
-    "time_p25_ms": 0.29900801181793213,
-    "time_p75_ms": 0.3038080036640167,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "fwd",
-    "time_ms": 0.12140800058841705,
-    "peak_memory_mb": 29.021484375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.009907436325458558,
-    "time_p25_ms": 0.11977600306272507,
-    "time_p75_ms": 0.12479999661445618,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 128
-    },
-    "mode": "full",
-    "time_ms": 0.3341439962387085,
-    "peak_memory_mb": 39.0693359375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.07734179456797283,
-    "time_p25_ms": 0.33052799105644226,
-    "time_p75_ms": 0.3412800133228302,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.10713600367307663,
-    "peak_memory_mb": 55.458984375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.01130687693432186,
-    "time_p25_ms": 0.1061440035700798,
-    "time_p75_ms": 0.1111999973654747,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "pytorch",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.30851200222969055,
-    "peak_memory_mb": 91.63232421875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.003909266194901887,
-    "time_p25_ms": 0.306304007768631,
-    "time_p75_ms": 0.31139200925827026,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.12185599654912949,
-    "peak_memory_mb": 56.79296875,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.002719594190734421,
-    "time_p25_ms": 0.12140800058841705,
-    "time_p75_ms": 0.12432000041007996,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "compile",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.3407360017299652,
-    "peak_memory_mb": 84.6689453125,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.004850735839151403,
-    "time_p25_ms": 0.3387199938297272,
-    "time_p75_ms": 0.3436479866504669,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "fwd",
-    "time_ms": 0.12444800138473511,
-    "peak_memory_mb": 63.65234375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0029925743906235973,
-    "time_p25_ms": 0.1234240010380745,
-    "time_p75_ms": 0.12716799974441528,
-    "extra": {}
-  },
-  {
-    "op_name": "AdaTransitionBlock",
-    "provider": "triton",
-    "shape": {
-      "N": 2048,
-      "C": 384
-    },
-    "mode": "full",
-    "time_ms": 0.33961600065231323,
-    "peak_memory_mb": 94.45068359375,
-    "dtype": "bfloat16",
-    "time_std_ms": 0.0063355926113619005,
-    "time_p25_ms": 0.33670398592948914,
-    "time_p75_ms": 0.3434560000896454,
+    "time_std_ms": 0.01031445141400544,
+    "time_p25_ms": 0.3275200128555298,
+    "time_p75_ms": 0.3346880078315735,
     "extra": {}
   }
 ]

@@ -141,37 +141,45 @@ def verify_evo_attention(verbose: bool = False) -> bool:
         return True
 
     B, N_seq, N_res, H, D = 1, 1, 64, 4, 32
-    q = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
-    k = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
-    v = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    q_data = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE)
+    k_data = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE)
+    v_data = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE)
     res_mask = torch.ones(B, N_seq, 1, 1, N_res, device=DEVICE, dtype=torch.bool)
-    pair_bias = torch.randn(B, 1, H, N_res, N_res, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    pb_data = torch.randn(B, 1, H, N_res, N_res, device=DEVICE, dtype=torch.float32)
+    do = torch.randn(B, N_seq, N_res, H, D, device=DEVICE, dtype=DTYPE)
 
-    # Triton kernel (5D layout directly)
-    o_triton = _EvoformerAttention.apply(q, k, v, res_mask, pair_bias)
+    # --- PyTorch reference (manual attention) ---
+    q1 = q_data.clone().requires_grad_(True)
+    k1 = k_data.clone().requires_grad_(True)
+    v1 = v_data.clone().requires_grad_(True)
+    pb1 = pb_data.clone().requires_grad_(True)
 
-    # PyTorch reference (manual attention)
     scale = D**-0.5
-    q_ref = q.transpose(-2, -3).contiguous()  # [B, N_seq, H, N_res, D]
-    k_ref = k.transpose(-2, -3).contiguous()
-    v_ref = v.transpose(-2, -3).contiguous()
-    logits = torch.matmul(q_ref * scale, k_ref.transpose(-2, -1))  # [B, N_seq, H, N_res, N_res]
-    logits = logits + pair_bias
-    mask_bias = torch.where(res_mask.squeeze(-2).squeeze(-2).unsqueeze(2), 0.0, -1e9)  # [B, N_seq, 1, N_res]
+    q_r = q1.transpose(-2, -3).contiguous()
+    k_r = k1.transpose(-2, -3).contiguous()
+    v_r = v1.transpose(-2, -3).contiguous()
+    logits = torch.matmul(q_r * scale, k_r.transpose(-2, -1))
+    logits = logits + pb1
+    mask_bias = torch.where(res_mask.squeeze(-2).squeeze(-2).unsqueeze(2), 0.0, -1e9)
     logits = logits + mask_bias.unsqueeze(-2)
     w = torch.softmax(logits.float(), dim=-1).to(DTYPE)
-    o_ref = torch.matmul(w, v_ref)  # [B, N_seq, H, N_res, D]
-    o_ref = o_ref.transpose(-2, -3).contiguous()  # [B, N_seq, N_res, H, D]
+    o_ref = torch.matmul(w, v_r).transpose(-2, -3).contiguous()
+    o_ref.backward(do)
 
-    ok = _allclose(o_triton, o_ref, "EvoAttention fwd", verbose)
+    # --- Triton kernel ---
+    q2 = q_data.clone().requires_grad_(True)
+    k2 = k_data.clone().requires_grad_(True)
+    v2 = v_data.clone().requires_grad_(True)
+    pb2 = pb_data.clone().requires_grad_(True)
 
-    # Check backward runs
-    do = torch.randn_like(o_triton)
-    o_triton.backward(do, retain_graph=True)
-    ok &= q.grad is not None
-    if verbose:
-        print(f"    {'PASS' if q.grad is not None else 'FAIL'}: EvoAttention backward produces gradients")
+    o_triton = _EvoformerAttention.apply(q2, k2, v2, res_mask, pb2)
+    o_triton.backward(do)
 
+    ok = _allclose(o_ref, o_triton, "EvoAttention fwd", verbose)
+    ok &= _allclose(q1.grad, q2.grad, "EvoAttention grad_q", verbose)
+    ok &= _allclose(k1.grad, k2.grad, "EvoAttention grad_k", verbose)
+    ok &= _allclose(v1.grad, v2.grad, "EvoAttention grad_v", verbose)
+    ok &= _allclose(pb1.grad, pb2.grad, "EvoAttention grad_bias", verbose)
     return ok
 
 
@@ -406,27 +414,31 @@ def verify_triangle_mul_gate(verbose: bool = False) -> bool:
 
 
 def verify_triangle_mul_e2e(verbose: bool = False) -> bool:
-    """Verify full TriangleMul (outgoing) with fused gate matches baseline at inference scale."""
+    """Verify full TriangleMul (outgoing) with fused gate matches baseline (fwd+bwd)."""
     from deepfold3.model.config import OptimConfig
     from deepfold3.model.ops import TriangleMulOutgoing
 
-    N, C = 256, 128  # larger scale to stress-test
+    N, C = 128, 128
     z = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
     mask = torch.ones(1, N, N, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(1, N, N, C, device=DEVICE, dtype=DTYPE)
 
     # Baseline (no fused)
     base = TriangleMulOutgoing(C, optim=OptimConfig()).to(DEVICE, DTYPE)
-    with torch.inference_mode():
-        out_base = base(z, mask)
+    z1 = z.clone().requires_grad_(True)
+    out_base = base(z1, mask)
+    out_base.backward(do)
 
-    # Fused gate only (no torch.compile)
+    # Fused gate (no torch.compile)
     fused = TriangleMulOutgoing(C, optim=OptimConfig(use_fused_triangle_mul=True)).to(DEVICE, DTYPE)
     with torch.no_grad():
         fused.load_state_dict(base.state_dict(), strict=False)
-    with torch.inference_mode():
-        out_fused = fused(z, mask)
+    z2 = z.clone().requires_grad_(True)
+    out_fused = fused(z2, mask)
+    out_fused.backward(do)
 
-    ok = _allclose(out_base, out_fused, "TriMulOutgoing e2e fused vs baseline", verbose)
+    ok = _allclose(out_base, out_fused, "TriMulOutgoing e2e fwd", verbose)
+    ok &= _allclose(z1.grad, z2.grad, "TriMulOutgoing e2e grad", verbose)
     return ok
 
 
@@ -460,6 +472,8 @@ def verify_layernorm_transpose(verbose: bool = False) -> bool:
 
     ok = _allclose(o1, o2, "LNTranspose fwd", verbose)
     ok &= _allclose(x1.grad, x2.grad, "LNTranspose grad_x", verbose)
+    ok &= _allclose(ln.weight.grad, fused.weight.grad, "LNTranspose grad_w", verbose)
+    ok &= _allclose(ln.bias.grad, fused.bias.grad, "LNTranspose grad_b", verbose)
     return ok
 
 
@@ -494,7 +508,7 @@ def verify_fused_dual_gemm(verbose: bool = False) -> bool:
 
 
 def verify_triangle_mul_center_proj(verbose: bool = False) -> bool:
-    """Verify TriangleMul with fused center norm+projection matches baseline."""
+    """Verify TriangleMul with fused center norm+projection matches baseline (fwd+bwd)."""
     from deepfold3.model.config import OptimConfig
     from deepfold3.model.ops import TriangleMulOutgoing
 
@@ -508,20 +522,24 @@ def verify_triangle_mul_center_proj(verbose: bool = False) -> bool:
     N, C = 64, 128
     z = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE)
     mask = torch.ones(N, N, device=DEVICE, dtype=DTYPE)
+    do = torch.randn(N, N, C, device=DEVICE, dtype=DTYPE)
 
     # Baseline
-    base = TriangleMulOutgoing(C).to(DEVICE, DTYPE).eval()
-    with torch.inference_mode():
-        out_base = base(z, mask)
+    base = TriangleMulOutgoing(C).to(DEVICE, DTYPE)
+    z1 = z.clone().requires_grad_(True)
+    out_base = base(z1, mask)
+    out_base.backward(do)
 
     # Fused center proj
-    fused = TriangleMulOutgoing(C, optim=OptimConfig(use_fused_triangle_mul=True)).to(DEVICE, DTYPE).eval()
+    fused = TriangleMulOutgoing(C, optim=OptimConfig(use_fused_triangle_mul=True)).to(DEVICE, DTYPE)
     with torch.no_grad():
         fused.load_state_dict(base.state_dict(), strict=False)
-    with torch.inference_mode():
-        out_fused = fused(z, mask)
+    z2 = z.clone().requires_grad_(True)
+    out_fused = fused(z2, mask)
+    out_fused.backward(do)
 
     ok = _allclose(out_base, out_fused, "TriMul center proj fwd", verbose)
+    ok &= _allclose(z1.grad, z2.grad, "TriMul center proj grad", verbose)
     return ok
 
 
@@ -563,57 +581,45 @@ def verify_grid_attn_ln_transpose(verbose: bool = False) -> bool:
     return ok
 
 
+_OPS = {
+    "swiglu": ("SwiGLU (Triton)", verify_swiglu),
+    "layernorm_linear": ("LayerNormLinear (Triton)", verify_layernorm_linear),
+    "transition": ("TransitionBlock (Triton)", verify_transition),
+    "evo_attention": ("EvoformerAttention (Triton)", verify_evo_attention),
+    "single_evo_attention": ("SingleAttention + EvoAttention (Triton)", verify_single_evo_attention),
+    "grid_evo_attention": ("GridSelfAttention + EvoAttention (Triton)", verify_grid_evo_attention),
+    "ada_layernorm_linear": ("AdaLayerNormLinear (Triton)", verify_ada_layernorm_linear),
+    "ada_transition": ("AdaTransitionBlock (Triton)", verify_ada_transition),
+    "triangle_mul_gate": ("TriangleMulGate (Triton)", verify_triangle_mul_gate),
+    "triangle_mul_e2e": ("TriangleMul E2E (fused gate)", verify_triangle_mul_e2e),
+    "layernorm_transpose": ("LayerNormTranspose (Triton)", verify_layernorm_transpose),
+    "dual_gemm": ("Fused Dual GEMM (Triton)", verify_fused_dual_gemm),
+    "triangle_mul_center_proj": ("TriangleMul center proj (Triton)", verify_triangle_mul_center_proj),
+    "grid_attn_ln_transpose": ("GridSelfAttention LN+transpose (Triton)", verify_grid_attn_ln_transpose),
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify optimized kernels match baseline")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--op", type=str, default=None, help=f"Run only this op ({', '.join(_OPS)})")
     args = parser.parse_args()
 
     if not check_cuda():
         sys.exit(1)
 
+    if args.op:
+        if args.op not in _OPS:
+            print(f"Unknown op: {args.op}. Available: {', '.join(_OPS)}")
+            sys.exit(1)
+        ops = {args.op: _OPS[args.op]}
+    else:
+        ops = _OPS
+
     all_ok = True
-
-    print("=== SwiGLU (Triton) ===")
-    all_ok &= verify_swiglu(args.verbose)
-
-    print("=== LayerNormLinear (Triton) ===")
-    all_ok &= verify_layernorm_linear(args.verbose)
-
-    print("=== TransitionBlock (Triton) ===")
-    all_ok &= verify_transition(args.verbose)
-
-    print("=== EvoformerAttention (Triton) ===")
-    all_ok &= verify_evo_attention(args.verbose)
-
-    print("=== SingleAttention + EvoAttention (Triton) ===")
-    all_ok &= verify_single_evo_attention(args.verbose)
-
-    print("=== GridSelfAttention + EvoAttention (Triton) ===")
-    all_ok &= verify_grid_evo_attention(args.verbose)
-
-    print("=== AdaLayerNormLinear (Triton) ===")
-    all_ok &= verify_ada_layernorm_linear(args.verbose)
-
-    print("=== AdaTransitionBlock (Triton) ===")
-    all_ok &= verify_ada_transition(args.verbose)
-
-    print("=== TriangleMulGate (Triton) ===")
-    all_ok &= verify_triangle_mul_gate(args.verbose)
-
-    print("=== TriangleMul E2E (fused gate) ===")
-    all_ok &= verify_triangle_mul_e2e(args.verbose)
-
-    print("=== LayerNormTranspose (Triton) ===")
-    all_ok &= verify_layernorm_transpose(args.verbose)
-
-    print("=== Fused Dual GEMM (Triton) ===")
-    all_ok &= verify_fused_dual_gemm(args.verbose)
-
-    print("=== TriangleMul center proj (Triton) ===")
-    all_ok &= verify_triangle_mul_center_proj(args.verbose)
-
-    print("=== GridSelfAttention LN+transpose (Triton) ===")
-    all_ok &= verify_grid_attn_ln_transpose(args.verbose)
+    for name, (label, func) in ops.items():
+        print(f"=== {label} ===")
+        all_ok &= func(args.verbose)
 
     print()
     if all_ok:

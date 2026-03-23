@@ -463,10 +463,21 @@ def training_loss(
         gt_rep = gt_pos[:, 1, :]  # fallback to CA
 
     # --- Distogram loss ---
-    if "distogram" in pred and cfg.alpha_distogram > 0:
-        l_disto = distogram_loss(pred["distogram"], gt_rep, seq_mask)
-        losses["distogram"] = l_disto
-        total = total + cfg.alpha_distogram * l_disto
+    if cfg.alpha_distogram > 0:
+        if "distogram_features" in pred:
+            from deepfold3.training.fused_loss import distogram_loss_fused
+
+            l_disto = distogram_loss_fused(
+                pred["distogram_features"], pred["distogram_weight"], gt_rep, seq_mask,
+                chunk_n=cfg.fused_ce_chunk_n,
+            )
+        elif "distogram" in pred:
+            l_disto = distogram_loss(pred["distogram"], gt_rep, seq_mask)
+        else:
+            l_disto = None
+        if l_disto is not None:
+            losses["distogram"] = l_disto
+            total = total + cfg.alpha_distogram * l_disto
 
     # --- Confidence losses ---
     # Only compute if resolution is within range
@@ -490,7 +501,16 @@ def training_loss(
             else:
                 mini_rep = mini_pos[:, :, 1, :]
 
-            if "pde" in pred:
+            if "pde_features" in pred:
+                from deepfold3.training.fused_loss import pde_loss_fused
+
+                l_pde = pde_loss_fused(
+                    pred["pde_features"], pred["pde_weight"], mini_rep, gt_rep, seq_mask,
+                    chunk_n=cfg.fused_ce_chunk_n,
+                )
+                losses["pde"] = l_pde
+                total = total + cfg.alpha_confidence * l_pde
+            elif "pde" in pred:
                 l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, seq_mask)
                 losses["pde"] = l_pde
                 total = total + cfg.alpha_confidence * l_pde
@@ -500,10 +520,20 @@ def training_loss(
                 losses["exp_resolved"] = l_resolved
                 total = total + cfg.alpha_confidence * l_resolved
 
-            if "pae" in pred and cfg.alpha_pae > 0:
-                l_pae = pae_loss(pred["pae"], mini_rep, gt_rep, seq_mask)
-                losses["pae"] = l_pae
-                total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
+            if cfg.alpha_pae > 0:
+                if "pae_features" in pred:
+                    from deepfold3.training.fused_loss import pae_loss_fused
+
+                    l_pae = pae_loss_fused(
+                        pred["pae_features"], pred["pae_weight"], mini_rep, gt_rep, seq_mask,
+                        chunk_n=cfg.fused_ce_chunk_n,
+                    )
+                    losses["pae"] = l_pae
+                    total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
+                elif "pae" in pred:
+                    l_pae = pae_loss(pred["pae"], mini_rep, gt_rep, seq_mask)
+                    losses["pae"] = l_pae
+                    total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
 
     losses["total"] = total
     return total, losses

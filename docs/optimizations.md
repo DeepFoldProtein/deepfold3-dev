@@ -14,23 +14,10 @@ Optimizations are toggled via `OptimConfig` — each can be independently enable
 | **Triton EvoAttention (Grid)** | **2.9-3.3x** | **3.4-4.6x** | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
 | **Triton FusedPairBias** | **+25-30%** on top of evo | tl.dot GEMM (5-10x vs scalar loop) | GridSelfAttention pair bias | 104 attn |
 | **Combined evo+pair_bias** | **3.7-4.6x** | **3.4-4.6x** | GridSelfAttention (row + col) | 104 attn |
-| **Triton FusedTriangleMul (L3)** | 1.24-1.32x | Eliminates In/Out memory asymmetry | TriangleMul outgoing + incoming | 96 modules |
+| **Triton FusedTriangleMul (L3)** | 1.24-1.32x | Symmetric memory (both directions) | TriangleMul outgoing + incoming | 96 modules |
 | **torch.compile (MSAAttention)** | 1.5-2.3x | 1.6-2.3x | EvoformerBlock (×4) | 4 modules |
 | **torch.compile (TriangleMul)** | 1.25-1.55x | ~1.0x | EvoformerBlock + PairFormerBlock | 104 modules |
 | **torch.compile (SingleAttention)** | 1.3-1.4x | ~1.0x | PairFormerBlock (×48) | 48 modules |
-
-### TriangleMul Memory Asymmetry (fixed by triton_l3)
-
-Without fusion, TriangleMulIncoming uses **1.2-1.5x more memory** than Outgoing due to
-cuBLAS workspace allocation for different contraction stride patterns. The fused dual GEMM
-(triton_l3) eliminates this completely:
-
-| N | pytorch Incoming excess | triton_l3 Incoming excess |
-|---|---|---|
-| 384 | +326 MB (1.52x) | +0 MB |
-| 512 | +252 MB (1.18x) | +0 MB |
-| 640 | +1128 MB (1.49x) | +0 MB |
-| 768 | +1553 MB (1.46x) | +0 MB |
 
 ### Grid Column Attention (evo + pair bias)
 
@@ -44,6 +31,7 @@ cuBLAS workspace allocation for different contraction stride patterns. The fused
 
 | Optimization | Speedup | Condition |
 |---|---|---|
+| **Triton SwiGLU (pair, M=N²)** | 1.4-1.6x fwd, 1.9-2.1x full | Only at pair-transition scale (M=N²); single transitions too small |
 | **Triton FusedTransition (C=384)** | 1.2-1.3x full | Only beneficial at C≥256 and N≥1024; smaller shapes are slower |
 | **Triton LayerNormLinear (C=384)** | 1.1-1.2x full | Composited inside FusedTransitionBlock; marginal standalone |
 | **Triton FusedLNTranspose** | 1.7-2.3x fwd | Column attention LN+transpose; inference only |
@@ -59,7 +47,7 @@ cuBLAS workspace allocation for different contraction stride patterns. The fused
 | torch.compile (AdaTransitionBlock) | 0.96-1.02x (neutral) | No meaningful benefit |
 | torch.compile (OuterProductMean) | 1.06-1.25x (marginal) | Minimal speedup, not worth compile cost |
 | Triton FusedTransition (C=64/128) | 0.8-1.0x (slower) | Shapes too small for Triton overhead |
-| Triton SwiGLU | 0.73-0.92x (slower) | Kernel launch overhead; 1.4-2.3x memory savings but time regression |
+| Triton SwiGLU (single, M=N) | 0.5x (slower) | Kernel launch overhead dominates at tiny M; use only inside pair transitions |
 
 ### Key Insight
 
@@ -69,8 +57,8 @@ The **dominant optimizations** are:
    **3-5x less memory**. This covers 104 pair attention modules (the N² bottleneck).
    FusedPairBias now supports training (autograd backward) in addition to inference.
 
-2. **Triton FusedTriangleMul (L3)** for TriangleMul — **1.2-1.3x faster** and eliminates
-   the Incoming/Outgoing **memory asymmetry** (1553 MB excess at N=768 → 0 MB).
+2. **Triton FusedTriangleMul (L3)** for TriangleMul — **1.2-1.3x faster** with symmetric
+   memory usage for both Incoming and Outgoing directions.
 
 `torch.compile` helps for MSAAttention (1.5-2.3x), TriangleMul (1.3-1.6x), and
 SingleAttention (1.3-1.4x) but hurts for small primitives (LN, Linear) and transitions.
@@ -90,6 +78,7 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 | Triton FusedLayerNormTranspose | `FusedLayerNormTranspose` | LN + dim transpose (col attention) | `triton/layernorm_transpose.py` |
 | Triton FusedTriangleMulGate | `FusedTriangleMulGate` | LN + packed 3-projection GEMM + sigmoid | `triton/triangle_mul_gate.py` |
 | Persistent Autotune Cache | `CacheManager` | GPU-fingerprinted JSON cache for Triton configs | `triton/cache.py` |
+| TiledLinear | `TiledLinear` | Memory-efficient tiled recomputation for pair transitions | `tiled_linear.py` |
 | torch.compile | — | Wraps TriangleMul, MSAAttention, SingleAttention | PyTorch built-in |
 
 ## Configuration
@@ -101,6 +90,7 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 class OptimConfig:
     use_fused_evo_attention: bool = False   # Triton flash-attn for GridSelfAttention
     use_fused_pair_bias: bool = False       # Triton fused LN+Linear+permute (tl.dot GEMM)
+    use_fused_swiglu: bool = False          # Triton multi-row SwiGLU (1.5-2.1x at pair M=N²)
     use_fused_transition_pair: bool = False # Triton fused transition for pair (M=N², C=128)
     use_fused_triangle_mul: bool = False    # Triton dual GEMM + gate fusion for TriangleMul
     use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
@@ -114,7 +104,7 @@ from deepfold3.model.config import ModelConfig, OptimConfig
 
 # Recommended for inference (biggest wins)
 config = ModelConfig()
-config.optim = OptimConfig.recommended()  # evo attention + compile
+config.optim = OptimConfig.recommended()  # evo attention + swiglu + triangle_mul + compile
 
 # Enable everything (including fused transition for training memory savings)
 config.optim = OptimConfig.all_enabled()
@@ -241,6 +231,7 @@ Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (
 - **Atomic writes**: Thread-safe JSON persistence via temp files + `os.replace`
 
 Environment variables:
+
 - `DEEPFOLD3_TRITON_CACHE_DIR`: Override cache directory
 - `DEEPFOLD3_TRITON_NO_CACHE=1`: Disable caching (re-tune every run)
 
@@ -272,6 +263,46 @@ in a single kernel pass:
 - **Mask fusion**: Per-row mask (AdaLN-zero gate) applied in epilogue
 - **L2 grouping**: GROUP_SIZE_M linearized grid for cache locality (our advantage over cuEQ)
 - **Backward**: Pre-GEMM kernel recomputes sigmoid + derives grad factors, then cuBLAS for weight/input gradients
+
+## TiledLinear (Memory-Efficient Pair Transitions)
+
+Pair transition blocks (`TransitionBlock` with C=64/128) operate on `[N, N, C]` tensors.
+At N=384 with 4x expansion, each stores `[384, 384, 512]` intermediates for backward —
+~150 MB per transition in bf16. With ~52 pair transitions in the Evoformer/PairFormer
+trunk, this totals ~8 GB in activation memory.
+
+`TiledLinear` wraps any transition block and chunks the input along `dim=-2` (pair rows).
+Each chunk is processed independently, and intermediates are recomputed during backward
+instead of being stored.
+
+**How it works:**
+
+- **Training**: Custom `torch.autograd.Function` runs forward under `torch.no_grad()`,
+  saves only the input. During backward, recomputes each chunk's forward with
+  `torch.enable_grad()` and accumulates parameter gradients across chunks.
+- **Inference**: Optionally chunks the forward pass for peak memory reduction on very
+  long sequences (enabled via `tiled_linear_inference=True`).
+
+**Why it's exact:** All operations in `TransitionBlock` (LayerNorm, Linear, SwiGLU) act
+on `dim=-1` (channels) independently per spatial position. Chunking along `dim=-2` produces
+bitwise identical forward results. Backward input gradients are also bitwise identical.
+Parameter gradients may differ at ULP level due to fp32 accumulation order (~1e-6 max diff).
+
+**Memory savings:** At N=384 with 3 shards (auto heuristic): ~67% reduction in pair
+transition activation memory (~5 GB saved). Cost: ~2x FLOPs for pair transitions only.
+
+**Config:**
+
+```python
+OptimConfig(
+    use_tiled_linear=True,        # Enable for pair-scale transitions (C=64/128)
+    tiled_linear_shards=0,        # 0 = auto: ceil(spatial_dim / channel_dim)
+    tiled_linear_inference=False,  # Also tile during inference (long sequences)
+)
+```
+
+Enabled by default in `OptimConfig.recommended()`. Composable with Triton fused kernels —
+the inner module can be `FusedTransitionBlock` with `FusedSwiGLU`.
 
 ## Attention Tuning Notes
 
@@ -395,7 +426,8 @@ benchmarks/
 ├── bench_transition.py    # TransitionBlock, AdaTransitionBlock
 ├── bench_attention.py     # GridSelfAttention, MSAAttention, SingleAttention
 ├── bench_pair_ops.py      # TriangleMul, OuterProductMean
-├── plot_results.py        # Matplotlib grouped bar charts
-├── run_all.py             # Orchestrator: verify -> bench all -> plot
-└── results/               # Output directory (JSON + PNG)
+├── plot_results.py        # Matplotlib grouped bar charts (per-suite PNGs)
+├── optimization_report.py # Slide-deck PDF: summary, verification, per-op charts, table
+├── run_all.py             # Orchestrator: verify -> bench all -> plot + report
+└── results/               # Output directory (JSON + PNG + PDF)
 ```

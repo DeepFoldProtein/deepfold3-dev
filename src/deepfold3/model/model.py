@@ -119,7 +119,7 @@ class DeepFold3(nn.Module):
         )
 
         # Confidence head
-        self.confidence_head = ConfidenceHead(cc)
+        self.confidence_head = ConfidenceHead(cc, optim=cfg.optim)
 
         # Distogram head
         self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram)
@@ -330,6 +330,7 @@ class DeepFold3(nn.Module):
         mini_rollout_steps: int = 20,
         mini_rollout_samples: int = 1,
         seed: int = 0,
+        fused_ce: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -408,14 +409,23 @@ class DeepFold3(nn.Module):
             target_feat=target_feat,
             atom_positions=pred["mini_rollout_pos"],
             rep_atom_index=features.get("token_to_rep_atom"),
+            return_pre_logits=fused_ce,
         )
         pred["plddt"] = conf_out["plddt_logits"]
-        pred["pae"] = conf_out["pae_logits"]
-        pred["pde"] = conf_out["pde_logits"]
         pred["exp_resolved"] = conf_out["exp_resolved_logits"]
 
-        # --- 5. Distogram ---
-        pred["distogram"] = self.distogram_head(embeddings["pair"])
+        if fused_ce:
+            # Return pre-projection features + weight refs for chunked linear+CE
+            pred["pae_features"] = conf_out["pae_features"]
+            pred["pde_features"] = conf_out["pde_features"]
+            pred["pae_weight"] = self.confidence_head.pae_logits.weight
+            pred["pde_weight"] = self.confidence_head.pde_half_logits.weight
+            pred["distogram_features"] = embeddings["pair"]
+            pred["distogram_weight"] = self.distogram_head.half_logits.weight
+        else:
+            pred["pae"] = conf_out["pae_logits"]
+            pred["pde"] = conf_out["pde_logits"]
+            pred["distogram"] = self.distogram_head(embeddings["pair"])
 
         return pred
 

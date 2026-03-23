@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from deepfold3.model.config import ConfidenceConfig
+from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
@@ -53,7 +53,7 @@ class ConfidenceHead(nn.Module):
         distogram_feat_project → distogram_feat_project (LinearNoBias)
     """
 
-    def __init__(self, cfg: ConfidenceConfig, target_feat_dim: int = 447):
+    def __init__(self, cfg: ConfidenceConfig, target_feat_dim: int = 447, optim: OptimConfig | None = None):
         super().__init__()
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
@@ -73,6 +73,7 @@ class ConfidenceHead(nn.Module):
                     num_single_heads=cfg.single_attention_num_head,
                     single_key_dim=c_single,
                     single_value_dim=c_single,
+                    optim=optim,
                 )
                 for _ in range(cfg.num_layer)
             ]
@@ -126,14 +127,25 @@ class ConfidenceHead(nn.Module):
         target_feat: torch.Tensor,  # [N, target_feat_dim]
         atom_positions: torch.Tensor,  # [num_samples, N, M, 3]
         rep_atom_index: torch.Tensor | None = None,  # [N] index of representative atom per token
+        return_pre_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run confidence head per diffusion sample.
 
+        Args:
+            return_pre_logits: If True, return post-LN features instead of
+                projected logits for pair-scale heads (PAE, PDE).  Used with
+                fused chunked linear+CE to avoid materializing [S,N,N,64] logits.
+                pLDDT and exp_resolved always return logits (small tensors).
+
         Returns:
-            plddt_logits:        [num_samples, N, max_atoms * num_plddt_bins]
-            pae_logits:          [num_samples, N, N, num_distogram_bins]
-            pde_logits:          [num_samples, N, N, num_distogram_bins]
-            exp_resolved_logits: [num_samples, N, max_atoms * 2]
+            When ``return_pre_logits=False`` (default):
+                plddt_logits:        [num_samples, N, max_atoms * num_plddt_bins]
+                pae_logits:          [num_samples, N, N, num_distogram_bins]
+                pde_logits:          [num_samples, N, N, num_distogram_bins]
+                exp_resolved_logits: [num_samples, N, max_atoms * 2]
+            When ``return_pre_logits=True``:
+                pae_logits → pae_features [num_samples, N, N, pair_channel]
+                pde_logits → pde_features [num_samples, N, N, pair_channel]
         """
         num_samples = atom_positions.shape[0]
         N = pair.shape[-3]
@@ -166,17 +178,26 @@ class ConfidenceHead(nn.Module):
             single_act = single_act.float()
 
             plddt_list.append(self.plddt_logits(self.plddt_logits_ln(single_act)))
-            pae_list.append(self.pae_logits(self.pae_logits_ln(pair_act)))
-
-            # PDE: symmetrised half-logits
-            pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
-            pde_list.append(pde_half + pde_half.transpose(-3, -2))
-
             exp_resolved_list.append(self.exp_resolved_logits(self.exp_resolved_ln(single_act)))
 
-        return {
+            if return_pre_logits:
+                # Return post-LN features for fused chunked loss (no logit materialization)
+                pae_list.append(self.pae_logits_ln(pair_act))
+                pde_list.append(self.pde_logits_ln(pair_act))
+            else:
+                pae_list.append(self.pae_logits(self.pae_logits_ln(pair_act)))
+                # PDE: symmetrised half-logits
+                pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
+                pde_list.append(pde_half + pde_half.transpose(-3, -2))
+
+        result = {
             "plddt_logits": torch.stack(plddt_list, dim=0),
-            "pae_logits": torch.stack(pae_list, dim=0),
-            "pde_logits": torch.stack(pde_list, dim=0),
             "exp_resolved_logits": torch.stack(exp_resolved_list, dim=0),
         }
+        if return_pre_logits:
+            result["pae_features"] = torch.stack(pae_list, dim=0)
+            result["pde_features"] = torch.stack(pde_list, dim=0)
+        else:
+            result["pae_logits"] = torch.stack(pae_list, dim=0)
+            result["pde_logits"] = torch.stack(pde_list, dim=0)
+        return result

@@ -160,7 +160,7 @@ class OptimConfig:
     ATTENTION (104 GridSelfAttention modules per forward):
     - use_fused_evo_attention: 2.9-3.3x faster (autotuned Triton flash-attn with pair bias)
     - use_fused_pair_bias: +30% on top of evo_attn (fused LN + tl.dot projection + permute)
-      Now supports training (autograd backward via PyTorch ops) + inference (fully fused).
+      Supports training (autograd backward) + inference (fully fused).
     - Combined evo+pair_bias: 3.7-4.6x faster vs pytorch baseline
     - use_torch_compile: 1.3-2.3x for MSAAttention/SingleAttention (SDPA backend)
     Note: Triton EvoAttention is NOT used for SingleAttention (N_seq=1 overhead dominates).
@@ -171,10 +171,12 @@ class OptimConfig:
         Supports TWO_INPUTS, bias, mask fusion, TF32 precision control.
       Level 2 (center proj): fused LN+Linear for post-einsum norm_center+out_proj
       Level 1 (gate): fallback fused LN+packed GEMM+sigmoid postprocess
-    - MEMORY: triton_l3 eliminates the Incoming/Outgoing memory asymmetry
-      (cuBLAS workspace causes Incoming to use 1.2-1.5x more memory without fusion;
-      triton_l3 reduces diff to ~0).
-    - Einsum replaced with torch.matmul on permuted views (zero-copy) for both variants.
+
+    SWIGLU (inside TransitionBlock / AdaTransitionBlock):
+    - use_fused_swiglu: 1.4-1.6x fwd, 1.9-2.1x full at pair scale (M=N², C=128)
+      Multi-row Triton kernel (128 rows/block) + in-place backward → 2-6x less memory.
+      Neutral at single scale (M=N) where launch overhead dominates — still safe to enable
+      because the memory saving is always beneficial.
 
     TRANSITION (context-sensitive — M size determines whether Triton wins):
     - use_fused_transition_pair: 1.2-1.3x for pair transitions (M=N², C=128) where M is large
@@ -185,12 +187,22 @@ class OptimConfig:
 
     use_fused_evo_attention: bool = False
     use_fused_pair_bias: bool = False
+    use_fused_swiglu: bool = False  # standalone FusedSwiGLU — wins at M=N² (pair transitions)
     use_fused_transition_pair: bool = False  # pair transitions (M=N², C=128) — Triton wins
     use_fused_transition_single: bool = False  # single transitions (M=N, C=384) — PyTorch wins, DO NOT enable
     use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
     use_torch_compile: bool = False
+    # Tiled linear: chunk pair transitions along dim=-2, recompute during backward
+    # Saves ~67% of pair transition activation memory at cost of ~2x FLOPs for those layers.
+    # Also supports inference tiling for very long sequences (peak memory reduction).
+    use_tiled_linear: bool = False  # tiled recomputation for pair-scale transitions
+    tiled_linear_shards: int = 0  # 0 = auto heuristic (ceil(spatial/channels))
+    tiled_linear_inference: bool = False  # also tile during inference (for long sequences)
+    # Tiled outer product mean: chunk rows to avoid [N,N,32,32] intermediate.
+    # Saves ~3.6 GB at N=768. 0 = disabled, >0 = chunk size (128 recommended).
+    tiled_opm_chunk: int = 0
 
     # Substrings that identify derived fused-kernel parameters in state dicts.
     # These keys are excluded from checkpoints (they are re-synced from base
@@ -209,36 +221,68 @@ class OptimConfig:
 
     @classmethod
     def recommended(cls) -> OptimConfig:
-        """Best overall: evo_attn + pair_bias + triangle_mul + pair_transition + compile.
+        """Best overall: evo_attn + pair_bias + swiglu + triangle_mul + pair_transition + compile.
 
         Only enables Triton kernels where they demonstrably outperform PyTorch.
+        SwiGLU is always safe (wins at pair scale, neutral+memory-saving at single scale).
         Single/diffusion transitions are left to PyTorch/compile (they're faster at small M).
         """
         return cls(
             use_fused_evo_attention=True,
             use_fused_pair_bias=True,
+            use_fused_swiglu=True,
             use_fused_triangle_mul=True,
             use_fused_transition_pair=True,
             use_torch_compile=True,
         )
 
     @classmethod
+    def recommended_tiled(cls) -> OptimConfig:
+        """Recommended + tiled linear for pair transitions (memory savings).
+
+        Same as recommended() plus tiled chunking for pair-scale transitions.
+        Reduces peak memory for pair transition intermediates [N,N,C*4] by
+        processing chunks of rows sequentially instead of all at once.
+        Applies to both training (recompute backward) and inference (chunked forward).
+
+        torch.compile is disabled: with Triton kernels dominating runtime,
+        compile adds no steady-state benefit but doubles peak memory during
+        the compilation pass (~14 GB vs ~8.7 GB at N=1280).
+        """
+        cfg = cls.recommended()
+        cfg.use_torch_compile = False
+        cfg.use_tiled_linear = True
+        cfg.tiled_linear_inference = True
+        cfg.tiled_opm_chunk = 128
+        return cfg
+
+    @classmethod
     def inference(cls) -> OptimConfig:
-        """Maximum inference speed (all beneficial Triton + forward-only kernels)."""
+        """Maximum inference speed + memory efficiency.
+
+        All beneficial Triton kernels + tiled pair transitions + forward-only
+        LN+transpose fusion. No torch.compile (Triton kernels dominate; compile
+        adds startup cost with no steady-state benefit).
+        """
         return cls(
             use_fused_evo_attention=True,
             use_fused_pair_bias=True,
+            use_fused_swiglu=True,
             use_fused_triangle_mul=True,
             use_fused_transition_pair=True,
             use_fused_ln_transpose=True,
+            use_tiled_linear=True,
+            tiled_linear_inference=True,
+            tiled_opm_chunk=128,
         )
 
     @classmethod
     def triton_only(cls) -> OptimConfig:
-        """All beneficial Triton kernels (no torch.compile)."""
+        """All beneficial Triton kernels without tiling (no torch.compile)."""
         return cls(
             use_fused_evo_attention=True,
             use_fused_pair_bias=True,
+            use_fused_swiglu=True,
             use_fused_transition_pair=True,
             use_fused_triangle_mul=True,
             use_fused_ln_transpose=True,
@@ -250,6 +294,7 @@ class OptimConfig:
         return cls(
             use_fused_evo_attention=True,
             use_fused_pair_bias=True,
+            use_fused_swiglu=True,
             use_fused_transition_pair=True,
             use_fused_transition_single=True,
             use_fused_ada_transition=True,
@@ -354,6 +399,10 @@ class TrainingConfig:
     # Confidence resolution gating
     min_resolution: float = 0.1
     max_resolution: float = 4.0
+
+    # Fused loss (chunked linear + CE for pair-scale heads)
+    use_fused_ce_loss: bool = False  # saves ~650 MB at N=768 (distogram + PAE + PDE)
+    fused_ce_chunk_n: int = 32  # rows of N per chunk
 
     # Mixed precision
     dtype: str = "bf16"

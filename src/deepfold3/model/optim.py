@@ -55,6 +55,7 @@ def make_transition_block(
     - Pair transitions: M = N² (up to 590k) — Triton wins at 1.2-1.3x
     - Single transitions: M = N (384-768) — PyTorch wins (Triton overhead dominates)
     """
+    block = None
     if config is not None:
         use_fused = False
         if config.use_fused_transition_pair and channels in _PAIR_TRANSITION_CHANNELS:
@@ -64,10 +65,16 @@ def make_transition_block(
         if use_fused:
             cls = _try_import("deepfold3.model.triton.fused_transition", "FusedTransitionBlock")
             if cls is not None:
-                return cls(channels, num_intermediate_factor=num_intermediate_factor)
-    from deepfold3.model.primitives import TransitionBlock
+                block = cls(channels, num_intermediate_factor=num_intermediate_factor)
+    if block is None:
+        from deepfold3.model.primitives import TransitionBlock
 
-    return TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor)
+        block = TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor, optim=config)
+    if config is not None and config.use_tiled_linear and channels in _PAIR_TRANSITION_CHANNELS:
+        from deepfold3.model.tiled_linear import TiledLinear
+
+        block = TiledLinear(block, num_shards=config.tiled_linear_shards, tile_inference=config.tiled_linear_inference)
+    return block
 
 
 def make_ada_transition_block(
@@ -80,7 +87,7 @@ def make_ada_transition_block(
             return cls(channels, cond_dim, num_intermediate_factor=num_intermediate_factor)
     from deepfold3.model.primitives import AdaTransitionBlock
 
-    return AdaTransitionBlock(channels, cond_dim, num_intermediate_factor=num_intermediate_factor)
+    return AdaTransitionBlock(channels, cond_dim, num_intermediate_factor=num_intermediate_factor, optim=config)
 
 
 def print_availability():

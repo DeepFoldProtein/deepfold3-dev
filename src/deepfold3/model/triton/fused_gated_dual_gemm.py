@@ -56,19 +56,21 @@ except ImportError:
 
 if HAS_TRITON:
     from deepfold3.model.triton import precision_dot
+    from deepfold3.model.triton.cache import persistent_autotune
 
     # ── Autotune config space ────────────────────────────────────────────
     # Covers the DeepFold3 triangle-mul shapes: K=128, N=256 (2×C_z).
+    # num_stages 1-4: 1 for Ampere (48KB shared), 2-3 for Ada/Blackwell, 4 for Hopper.
     _AUTOTUNE_CONFIGS = [
         triton.Config({"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk, "GROUP_SIZE_M": 8}, num_stages=ns, num_warps=nw)
         for bm in (64, 128)
         for bn in (32, 64, 128)
         for bk in (32, 64)
-        for ns in (3, 4)
+        for ns in (1, 2, 3, 4)
         for nw in (4, 8)
     ]
 
-    @triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
+    @persistent_autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
     @triton.jit
     def _fused_dual_gemm_fwd_kernel(
         # ── Pointers ──
@@ -184,7 +186,7 @@ if HAS_TRITON:
             out_ptrs = OUT_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
             tl.store(out_ptrs, out, mask=out_mask)
 
-    @triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
+    @persistent_autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
     @triton.jit
     def _fused_dual_gemm_bwd_pregemm_kernel(
         # ── Pointers ──

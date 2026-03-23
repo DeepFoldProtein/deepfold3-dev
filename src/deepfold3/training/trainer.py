@@ -286,6 +286,7 @@ class Trainer:
             mini_rollout_steps=cfg.mini_rollout_steps,
             mini_rollout_samples=cfg.mini_rollout_samples,
             seed=self.global_step,
+            fused_ce=cfg.use_fused_ce_loss,
         )
 
         total_loss, loss_dict = training_loss(pred, features, cfg)

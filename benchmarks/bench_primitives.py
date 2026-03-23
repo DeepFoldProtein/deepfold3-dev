@@ -83,14 +83,32 @@ def bench_layernorm(shapes: list[dict], warmup: int, rep: int) -> list:
     return results
 
 
+# SwiGLU realistic shapes: pair transitions (M=N², C=128) and single transitions (M=N, C=384).
+# Pair transitions dominate runtime; single transitions are too small for Triton to win.
+SWIGLU_SHAPES = [
+    {"M": 384 * 384, "C": 128, "label": "pair N=384"},
+    {"M": 512 * 512, "C": 128, "label": "pair N=512"},
+    {"M": 640 * 640, "C": 128, "label": "pair N=640"},
+    {"M": 768 * 768, "C": 128, "label": "pair N=768"},
+    {"M": 384, "C": 384, "label": "single N=384"},
+    {"M": 768, "C": 384, "label": "single N=768"},
+]
+
+
 def bench_swiglu(shapes: list[dict], warmup: int, rep: int) -> list:
+    import gc
+
     results = []
     FusedSwiGLU = try_import("deepfold3.model.triton.swiglu", "FusedSwiGLU")  # noqa: N806
 
-    for shape in shapes:
-        N, C = shape["N"], shape["C"]
-        x = torch.randn(N, C * 2, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        do = torch.randn(N, C, device=DEVICE, dtype=DTYPE)
+    swiglu_shapes = dry_run_shapes(SWIGLU_SHAPES, len(shapes) == 1 and shapes[0].get("N", 0) <= 4)
+
+    for shape in swiglu_shapes:
+        M, C = shape["M"], shape["C"]
+        gc.collect()
+        torch.cuda.empty_cache()
+        x = torch.randn(M, C * 2, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        do = torch.randn(M, C, device=DEVICE, dtype=DTYPE)
 
         def fwd(x=x):
             a, b = x.chunk(2, dim=-1)
@@ -101,7 +119,11 @@ def bench_swiglu(shapes: list[dict], warmup: int, rep: int) -> list:
             o = F.silu(a) * b
             o.backward(do, retain_graph=True)
 
-        results.extend(bench_fwd_full("SwiGLU", "pytorch", shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x]))
+        bench_shape = {"M": M, "C": C}
+        label = shape.get("label", f"M={M}")
+        kind = label.split()[0] if " " in label else "pair"
+        op_name = f"SwiGLU ({kind})"
+        results.extend(bench_fwd_full(op_name, "pytorch", bench_shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x]))
 
         if FusedSwiGLU is not None:
             swiglu = FusedSwiGLU()
@@ -115,12 +137,15 @@ def bench_swiglu(shapes: list[dict], warmup: int, rep: int) -> list:
                 o.backward(do, retain_graph=True)
 
             results.extend(
-                bench_fwd_full("SwiGLU", "triton", shape, fwd_t, full_t, warmup=warmup, rep=rep, grad_to_none=[x2])
+                bench_fwd_full(op_name, "triton", bench_shape, fwd_t, full_t, warmup=warmup, rep=rep, grad_to_none=[x2])
             )
+            del swiglu, x2
         else:
             print("  [skip] Triton FusedSwiGLU not available")
 
-        print(f"  SwiGLU N={N} C={C} done")
+        label = shape.get("label", f"M={M}")
+        print(f"  SwiGLU {label} C={C} done")
+        del x, do
 
     return results
 

@@ -3,8 +3,12 @@
 Computes silu(a) * b where [a, b] = split(x, 2, dim=-1).
 This matches DeepFold3's convention (silu on the FIRST half).
 
-Adapted from MegaFold's FusedSwiGLU kernel with convention swap:
-MegaFold computes silu(b) * a; DeepFold3 computes silu(a) * b.
+Performance note: At DeepFold3's channel dimensions (C=128→D=64, C=384→D=192),
+the naive 1-row-per-block Triton kernel loses to PyTorch's vectorized CUDA
+elementwise kernels because grid dispatch overhead dominates the trivial per-row
+compute.  Fix: process ROWS_PER_BLOCK rows per thread block via tl.static_range,
+reducing grid size 32-128x.  Each block does more work, amortizing launch cost
+and improving SM occupancy on high-SM-count GPUs (e.g. 170 SMs on RTX 5090).
 """
 
 from __future__ import annotations
@@ -21,77 +25,126 @@ except ImportError:
     HAS_TRITON = False
 
 
-from deepfold3.model.triton import calculate_settings as _calculate_settings
-
 if HAS_TRITON:
 
     @triton.jit
-    def _swiglu_forward_kernel(x_ptr, y_ptr, stride_y, D: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-        """Forward: y = silu(a) * b where x = [a, b]."""
-        row_idx = tl.program_id(axis=0).to(tl.int64)
+    def _swiglu_forward_kernel(
+        x_ptr,
+        y_ptr,
+        stride_x,  # stride between rows of x (= 2*D for contiguous)
+        stride_y,  # stride between rows of y (= D for contiguous)
+        M,  # total number of rows
+        D: tl.constexpr,  # output dimension (half of input)
+        BLOCK_D: tl.constexpr,  # >= D, power of 2
+        ROWS_PER_BLOCK: tl.constexpr,  # rows processed per thread block
+    ):
+        """Forward: y = silu(a) * b where x = [a | b] concatenated."""
+        pid = tl.program_id(0)
+        row_start = (pid * ROWS_PER_BLOCK).to(tl.int64)
 
-        # DeepFold3 convention: a = left half (apply silu), b = right half
-        a_ptr = x_ptr + row_idx * stride_y * 2
-        b_ptr = x_ptr + row_idx * stride_y * 2 + stride_y
-        y_ptr += row_idx * stride_y
+        cols = tl.arange(0, BLOCK_D)
+        col_mask = cols < D
 
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < stride_y
+        for i in tl.static_range(ROWS_PER_BLOCK):
+            row = row_start + i
+            if row < M:
+                a_off = row * stride_x + cols
+                b_off = row * stride_x + D + cols
+                y_off = row * stride_y + cols
 
-        a_row = tl.load(a_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
-        b_row = tl.load(b_ptr + col_offsets, mask=mask, other=0)
-        c_row = a_row * tl.sigmoid(a_row) * b_row  # silu(a) * b
-
-        tl.store(y_ptr + col_offsets, c_row, mask=mask)
+                a = tl.load(x_ptr + a_off, mask=col_mask, other=0).to(tl.float32)
+                b = tl.load(x_ptr + b_off, mask=col_mask, other=0)
+                y = (a * tl.sigmoid(a)).to(b.dtype) * b
+                tl.store(y_ptr + y_off, y, mask=col_mask)
 
     @triton.jit
-    def _swiglu_backward_kernel(dy_ptr, x_ptr, stride, D: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    def _swiglu_backward_kernel(
+        dy_ptr,
+        x_ptr,
+        stride_dy,
+        stride_x,
+        M,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        ROWS_PER_BLOCK: tl.constexpr,
+    ):
         """Backward: compute da, db in-place into x buffer."""
-        row_idx = tl.program_id(axis=0).to(tl.int64)
+        pid = tl.program_id(0)
+        row_start = (pid * ROWS_PER_BLOCK).to(tl.int64)
 
-        dy_ptr += row_idx * stride
-        a_ptr = x_ptr + row_idx * stride * 2
-        b_ptr = x_ptr + row_idx * stride * 2 + stride
+        cols = tl.arange(0, BLOCK_D)
+        col_mask = cols < D
 
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < D
+        for i in tl.static_range(ROWS_PER_BLOCK):
+            row = row_start + i
+            if row < M:
+                dy_off = row * stride_dy + cols
+                a_off = row * stride_x + cols
+                b_off = row * stride_x + D + cols
 
-        dy_row = tl.load(dy_ptr + col_offsets, mask=mask, other=0.0)
-        a_row = tl.load(a_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        b_row = tl.load(b_ptr + col_offsets, mask=mask, other=0.0)
+                dy = tl.load(dy_ptr + dy_off, mask=col_mask, other=0)
+                a = tl.load(x_ptr + a_off, mask=col_mask, other=0).to(tl.float32)
+                b = tl.load(x_ptr + b_off, mask=col_mask, other=0)
 
-        sig_a = tl.sigmoid(a_row)
-        silu_a = a_row * sig_a
-        # da = dy * b * (silu(a) * (1 - sig(a)) + sig(a))  = dy * b * d(silu(a))/da
-        da_row = dy_row * (silu_a * (1 - sig_a) + sig_a) * b_row
-        # db = dy * silu(a)
-        db_row = dy_row * silu_a
+                sig_a = tl.sigmoid(a)
+                silu_a = a * sig_a
+                da = dy * (silu_a * (1 - sig_a) + sig_a) * b
+                db = dy * silu_a
 
-        tl.store(a_ptr + col_offsets, da_row, mask=mask)
-        tl.store(b_ptr + col_offsets, db_row, mask=mask)
+                tl.store(x_ptr + a_off, da, mask=col_mask)
+                tl.store(x_ptr + b_off, db, mask=col_mask)
+
+
+def _kernel_config(D: int, M: int) -> tuple[int, int, int]:
+    """Choose BLOCK_D, ROWS_PER_BLOCK, num_warps for given dimensions."""
+    BLOCK_D = max(triton.next_power_of_2(D), 16)
+
+    # Target: enough blocks to fill SMs (aim for ~4 waves on 170 SMs),
+    # but each block should do meaningful work (32-128 rows).
+    if BLOCK_D <= 64:
+        # Small D: each row is tiny, process many rows per block.
+        ROWS_PER_BLOCK = 128
+        num_warps = 2
+    elif BLOCK_D <= 256:
+        ROWS_PER_BLOCK = 64
+        num_warps = 2
+    else:
+        ROWS_PER_BLOCK = 32
+        num_warps = 4
+
+    # Don't over-chunk for small M (avoid blocks with no work)
+    if M < ROWS_PER_BLOCK * 128:
+        ROWS_PER_BLOCK = max(ROWS_PER_BLOCK // 4, 1)
+
+    return BLOCK_D, ROWS_PER_BLOCK, num_warps
 
 
 def swiglu_forward(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward pass: x=[a,b] -> y=silu(a)*b. Returns (x_saved, y)."""
     ori_shape = x.shape
-    D = ori_shape[-1]
-    dim_out = D // 2
+    D_full = ori_shape[-1]
+    D = D_full // 2
 
-    x = x.view(-1, D)
+    x = x.view(-1, D_full)
     M = x.shape[0]
 
-    y = torch.empty((M, dim_out), device=x.device, dtype=x.dtype)
+    y = torch.empty((M, D), device=x.device, dtype=x.dtype)
 
-    BLOCK_SIZE, num_warps = _calculate_settings(dim_out)
-    _swiglu_forward_kernel[(M,)](
+    BLOCK_D, ROWS_PER_BLOCK, num_warps = _kernel_config(D, M)
+    grid = (triton.cdiv(M, ROWS_PER_BLOCK),)
+
+    _swiglu_forward_kernel[grid](
         x,
         y,
+        x.stride(0),
         y.stride(0),
+        M,
         D=D,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_D=BLOCK_D,
+        ROWS_PER_BLOCK=ROWS_PER_BLOCK,
         num_warps=num_warps,
     )
-    return x, y.view(ori_shape[:-1] + (dim_out,))
+    return x, y.view(ori_shape[:-1] + (D,))
 
 
 def swiglu_backward(x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
@@ -101,13 +154,18 @@ def swiglu_backward(x: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     dy = dy.view(-1, D)
     M = dy.shape[0]
 
-    BLOCK_SIZE, num_warps = _calculate_settings(D)
-    _swiglu_backward_kernel[(M,)](
+    BLOCK_D, ROWS_PER_BLOCK, num_warps = _kernel_config(D, M)
+    grid = (triton.cdiv(M, ROWS_PER_BLOCK),)
+
+    _swiglu_backward_kernel[grid](
         dy,
         x,
         dy.stride(0),
+        x.stride(0),
+        M,
         D=D,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_D=BLOCK_D,
+        ROWS_PER_BLOCK=ROWS_PER_BLOCK,
         num_warps=num_warps,
     )
     return x.view(ori_shape[:-1] + (D * 2,))

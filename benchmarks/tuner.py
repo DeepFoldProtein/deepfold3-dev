@@ -13,14 +13,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import sys
 
 import torch
 
 from benchmarks.optim_config import OptimConfig, get_optimized_module, is_available, print_availability
-from benchmarks.utils import RESULTS_DIR, BenchResult, check_cuda, gpu_timer, peak_memory_mb
+from benchmarks.utils import RESULTS_DIR, BenchResult, check_cuda, free_gpu, gpu_timer, peak_memory_mb
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -96,11 +95,6 @@ def _configs_for_op(op: str) -> list[tuple[str, OptimConfig]]:
             configs.append(("all", cfg))
 
     return configs
-
-
-def _free_gpu():
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def _bench_transition(config: OptimConfig, N: int, C: int, mode: str, warmup: int, rep: int) -> BenchResult:
@@ -179,7 +173,7 @@ def tune(op: str, N: int, C: int, mode: str = "full", warmup: int = 50, rep: int
 
     results = []
     for name, cfg in configs:
-        _free_gpu()
+        free_gpu()
         try:
             if op == "attention":
                 result = _bench_attention(cfg, N, C, H, mode, warmup, rep)

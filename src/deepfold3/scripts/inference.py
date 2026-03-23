@@ -92,9 +92,10 @@ import torch
 )
 @click.option(
     "--optim",
-    default=None,
-    type=click.Choice(["none", "recommended", "all", "triton"]),
-    help="Optimization backend: none (default), recommended (evo attn + triangle mul + compile), all, triton (fused kernels only)",
+    default="inference",
+    type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
+    show_default=True,
+    help="Optimization preset: inference (default, Triton+tiling), recommended (training), triton (no tiling), none, all (testing)",
 )
 def inference(
     msa: Path | None,
@@ -159,11 +160,14 @@ def inference(
         model_cfg.optim = OptimConfig.all_enabled()
     elif optim == "recommended":
         model_cfg.optim = OptimConfig.recommended()
+    elif optim == "inference":
+        model_cfg.optim = OptimConfig.inference()
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
     # else: default OptimConfig (all False)
 
     if optim and optim != "none":
+        torch.set_float32_matmul_precision("high")  # TF32 for better perf
         click.echo(f"[inference] optimizations: {optim}")
 
     model = DeepFold3(model_cfg)
