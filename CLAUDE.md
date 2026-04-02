@@ -46,6 +46,10 @@ deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --outpu
 deepfold3 plot      --input out_confidences.json --output confidences.png
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
+deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --cluster-file clusters-by-entity-40.txt
+deepfold3 cluster   --data-dir /data/training --output clusters.txt
+deepfold3 cluster   --data-dir /data/training --output clusters.txt --min-seq-id 0.3
+deepfold3 apply-clusters --manifest /data/training/manifest.json --cluster-file clusters-by-entity-40.txt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt

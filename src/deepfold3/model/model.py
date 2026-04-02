@@ -144,14 +144,32 @@ class DeepFold3(nn.Module):
         return result
 
     def _sync_fused_kernels(self):
-        """Sync all fused kernel parameters from their base module weights."""
+        """Sync all fused kernel parameters from their base module weights.
+
+        Fused Triton modules hold copies of weights from their base (unfused)
+        counterparts. When the top-level model.load_state_dict() loads weights,
+        only the base params are updated — fused copies become stale. This
+        method walks all modules and re-syncs every fused copy.
+        """
         for mod in self.modules():
+            # TriangleMul: fused gate (LN+packed GEMM), dual GEMM, center proj (LN+Linear)
             if hasattr(mod, "_fused_gate") and mod._fused_gate is not None:
                 mod._sync_to_fused_gate()
+            if hasattr(mod, "_fused_dual_gemm") and mod._fused_dual_gemm is not None:
+                mod._sync_dual_gemm()
+            if hasattr(mod, "_fused_center_proj") and mod._fused_center_proj is not None:
+                mod._sync_center_proj()
+            # AdaTransitionBlock: fused AdaLN+Linear
             if hasattr(mod, "_fused_ada_ln_linear") and mod._fused_ada_ln_linear is not None:
                 mod._sync_ffn_to_fused()
+            # FusedTransitionBlock: fused LN+Linear
             if hasattr(mod, "_sync_to_fused") and hasattr(mod, "_ln_linear") and mod._ln_linear is not None:
                 mod._sync_to_fused()
+            # GridSelfAttention: fused LN+transpose, fused pair bias (LN+proj+permute)
+            if hasattr(mod, "_ln_transpose") and mod._ln_transpose is not None:
+                mod._sync_ln_transpose()
+            if hasattr(mod, "_fused_pair_bias") and mod._fused_pair_bias is not None:
+                mod._sync_pair_bias()
 
     def run_evoformer(
         self,

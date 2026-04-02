@@ -126,23 +126,25 @@ Add corresponding config fields: `nucleotide_loss_weight=5.0`, `ligand_loss_weig
 
 ### 2.2 Bond violation loss
 
-**What**: MSE on bonded atom pair distances vs ideal CCD distances (Protenix stage 2).
+**What**: MSE on bonded atom pair distances vs observed GT distances (Protenix approach — uses experimentally resolved distances, not CCD ideal).
 
 **Design**:
 
 ```
 src/deepfold3/training/loss.py
     def bond_loss(
-        pred_positions,   # [S, N, M, 3]
-        bond_indices,     # [B, 2] — pairs of (token_idx, atom_idx)
-        ideal_distances,  # [B] — from CCD
-        mask,             # [B]
+        pred_pos,           # [S, N, M, 3]
+        bond_atom_indices,  # [B, 4] — (token_1, atom_1, token_2, atom_2)
+        ideal_distances,    # [B] — observed GT distances from structure
+        bond_mask,          # [B]
+        sigma_data,         # 16.0
+        noise_levels,       # [S] optional EDM weighting
     ) -> Tensor
 ```
 
 **Integration**: `training_loss()` includes `alpha_bond × bond_loss` when `alpha_bond > 0`.
 
-**Data**: Bond indices + ideal distances need to be added to the feature dict by the featurizer (from CCD lookup, already partially available via `ref_atoms.py`).
+**Data**: Bond indices + GT distances produced by `featurizer._build_bond_features()` — backbone (intra: N-CA, CA-C; inter: C[i]-N[i+1]) + ligand-ligand bonds.
 
 ### 2.3 Diffusion chunk size
 
@@ -313,6 +315,6 @@ Priority  Phase  Task                         Status
 
 ## Remaining Work
 
-- **Template loading**: Requires HMM-based template search with date cutoff for training.
-- **Nucleic backbone bonds**: O3'→P inter-residue bonds need atom name lookup (protein backbone bonds are implemented).
+- **Template loading (training)**: Requires HMM-based template search with date cutoff. Inference template pipeline works; training needs: `hmmsearch` against PDB HMM DB, date-cutoff filtering, template dropout (0.25).
+- **Nucleic backbone bonds**: O3'→P inter-residue bonds need atom name lookup in featurizer (protein backbone N-CA, CA-C, C[i]-N[i+1] are implemented).
 - **Bucket padding in training**: Low priority, only matters for `torch.compile`.

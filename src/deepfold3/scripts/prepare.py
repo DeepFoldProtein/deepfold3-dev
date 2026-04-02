@@ -104,6 +104,24 @@ def _collect_pdb_ids(mmcif_dir: Path, limit: int | None = None) -> list[str]:
     return ids
 
 
+def _apply_clusters(records: list, cluster_file: Path) -> int:
+    """Apply cluster IDs from a cluster file to manifest records.
+
+    Returns the number of chains that were matched to a cluster.
+    """
+    from deepfold3.data.prepare.clustering import load_pdb_clusters, sequence_to_cluster_key
+
+    pdb_clusters = load_pdb_clusters(cluster_file)
+    matched = 0
+    for record in records:
+        for chain in record.chains:
+            key = sequence_to_cluster_key(record.id, chain.chain_name)
+            if key in pdb_clusters:
+                chain.cluster_id = pdb_clusters[key]
+                matched += 1
+    return matched
+
+
 @cli.command()
 @click.option("--mmcif-dir", required=True, type=click.Path(exists=True), help="PDB mmCIF mirror directory.")
 @click.option("--output", required=True, type=click.Path(), help="Output directory for processed data.")
@@ -117,6 +135,13 @@ def _collect_pdb_ids(mmcif_dir: Path, limit: int | None = None) -> list[str]:
     type=click.Path(exists=True),
     help="Path to components.cif(.gz) for bulk CCD lookup (avoids per-compound downloads).",
 )
+@click.option(
+    "--cluster-file",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to clusters-by-entity-40.txt (wwPDB or MMseqs2-generated). "
+    "Maps chains to integer cluster IDs for cluster-balanced sampling.",
+)
 @click.option("--workers", default=1, type=int, help="Number of parallel workers.")
 def prepare(
     mmcif_dir: str,
@@ -126,6 +151,7 @@ def prepare(
     max_resolution: float | None,
     no_assembly: bool,
     ccd: str | None,
+    cluster_file: str | None,
     workers: int,
 ) -> None:
     """Preprocess PDB mmCIF files into training data."""
@@ -202,6 +228,13 @@ def prepare(
     from deepfold3.data.types import Record
 
     manifest_records = [Record.from_dict(r) for r in records]
+
+    # Apply cluster IDs if cluster file provided
+    if cluster_file:
+        matched = _apply_clusters(manifest_records, Path(cluster_file))
+        total_chains = sum(len(r.chains) for r in manifest_records)
+        log.info("Cluster mapping: %d/%d chains matched (%d records)", matched, total_chains, len(manifest_records))
+
     manifest_path = output_path / "manifest.json"
     save_manifest(manifest_records, manifest_path)
 
@@ -226,6 +259,221 @@ def fetch_ccd(output: str) -> None:
 
     path = fetch_components_cif(output)
     click.echo(f"CCD components saved to: {path}")
+
+
+@cli.command()
+@click.option(
+    "--manifest",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to existing manifest.json to update with cluster IDs.",
+)
+@click.option(
+    "--cluster-file",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to clusters-by-entity-40.txt (wwPDB or MMseqs2-generated).",
+)
+def apply_clusters(manifest: str, cluster_file: str) -> None:
+    """Apply sequence cluster IDs to an existing manifest.
+
+    Updates chain cluster_id fields in-place from a wwPDB-format cluster file.
+    Chains not found in the cluster file keep their hash-based fallback IDs.
+
+    Examples::
+
+        # Download wwPDB clusters and apply
+        wget https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-40.txt
+        deepfold3 apply-clusters --manifest /data/training/manifest.json \\
+            --cluster-file clusters-by-entity-40.txt
+
+        # Apply MMseqs2-generated clusters
+        deepfold3 apply-clusters --manifest /data/training/manifest.json \\
+            --cluster-file mmseqs_clusters.txt
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    from deepfold3.data.prepare.manifest import load_manifest, save_manifest
+
+    records = load_manifest(manifest)
+    matched = _apply_clusters(records, Path(cluster_file))
+    total_chains = sum(len(r.chains) for r in records)
+
+    save_manifest(records, Path(manifest))
+    log.info("Updated %s: %d/%d chains matched to clusters.", manifest, matched, total_chains)
+
+
+@cli.command()
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Training data directory containing structures/ with NPZ files.",
+)
+@click.option("--output", required=True, type=click.Path(), help="Output cluster file path.")
+@click.option("--min-seq-id", default=0.4, type=float, help="Minimum sequence identity threshold (default: 0.4).")
+@click.option("--coverage", default=0.8, type=float, help="Minimum coverage (default: 0.8).")
+@click.option("--cov-mode", default=0, type=int, help="MMseqs2 coverage mode (default: 0).")
+@click.option("--threads", default=0, type=int, help="MMseqs2 threads (default: 0 = all).")
+def cluster(
+    data_dir: str,
+    output: str,
+    min_seq_id: float,
+    coverage: float,
+    cov_mode: int,
+    threads: int,
+) -> None:
+    """Cluster sequences from training data using MMseqs2.
+
+    Extracts all unique entity sequences from processed structures, clusters
+    them at the given identity threshold with MMseqs2, and writes a
+    wwPDB-format cluster file compatible with ``--cluster-file``.
+
+    Requires ``mmseqs`` binary on PATH.
+
+    Examples::
+
+        deepfold3 cluster --data-dir /data/training --output clusters.txt
+        deepfold3 cluster --data-dir /data/training --output clusters.txt --min-seq-id 0.3
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    from deepfold3.data.prepare.manifest import discover_records
+
+    mmseqs = shutil.which("mmseqs")
+    if mmseqs is None:
+        click.echo("Error: mmseqs binary not found on PATH. Install MMseqs2 first.", err=True)
+        sys.exit(1)
+
+    data_path = Path(data_dir)
+    output_path = Path(output)
+    records = discover_records(data_path)
+    if not records:
+        click.echo("Error: no records found in data directory.", err=True)
+        sys.exit(1)
+
+    # Extract unique protein sequences keyed by pdb_chain
+    sequences: dict[str, str] = {}
+    structures_dir = data_path / "structures"
+
+    from deepfold3.data.const import RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
+    from deepfold3.data.prepare.clustering import sequence_to_cluster_key
+    from deepfold3.data.types import Structure
+
+    # Build res_type index → one-letter lookup (protein only, UNK→X)
+    _RT_TO_LETTER = {i: THREE_LETTER_TO_ONE.get(name, "X") for i, name in RES_TYPE_INDEX_TO_NAME.items()}
+
+    log.info("Extracting sequences from %d records...", len(records))
+    seen_entities: set[tuple[str, str | int | None]] = set()
+    for record in records:
+        npz_path = structures_dir / f"{record.id}.npz"
+        if not npz_path.exists():
+            continue
+        try:
+            structure = Structure.load(npz_path)
+        except Exception:
+            log.debug("Failed to load %s, skipping", npz_path)
+            continue
+
+        for chain_info in record.chains:
+            if not chain_info.valid or chain_info.mol_type != 0:  # protein only
+                continue
+            entity_key = (record.id, chain_info.entity_id)
+            if entity_key in seen_entities:
+                continue
+            seen_entities.add(entity_key)
+
+            chain_mask = structure.residues["chain_id"] == chain_info.chain_id
+            res_types = structure.residues["res_type"][chain_mask]
+            if len(res_types) == 0:
+                continue
+
+            seq = "".join(_RT_TO_LETTER.get(int(rt), "X") for rt in res_types)
+            if len(seq) < 10:
+                continue
+
+            key = sequence_to_cluster_key(record.id, chain_info.chain_name)
+            sequences[key] = seq
+
+    log.info("Extracted %d unique polymer sequences.", len(sequences))
+    if not sequences:
+        click.echo("Error: no polymer sequences found.", err=True)
+        sys.exit(1)
+
+    # Write FASTA, run MMseqs2, parse results
+    with tempfile.TemporaryDirectory(prefix="deepfold3_cluster_") as tmpdir:
+        tmp = Path(tmpdir)
+        fasta_path = tmp / "sequences.fasta"
+        db_path = tmp / "seqDB"
+        cluster_prefix = tmp / "clusters"
+        tsv_path = tmp / "clusters_cluster.tsv"
+
+        # Write FASTA
+        with open(fasta_path, "w") as f:
+            for name, seq in sequences.items():
+                f.write(f">{name}\n{seq}\n")
+
+        # Create MMseqs2 database
+        log.info("Creating MMseqs2 sequence database...")
+        subprocess.run([mmseqs, "createdb", str(fasta_path), str(db_path)], check=True)
+
+        # Run clustering
+        log.info("Clustering at %.0f%% identity (coverage=%.1f, cov-mode=%d)...", min_seq_id * 100, coverage, cov_mode)
+        cmd = [
+            mmseqs,
+            "cluster",
+            str(db_path),
+            str(cluster_prefix),
+            str(tmp / "tmp"),
+            "--min-seq-id",
+            str(min_seq_id),
+            "-c",
+            str(coverage),
+            "--cov-mode",
+            str(cov_mode),
+        ]
+        if threads > 0:
+            cmd.extend(["--threads", str(threads)])
+        subprocess.run(cmd, check=True)
+
+        # Convert to TSV
+        log.info("Generating cluster TSV...")
+        subprocess.run(
+            [mmseqs, "createtsv", str(db_path), str(db_path), str(cluster_prefix), str(tsv_path)],
+            check=True,
+        )
+
+        # Parse TSV (rep_id\tmember_id per line) → wwPDB-format cluster file
+        clusters: dict[str, list[str]] = {}
+        with open(tsv_path) as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    rep, member = parts[0], parts[1]
+                    clusters.setdefault(rep, []).append(member)
+
+    # Write wwPDB-format cluster file
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        for members in clusters.values():
+            f.write(" ".join(members) + "\n")
+
+    log.info("Wrote %d clusters (%d sequences) to %s", len(clusters), len(sequences), output_path)
+    click.echo(f"Cluster file: {output_path} ({len(clusters)} clusters, {len(sequences)} sequences)")
 
 
 # Allow running as module

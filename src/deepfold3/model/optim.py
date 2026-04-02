@@ -56,8 +56,8 @@ def make_transition_block(
     - Single transitions: M = N (384-768) — PyTorch wins (Triton overhead dominates)
     """
     block = None
+    use_fused = False
     if config is not None:
-        use_fused = False
         if config.use_fused_transition_pair and channels in _PAIR_TRANSITION_CHANNELS:
             use_fused = True
         elif config.use_fused_transition_single and channels in _SINGLE_TRANSITION_CHANNELS:
@@ -70,7 +70,10 @@ def make_transition_block(
         from deepfold3.model.primitives import TransitionBlock
 
         block = TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor, optim=config)
-    if config is not None and config.use_tiled_linear and channels in _PAIR_TRANSITION_CHANNELS:
+    # Tiled recomputation: only wrap non-fused blocks. FusedTransitionBlock
+    # contains a fused LayerNorm+Linear — tiling would compute LN statistics
+    # per chunk instead of globally, corrupting the normalization.
+    if config is not None and config.use_tiled_linear and channels in _PAIR_TRANSITION_CHANNELS and not use_fused:
         from deepfold3.model.tiled_linear import TiledLinear
 
         block = TiledLinear(block, num_shards=config.tiled_linear_shards, tile_inference=config.tiled_linear_inference)

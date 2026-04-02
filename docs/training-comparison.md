@@ -8,7 +8,7 @@
 | Multi-GPU | DDP (Lightning) | DDP (manual) | DDP (manual) |
 | FSDP | No | No | No |
 | Config system | Hydra YAML + `_target_` | Nested dict + CLI merge | Dataclass + JSON |
-| Experiment tracking | WandB (optional) | WandB (optional) | **None** |
+| Experiment tracking | WandB (optional) | WandB (optional) | WandB (optional) |
 | Batch size | 1 per GPU | 1 per GPU | 1 per GPU |
 | Grad accumulation | 128 (via Lightning) | configurable `iters_to_accumulate` | configurable |
 | Mixed precision | fp32 default | bf16 default | bf16/fp16/fp32 |
@@ -30,11 +30,11 @@
 
 | Aspect | Boltz | Protenix | DeepFold3 |
 |--------|-------|----------|-----------|
-| Method | MMseqs2 `easy-cluster` 40% | Pre-computed PDB clusters (40%) | **Not implemented** |
-| Protein | MMseqs2 at 40% seq identity | `clusters-by-entity-40.txt` from wwPDB | SHA256 hash placeholder |
-| Nucleic acid | Each unique sequence = own cluster | Same PDB cluster file | N/A |
-| Ligand | Each CCD code = own cluster | N/A (handled by entity) | N/A |
-| Output | `clustering.json` | CSV with cluster_id per chain | `cluster_id` field in ChainInfo (unused) |
+| Method | MMseqs2 `easy-cluster` 40% | Pre-computed PDB clusters (40%) | Pre-computed PDB clusters (40%) |
+| Protein | MMseqs2 at 40% seq identity | `clusters-by-entity-40.txt` from wwPDB | `clusters-by-entity-40.txt` from wwPDB |
+| Nucleic acid | Each unique sequence = own cluster | Same PDB cluster file | Same PDB cluster file |
+| Ligand | Each CCD code = own cluster | N/A (handled by entity) | N/A (handled by entity) |
+| Output | `clustering.json` | CSV with cluster_id per chain | `cluster_id` in ChainInfo → `WeightedClusterSampler` |
 
 ### 2.3 MSA Generation
 
@@ -43,7 +43,7 @@
 | Search tool | External (pre-computed A3M) | JackHMMER/HHBlits (AF2-style) | MMseqs2 (ColabFold API or local) |
 | Storage | `.npz` per chain | A3M files per chain | `.npz` per chain |
 | Max sequences | 16384 | 16384 | 16384 |
-| Pairing | Taxonomy-based (Redis) | UniRef-based pairing/non-pairing DBs | **Not implemented for training** |
+| Pairing | Taxonomy-based (Redis) | UniRef-based pairing/non-pairing DBs | Per-chain `paired_msa_id` in ChainInfo |
 | RNA MSA | Not mentioned | Separate RNA MSA pipeline | Not implemented |
 
 ### 2.4 Template Search
@@ -61,32 +61,33 @@
 
 | Aspect | Boltz | Protenix | DeepFold3 |
 |--------|-------|----------|-----------|
-| Sampler | `ClusterSampler` (infinite iterator) | `DistributedWeightedSampler` | `DistributedSampler` (uniform) |
-| Weighting | `β × Σ(α × count) / cluster_size` | `β × Σ(α × count) / (cluster_size + ε)` | **No weighting** |
-| α weights | prot=3, nucl=3, lig=1 | prot=3, nucl=3, lig=1 | N/A |
-| β weights | chain=0.5, interface=1.0 | chain=0.5, interface=1.0 | N/A |
-| Epoch size | 100,000 synthetic | 10,000 synthetic | len(records) |
-| Interface bias | Yes (β_interface > β_chain) | Yes (same scheme) | No |
+| Sampler | `ClusterSampler` (infinite iterator) | `DistributedWeightedSampler` | `WeightedClusterSampler` (falls back to `DistributedSampler`) |
+| Weighting | `β × Σ(α × count) / cluster_size` | `β × Σ(α × count) / (cluster_size + ε)` | `β × Σ(α × count) / cluster_size` (AF3 formula) |
+| α weights | prot=3, nucl=3, lig=1 | prot=3, nucl=3, lig=1 | prot=3, nucl=3, lig=1 |
+| β weights | chain=0.5, interface=1.0 | chain=0.5, interface=1.0 | chain=0.5, interface=1.0 |
+| Epoch size | 100,000 synthetic | 10,000 synthetic | 10,000 synthetic (configurable) |
+| Interface bias | Yes (β_interface > β_chain) | Yes (same scheme) | Yes (same scheme) |
 
 ### 3.2 Cropping
 
 | Aspect | Boltz | Protenix | DeepFold3 |
 |--------|-------|----------|-----------|
-| Methods | Hybrid spatial-contiguous | 3 methods (weighted random) | 2 methods (coin flip) |
+| Methods | Hybrid spatial-contiguous | 3 methods (weighted random) | 3 methods (weighted random) |
 | Spatial | KD-tree by 3D distance | KD-tree by 3D distance | KD-tree by 3D distance |
 | Contiguous | Chain-walk with neighborhood window | AF-Multimer Algorithm 1 | Random chain, random start, walk forward |
-| Interface-seeded | Via `interface_id` parameter | `SpatialInterfaceCropping` (40% weight) | No |
-| Train weights | Unified (neighborhood_size controls blend) | contiguous=0.2, spatial=0.4, interface=0.4 | spatial_prob=0.5 |
+| Interface-seeded | Via `interface_id` parameter | `SpatialInterfaceCropping` (40% weight) | Seed from tokens within 15 Å of another chain |
+| Train weights | Unified (neighborhood_size controls blend) | contiguous=0.2, spatial=0.4, interface=0.4 | contiguous=0.2, spatial=0.4, interface=0.4 |
 | Max tokens | configurable | 384 (train) | 384 (configurable) |
 | Ligand handling | Not detailed | Complete-ligand enforcement | No special handling |
 
 ### 3.3 Featurization
 
-Both Boltz and Protenix produce equivalent feature sets (res_type, MSA, templates, ref atoms, GT positions). DeepFold3 produces all features except:
+Both Boltz and Protenix produce equivalent feature sets (res_type, MSA, templates, ref atoms, GT positions). DeepFold3 produces all features including:
 
-- **`resolution`**: never added (confidence loss gate is dead code)
-- **Paired MSA**: always empty dict (no cross-chain coevolution)
-- **Templates**: not loaded during training
+- **`resolution`**: loaded from manifest metadata; gates confidence losses to [0.1, 4.0] Å
+- **Paired MSA**: loaded via per-chain `paired_msa_id`; merged as paired rows + dense unpaired
+- **Bond features**: `bond_atom_indices`, `bond_gt_distances`, `bond_loss_mask` (backbone + ligand bonds, observed GT distances)
+- **Templates**: not loaded during training (lower priority; inference templates work)
 
 ## 4. Model Training
 
@@ -94,10 +95,10 @@ Both Boltz and Protenix produce equivalent feature sets (res_type, MSA, template
 
 | Aspect | Boltz | Protenix | DeepFold3 |
 |--------|-------|----------|-----------|
-| Max recycles (train) | 3 | 4 (N_cycle=4) | configurable (default 10) |
+| Max recycles (train) | 3 | 4 (N_cycle=4) | configurable (default 4) |
 | Random recycles | `randint(0, max)` per step | fixed N_cycle | `randint(1, max)` per step |
 | Gradient | Last recycle only | Last recycle only | Last recycle only |
-| Implementation | Correct (loop with `set_grad_enabled`) | Correct (loop with `no_grad` wrapper) | **BUG**: `_prev_pair`/`_prev_single` written to features dict but `run_evoformer()` always initializes from zeros — multi-recycle is effectively 1 recycle |
+| Implementation | Correct (loop with `set_grad_enabled`) | Correct (loop with `no_grad` wrapper) | Correct (loop with `set_grad_enabled`; reads `_prev_pair`/`_prev_single` from features) |
 
 ### 4.2 Diffusion Training
 
@@ -109,7 +110,7 @@ Both Boltz and Protenix produce equivalent feature sets (res_type, MSA, template
 | Augmentation | `center_random_augmentation` per step | `centre_random_augmentation` per step | `_random_augmentation` per step |
 | Alignment | Kabsch (SVD, fp32) | Weighted rigid alignment (fp32) | Kabsch alignment |
 | Preconditioning | EDM (c_skip, c_out, c_in) | EDM (c_skip, c_out, c_in) | EDM |
-| Chunking | Not mentioned | `diffusion_chunk_size=4` | Not implemented |
+| Chunking | Not mentioned | `diffusion_chunk_size=4` | Configurable (`diffusion_chunk_size`, default 0 = no chunking) |
 
 ### 4.3 Mini-Rollout (for Confidence)
 
@@ -126,22 +127,22 @@ Both Boltz and Protenix produce equivalent feature sets (res_type, MSA, template
 |------|-------|----------|-----------|
 | Diffusion MSE | ✓ (EDM-weighted) | ✓ (EDM-weighted) | ✓ (EDM-weighted) |
 | Smooth LDDT | ✓ (optional, default on) | ✓ (on in stage 1) | ✓ |
-| Bond violation | ✗ | ✓ (stage 2, α=1.0) | **Config exists, not implemented** |
+| Bond violation | ✗ | ✓ (stage 2, α=1.0) | ✓ (stage 2, α configurable; uses observed GT distances) |
 | Distogram | ✓ (CE, α=0.03) | ✓ (CE, α=0.03) | ✓ (CE, α=0.03) |
 | pLDDT | ✓ (CE, 50 bins) | ✓ (CE, 50 bins) | ✓ (CE, 50 bins) |
 | PAE | ✓ (CE, gated by α_pae) | ✓ (off stage 1, on stage 3) | ✓ (α_pae=0 default) |
 | PDE | ✓ | ✓ | ✓ |
 | Exp resolved | ✓ (BCE) | ✓ (BCE) | ✓ (BCE) |
-| Resolution gate | Not mentioned | ✓ (0.1–4.0 Å) | Dead code (resolution not in features) |
+| Resolution gate | Not mentioned | ✓ (0.1–4.0 Å) | ✓ (0.1–4.0 Å, configurable) |
 
 **Molecule-type loss reweighting:**
 
 | Mol type | Boltz MSE weight | Protenix MSE weight | DeepFold3 |
 |----------|-----------------|---------------------|-----------|
 | Protein | 1× | 1× | 1× |
-| DNA | Not detailed | 5× | 1× (no reweighting) |
-| RNA | Not detailed | 5× | 1× (no reweighting) |
-| Ligand | 10× | 10× | 1× (no reweighting) |
+| DNA | Not detailed | 5× | 5× (configurable) |
+| RNA | Not detailed | 5× | 5× (configurable) |
+| Ligand | 10× | 10× | 10× (configurable) |
 | Nucleotide (Boltz) | 5× | — | — |
 
 ### 4.5 Loss Weights (Combined)
@@ -158,7 +159,7 @@ total_loss = α_diffusion × (MSE + smooth_LDDT [+ bond])
 | α_distogram | 0.03 | 0.03 | 0.03 |
 | α_confidence | 3e-3 (full) / 1e-4 (struct) | 1e-4 | 1e-4 |
 | α_pae | 0 (stage 1) → 1 | 0 (stage 1) → 1 (stage 3) | 0 (default) |
-| α_bond | N/A | 0 (stage 1) → 1 (stage 2) | 0 (unimplemented) |
+| α_bond | N/A | 0 (stage 1) → 1 (stage 2) | 0 (stage 1) → configurable (stage 2) |
 
 ## 5. Optimizer & Schedule
 
@@ -172,7 +173,7 @@ total_loss = α_diffusion × (MSE + smooth_LDDT [+ bond])
 | Warmup steps | 1000 | 2000 (demo) / 10 (config) | 1000 |
 | Decay start | 50,000 | After warmup | 50,000 |
 | Decay schedule | `0.95^(step/50000)` | `0.95^(step/50000)` | `0.95^(step/50000)` |
-| Finetune schedule | Not detailed | Cosine annealing + warmup | Not implemented |
+| Finetune schedule | Not detailed | Cosine annealing + warmup | AF3 or Cosine annealing (selectable) |
 
 ## 6. EMA
 
@@ -202,7 +203,11 @@ Three config files suggest stages but details are sparse:
 
 ### DeepFold3
 
-- **Single stage only**. `TrainingConfig` has `alpha_pae=0.0` (stage 1 behavior) but no mechanism for stage transitions, confidence-only training, or fine-tune LR schedules.
+Config-override-driven stages (no hardcoded presets — use `--config` JSON or `--override key=value`):
+
+1. **Stage 1 — Initial**: Default config. `alpha_diffusion=4.0`, `alpha_pae=0.0`, `alpha_bond=0.0`. AF3 LR schedule.
+2. **Stage 2 — Finetune (structure)**: `alpha_bond>0`. Optional cosine annealing (`finetune_scheduler=cosine`). Load stage 1 checkpoint with `--params`.
+3. **Stage 3 — Finetune (confidence)**: `train_confidence_only=True` (freezes trunk). `alpha_pae=1.0`. `alpha_diffusion=0`, `alpha_distogram=0`.
 
 ## 8. Checkpointing
 
@@ -210,19 +215,19 @@ Three config files suggest stages but details are sparse:
 |--------|-------|----------|-----------|
 | Format | Lightning `.ckpt` | `{step}.pt` | `checkpoint_{step}.pt` |
 | Contents | model + optimizer + scheduler + EMA | model + optimizer + scheduler + step | model + optimizer + scheduler + EMA + step |
-| Rotation | `save_top_k` (configurable) | All kept | All kept |
+| Rotation | `save_top_k` (configurable) | All kept | `max_checkpoints` (default 5, excludes final) |
 | Resume | `ckpt_path` to `trainer.fit()` | `load_checkpoint_path` + fine-grained flags | `--resume` flag |
-| Partial load | via `strict_loading` flag | `load_strict`, `skip_load_optimizer/scheduler` | Not supported |
-| Confidence from trunk | Special trunk→confidence weight copy | `load_strict=False` + new params | Not supported |
+| Partial load | via `strict_loading` flag | `load_strict`, `skip_load_optimizer/scheduler` | `load_strict`, `skip_load_optimizer/scheduler/step` |
+| Confidence from trunk | Special trunk→confidence weight copy | `load_strict=False` + new params | `load_strict=False` + `skip_load_*` flags |
 
 ## 9. Evaluation
 
 | Aspect | Boltz | Protenix | DeepFold3 |
 |--------|-------|----------|-----------|
-| Metrics | Per-type lDDT, RMSD, confidence MAE | lDDT, TM-score, DockQ (via external) | **None** (eval loop is a stub) |
+| Metrics | Per-type lDDT, RMSD, confidence MAE | lDDT, TM-score, DockQ (via external) | All training losses (with EMA weights) |
 | EMA for eval | Yes (weight swap) | Yes (weight swap) | Yes (weight swap) |
-| Eval frequency | Every epoch | Every `eval_interval` steps | Every `eval_every` steps |
-| Eval data | Separate validation set | Separate validation set | 5% random split |
+| Eval frequency | Every epoch | Every `eval_interval` steps | Every `eval_interval` steps |
+| Eval data | Separate validation set | Separate validation set | 5% random split (seeded, reproducible) |
 
 ## 10. Code Style Comparison
 
@@ -248,7 +253,8 @@ Three config files suggest stages but details are sparse:
 - **Native DDP**: Manual `Trainer` class, no framework dependency
 - **Dataclass config**: `TrainingConfig`, `ModelConfig` — type-safe, validated in `__post_init__`
 - **Clean separation**: `trainer.py`, `loss.py`, `ema.py`, `scheduler.py` are independent modules
-- **Minimal**: Lean implementation, but some features are stubs
+- **Config-driven stages**: No hardcoded stage presets — stages via JSON config files + CLI `--override`
+- **Feature-complete**: Cluster-weighted sampling, 3-strategy cropping, paired MSA, bond loss, mol-type reweighting, NaN detection, WandB, checkpoint rotation, partial checkpoint loading, confidence-only freezing, dual LR schedulers
 
 ## 11. Gap Analysis: What DeepFold3 Needs
 
@@ -274,6 +280,6 @@ Three config files suggest stages but details are sparse:
 
 | Gap | Impact | Reference |
 |-----|--------|-----------|
-| **No template loading** | No structural homolog signal during training | Protenix loads + dropout 0.25 |
-| **No nucleic backbone bonds** | O3'→P bonds missing from bond loss | Protenix covers all backbone |
-| **No bucket padding** | `torch.compile` recompiles per sequence length | Low priority |
+| **No template loading (training)** | No structural homolog signal during training | Protenix loads + dropout 0.25 |
+| **No nucleic backbone bonds** | O3'→P inter-residue bonds missing from bond loss (protein N-CA-C + peptide C-N are covered) | Protenix covers all backbone |
+| **No bucket padding (training)** | `torch.compile` recompiles per sequence length | Low priority |
