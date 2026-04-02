@@ -1,48 +1,23 @@
 """Reference atom data lookup.
 
-Uses pdbeccdutils CCD for ideal atom coordinates when available;
-falls back to hardcoded ideal CCD coordinates in const.py.
+Uses CCD for ideal atom coordinates when available (via bulk ``components.cif``
+or per-compound RCSB download); falls back to hardcoded ideal CCD coordinates
+in const.py.
 """
 
 from __future__ import annotations
 
 import logging
-import tempfile
-import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
 from deepfold3.data import const
+from deepfold3.data.ccd import fetch_ccd_block
 
 log = logging.getLogger(__name__)
 
 _CCD_CACHE: dict[str, _CCDEntry | None] = {}
-_CCD_AVAILABLE: bool | None = None
-_CCD_DIR: Path | None = None
-
-
-def _check_ccd_available() -> bool:
-    global _CCD_AVAILABLE
-    if _CCD_AVAILABLE is None:
-        try:
-            import gemmi  # noqa: F401
-            from pdbeccdutils.core import ccd_reader  # noqa: F401
-
-            _CCD_AVAILABLE = True
-        except ImportError:
-            _CCD_AVAILABLE = False
-    return _CCD_AVAILABLE
-
-
-def _get_ccd_dir() -> Path:
-    """Get/create CCD cache directory."""
-    global _CCD_DIR
-    if _CCD_DIR is None:
-        _CCD_DIR = Path(tempfile.gettempdir()) / "deepfold3_ccd_cache"
-        _CCD_DIR.mkdir(exist_ok=True)
-    return _CCD_DIR
 
 
 @dataclass
@@ -54,26 +29,12 @@ class _CCDEntry:
 
 
 def _load_ccd_entry_gemmi(res_name: str) -> _CCDEntry | None:
-    """Load CCD entry using gemmi CIF parsing (proper atom names)."""
-    try:
-        import gemmi
-    except ImportError:
+    """Load CCD entry via shared fetch_ccd_block (bulk or per-compound)."""
+    block = fetch_ccd_block(res_name)
+    if block is None:
         return None
 
-    ccd_dir = _get_ccd_dir()
-    cif_path = ccd_dir / f"{res_name}.cif"
-
-    # Download if not cached
-    if not cif_path.exists():
-        url = f"https://files.rcsb.org/ligands/view/{res_name}.cif"
-        try:
-            urllib.request.urlretrieve(url, str(cif_path))
-        except Exception:
-            return None
-
     try:
-        doc = gemmi.cif.read(str(cif_path))
-        block = doc[0]
         table = block.find(
             [
                 "_chem_comp_atom.atom_id",

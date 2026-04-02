@@ -6,8 +6,10 @@ and converts to the DeepFold3 Structure format (numpy structured arrays).
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +40,40 @@ _ELEMENT_D = gemmi.Element("D")
 
 # Interface detection cutoff (Å)
 _INTERFACE_DIST = 5.0
+
+
+def _read_cif_lenient(path: Path) -> gemmi.cif.Document:
+    """Read a CIF file, stripping duplicate loop blocks that gemmi rejects."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
+        text = f.read()
+
+    # Remove duplicate loop_ blocks: keep the first occurrence of each
+    # category prefix (e.g. _chem_comp.), strip later duplicates.
+    seen_categories: set[str] = set()
+    result_parts: list[str] = []
+    in_dup = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("loop_"):
+            in_dup = False  # reset
+            result_parts.append(line)
+            continue
+        m = re.match(r"(_\w+)\.", stripped)
+        if m and result_parts and result_parts[-1].strip() == "loop_":
+            cat = m.group(1)
+            if cat in seen_categories:
+                # Duplicate category — skip this entire loop
+                in_dup = True
+                result_parts.pop()  # remove the loop_ line
+                continue
+            seen_categories.add(cat)
+        if not in_dup:
+            result_parts.append(line)
+        elif stripped.startswith("#"):
+            in_dup = False
+
+    return gemmi.cif.read_string("".join(result_parts))
 
 
 def _extract_metadata(block: gemmi.cif.Block, resolution: float | None) -> StructureInfo:
@@ -141,10 +177,21 @@ def process_mmcif(
     Returns:
         Tuple of (Structure, Record).
     """
-    # Read CIF document once, extract both structure and metadata
-    doc = gemmi.cif.read(str(path))
+    # Read CIF document once, extract both structure and metadata.
+    # Some CIF files (e.g. PATCHR Atlas ModelCIF) have duplicate _chem_comp
+    # loops; gemmi rejects these, so we strip duplicates on retry.
+    try:
+        doc = gemmi.cif.read(str(path))
+    except RuntimeError as exc:
+        if "duplicate tag" in str(exc):
+            doc = _read_cif_lenient(path)
+        else:
+            raise
     st = gemmi.make_structure_from_block(doc[0])
-    pdb_id = st.name.lower() if st.name else Path(path).stem.split(".")[0].lower()
+    file_stem = Path(path).stem.split(".")[0].lower()
+    # Use entry ID from CIF, but fall back to filename for generic IDs
+    # (e.g. ModelCIF files use "_entry.id model")
+    pdb_id = st.name.lower() if st.name and st.name.lower() != "model" else file_stem
 
     resolution = st.resolution if st.resolution > 0 else None
     metadata = _extract_metadata(doc[0], resolution)

@@ -75,17 +75,30 @@ def _process_one(
 def _collect_pdb_ids(mmcif_dir: Path, limit: int | None = None) -> list[str]:
     """Scan mmCIF directory for all PDB IDs.
 
-    Uses single-level glob (``*/*.cif.gz``) matching the standard PDB mirror layout.
-    Falls back to recursive glob if no matches found.
+    Tries standard PDB mirror layout (``{mid2}/{pdb_id}.cif.gz``) first,
+    then flat ``.cif.gz``, then flat ``.cif`` files.
+    Uses lazy iteration to avoid materializing 250k+ Path objects when
+    ``limit`` is set.
     """
+    # Try glob patterns in priority order; use generators to avoid
+    # materializing the full directory listing upfront.
+    patterns = ["*/*.cif.gz", "*.cif.gz", "*.cif"]
+    matches = None
+    for pat in patterns:
+        gen = mmcif_dir.glob(pat)
+        first = next(gen, None)
+        if first is not None:
+            from itertools import chain
+
+            matches = chain([first], gen)
+            break
+
+    if matches is None:
+        return []
+
     ids = []
-    # Standard PDB layout: {mid2}/{pdb_id}.cif.gz
-    matches = list(mmcif_dir.glob("*/*.cif.gz"))
-    if not matches:
-        matches = list(mmcif_dir.glob("*.cif.gz"))
-    for gz in matches:
-        pdb_id = gz.stem.split(".")[0].lower()
-        ids.append(pdb_id)
+    for p in matches:
+        ids.append(p.stem.split(".")[0].lower())
         if limit and len(ids) >= limit:
             break
     return ids
@@ -98,6 +111,12 @@ def _collect_pdb_ids(mmcif_dir: Path, limit: int | None = None) -> list[str]:
 @click.option("--limit", default=None, type=int, help="Max number of structures to process (for sampling).")
 @click.option("--max-resolution", default=None, type=float, help="Max resolution in Å (e.g. 4.0).")
 @click.option("--no-assembly", is_flag=True, help="Skip assembly expansion (use asymmetric unit).")
+@click.option(
+    "--ccd",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to components.cif(.gz) for bulk CCD lookup (avoids per-compound downloads).",
+)
 @click.option("--workers", default=1, type=int, help="Number of parallel workers.")
 def prepare(
     mmcif_dir: str,
@@ -106,6 +125,7 @@ def prepare(
     limit: int | None,
     max_resolution: float | None,
     no_assembly: bool,
+    ccd: str | None,
     workers: int,
 ) -> None:
     """Preprocess PDB mmCIF files into training data."""
@@ -115,6 +135,12 @@ def prepare(
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     log = logging.getLogger(__name__)
+
+    # Load bulk CCD if provided
+    if ccd:
+        from deepfold3.data.ccd import set_ccd_components_path
+
+        set_ccd_components_path(ccd)
 
     mmcif_path = Path(mmcif_dir)
     output_path = Path(output)
@@ -180,6 +206,26 @@ def prepare(
     save_manifest(manifest_records, manifest_path)
 
     log.info("Done: %d processed, %d skipped/failed.", len(records), failed)
+
+
+@cli.command("fetch-ccd")
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(),
+    help="Directory to save components.cif.gz.",
+)
+def fetch_ccd(output: str) -> None:
+    """Download the full CCD components.cif.gz from wwPDB (~100 MB)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    from deepfold3.data.ccd import fetch_components_cif
+
+    path = fetch_components_cif(output)
+    click.echo(f"CCD components saved to: {path}")
 
 
 # Allow running as module

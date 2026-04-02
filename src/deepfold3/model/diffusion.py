@@ -16,6 +16,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder
 from deepfold3.model.config import DiffusionConfig, OptimConfig
@@ -34,39 +35,44 @@ def noise_schedule(
     return sigma_data * (smax ** (1 / p) + t * (smin ** (1 / p) - smax ** (1 / p))) ** p
 
 
-def _random_augmentation(
+def _random_augmentation_from_vectors(
     positions: torch.Tensor,  # [N, M, 3]
     mask: torch.Tensor,  # [N, M] bool or float
-    generator: torch.Generator | None,
+    v0: torch.Tensor,  # [3]
+    v1: torch.Tensor,  # [3]
+    translation: torch.Tensor,  # [3]
 ) -> torch.Tensor:
-    """Apply random rigid augmentation (center → rotate → translate).
+    """Apply random rigid augmentation using pre-sampled random vectors.
 
     Matches AF3 diffusion_head.random_augmentation() exactly.
-    Applied at every denoising step so the model sees training-time distribution.
     """
-    device = positions.device
     mask_f = mask.float().unsqueeze(-1)  # [N, M, 1]
     total = mask_f.sum().clamp(min=1e-6)
-    center = (positions * mask_f).sum(dim=(0, 1), keepdim=True) / total  # [1, 1, 3]
+    center = (positions * mask_f).sum(dim=(0, 1), keepdim=True) / total
     pos = positions - center
 
-    # Random rotation via Gram-Schmidt (matches AF3 random_rotation)
+    # Random rotation via Gram-Schmidt
+    e0 = v0 / v0.norm().clamp(min=1e-10)
+    v1_orth = v1 - e0 * torch.dot(v1, e0)
+    e1 = v1_orth / v1_orth.norm().clamp(min=1e-10)
+    e2 = torch.linalg.cross(e0, e1)
+    rot = torch.stack([e0, e1, e2], dim=0)
+
+    pos = pos @ rot + translation
+    return pos * mask_f
+
+
+def _random_augmentation(
+    positions: torch.Tensor,
+    mask: torch.Tensor,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    """Apply random rigid augmentation (backward-compatible single-sample interface)."""
+    device = positions.device
     v0 = torch.randn(3, device=device, generator=generator)
     v1 = torch.randn(3, device=device, generator=generator)
-    e0 = v0 / v0.norm().clamp(min=1e-10)
-    v1 = v1 - e0 * torch.dot(v1, e0)
-    e1 = v1 / v1.norm().clamp(min=1e-10)
-    e2 = torch.linalg.cross(e0, e1)
-    rot = torch.stack([e0, e1, e2], dim=0)  # [3, 3] rows = basis vectors
-
-    # pos @ rot  matches AF3's einsum('...i,ij->...j', x, rot)
-    pos = pos @ rot  # [N, M, 3]
-
-    # Random translation ~ N(0, 1) for each coordinate (matches AF3)
     translation = torch.randn(3, device=device, generator=generator)
-    pos = pos + translation
-
-    return pos * mask_f
+    return _random_augmentation_from_vectors(positions, mask, v0, v1, translation)
 
 
 def _augment_in_place(
@@ -74,16 +80,32 @@ def _augment_in_place(
     mask: torch.Tensor,  # [B?, N, M] bool
     generator: torch.Generator | None,
 ) -> None:
-    """Apply random augmentation to each sample in-place."""
+    """Apply random augmentation to each sample in-place.
+
+    Pre-samples all random vectors in a single kernel call to reduce
+    the number of small CUDA kernel launches from 3*B*S to 3.
+    """
     assert positions.dim() in (4, 5), f"Expected 4D or 5D positions, got {positions.dim()}D"
+    device = positions.device
     S = positions.shape[-4]
+
     if positions.dim() == 5:  # [B, S, N, M, 3]
-        for b in range(positions.shape[0]):
+        B = positions.shape[0]
+        # Pre-sample all random vectors: 3 vectors per (b, s) pair
+        v0_all = torch.randn(B, S, 3, device=device, generator=generator)
+        v1_all = torch.randn(B, S, 3, device=device, generator=generator)
+        trans_all = torch.randn(B, S, 3, device=device, generator=generator)
+        for b in range(B):
             for s in range(S):
-                positions[b, s] = _random_augmentation(positions[b, s], mask[b], generator)
+                positions[b, s] = _random_augmentation_from_vectors(
+                    positions[b, s], mask[b], v0_all[b, s], v1_all[b, s], trans_all[b, s]
+                )
     else:  # [S, N, M, 3]
+        v0_all = torch.randn(S, 3, device=device, generator=generator)
+        v1_all = torch.randn(S, 3, device=device, generator=generator)
+        trans_all = torch.randn(S, 3, device=device, generator=generator)
         for s in range(S):
-            positions[s] = _random_augmentation(positions[s], mask, generator)
+            positions[s] = _random_augmentation_from_vectors(positions[s], mask, v0_all[s], v1_all[s], trans_all[s])
 
 
 class DiffusionTransformerBlock(nn.Module):
@@ -587,22 +609,25 @@ class DiffusionHead(nn.Module):
             noise_level=noise_level,
         )
 
-        # Atom encoder: per-sample (build_atom_subsets is sample-dependent)
+        # Atom encoder: per-sample (build_atom_subsets is sample-dependent).
+        # enc_list must persist until the decoder loop because the decoder
+        # reuses encoder conditioning (skip_connection, pair_cond, subsets).
         if has_batch:
             B = noisy_pos.shape[0]
             enc_list = []
             for b in range(B):
-                enc_b = self.atom_encoder(
-                    ref_pos=ref_pos[b],
-                    ref_mask=ref_mask[b],
-                    ref_element=ref_element[b],
-                    ref_charge=ref_charge[b],
-                    ref_atom_name_chars=ref_atom_name_chars[b],
-                    noisy_atom_pos=act_pos[b],
-                    trunk_single=embeddings["single"][b],
-                    trunk_pair=pair_cond[b],
+                enc_list.append(
+                    self.atom_encoder(
+                        ref_pos=ref_pos[b],
+                        ref_mask=ref_mask[b],
+                        ref_element=ref_element[b],
+                        ref_charge=ref_charge[b],
+                        ref_atom_name_chars=ref_atom_name_chars[b],
+                        noisy_atom_pos=act_pos[b],
+                        trunk_single=embeddings["single"][b],
+                        trunk_pair=pair_cond[b],
+                    )
                 )
-                enc_list.append(enc_b)
             act = torch.stack([e.token_act for e in enc_list]).float()
         else:
             enc = self.atom_encoder(
@@ -624,11 +649,13 @@ class DiffusionHead(nn.Module):
         # Main transformer (already batch-aware)
         act = self.transformer(act, seq_mask, single_cond, pair_cond)
 
-        # Atom decoder: per-sample
+        # Atom decoder: per-sample. Pop from enc_list to free each encoder
+        # output as soon as it's consumed (enables GC mid-loop).
         if has_batch:
             pos_updates = []
             for b in range(B):
                 pos_updates.append(self.atom_decoder(act[b], enc_list[b]))
+                enc_list[b] = None  # release encoder output for GC
             pos_update = torch.stack(pos_updates)
         else:
             pos_update = self.atom_decoder(act, enc)
@@ -652,13 +679,36 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """Denoise each sample independently. Returns [B?, S, N, M, 3]."""
+        """Denoise each sample independently. Returns [B?, S, N, M, 3].
+
+        Each denoise call is wrapped in ``torch.utils.checkpoint`` so that
+        forward-pass intermediates (24 transformer blocks + atom encoder/decoder)
+        are freed per-sample rather than accumulated across all S samples.
+        This reduces peak memory from O(S) to O(1) w.r.t. transformer activations,
+        at the cost of recomputing each sample's forward pass during backward.
+        """
         S = noisy_pos.shape[-4]
+        use_ckpt = torch.is_grad_enabled()
         results = []
         for s in range(S):
             nl_s = noise_level if noise_level.dim() == 0 else noise_level[..., s]
-            results.append(
-                self.denoise(
+            if use_ckpt:
+                result = torch_checkpoint(
+                    self.denoise,
+                    noisy_pos[..., s, :, :, :],
+                    nl_s,
+                    embeddings,
+                    ref_pos,
+                    ref_mask,
+                    ref_element,
+                    ref_charge,
+                    ref_atom_name_chars,
+                    seq_mask,
+                    rel_feat,
+                    use_reentrant=False,
+                )
+            else:
+                result = self.denoise(
                     noisy_pos=noisy_pos[..., s, :, :, :],
                     noise_level=nl_s,
                     embeddings=embeddings,
@@ -670,7 +720,7 @@ class DiffusionHead(nn.Module):
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
                 )
-            )
+            results.append(result)
         return torch.stack(results, dim=-4)
 
     @torch.no_grad()
@@ -705,6 +755,9 @@ class DiffusionHead(nn.Module):
             p=cfg.noise_p,
         )
 
+        # Pre-compute per-step gamma to avoid GPU→CPU sync inside the loop
+        gammas = torch.where(noise_levels[1:] > cfg.gamma_min, cfg.gamma_0, 0.0)  # [steps]
+
         # Initialize from pure noise: [B?, S, N, M, 3]
         positions = torch.randn(*batch_shape, cfg.num_samples, N, M, 3, device=device, generator=generator)
         positions = positions * noise_levels[0]
@@ -717,8 +770,8 @@ class DiffusionHead(nn.Module):
             # Random augmentation per sample — required for AF3 equivalence.
             _augment_in_place(positions, aug_mask, generator)
 
-            # Stochastic gamma step.
-            gamma = cfg.gamma_0 if sigma_next > cfg.gamma_min else 0.0
+            # Stochastic gamma step (pre-computed, no GPU sync).
+            gamma = gammas[step]
             sigma_hat = sigma_prev * (1 + gamma)
 
             # Add noise

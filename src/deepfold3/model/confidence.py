@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
@@ -159,36 +160,38 @@ class ConfidenceHead(nn.Module):
         pde_list = []
         exp_resolved_list = []
 
+        arange_n = torch.arange(N, device=pair.device)
+        use_ckpt = torch.is_grad_enabled()
         for s in range(num_samples):
-            # Extract representative atom positions for this sample
-            positions = atom_positions[s, torch.arange(N, device=pair.device), rep_atom_index]  # [N, 3]
+            positions = atom_positions[s, arange_n, rep_atom_index]  # [N, 3]
 
-            # Start from trunk embeddings (shared across samples)
-            pair_act = pair.clone()
-            single_act = single.clone()
-
-            # Add position-dependent features
-            pair_act = pair_act + self._embed_features(target_feat, positions, pair_mask)
-
-            # Run confidence PairFormer
-            for layer in self.layers:
-                pair_act, single_act = layer(pair_act, single_act, pair_mask, seq_mask)
-
-            pair_act = pair_act.float()
-            single_act = single_act.float()
-
-            plddt_list.append(self.plddt_logits(self.plddt_logits_ln(single_act)))
-            exp_resolved_list.append(self.exp_resolved_logits(self.exp_resolved_ln(single_act)))
-
-            if return_pre_logits:
-                # Return post-LN features for fused chunked loss (no logit materialization)
-                pae_list.append(self.pae_logits_ln(pair_act))
-                pde_list.append(self.pde_logits_ln(pair_act))
+            if use_ckpt:
+                plddt, exp_res, pae, pde = torch_checkpoint(
+                    self._process_one_sample,
+                    pair,
+                    single,
+                    target_feat,
+                    positions,
+                    pair_mask,
+                    seq_mask,
+                    return_pre_logits,
+                    use_reentrant=False,
+                )
             else:
-                pae_list.append(self.pae_logits(self.pae_logits_ln(pair_act)))
-                # PDE: symmetrised half-logits
-                pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
-                pde_list.append(pde_half + pde_half.transpose(-3, -2))
+                plddt, exp_res, pae, pde = self._process_one_sample(
+                    pair,
+                    single,
+                    target_feat,
+                    positions,
+                    pair_mask,
+                    seq_mask,
+                    return_pre_logits,
+                )
+
+            plddt_list.append(plddt)
+            exp_resolved_list.append(exp_res)
+            pae_list.append(pae)
+            pde_list.append(pde)
 
         result = {
             "plddt_logits": torch.stack(plddt_list, dim=0),
@@ -201,3 +204,42 @@ class ConfidenceHead(nn.Module):
             result["pae_logits"] = torch.stack(pae_list, dim=0)
             result["pde_logits"] = torch.stack(pde_list, dim=0)
         return result
+
+    def _process_one_sample(
+        self,
+        pair: torch.Tensor,
+        single: torch.Tensor,
+        target_feat: torch.Tensor,
+        positions: torch.Tensor,
+        pair_mask: torch.Tensor,
+        seq_mask: torch.Tensor,
+        return_pre_logits: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run PairFormer + logit projections for one confidence sample.
+
+        Extracted as a separate method so it can be wrapped with
+        ``torch.utils.checkpoint`` to free per-sample intermediates.
+        """
+        pair_act = pair.clone()
+        single_act = single.clone()
+
+        pair_act = pair_act + self._embed_features(target_feat, positions, pair_mask)
+
+        for layer in self.layers:
+            pair_act, single_act = layer(pair_act, single_act, pair_mask, seq_mask)
+
+        pair_act = pair_act.float()
+        single_act = single_act.float()
+
+        plddt = self.plddt_logits(self.plddt_logits_ln(single_act))
+        exp_res = self.exp_resolved_logits(self.exp_resolved_ln(single_act))
+
+        if return_pre_logits:
+            pae = self.pae_logits_ln(pair_act)
+            pde = self.pde_logits_ln(pair_act)
+        else:
+            pae = self.pae_logits(self.pae_logits_ln(pair_act))
+            pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
+            pde = pde_half + pde_half.transpose(-3, -2)
+
+        return plddt, exp_res, pae, pde

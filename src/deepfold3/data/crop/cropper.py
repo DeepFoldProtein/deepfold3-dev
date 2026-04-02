@@ -16,11 +16,30 @@ from deepfold3.data.types import MSA as MSAType
 
 
 class Cropper:
-    """Crop a Tokenized input to at most max_tokens / max_atoms."""
+    """Crop a Tokenized input to at most max_tokens / max_atoms.
 
-    def __init__(self, max_neighborhood: int = 40, spatial_prob: float = 0.5):
+    Three crop strategies (Protenix-style weights):
+      1. Contiguous (20%): pick a chain, walk sequentially.
+      2. Spatial (40%): pick a random seed token, expand by 3D proximity.
+      3. Interface-seeded spatial (40%): seed from interface tokens (within
+         ``interface_distance`` of another chain), then expand spatially.
+
+    When no interface tokens exist, interface crop falls back to spatial.
+    """
+
+    def __init__(
+        self,
+        max_neighborhood: int = 40,
+        contiguous_weight: float = 0.2,
+        spatial_weight: float = 0.4,
+        interface_weight: float = 0.4,
+        interface_distance: float = 15.0,
+    ):
         self.max_neighborhood = max_neighborhood
-        self.spatial_prob = spatial_prob
+        self.contiguous_weight = contiguous_weight
+        self.spatial_weight = spatial_weight
+        self.interface_weight = interface_weight
+        self.interface_distance = interface_distance
 
     def crop(
         self,
@@ -57,10 +76,17 @@ class Cropper:
 
         rng = random.Random(seed)
 
-        if chain_id is not None or rng.random() < (1 - self.spatial_prob):
+        if chain_id is not None:
             selected = self._contiguous_crop(tokens, max_tokens, max_atoms, chain_id, rng)
         else:
-            selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+            # Weighted random choice among three strategies
+            r = rng.random()
+            if r < self.contiguous_weight:
+                selected = self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
+            elif r < self.contiguous_weight + self.interface_weight:
+                selected = self._interface_spatial_crop(tokens, max_tokens, max_atoms, rng)
+            else:
+                selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
 
         return self._reindex(data, selected)
 
@@ -149,6 +175,82 @@ class Cropper:
         k = min(max_tokens * 2, len(tokens))
         dists, indices = tree.query(seed_coord, k=k)
         indices = np.atleast_1d(indices[0])  # flatten; atleast_1d handles k=1
+
+        selected: list[int] = []
+        atom_count = 0
+        for idx in indices:
+            an = int(tokens[idx]["atom_num"])
+            if len(selected) >= max_tokens or atom_count + an > max_atoms:
+                break
+            selected.append(int(idx))
+            atom_count += an
+
+        return np.array(sorted(selected), dtype=np.int64)
+
+    # ------------------------------------------------------------------
+    # Interface-seeded spatial cropping
+    # ------------------------------------------------------------------
+
+    def _interface_spatial_crop(
+        self,
+        tokens: np.ndarray,
+        max_tokens: int,
+        max_atoms: int,
+        rng: random.Random,
+    ) -> np.ndarray:
+        """Spatial crop seeded from interface tokens (near another chain).
+
+        Finds tokens whose representative atom is within ``interface_distance``
+        of a token from a different chain, then picks a random seed among those
+        and expands spatially. Falls back to standard spatial crop if no
+        interface tokens exist.
+        """
+        try:
+            from scipy.spatial import KDTree
+        except ImportError:
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+
+        coords = np.stack(
+            [
+                tokens["center_x"].astype(np.float64),
+                tokens["center_y"].astype(np.float64),
+                tokens["center_z"].astype(np.float64),
+            ],
+            axis=1,
+        )
+
+        valid = ~np.all(coords == 0.0, axis=1)
+        if valid.sum() < 2:
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+
+        centroid = coords[valid].mean(axis=0)
+        coords[~valid] = centroid
+
+        # Find interface tokens: tokens within interface_distance of another chain
+        asym_ids = tokens["asym_id"]
+        tree = KDTree(coords)
+        interface_indices: list[int] = []
+
+        for i in range(len(tokens)):
+            if not valid[i]:
+                continue
+            # Query neighbors within interface_distance
+            neighbors = tree.query_ball_point(coords[i], self.interface_distance)
+            for j in neighbors:
+                if asym_ids[j] != asym_ids[i]:
+                    interface_indices.append(i)
+                    break
+
+        if not interface_indices:
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+
+        # Pick seed from interface tokens, then expand spatially
+        seed_idx = rng.choice(interface_indices)
+        seed_coord = coords[seed_idx : seed_idx + 1]
+
+        k = min(max_tokens * 2, len(tokens))
+        dists, indices = tree.query(seed_coord, k=k)
+        indices = np.atleast_1d(indices[0])
 
         selected: list[int] = []
         atom_count = 0

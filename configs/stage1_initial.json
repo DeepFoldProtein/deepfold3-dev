@@ -1,0 +1,92 @@
+{
+  "training": {
+    "lr": 0.0018,
+    "weight_decay": 0.0,
+    "warmup_steps": 1000,
+    "start_decay_after": 50000,
+    "decay_every": 50000,
+    "decay_factor": 0.95,
+    "finetune_scheduler": "af3",
+    "grad_clip_norm": 10.0,
+    "accumulate_grad_batches": 1,
+    "ema_decay": 0.999,
+
+    "max_tokens": 384,
+    "max_atoms": 4096,
+    "max_msa_seqs": 16384,
+    "max_recycles": 4,
+
+    "diffusion_batch_size": 48,
+    "diffusion_chunk_size": 0,
+    "mini_rollout_steps": 20,
+    "mini_rollout_samples": 1,
+
+    "alpha_diffusion": 4.0,
+    "alpha_distogram": 0.03,
+    "alpha_confidence": 1e-4,
+    "alpha_pae": 0.0,
+    "alpha_bond": 0.0,
+    "nucleotide_loss_weight": 5.0,
+    "ligand_loss_weight": 10.0,
+
+    "lddt_cutoffs": [0.5, 1.0, 2.0, 4.0],
+    "lddt_inclusion_radius": 30.0,
+    "min_resolution": 0.1,
+    "max_resolution": 4.0,
+
+    "use_fused_ce_loss": false,
+    "fused_ce_chunk_n": 32,
+
+    "dtype": "bf16",
+    "find_unused_parameters": false,
+    "static_graph": true,
+    "train_confidence_only": false,
+
+    "max_steps": 200000,
+    "seed": 42,
+    "checkpoint_interval": 1000,
+    "eval_interval": 5000,
+    "log_interval": 50,
+    "max_checkpoints": 5,
+    "num_workers": 4
+  },
+  "model": {
+    "num_recycles": 10,
+    "msa_crop_size": 1024,
+    "evoformer": {
+      "num_layer": 4,
+      "msa_channel": 64,
+      "seq_channel": 384,
+      "pair_channel": 128
+    },
+    "pairformer": {
+      "num_layer": 48,
+      "pair_channel": 128,
+      "seq_channel": 384
+    },
+    "diffusion": {
+      "steps": 200,
+      "num_samples": 5,
+      "sigma_data": 16.0,
+      "p_mean": -1.2,
+      "p_std": 1.5
+    },
+    "confidence": {
+      "num_layer": 4,
+      "num_plddt_bins": 50,
+      "num_distogram_bins": 64,
+      "max_error_bin": 31.0
+    },
+    "template": {
+      "num_channels": 64,
+      "pairformer": {
+        "num_layer": 2
+      }
+    },
+    "data": {
+      "max_templates": 4,
+      "spatial_crop_prob": 0.5
+    },
+    "optim": {}
+  }
+}

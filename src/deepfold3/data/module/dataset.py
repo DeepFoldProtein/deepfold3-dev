@@ -75,19 +75,31 @@ class TrainingDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Structure file not found: {structure_path}")
         structure = Structure.load(structure_path)
 
-        # Load MSAs keyed by chain index (treated as unpaired for disk-loaded MSAs)
-        msa: dict[int, MSA] = {}
+        # Load per-chain MSAs (unpaired + optional paired)
+        unpaired_msa: dict[int, MSA] = {}
+        paired_msa: dict[int, MSA] = {}
         for chain_info in record.chains:
+            # Unpaired MSA
             msa_path = self.data_dir / "msa" / f"{chain_info.msa_id}.npz"
             if msa_path.exists():
-                msa[chain_info.chain_id] = MSA.load(msa_path)
+                unpaired_msa[chain_info.chain_id] = MSA.load(msa_path)
 
-        inp = Input(structure=structure, paired_msa={}, unpaired_msa=msa)
+            # Paired MSA (cross-chain co-evolutionary signal)
+            if chain_info.paired_msa_id is not None:
+                paired_path = self.data_dir / "msa" / f"{chain_info.paired_msa_id}.npz"
+                if paired_path.exists():
+                    paired_msa[chain_info.chain_id] = MSA.load(paired_path)
+
+        inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
 
         # Tokenize -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
         feats = self.featurizer.process(tokenized, training=True, random_rot=True)
+
+        # Add resolution from manifest metadata (enables confidence loss gating)
+        if record.structure_info and record.structure_info.resolution is not None:
+            feats["resolution"] = torch.tensor(record.structure_info.resolution, dtype=torch.float32)
 
         return feats
 

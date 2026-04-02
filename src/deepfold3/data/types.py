@@ -304,6 +304,7 @@ class ChainInfo:
     msa_id: str | int
     num_residues: int
     entity_id: str | int | None = None
+    paired_msa_id: str | int | None = None  # separate file for paired (cross-chain) MSA
     valid: bool = True
 
 
@@ -346,6 +347,7 @@ class Record:
                 "msa_id": c.msa_id,
                 "num_residues": c.num_residues,
                 "entity_id": c.entity_id,
+                "paired_msa_id": c.paired_msa_id,
                 "valid": c.valid,
             }
             for c in self.chains

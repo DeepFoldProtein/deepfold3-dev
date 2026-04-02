@@ -48,6 +48,9 @@ deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
+deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
+deepfold3 train     --data-dir /data/training --output runs/exp1 --override alpha_pae=1.0 --override train_confidence_only=true
+deepfold3 train     --data-dir /data/training --output runs/exp1 --wandb deepfold3
 # Multi-GPU training via torchrun
 torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training --output runs/exp1
 ```
@@ -127,9 +130,10 @@ src/deepfold3/
 │   ├── msa/             # mmseqs2.py (server API + local binary + GPU-accelerated MSA search + template m8 parsing)
 │   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), hhr.py, json_input.py (4 dialects)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
-│   ├── crop/             # cropper.py (contiguous + spatial)
+│   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
+│   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py
+│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py, clustering.py
 │   └── module/           # dataset.py (TrainingDataset, InferenceInput), collate.py (batch)
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
@@ -137,10 +141,10 @@ src/deepfold3/
 │   ├── mmcif.py          # save_mmcif() (gemmi-based, pLDDT in B-factors)
 │   └── confidences.py    # Confidence metric computation + save_confidences_json()
 ├── training/        # Training pipeline
-│   ├── loss.py           # smooth_lddt, diffusion_mse, distogram, plddt, pae, pde, exp_resolved, training_loss
+│   ├── loss.py           # smooth_lddt, diffusion_mse, bond, distogram, plddt, pae, pde, exp_resolved, training_loss
 │   ├── ema.py            # EMA with warm-start decay + fused kernel re-sync
-│   ├── scheduler.py      # AF3LRScheduler (warmup → plateau → step decay)
-│   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval)
+│   ├── scheduler.py      # AF3LRScheduler + CosineAnnealingScheduler
+│   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval, WandB)
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
 │   ├── __init__.py       # click.Group `cli` — unified entry point
 │   ├── inference.py      # `deepfold3 inference`
@@ -191,10 +195,28 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 
 | Loss | Weight | Notes |
 |------|--------|-------|
-| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted: w(σ) = (σ²+σ_d²)/(σ·σ_d)² |
+| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted; mol-type reweight: DNA/RNA 5×, ligand 10× |
+| Bond violation | `alpha_diffusion × alpha_bond` (0) | MSE on bond distances vs CCD ideal; enable for stage 2 |
 | Distogram | `alpha_distogram` (0.03) | 64-bin cross-entropy |
-| pLDDT, PDE, exp_resolved | `alpha_confidence` (1e-4) | Per-atom/pair confidence |
+| pLDDT, PDE, exp_resolved | `alpha_confidence` (1e-4) | Per-atom/pair confidence; gated on resolution ∈ [0.1, 4.0] |
 | PAE | `alpha_confidence × alpha_pae` (0) | Disabled in stage 1; set alpha_pae=1.0 for finetuning |
+
+### Multi-Stage Training
+
+Stages are controlled by config overrides, not hardcoded presets. Use `--config` with stage JSON files or `--override key=value`:
+
+```bash
+# Stage 1: Initial training (default config)
+deepfold3 train --data-dir /data/training --output runs/exp1
+
+# Stage 2: Fine-tune structure (bond loss on, cosine LR)
+deepfold3 train --data-dir /data/training --output runs/exp2 \
+    --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
+
+# Stage 3: Fine-tune confidence (freeze trunk, enable PAE)
+deepfold3 train --data-dir /data/training --output runs/exp3 \
+    --config configs/stage3_finetune_confidence.json --params runs/exp2/checkpoint_final.pt
+```
 
 ### Training Data Format
 

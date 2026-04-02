@@ -381,6 +381,7 @@ class TrainingConfig:
 
     # Diffusion training
     diffusion_batch_size: int = 48
+    diffusion_chunk_size: int = 0  # 0 = no chunking; >0 = process S samples in chunks
     mini_rollout_steps: int = 20
     mini_rollout_samples: int = 1
 
@@ -390,6 +391,10 @@ class TrainingConfig:
     alpha_confidence: float = 1e-4
     alpha_pae: float = 0.0
     alpha_bond: float = 0.0
+
+    # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
+    nucleotide_loss_weight: float = 5.0
+    ligand_loss_weight: float = 10.0
 
     # Smooth LDDT thresholds
     lddt_cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
@@ -423,6 +428,23 @@ class TrainingConfig:
     checkpoint_interval: int = 1000
     eval_interval: int = 5000
     log_interval: int = 50
+    max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
+
+    # Multi-stage training (use --override or JSON config to set these per stage)
+    train_confidence_only: bool = False  # freeze trunk, only train confidence head
+    finetune_scheduler: str = "af3"  # "af3" or "cosine"
+    cosine_min_lr_ratio: float = 0.1  # min LR = lr * ratio (for cosine scheduler)
+    cosine_max_steps: int = 20000  # total steps for cosine annealing
+
+    # Checkpoint loading
+    load_strict: bool = True  # strict state_dict loading
+    skip_load_optimizer: bool = False
+    skip_load_scheduler: bool = False
+    skip_load_step: bool = False
+
+    # Experiment tracking
+    wandb_project: str = ""  # empty = disabled
+    wandb_run_name: str = ""
 
     # Paths (set at runtime)
     output_dir: str = "output"

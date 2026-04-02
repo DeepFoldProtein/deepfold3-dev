@@ -2,6 +2,14 @@
 
 Build molecule data from CCD codes (downloaded from RCSB) or SMILES strings
 (via RDKit).  Heavy atoms only — hydrogens are excluded.
+
+CCD lookups can use either:
+1. A monolithic ``components.cif`` file (recommended for training; ~110 MB,
+   loaded once via gemmi into memory).
+2. Individual per-compound downloads from RCSB (on-demand, cached in
+   ``/tmp/deepfold3_ccd_cache/``).
+
+Call :func:`set_ccd_components_path` before any lookups to use the bulk file.
 """
 
 from __future__ import annotations
@@ -21,6 +29,66 @@ _CCD_DIR: Path | None = None
 # Bond order mapping from CCD _chem_comp_bond.value_order
 _BOND_ORDER: dict[str, int] = {"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}
 
+# Global components.cif document (loaded once, shared across ccd.py and ref_atoms.py)
+_COMPONENTS_DOC = None  # gemmi.cif.Document | None
+_COMPONENTS_PATH: Path | None = None
+
+_COMPONENTS_CIF_URL = "https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz"
+
+
+def set_ccd_components_path(path: str | Path) -> None:
+    """Point CCD lookups at a local ``components.cif`` (or ``.cif.gz``).
+
+    This avoids per-compound HTTP downloads and is strongly recommended
+    for batch processing (training data preparation).  The file is loaded
+    lazily on first CCD lookup.
+    """
+    global _COMPONENTS_PATH, _COMPONENTS_DOC
+    _COMPONENTS_PATH = Path(path)
+    _COMPONENTS_DOC = None  # reset — will be loaded on next access
+
+
+def get_ccd_block(ccd_code: str):
+    """Look up a CCD block from the loaded components.cif, or return None.
+
+    Returns a ``gemmi.cif.Block`` if ``components.cif`` is configured and the
+    code exists, otherwise ``None`` (caller should fall back to per-file download).
+    """
+    global _COMPONENTS_DOC
+    if _COMPONENTS_PATH is None:
+        return None
+
+    if _COMPONENTS_DOC is None:
+        import gemmi
+
+        log.info("Loading CCD components from %s (this may take a minute)...", _COMPONENTS_PATH)
+        _COMPONENTS_DOC = gemmi.cif.read(str(_COMPONENTS_PATH))
+        log.info("CCD components loaded: %d blocks", len(_COMPONENTS_DOC))
+
+    return _COMPONENTS_DOC.find_block(ccd_code.strip().upper())
+
+
+def fetch_components_cif(dest: str | Path) -> Path:
+    """Download the full CCD ``components.cif.gz`` from wwPDB.
+
+    Args:
+        dest: Directory to save the file in.  The file will be named
+              ``components.cif.gz``.
+
+    Returns:
+        Path to the downloaded (or already-existing) file.
+    """
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    out_path = dest / "components.cif.gz"
+    if out_path.exists():
+        log.info("CCD components already present: %s", out_path)
+        return out_path
+    log.info("Downloading CCD components.cif.gz from wwPDB (~100 MB)...")
+    urllib.request.urlretrieve(_COMPONENTS_CIF_URL, str(out_path))
+    log.info("Downloaded to %s", out_path)
+    return out_path
+
 
 def _get_ccd_dir() -> Path:
     global _CCD_DIR
@@ -28,6 +96,39 @@ def _get_ccd_dir() -> Path:
         _CCD_DIR = Path(tempfile.gettempdir()) / "deepfold3_ccd_cache"
         _CCD_DIR.mkdir(exist_ok=True)
     return _CCD_DIR
+
+
+def fetch_ccd_block(ccd_code: str):
+    """Resolve a CCD code to a gemmi.cif.Block.
+
+    Tries bulk components.cif first, then falls back to per-compound
+    RCSB download.  Returns ``None`` if the code cannot be resolved.
+    """
+    import gemmi
+
+    ccd_code = ccd_code.strip().upper()
+
+    # Try bulk components.cif first
+    block = get_ccd_block(ccd_code)
+    if block is not None:
+        return block
+
+    # Fall back to per-compound download
+    ccd_dir = _get_ccd_dir()
+    cif_path = ccd_dir / f"{ccd_code}.cif"
+
+    if not cif_path.exists():
+        url = f"https://files.rcsb.org/ligands/view/{ccd_code}.cif"
+        try:
+            urllib.request.urlretrieve(url, str(cif_path))
+        except Exception:
+            return None
+
+    try:
+        doc = gemmi.cif.read(str(cif_path))
+        return doc[0]
+    except Exception:
+        return None
 
 
 @dataclass
@@ -88,18 +189,11 @@ def load_ccd_molecule(ccd_code: str) -> CcdMolecule:
 
 
 def _parse_ccd_cif(ccd_code: str) -> CcdMolecule:
-    """Downloads and parses a CCD CIF file from RCSB."""
-    import gemmi
-
-    ccd_dir = _get_ccd_dir()
-    cif_path = ccd_dir / f"{ccd_code}.cif"
-
-    if not cif_path.exists():
-        url = f"https://files.rcsb.org/ligands/view/{ccd_code}.cif"
-        urllib.request.urlretrieve(url, str(cif_path))
-
-    doc = gemmi.cif.read(str(cif_path))
-    block = doc[0]
+    """Parse a CCD CIF entry. Uses components.cif if available, else downloads."""
+    ccd_code = ccd_code.strip().upper()
+    block = fetch_ccd_block(ccd_code)
+    if block is None:
+        raise ValueError(f"CCD code {ccd_code!r} not found")
 
     # Parse atoms
     atom_table = block.find(

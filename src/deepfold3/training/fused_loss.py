@@ -39,7 +39,11 @@ class _ChunkedLinearCE(torch.autograd.Function):
         S, N, _, H = features.shape
         C = weight.shape[0]
 
-        n_valid = mask.sum().clamp(min=1).float() if mask is not None else torch.tensor(S * N * N, dtype=torch.float32, device=features.device)
+        n_valid = (
+            mask.sum().clamp(min=1).float()
+            if mask is not None
+            else torch.tensor(S * N * N, dtype=torch.float32, device=features.device)
+        )
 
         loss_acc = torch.zeros((), dtype=torch.float32, device=features.device)
         grad_input = torch.zeros_like(features)
@@ -191,7 +195,12 @@ def distogram_loss_fused(
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
 
     return chunked_linear_cross_entropy(
-        features, weight, target, pair_mask, chunk_n=chunk_n, symmetrize=True,
+        features,
+        weight,
+        target,
+        pair_mask,
+        chunk_n=chunk_n,
+        symmetrize=True,
     )
 
 
@@ -224,7 +233,12 @@ def pae_loss_fused(
     mask_s = pair_mask.unsqueeze(0).expand(features.shape[0], -1, -1)
 
     return chunked_linear_cross_entropy(
-        features, weight, target, mask_s, chunk_n=chunk_n, symmetrize=False,
+        features,
+        weight,
+        target,
+        mask_s,
+        chunk_n=chunk_n,
+        symmetrize=False,
     )
 
 
@@ -258,5 +272,10 @@ def pde_loss_fused(
     mask_s = pair_mask.unsqueeze(0).expand(features.shape[0], -1, -1)
 
     return chunked_linear_cross_entropy(
-        features, weight, target, mask_s, chunk_n=chunk_n, symmetrize=True,
+        features,
+        weight,
+        target,
+        mask_s,
+        chunk_n=chunk_n,
+        symmetrize=True,
     )

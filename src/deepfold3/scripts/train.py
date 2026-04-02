@@ -28,6 +28,24 @@ import click
 from deepfold3.scripts import cli
 
 
+def _apply_overrides(cfg: object, overrides: dict) -> None:
+    """Recursively apply dict overrides to a nested dataclass config.
+
+    Handles arbitrarily nested dataclass hierarchies: if a value is a dict
+    and the corresponding attribute is a dataclass, recurse into it.
+    """
+    for key, val in overrides.items():
+        if key.startswith("_"):
+            continue  # skip metadata keys like _description, _usage
+        if not hasattr(cfg, key):
+            continue
+        cur = getattr(cfg, key)
+        if isinstance(val, dict) and hasattr(cur, "__dataclass_fields__"):
+            _apply_overrides(cur, val)
+        else:
+            setattr(cfg, key, val)
+
+
 @cli.command()
 @click.option("--data-dir", required=True, type=click.Path(exists=True), help="Training data directory.")
 @click.option("--output", required=True, type=click.Path(), help="Output directory for checkpoints and logs.")
@@ -40,6 +58,14 @@ from deepfold3.scripts import cli
 @click.option("--grad-accum", default=None, type=int, help="Override gradient accumulation steps.")
 @click.option("--seed", default=None, type=int, help="Override random seed.")
 @click.option("--dtype", default=None, type=click.Choice(["bf16", "fp32", "fp16"]), help="Override precision.")
+@click.option("--wandb", "wandb_project", default=None, help="WandB project name (enables tracking).")
+@click.option("--override", multiple=True, help="Override config: key=value (e.g. --override alpha_pae=1.0).")
+@click.option(
+    "--ccd",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to components.cif(.gz) for bulk CCD lookup.",
+)
 def train(
     data_dir: str,
     output: str,
@@ -52,6 +78,9 @@ def train(
     grad_accum: int | None,
     seed: int | None,
     dtype: str | None,
+    wandb_project: str | None,
+    override: tuple[str, ...],
+    ccd: str | None,
 ) -> None:
     """Train DeepFold3 model."""
     from deepfold3.model.config import ModelConfig, TrainingConfig
@@ -62,6 +91,12 @@ def train(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    # Load bulk CCD if provided
+    if ccd:
+        from deepfold3.data.ccd import set_ccd_components_path
+
+        set_ccd_components_path(ccd)
 
     # Build config from defaults + JSON override + CLI overrides
     train_cfg = TrainingConfig()
@@ -76,16 +111,8 @@ def train(
             if hasattr(train_cfg, key):
                 setattr(train_cfg, key, val)
 
-        # Apply model config overrides (flat or nested)
-        for key, val in overrides.get("model", {}).items():
-            if hasattr(model_cfg, key):
-                sub_cfg = getattr(model_cfg, key)
-                if isinstance(val, dict) and hasattr(sub_cfg, "__dataclass_fields__"):
-                    for sk, sv in val.items():
-                        if hasattr(sub_cfg, sk):
-                            setattr(sub_cfg, sk, sv)
-                else:
-                    setattr(model_cfg, key, val)
+        # Apply model config overrides (recursively for nested dataclasses)
+        _apply_overrides(model_cfg, overrides.get("model", {}))
 
     # Apply CLI overrides
     train_cfg.data_dir = data_dir
@@ -103,6 +130,25 @@ def train(
         train_cfg.seed = seed
     if dtype is not None:
         train_cfg.dtype = dtype
+    if wandb_project is not None:
+        train_cfg.wandb_project = wandb_project
+
+    # Apply --override key=value pairs (supports int, float, bool, str)
+    for kv in override:
+        if "=" not in kv:
+            raise click.BadParameter(f"Override must be key=value, got: {kv}")
+        key, val = kv.split("=", 1)
+        if not hasattr(train_cfg, key):
+            raise click.BadParameter(f"Unknown config key: {key}")
+        cur = getattr(train_cfg, key)
+        if isinstance(cur, bool):
+            setattr(train_cfg, key, val.lower() in ("true", "1", "yes"))
+        elif isinstance(cur, int):
+            setattr(train_cfg, key, int(val))
+        elif isinstance(cur, float):
+            setattr(train_cfg, key, float(val))
+        else:
+            setattr(train_cfg, key, val)
 
     # Load records from manifest or by scanning data_dir
     from deepfold3.data.prepare.manifest import discover_records

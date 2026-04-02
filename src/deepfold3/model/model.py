@@ -15,6 +15,7 @@ import dataclasses
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from deepfold3.model.atom_cross_attn import EvoformerConditioningEncoder
 from deepfold3.model.confidence import ConfidenceHead
@@ -207,18 +208,29 @@ class DeepFold3(nn.Module):
 
         if has_batch:
             B = features["res_type"].shape[0]
-            evo_cond_act = torch.stack(
-                [
-                    self.evo_cond_encoder(
+            use_ckpt = torch.is_grad_enabled()
+            results = []
+            for b in range(B):
+                if use_ckpt:
+                    r = torch_checkpoint(
+                        self.evo_cond_encoder,
+                        ref_pos[b],
+                        ref_mask[b],
+                        ref_element[b],
+                        ref_charge[b],
+                        ref_atom_name_chars[b],
+                        use_reentrant=False,
+                    )
+                else:
+                    r = self.evo_cond_encoder(
                         ref_pos=ref_pos[b],
                         ref_mask=ref_mask[b],
                         ref_element=ref_element[b],
                         ref_charge=ref_charge[b],
                         ref_atom_name_chars=ref_atom_name_chars[b],
                     )
-                    for b in range(B)
-                ]
-            )
+                results.append(r)
+            evo_cond_act = torch.stack(results)
         else:
             evo_cond_act = self.evo_cond_encoder(
                 ref_pos=ref_pos,
@@ -239,15 +251,20 @@ class DeepFold3(nn.Module):
         full_msa_mask = features["msa_mask"]
         full_del_matrix = features.get("deletion_matrix")
 
-        # Initialize recycling buffers
+        # Initialize recycling buffers (or resume from features if warm-started)
         c_pair = self.cfg.evoformer.pair_channel
         c_single = self.cfg.evoformer.seq_channel
-        if has_batch:
-            prev_pair = torch.zeros(B, N, N, c_pair, device=device)
-            prev_single = torch.zeros(B, N, c_single, device=device)
+        # Match dtype of model parameters to avoid mixed-precision mismatch under autocast
+        param_dtype = target_feat.dtype
+        if "_prev_pair" in features:
+            prev_pair = features["_prev_pair"]
+            prev_single = features["_prev_single"]
+        elif has_batch:
+            prev_pair = torch.zeros(B, N, N, c_pair, device=device, dtype=param_dtype)
+            prev_single = torch.zeros(B, N, c_single, device=device, dtype=param_dtype)
         else:
-            prev_pair = torch.zeros(N, N, c_pair, device=device)
-            prev_single = torch.zeros(N, c_single, device=device)
+            prev_pair = torch.zeros(N, N, c_pair, device=device, dtype=param_dtype)
+            prev_single = torch.zeros(N, c_single, device=device, dtype=param_dtype)
 
         # Extract template features (optional — T=0 tensors when no templates)
         template_kwargs: dict[str, torch.Tensor] = {}
@@ -358,15 +375,20 @@ class DeepFold3(nn.Module):
         ref_kwargs = self._ref_kwargs(features)
 
         # --- 1. Evoformer trunk (gradient only on last cycle) ---
-        with torch.no_grad():
-            if num_recycles > 1:
+        if num_recycles > 1:
+            with torch.no_grad():
                 embeddings_det, _, _, _, _ = self.run_evoformer(features, num_recycles - 1, seed=seed)
-                features["_prev_pair"] = embeddings_det["pair"].detach()
-                features["_prev_single"] = embeddings_det["single"].detach()
+            # Pass warm-start buffers via features for the final (grad-enabled) recycle.
+            # No .detach() needed — tensors from no_grad() context already lack grad_fn.
+            features["_prev_pair"] = embeddings_det["pair"]
+            features["_prev_single"] = embeddings_det["single"]
 
         embeddings, rel_feat, target_feat, seq_mask, pair_mask = self.run_evoformer(
             features, 1, seed=seed + num_recycles - 1
         )
+        # Clean up side-channel keys to avoid stale references
+        features.pop("_prev_pair", None)
+        features.pop("_prev_single", None)
         embeddings["target_feat"] = target_feat
 
         pred: dict[str, torch.Tensor] = {}
@@ -401,9 +423,16 @@ class DeepFold3(nn.Module):
         pred["mini_rollout_pos"] = mini_result["atom_positions"].detach()
 
         # --- 4. Confidence head ---
+        # When trunk is frozen (confidence-only training), detach to avoid
+        # storing autograd graph through frozen Evoformer parameters.
+        conf_pair = embeddings["pair"]
+        conf_single = embeddings["single"]
+        if not conf_pair.requires_grad:
+            conf_pair = conf_pair.detach()
+            conf_single = conf_single.detach()
         conf_out = self.confidence_head(
-            pair=embeddings["pair"],
-            single=embeddings["single"],
+            pair=conf_pair,
+            single=conf_single,
             pair_mask=pair_mask,
             seq_mask=seq_mask,
             target_feat=target_feat,
