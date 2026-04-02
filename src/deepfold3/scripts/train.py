@@ -66,6 +66,18 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     type=click.Path(exists=True),
     help="Path to components.cif(.gz) for bulk CCD lookup.",
 )
+@click.option(
+    "--include-list",
+    default=None,
+    type=click.Path(exists=True),
+    help="Text file of PDB IDs to include (one per line). Only these records are used.",
+)
+@click.option(
+    "--exclude-list",
+    default=None,
+    type=click.Path(exists=True),
+    help="Text file of PDB IDs to exclude (one per line). These records are skipped.",
+)
 def train(
     data_dir: str,
     output: str,
@@ -81,6 +93,8 @@ def train(
     wandb_project: str | None,
     override: tuple[str, ...],
     ccd: str | None,
+    include_list: str | None,
+    exclude_list: str | None,
 ) -> None:
     """Train DeepFold3 model."""
     from deepfold3.model.config import ModelConfig, TrainingConfig
@@ -154,8 +168,24 @@ def train(
     from deepfold3.data.prepare.manifest import discover_records
 
     all_records = discover_records(Path(data_dir))
+    log = logging.getLogger(__name__)
     if not all_records:
-        logging.getLogger(__name__).warning("No records found in %s", data_dir)
+        log.warning("No records found in %s", data_dir)
+
+    # Filter by include/exclude lists
+    if include_list or exclude_list:
+        from deepfold3.data.prepare.manifest import load_id_list
+
+        if include_list:
+            allowed = load_id_list(Path(include_list))
+            before = len(all_records)
+            all_records = [r for r in all_records if r.id in allowed]
+            log.info("Include list: %d → %d records", before, len(all_records))
+        if exclude_list:
+            denied = load_id_list(Path(exclude_list))
+            before = len(all_records)
+            all_records = [r for r in all_records if r.id not in denied]
+            log.info("Exclude list: %d → %d records", before, len(all_records))
 
     # Shuffle with fixed seed for reproducible train/eval split
     import random

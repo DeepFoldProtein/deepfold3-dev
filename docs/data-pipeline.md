@@ -625,7 +625,7 @@ def process_mmcif(path, use_assembly=True, assembly_id="1") -> tuple[Structure, 
 ### Quality Filters (`data/prepare/filters.py`)
 
 ```python
-def filter_structure(structure, record, ...) -> Record:
+def filter_structure(structure, record, ...) -> tuple[Record, dict[str, str]]:
 ```
 
 Marks chains as `valid=False` (does not remove them). Per-chain filters:

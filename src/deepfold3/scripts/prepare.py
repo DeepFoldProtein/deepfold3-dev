@@ -17,13 +17,16 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from deepfold3.scripts import cli
+
+if TYPE_CHECKING:
+    from deepfold3.data.prepare.filters import StructureFilterConfig
 
 
 def _process_one(
@@ -31,35 +34,34 @@ def _process_one(
     mmcif_dir: Path,
     output_dir: Path,
     use_assembly: bool,
-    max_resolution: float | None,
-) -> dict | None:
-    """Process a single PDB entry. Returns record dict or None on failure."""
+    filter_cfg: StructureFilterConfig | None = None,
+) -> dict | str:
+    """Process a single PDB entry. Returns record dict or skip reason string."""
     from deepfold3.data.parse.templates import find_pdb_mmcif_path
-    from deepfold3.data.prepare.filters import filter_structure
+    from deepfold3.data.prepare.filters import filter_structure, filter_structure_metadata
     from deepfold3.data.prepare.structure import process_mmcif
 
     cif_path = find_pdb_mmcif_path(pdb_id, mmcif_dir)
     if cif_path is None:
-        return None
+        return "file not found"
 
     try:
         structure, record = process_mmcif(cif_path, use_assembly=use_assembly)
-    except Exception:
-        traceback.print_exc()
-        return None
+    except Exception as e:
+        return f"parse error: {e}"
 
-    # Resolution filter (skip if no resolution available for non-X-ray)
-    if max_resolution is not None and record.structure_info is not None:
-        res = record.structure_info.resolution
-        if res is not None and res > max_resolution:
-            return None
+    # Structure-level metadata filters (resolution, method, date, chain count)
+    skip_reason = filter_structure_metadata(record, filter_cfg)
+    if skip_reason is not None:
+        return skip_reason
 
-    # Apply quality filters
-    record = filter_structure(structure, record)
+    # Chain-level quality filters
+    record, reasons = filter_structure(structure, record, filter_cfg)
 
     # Skip if no valid chains remain
     if not any(c.valid for c in record.chains):
-        return None
+        detail = "; ".join(f"{name}: {reason}" for name, reason in reasons.items())
+        return f"all chains filtered ({detail})"
 
     # Save structure NPZ
     structure.save(output_dir / "structures" / f"{record.id}.npz")
@@ -127,7 +129,18 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
 @click.option("--output", required=True, type=click.Path(), help="Output directory for processed data.")
 @click.option("--pdb-ids", default=None, help="Comma-separated PDB IDs to process (e.g. 1pfe,8qy0).")
 @click.option("--limit", default=None, type=int, help="Max number of structures to process (for sampling).")
-@click.option("--max-resolution", default=None, type=float, help="Max resolution in Å (e.g. 4.0).")
+@click.option("--max-resolution", default=None, type=float, help="Max resolution in Å (e.g. 9.0). Disabled by default.")
+@click.option("--min-resolution", default=None, type=float, help="Min resolution in Å (e.g. 0.1). Disabled by default.")
+@click.option(
+    "--methods",
+    default=None,
+    help="Comma-separated allowed methods (e.g. 'X-RAY DIFFRACTION,ELECTRON MICROSCOPY'). Disabled by default.",
+)
+@click.option("--max-date", default=None, help="Max release date YYYY-MM-DD (training cutoff). Disabled by default.")
+@click.option("--min-date", default=None, help="Min release date YYYY-MM-DD (validation set). Disabled by default.")
+@click.option("--max-chains", default=300, type=int, show_default=True, help="Max chains per structure.")
+@click.option("--max-total-residues", default=16384, type=int, show_default=True, help="Max total residues per structure.")
+@click.option("--min-polymer-chains", default=1, type=int, show_default=True, help="Min polymer chains per structure.")
 @click.option("--no-assembly", is_flag=True, help="Skip assembly expansion (use asymmetric unit).")
 @click.option(
     "--ccd",
@@ -149,6 +162,13 @@ def prepare(
     pdb_ids: str | None,
     limit: int | None,
     max_resolution: float | None,
+    min_resolution: float | None,
+    methods: str | None,
+    max_date: str | None,
+    min_date: str | None,
+    max_chains: int,
+    max_total_residues: int,
+    min_polymer_chains: int,
     no_assembly: bool,
     ccd: str | None,
     cluster_file: str | None,
@@ -168,9 +188,21 @@ def prepare(
 
         set_ccd_components_path(ccd)
 
+    from deepfold3.data.prepare.filters import StructureFilterConfig
+
+    filter_cfg = StructureFilterConfig(
+        max_resolution=max_resolution,
+        min_resolution=min_resolution,
+        allowed_methods=frozenset(m.strip().lower() for m in methods.split(",") if m.strip()) if methods else None,
+        max_release_date=max_date,
+        min_release_date=min_date,
+        max_chains=max_chains,
+        max_total_residues=max_total_residues,
+        min_polymer_chains=min_polymer_chains,
+    )
+
     mmcif_path = Path(mmcif_dir)
     output_path = Path(output)
-    # Create output directories once upfront
     (output_path / "structures").mkdir(parents=True, exist_ok=True)
     (output_path / "records").mkdir(parents=True, exist_ok=True)
     use_assembly = not no_assembly
@@ -189,8 +221,8 @@ def prepare(
 
     if workers <= 1:
         for i, pdb_id in enumerate(ids):
-            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, max_resolution)
-            if result is not None:
+            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg)
+            if isinstance(result, dict):
                 records.append(result)
                 log.info(
                     "[%d/%d] %s: %d chains, %d interfaces",
@@ -202,26 +234,26 @@ def prepare(
                 )
             else:
                 failed += 1
-                log.info("[%d/%d] %s: skipped", i + 1, len(ids), pdb_id)
+                log.info("[%d/%d] %s: skipped (%s)", i + 1, len(ids), pdb_id, result)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, max_resolution): pid
+                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg): pid
                 for pid in ids
             }
             for i, future in enumerate(as_completed(futures)):
                 pdb_id = futures[future]
                 try:
                     result = future.result()
-                except Exception:
-                    result = None
-                    traceback.print_exc()
+                except Exception as e:
+                    result = f"worker error: {e}"
 
-                if result is not None:
+                if isinstance(result, dict):
                     records.append(result)
                     log.info("[%d/%d] %s: %d chains", i + 1, len(ids), pdb_id, len(result["chains"]))
                 else:
                     failed += 1
+                    log.info("[%d/%d] %s: skipped (%s)", i + 1, len(ids), pdb_id, result)
 
     # Save manifest using the shared utility
     from deepfold3.data.prepare.manifest import save_manifest
@@ -266,7 +298,7 @@ def fetch_ccd(output: str) -> None:
     "--manifest",
     required=True,
     type=click.Path(exists=True),
-    help="Path to existing manifest.json to update with cluster IDs.",
+    help="Path to input manifest.json.",
 )
 @click.option(
     "--cluster-file",
@@ -274,22 +306,28 @@ def fetch_ccd(output: str) -> None:
     type=click.Path(exists=True),
     help="Path to clusters-by-entity-40.txt (wwPDB or MMseqs2-generated).",
 )
-def apply_clusters(manifest: str, cluster_file: str) -> None:
-    """Apply sequence cluster IDs to an existing manifest.
+@click.option(
+    "--output",
+    default=None,
+    type=click.Path(),
+    help="Output manifest path (default: writes next to input as manifest_clustered.json).",
+)
+def apply_clusters(manifest: str, cluster_file: str, output: str | None) -> None:
+    """Apply sequence cluster IDs to a manifest.
 
-    Updates chain cluster_id fields in-place from a wwPDB-format cluster file.
-    Chains not found in the cluster file keep their hash-based fallback IDs.
+    Reads the input manifest, maps chains to cluster IDs from the cluster
+    file, and writes a new manifest. Chains not found in the cluster file
+    keep their hash-based fallback IDs.
 
     Examples::
 
-        # Download wwPDB clusters and apply
-        wget https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-40.txt
+        # Write to default output (manifest_clustered.json next to input)
         deepfold3 apply-clusters --manifest /data/training/manifest.json \\
             --cluster-file clusters-by-entity-40.txt
 
-        # Apply MMseqs2-generated clusters
+        # Write to explicit output path
         deepfold3 apply-clusters --manifest /data/training/manifest.json \\
-            --cluster-file mmseqs_clusters.txt
+            --cluster-file clusters-by-entity-40.txt --output /data/training/manifest_final.json
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -304,8 +342,14 @@ def apply_clusters(manifest: str, cluster_file: str) -> None:
     matched = _apply_clusters(records, Path(cluster_file))
     total_chains = sum(len(r.chains) for r in records)
 
-    save_manifest(records, Path(manifest))
-    log.info("Updated %s: %d/%d chains matched to clusters.", manifest, matched, total_chains)
+    if output is None:
+        manifest_path = Path(manifest)
+        output_path = manifest_path.parent / f"{manifest_path.stem}_clustered.json"
+    else:
+        output_path = Path(output)
+
+    save_manifest(records, output_path)
+    log.info("Wrote %s: %d/%d chains matched to clusters.", output_path, matched, total_chains)
 
 
 @cli.command()

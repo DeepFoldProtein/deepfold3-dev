@@ -200,9 +200,9 @@ Apply during prepare or to an existing manifest:
 deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training \
     --cluster-file clusters-by-entity-40.txt
 
-# Or apply to existing manifest
+# Or apply to existing manifest (writes manifest_clustered.json by default)
 deepfold3 apply-clusters --manifest /data/training/manifest.json \
-    --cluster-file clusters-by-entity-40.txt
+    --cluster-file clusters-by-entity-40.txt --output /data/training/manifest.json
 ```
 
 #### **Option B: Compute locally with MMseqs2**
@@ -219,7 +219,7 @@ deepfold3 cluster --data-dir /data/training --output clusters.txt \
 
 # Then apply to manifest
 deepfold3 apply-clusters --manifest /data/training/manifest.json \
-    --cluster-file clusters.txt
+    --cluster-file clusters.txt --output /data/training/manifest.json
 ```
 
 The `cluster` command extracts all unique polymer entity sequences from the `structures/` directory, runs `mmseqs cluster`, and writes a wwPDB-format cluster file (one cluster per line, space-separated `pdb_chain` identifiers).

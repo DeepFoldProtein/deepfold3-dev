@@ -41,6 +41,22 @@ def load_manifest(path: Path) -> list[Record]:
     return records
 
 
+def load_id_list(path: Path) -> set[str]:
+    """Load a text file of PDB IDs (one per line, case-insensitive).
+
+    Blank lines and lines starting with ``#`` are ignored.
+    Only the first whitespace-delimited token per line is used,
+    so trailing comments or extra columns are safe.
+    """
+    ids: set[str] = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ids.add(line.split()[0].lower())
+    return ids
+
+
 def discover_records(data_dir: Path) -> list[Record]:
     """Discover records from a data directory.
 
