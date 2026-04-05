@@ -50,6 +50,10 @@ def _process_one(
     except Exception as e:
         return f"parse error: {e}"
 
+    # Override record ID with the requested PDB ID (handles ModelCIF where
+    # _entry.id is generic like "model" and filename-derived ID is too long)
+    record.id = pdb_id
+
     # Structure-level metadata filters (resolution, method, date, chain count)
     skip_reason = filter_structure_metadata(record, filter_cfg)
     if skip_reason is not None:
@@ -219,7 +223,8 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
 @cli.command()
 @click.option("--mmcif-dir", required=True, type=click.Path(exists=True), help="PDB mmCIF mirror directory.")
 @click.option("--output", required=True, type=click.Path(), help="Output directory for processed data.")
-@click.option("--pdb-ids", default=None, help="Comma-separated PDB IDs to process (e.g. 1pfe,8qy0).")
+@click.option("--pdb-ids", default=None, help="Comma-separated PDB IDs to process (e.g. 1pfe,8qy0). Mutually exclusive with --pdb-id-file.")
+@click.option("--pdb-id-file", default=None, type=click.Path(exists=True), help="Text file with one PDB ID per line. Mutually exclusive with --pdb-ids.")
 @click.option("--limit", default=None, type=int, help="Max number of structures to process (for sampling).")
 @click.option("--max-resolution", default=None, type=float, help="Max resolution in Å (e.g. 9.0). Disabled by default.")
 @click.option("--min-resolution", default=None, type=float, help="Min resolution in Å (e.g. 0.1). Disabled by default.")
@@ -258,6 +263,7 @@ def prepare(
     mmcif_dir: str,
     output: str,
     pdb_ids: str | None,
+    pdb_id_file: str | None,
     limit: int | None,
     max_resolution: float | None,
     min_resolution: float | None,
@@ -307,8 +313,15 @@ def prepare(
     use_assembly = not no_assembly
 
     # Determine PDB IDs to process
+    if pdb_ids and pdb_id_file:
+        click.echo("Error: --pdb-ids and --pdb-id-file are mutually exclusive.", err=True)
+        sys.exit(1)
+
     if pdb_ids:
         ids = [pid.strip().lower() for pid in pdb_ids.split(",")]
+    elif pdb_id_file:
+        ids = [line.strip().lower() for line in Path(pdb_id_file).read_text().splitlines() if line.strip()]
+        log.info("Loaded %d PDB IDs from %s", len(ids), pdb_id_file)
     else:
         log.info("Scanning %s for mmCIF files...", mmcif_path)
         ids = _collect_pdb_ids(mmcif_path, limit=limit)
@@ -517,69 +530,41 @@ def cluster(
         sys.exit(1)
 
     # Extract unique protein sequences keyed by pdb_chain
-    sequences: dict[str, str] = {}
-    structures_dir = data_path / "structures"
+    # Try loading from cached FASTA first (avoids re-reading 159k NPZ files)
+    from deepfold3.data.prepare.sequences import (
+        extract_sequences_by_cluster_key,
+        load_fasta,
+        save_fasta,
+    )
 
-    from deepfold3.data.const import RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
-    from deepfold3.data.prepare.clustering import sequence_to_cluster_key
-    from deepfold3.data.types import Structure
-
-    # Build res_type index → one-letter lookup (protein only, UNK→X)
-    _RT_TO_LETTER = {i: THREE_LETTER_TO_ONE.get(name, "X") for i, name in RES_TYPE_INDEX_TO_NAME.items()}
-
-    log.info("Extracting sequences from %d records...", len(records))
-    seen_entities: set[tuple[str, str | int | None]] = set()
-    for record in records:
-        npz_path = structures_dir / f"{record.id}.npz"
-        if not npz_path.exists():
-            continue
-        try:
-            structure = Structure.load(npz_path)
-        except Exception:
-            log.debug("Failed to load %s, skipping", npz_path)
-            continue
-
-        for chain_info in record.chains:
-            if not chain_info.valid or chain_info.mol_type != 0:  # protein only
-                continue
-            entity_key = (record.id, chain_info.entity_id)
-            if entity_key in seen_entities:
-                continue
-            seen_entities.add(entity_key)
-
-            chain_mask = structure.residues["chain_id"] == chain_info.chain_id
-            res_types = structure.residues["res_type"][chain_mask]
-            if len(res_types) == 0:
-                continue
-
-            seq = "".join(_RT_TO_LETTER.get(int(rt), "X") for rt in res_types)
-            if len(seq) < 10:
-                continue
-
-            key = sequence_to_cluster_key(record.id, chain_info.chain_name)
-            sequences[key] = seq
-
-    log.info("Extracted %d unique polymer sequences.", len(sequences))
+    cached_fasta = output_path.parent / "sequences.fasta"
+    if cached_fasta.exists():
+        log.info("Loading cached FASTA from %s...", cached_fasta)
+        sequences = load_fasta(cached_fasta)
+        log.info("Loaded %d sequences from cached FASTA.", len(sequences))
+    else:
+        log.info("Extracting sequences from %d records...", len(records))
+        sequences = extract_sequences_by_cluster_key(records, data_path / "structures")
+        log.info("Extracted %d unique polymer sequences.", len(sequences))
     if not sequences:
         click.echo("Error: no polymer sequences found.", err=True)
         sys.exit(1)
 
-    # Write FASTA, run MMseqs2, parse results
+    # Save FASTA (also used as cache for future runs)
+    saved_fasta = output_path.parent / "sequences.fasta"
+    save_fasta(sequences, saved_fasta)
+    log.info("Saved FASTA to %s (%d sequences)", saved_fasta, len(sequences))
+
+    # Run MMseqs2 clustering
     with tempfile.TemporaryDirectory(prefix="deepfold3_cluster_") as tmpdir:
         tmp = Path(tmpdir)
-        fasta_path = tmp / "sequences.fasta"
         db_path = tmp / "seqDB"
         cluster_prefix = tmp / "clusters"
         tsv_path = tmp / "clusters_cluster.tsv"
 
-        # Write FASTA
-        with open(fasta_path, "w") as f:
-            for name, seq in sequences.items():
-                f.write(f">{name}\n{seq}\n")
-
         # Create MMseqs2 database
         log.info("Creating MMseqs2 sequence database...")
-        subprocess.run([mmseqs, "createdb", str(fasta_path), str(db_path)], check=True)
+        subprocess.run([mmseqs, "createdb", str(saved_fasta), str(db_path)], check=True)
 
         # Run clustering
         log.info("Clustering at %.0f%% identity (coverage=%.1f, cov-mode=%d)...", min_seq_id * 100, coverage, cov_mode)

@@ -213,6 +213,13 @@ def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     for path in candidates:
         if path.is_file():
             return path.resolve()
+    # Glob fallback: flat directories with prefixed names (e.g. 102l_A_model_0.cif)
+    matches = sorted(pdb_mmcif_dir.glob(f"{pdb_lower}*.cif"))
+    if matches:
+        return matches[0].resolve()
+    matches = sorted(pdb_mmcif_dir.glob(f"{pdb_lower}*.cif.gz"))
+    if matches:
+        return matches[0].resolve()
     return None
 
 

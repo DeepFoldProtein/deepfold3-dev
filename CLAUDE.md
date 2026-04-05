@@ -45,6 +45,8 @@ deepfold3 inference --json input.json --output output_dir/ --params weights.safe
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 plot      --input out_confidences.json --output confidences.png
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0
+deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-id-file pdb_ids.txt --workers 16
+deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-id-file pdb_ids.txt --no-assembly --workers 16
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --cluster-file clusters-by-entity-40.txt
 deepfold3 cluster   --data-dir /data/training --output clusters.txt
@@ -52,6 +54,7 @@ deepfold3 cluster   --data-dir /data/training --output clusters.txt --min-seq-id
 deepfold3 apply-clusters --manifest /data/training/manifest.json --cluster-file clusters-by-entity-40.txt --output /data/training/manifest.json
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu --use-pairing
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --convert-only
 deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
