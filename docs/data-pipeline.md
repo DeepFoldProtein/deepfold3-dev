@@ -624,18 +624,41 @@ def process_mmcif(path, use_assembly=True, assembly_id="1") -> tuple[Structure, 
 
 ### Quality Filters (`data/prepare/filters.py`)
 
-```python
-def filter_structure(structure, record, ...) -> tuple[Record, dict[str, str]]:
-```
+Two-level filtering controlled by `StructureFilterConfig`:
 
-Marks chains as `valid=False` (does not remove them). Per-chain filters:
+**Structure-level** (`filter_structure_metadata`) — reject entire structures (cheap, metadata only):
+
+| Filter | CLI flag | Default |
+|--------|----------|---------|
+| max_resolution | `--max-resolution` | disabled |
+| min_resolution | `--min-resolution` | disabled |
+| allowed_methods | `--methods` | disabled |
+| max_release_date | `--max-date` | disabled |
+| min_release_date | `--min-date` | disabled |
+| max_chains | `--max-chains` | 300 |
+| max_total_residues | `--max-total-residues` | 16384 |
+| min_polymer_chains | `--min-polymer-chains` | 1 |
+
+**Chain-level** (`filter_structure`) — mark individual chains as `valid=False`:
 
 - **min_length**: reject polymer chains with < 4 or > 5000 resolved residues
 - **all_unknown**: reject chains where all residues are UNK/N
 - **consecutive_ca**: reject protein chains with consecutive CA atoms > 10 Å apart
 - **clashing_chains**: reject chains with > 30% of atoms clashing (< 1.7 Å) with other chains
 
-Interfaces with any invalid chain endpoint are also marked invalid.
+`filter_structure` returns `(record, reasons)` where reasons maps chain_name to the filter that rejected it. Interfaces with any invalid chain endpoint are also marked invalid.
+
+### Sequence Clustering (`data/prepare/clustering.py`)
+
+```python
+def load_pdb_clusters(path) -> dict[str, int]: ...  # wwPDB format -> pdb_chain -> cluster_id
+def sequence_to_cluster_key(pdb_id, chain_name) -> str: ...  # "1abc_a"
+```
+
+Two workflows:
+
+1. **Pre-computed**: Download `clusters-by-entity-40.txt` from wwPDB, apply via `deepfold3 apply-clusters`
+2. **In-house**: `deepfold3 cluster` extracts sequences from Structure NPZs, runs `mmseqs cluster`, writes wwPDB-format output
 
 ### Manifest (`data/prepare/manifest.py`)
 
@@ -643,7 +666,9 @@ Interfaces with any invalid chain endpoint are also marked invalid.
 def save_manifest(records, path): ...
 def load_manifest(path) -> list[Record]: ...
 def discover_records(data_dir) -> list[Record]: ...
+def load_id_list(path) -> set[str]: ...  # text file of PDB IDs
 ```
 
 - `discover_records()` loads `manifest.json` if present, otherwise scans `structures/` for NPZ files and builds minimal records
+- `load_id_list()` loads a text file of PDB IDs (one per line, `#` comments) for `--include-list`/`--exclude-list` filtering
 - Used by `deepfold3 train` to find training data

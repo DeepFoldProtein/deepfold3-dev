@@ -19,17 +19,20 @@ def cli() -> None:
 def _register_commands() -> None:
     from deepfold3.scripts.convert_weights import convert
     from deepfold3.scripts.inference import inference
+    from deepfold3.scripts.msa_batch import msa_batch
     from deepfold3.scripts.msa_search import msa_search
     from deepfold3.scripts.plot_confidences import plot
-    from deepfold3.scripts.prepare import fetch_ccd, prepare
+    from deepfold3.scripts.prepare import fetch_ccd, import_msa, prepare
     from deepfold3.scripts.train import train
 
     cli.add_command(inference)
     cli.add_command(convert)
     cli.add_command(plot)
     cli.add_command(msa_search)
+    cli.add_command(msa_batch)
     cli.add_command(prepare)
     cli.add_command(fetch_ccd)
+    cli.add_command(import_msa)
     cli.add_command(train)
 
 

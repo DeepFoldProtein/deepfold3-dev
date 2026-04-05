@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** sequence clustering, MSA processing for training (A3M→NPZ), training-time template pipeline (HMM-based search with date cutoff).
+**Not yet implemented:** MSA processing for training (A3M→NPZ), training-time template pipeline (HMM-based search with date cutoff).
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.11+ (pinned in `.python-version`)
@@ -50,6 +50,10 @@ deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --clu
 deepfold3 cluster   --data-dir /data/training --output clusters.txt
 deepfold3 cluster   --data-dir /data/training --output clusters.txt --min-seq-id 0.3
 deepfold3 apply-clusters --manifest /data/training/manifest.json --cluster-file clusters-by-entity-40.txt --output /data/training/manifest.json
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --convert-only
+deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
@@ -235,14 +239,18 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py` (rea
 
 ### Data Preprocessing Pipeline
 
-Implemented: `deepfold3 prepare` (steps 1 + 6), `deepfold3 msa` (step 3 for inference). Remaining steps (2, 4, 5) need implementation for training.
+Implemented: `deepfold3 prepare` (steps 1 + 2 + 7), `deepfold3 msa` (step 3 for inference), `deepfold3 cluster` (step 2 via MMseqs2), `deepfold3 apply-clusters` (apply pre-computed clusters). Remaining steps (3 batch, 4, 5) need implementation for training.
 
 ```bash
 # Process specific PDB IDs
 deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0,4hhb
 
-# Batch process with resolution filter
-deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
+# Batch process with filters
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training \
+    --max-resolution 9.0 --methods "X-RAY DIFFRACTION,ELECTRON MICROSCOPY" --workers 8
+
+# With date cutoff for train/val split
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-date 2023-09-30
 
 # Sample N structures
 deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --limit 100
@@ -250,14 +258,14 @@ deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training --limit
 
 Steps:
 
-1. **Structure processing** (implemented): PDB mmCIF → `gemmi.make_assembly()` (assembly 1) → quality filters → Structure NPZ. Filters: min/max residue count, all-unknown, consecutive CA distance, chain clashing.
-2. **Sequence clustering** (not yet): MMseqs2 at 40% identity → cluster_id per chain
-3. **MSA generation** (inference: implemented via `deepfold3 msa`; training batch: not yet): MMseqs2 against UniRef30/ColabFoldDB → A3M per unique sequence
+1. **Structure processing** (implemented): PDB mmCIF → `gemmi.make_assembly()` (assembly 1) → structure-level filters (resolution, method, date, chain count, residue count, polymer count) → chain-level filters (min/max residue count, all-unknown, consecutive CA distance, chain clashing) → Structure NPZ.
+2. **Sequence clustering** (implemented): `deepfold3 cluster` (MMseqs2 at 40% identity) or download pre-computed wwPDB `clusters-by-entity-40.txt`. Apply via `deepfold3 apply-clusters` or `--cluster-file` during prepare.
+3. **MSA generation** (implemented): `deepfold3 msa` for inference, `deepfold3 msa-batch` for training. Local MMseqs2 (GPU optional) against UniRef30/ColabFoldDB → A3M → NPZ per unique sequence. Resume support, batch splitting.
 4. **Template search** (not yet): `pdb_seqres.txt` → HMM database (hmmpress) → hmmsearch per query → template hits with date cutoff
-5. **MSA processing** (not yet): A3M → MSA NPZ (sequences + deletion matrix)
+5. **ID filtering** (implemented): `--include-list` / `--exclude-list` text files for `deepfold3 train`
 6. **Manifest creation** (implemented): collect records/ → `manifest.json`
 
-Source: `src/deepfold3/data/prepare/` (structure.py, filters.py, manifest.py).
+Source: `src/deepfold3/data/prepare/` (structure.py, filters.py, manifest.py, clustering.py).
 
 PDB mmCIF mirror: `/scratch/pdb/mmCIF/` (layout: `{mid2}/{pdb_id}.cif.gz`, ~250k structures).
 

@@ -106,6 +106,98 @@ def _collect_pdb_ids(mmcif_dir: Path, limit: int | None = None) -> list[str]:
     return ids
 
 
+def _build_a3m_index(msa_dir: Path, workers: int = 1) -> dict[str, Path]:
+    """Build a SHA256 → A3M path index by reading query sequences.
+
+    Scans all ``.a3m`` files in ``msa_dir`` (recursively), reads the first
+    sequence from each, computes its SHA256 hash, and returns a mapping from
+    hash to file path. This allows matching A3M files to chains regardless of
+    file naming convention.
+    """
+    import hashlib
+
+    log = logging.getLogger(__name__)
+    a3m_files = list(msa_dir.rglob("*.a3m"))
+    log.info("Indexing %d A3M files in %s...", len(a3m_files), msa_dir)
+
+    index: dict[str, Path] = {}
+    for path in a3m_files:
+        try:
+            seq = _read_a3m_query_sequence(path)
+            if seq:
+                h = hashlib.sha256(seq.encode()).hexdigest()
+                index[h] = path
+        except Exception:
+            pass
+
+    log.info("Indexed %d A3M files (%d with valid sequences).", len(a3m_files), len(index))
+    return index
+
+
+def _read_a3m_query_sequence(path: Path) -> str | None:
+    """Read the query (first) sequence from an A3M file.
+
+    Only reads until the second '>' header to avoid loading the entire file.
+    Returns the uppercase sequence (match states only), or None on failure.
+    """
+    seq_lines = []
+    found_header = False
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(">"):
+                if found_header:
+                    break  # reached second sequence
+                found_header = True
+                continue
+            if found_header:
+                seq_lines.append(line)
+    if not seq_lines:
+        return None
+    # A3M query is always uppercase (no insertions)
+    return "".join(seq_lines).upper()
+
+
+def _import_msa_files(
+    records: list,
+    a3m_index: dict[str, Path],
+    output_msa_dir: Path,
+) -> int:
+    """Import matching A3M files for manifest records.
+
+    Copies A3M files from the source directory to ``output_msa_dir/{msa_id}.a3m``
+    for each chain whose ``msa_id`` matches a hash in the index.
+
+    Returns the number of chains matched.
+    """
+    import shutil
+
+    output_msa_dir.mkdir(parents=True, exist_ok=True)
+    matched = 0
+    seen: set[str] = set()
+
+    for record in records:
+        for chain in record.chains:
+            msa_id = str(chain.msa_id)
+            if msa_id in seen:
+                continue
+            seen.add(msa_id)
+
+            dest = output_msa_dir / f"{msa_id}.a3m"
+            if dest.exists():
+                matched += 1
+                continue
+
+            src = a3m_index.get(msa_id)
+            if src is not None:
+                shutil.copy2(src, dest)
+                matched += 1
+
+    return matched
+
+
 def _apply_clusters(records: list, cluster_file: Path) -> int:
     """Apply cluster IDs from a cluster file to manifest records.
 
@@ -155,6 +247,12 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
     help="Path to clusters-by-entity-40.txt (wwPDB or MMseqs2-generated). "
     "Maps chains to integer cluster IDs for cluster-balanced sampling.",
 )
+@click.option(
+    "--msa-dir",
+    default=None,
+    type=click.Path(exists=True),
+    help="Directory of pre-existing A3M files (e.g. AFDB). Matched by query sequence hash.",
+)
 @click.option("--workers", default=1, type=int, help="Number of parallel workers.")
 def prepare(
     mmcif_dir: str,
@@ -172,6 +270,7 @@ def prepare(
     no_assembly: bool,
     ccd: str | None,
     cluster_file: str | None,
+    msa_dir: str | None,
     workers: int,
 ) -> None:
     """Preprocess PDB mmCIF files into training data."""
@@ -266,6 +365,13 @@ def prepare(
         matched = _apply_clusters(manifest_records, Path(cluster_file))
         total_chains = sum(len(r.chains) for r in manifest_records)
         log.info("Cluster mapping: %d/%d chains matched (%d records)", matched, total_chains, len(manifest_records))
+
+    # Import pre-existing A3M files if provided
+    if msa_dir:
+        a3m_index = _build_a3m_index(Path(msa_dir))
+        matched = _import_msa_files(manifest_records, a3m_index, output_path / "msa")
+        unique_msa_ids = len({str(c.msa_id) for r in manifest_records for c in r.chains})
+        log.info("MSA import: %d/%d unique sequences matched.", matched, unique_msa_ids)
 
     manifest_path = output_path / "manifest.json"
     save_manifest(manifest_records, manifest_path)
@@ -518,6 +624,54 @@ def cluster(
 
     log.info("Wrote %d clusters (%d sequences) to %s", len(clusters), len(sequences), output_path)
     click.echo(f"Cluster file: {output_path} ({len(clusters)} clusters, {len(sequences)} sequences)")
+
+
+@cli.command("import-msa")
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Training data directory (contains manifest.json).",
+)
+@click.option(
+    "--msa-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Directory of A3M files to import (scanned recursively).",
+)
+def import_msa(data_dir: str, msa_dir: str) -> None:
+    """Import pre-existing A3M files into a training dataset.
+
+    Scans the A3M directory, reads the query sequence from each file,
+    computes its SHA256 hash, and copies matching files into
+    ``{data_dir}/msa/{msa_id}.a3m``. Works with any naming convention
+    (AFDB, PDB, custom).
+
+    Examples::
+
+        deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    from deepfold3.data.prepare.manifest import discover_records
+
+    data_path = Path(data_dir)
+    records = discover_records(data_path)
+    if not records:
+        click.echo("Error: no records found in data directory.", err=True)
+        sys.exit(1)
+
+    a3m_index = _build_a3m_index(Path(msa_dir))
+    output_msa_dir = data_path / "msa"
+    matched = _import_msa_files(records, a3m_index, output_msa_dir)
+    unique_msa_ids = len({str(c.msa_id) for r in records for c in r.chains})
+
+    log.info("Done: %d/%d unique sequences matched.", matched, unique_msa_ids)
 
 
 # Allow running as module

@@ -12,7 +12,8 @@ PyTorch implementation of biomolecular complex structure prediction, architectur
 - **Flexible input** -- A3M MSA files, four JSON dialects (AlphaFold 3, AlphaFold Server, Protenix, DeepFold3)
 - **mmCIF + JSON output** -- standard structure files with per-atom pLDDT and comprehensive confidence JSON
 - **Training pipeline** -- native PyTorch DDP with EMA, LR scheduling, gradient accumulation, and checkpointing
-- **Data preprocessing** -- `deepfold3 prepare` converts PDB mmCIF mirror to training data with quality filtering
+- **Data preprocessing** -- `deepfold3 prepare` converts PDB mmCIF mirror to training data with structure-level and chain-level quality filtering
+- **Sequence clustering** -- `deepfold3 cluster` via MMseqs2, or use pre-computed wwPDB clusters with `deepfold3 apply-clusters`
 
 ## Installation
 
@@ -103,6 +104,8 @@ deepfold3 inference --help
 deepfold3 convert --help
 deepfold3 plot --help
 deepfold3 prepare --help
+deepfold3 cluster --help
+deepfold3 apply-clusters --help
 deepfold3 train --help
 ```
 
@@ -113,6 +116,10 @@ deepfold3 train --help
 | `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
 | `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
 | `deepfold3 prepare` | Preprocess PDB mmCIF files into training data |
+| `deepfold3 cluster` | Cluster sequences with MMseqs2 (builds cluster file from training data) |
+| `deepfold3 apply-clusters` | Apply a cluster file to a manifest for cluster-balanced sampling |
+| `deepfold3 msa-batch` | Generate MSAs for all unique sequences in training data (local MMseqs2) |
+| `deepfold3 import-msa` | Import pre-existing A3M files (e.g. AFDB) into training data by sequence matching |
 | `deepfold3 train` | Train the model (single GPU or multi-GPU via torchrun) |
 
 ## JSON Input Dialects
@@ -151,8 +158,8 @@ Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffus
 
 ## TODO
 
-- [ ] Sequence clustering (MMseqs2 at 40% identity)
-- [ ] MSA generation for training (MMseqs2 against UniRef30/ColabFoldDB)
+- [x] Sequence clustering (`deepfold3 cluster` via MMseqs2, or pre-computed wwPDB clusters via `deepfold3 apply-clusters`)
+- [x] MSA generation for training (`deepfold3 msa-batch` -- local MMseqs2 with GPU support, resume, batch splitting)
 - [ ] Training-time template pipeline (hmmsearch against PDB HMM profiles)
 
 ## Confidence Metrics
@@ -203,9 +210,10 @@ src/deepfold3/
 |   |-- msa/            # MMseqs2 MSA search (server API + local binary)
 |   |-- parse/          # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
 |   |-- tokenize/       # tokenizer.py (Input -> Tokenized)
-|   |-- crop/           # cropper.py (contiguous + spatial)
+|   |-- crop/           # cropper.py (contiguous + spatial + interface-seeded)
+|   |-- sample/         # weighted.py (WeightedClusterSampler)
 |   |-- feature/        # featurizer.py, ref_atoms.py (CCD)
-|   |-- prepare/        # structure.py, filters.py, manifest.py (PDB preprocessing)
+|   |-- prepare/        # structure.py, filters.py, manifest.py, clustering.py
 |   +-- module/         # dataset.py (TrainingDataset, InferenceInput), collate.py
 |-- training/           # Training pipeline
 |   |-- loss.py         # All loss functions (diffusion MSE, smooth LDDT, distogram, confidence)
@@ -214,7 +222,7 @@ src/deepfold3/
 |   +-- trainer.py      # DDP trainer (training loop, checkpointing, eval)
 |-- convert/af3.py      # Haiku -> PyTorch weight converter
 |-- io/                 # Output: mmCIF + confidences JSON
-+-- scripts/            # CLI: msa, inference, convert, plot, prepare, train
++-- scripts/            # CLI: msa, inference, convert, plot, prepare, cluster, apply-clusters, train
 ```
 
 ## References
