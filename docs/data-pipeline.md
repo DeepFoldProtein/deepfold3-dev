@@ -660,6 +660,19 @@ Two workflows:
 1. **Pre-computed**: Download `clusters-by-entity-40.txt` from wwPDB, apply via `deepfold3 apply-clusters`
 2. **In-house**: `deepfold3 cluster` extracts sequences from Structure NPZs, runs `mmseqs cluster`, writes wwPDB-format output
 
+### Batch MSA Generation (`scripts/msa_batch.py`)
+
+`deepfold3 msa-batch` extracts unique protein sequences from the manifest, searches via local MMseqs2 (GPU optional) against UniRef30 + ColabFoldDB, and writes per-sequence A3M + NPZ to `{data_dir}/msa/`. Resume-safe: skips sequences with existing NPZ; converts A3M-only without re-searching.
+
+### MSA Import for Distillation (`scripts/prepare.py`)
+
+For distillation databases (AFDB, ESMFold, etc.) that provide pre-computed A3Ms:
+
+- `deepfold3 prepare --msa-dir <dir>` — import during structure preprocessing
+- `deepfold3 import-msa --data-dir <dir> --msa-dir <dir>` — import into existing dataset
+
+Matching is naming-convention-agnostic: reads the query sequence from each A3M file, computes SHA256, and copies to `{data_dir}/msa/{msa_id}.a3m`.
+
 ### Manifest (`data/prepare/manifest.py`)
 
 ```python

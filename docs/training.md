@@ -226,6 +226,41 @@ The `cluster` command extracts all unique polymer entity sequences from the `str
 
 Chains not matched to any cluster keep their SHA256 hash fallback IDs. The trainer detects integer cluster IDs and automatically activates `WeightedClusterSampler`; otherwise it falls back to uniform sampling.
 
+### MSA Generation
+
+Generate MSAs for all unique protein sequences in the training data:
+
+```bash
+# Search all unique sequences via local MMseqs2 (GPU-accelerated)
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
+
+# Resume-safe: re-running skips sequences that already have NPZ files.
+# Sequences with A3M but no NPZ are converted without re-searching.
+
+# Convert-only mode (A3M→NPZ, no search)
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --convert-only
+```
+
+The command extracts unique protein sequences from the manifest, deduplicates by `msa_id` (SHA256 of sequence), searches against UniRef30 + ColabFoldDB, and writes per-sequence A3M + NPZ files to `{data_dir}/msa/`. Requires local MMseqs2 databases (see `scripts/setup_databases.sh`).
+
+### Distillation Datasets (AFDB, ESMFold, etc.)
+
+Distillation databases like AFDB provide predicted structures (CIF) alongside pre-computed MSAs (A3M). The pipeline handles these without re-searching:
+
+```bash
+# Option 1: Import during prepare (CIF + A3M together)
+deepfold3 prepare --mmcif-dir /data/afdb/cifs --output /data/distill \
+    --msa-dir /data/afdb/a3ms
+
+# Option 2: Import A3Ms into an existing dataset
+deepfold3 import-msa --data-dir /data/distill --msa-dir /data/afdb/a3ms
+
+# Then search only the missing sequences (if any)
+deepfold3 msa-batch --data-dir /data/distill --db-dir /data/mmseqs_dbs/ --gpu
+```
+
+Both `--msa-dir` and `import-msa` match A3M files to chains by reading the query sequence from each A3M file, computing its SHA256 hash, and copying to `{data_dir}/msa/{msa_id}.a3m`. This works regardless of file naming convention (AFDB `AF-{uniprot}-F1-model_v4.a3m`, PDB-style, or custom).
+
 The featurizer produces these training-specific features:
 
 - `atom_gt_positions [N, M, 3]`: experimentally observed atom coordinates.
