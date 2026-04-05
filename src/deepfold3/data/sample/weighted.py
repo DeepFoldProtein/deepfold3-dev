@@ -19,6 +19,78 @@ from deepfold3.data import const
 from deepfold3.data.types import Record
 
 
+def compute_cluster_weights(
+    records: list[Record],
+    alpha_prot: float = 3.0,
+    alpha_nucl: float = 3.0,
+    alpha_lig: float = 1.0,
+    beta_chain: float = 0.5,
+    beta_interface: float = 1.0,
+) -> np.ndarray:
+    """Compute AF3-style cluster-balanced sampling weights for records.
+
+    Returns:
+        Normalized probability array of shape ``(len(records),)``.
+    """
+    cluster_sizes = _compute_cluster_sizes(records)
+    weights = np.zeros(len(records), dtype=np.float64)
+
+    for i, rec in enumerate(records):
+        w = 0.0
+        for chain in rec.chains:
+            if not chain.valid:
+                continue
+            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
+            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
+            w += beta_chain * alpha / cs
+
+        for iface in rec.interfaces:
+            if not iface.valid:
+                continue
+            c1 = _find_chain(rec, iface.chain_1)
+            c2 = _find_chain(rec, iface.chain_2)
+            if c1 is None or c2 is None:
+                continue
+            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
+            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
+            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
+                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
+            )
+            cs = max((cs1 * cs2) ** 0.5, 1)
+            w += beta_interface * alpha_sum / cs
+
+        weights[i] = w
+
+    total = weights.sum()
+    return weights / total if total > 0 else np.ones(len(records)) / len(records)
+
+
+def _compute_cluster_sizes(records: list[Record]) -> dict:
+    counter: Counter = Counter()
+    for rec in records:
+        for chain in rec.chains:
+            if chain.valid:
+                counter[chain.cluster_id] += 1
+    return dict(counter)
+
+
+def _mol_type_alpha(mol_type: int, alpha_prot: float, alpha_nucl: float, alpha_lig: float) -> float:
+    if mol_type == const.MOL_PROTEIN:
+        return alpha_prot
+    elif mol_type in (const.MOL_RNA, const.MOL_DNA):
+        return alpha_nucl
+    elif mol_type == const.MOL_NONPOLYMER:
+        return alpha_lig
+    return 1.0
+
+
+def _find_chain(rec: Record, chain_id: int):
+    for c in rec.chains:
+        if c.chain_id == chain_id:
+            return c
+    return None
+
+
 class WeightedClusterSampler(Sampler[int]):
     """Cluster-balanced sampler for training datasets.
 
@@ -58,68 +130,14 @@ class WeightedClusterSampler(Sampler[int]):
         self.seed = seed
         self.epoch = 0
 
-        # Compute per-record weights
-        cluster_sizes = self._compute_cluster_sizes(records)
-        weights = np.zeros(len(records), dtype=np.float64)
-
-        for i, rec in enumerate(records):
-            w = 0.0
-            for chain in rec.chains:
-                if not chain.valid:
-                    continue
-                cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
-                alpha = self._mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
-                w += beta_chain * alpha / cs
-
-            for iface in rec.interfaces:
-                if not iface.valid:
-                    continue
-                # Interface weight: sum of mol_type alphas for both chains
-                c1 = self._find_chain(rec, iface.chain_1)
-                c2 = self._find_chain(rec, iface.chain_2)
-                if c1 is None or c2 is None:
-                    continue
-                cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
-                cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
-                alpha_sum = self._mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + self._mol_type_alpha(
-                    c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
-                )
-                # Use geometric mean of cluster sizes for interface
-                cs = max((cs1 * cs2) ** 0.5, 1)
-                w += beta_interface * alpha_sum / cs
-
-            weights[i] = w
-
-        # Normalize to probability distribution
-        total = weights.sum()
-        self.weights = weights / total if total > 0 else np.ones(len(records)) / len(records)
-
-    @staticmethod
-    def _compute_cluster_sizes(records: list[Record]) -> dict:
-        """Count records per cluster_id."""
-        counter: Counter = Counter()
-        for rec in records:
-            for chain in rec.chains:
-                if chain.valid:
-                    counter[chain.cluster_id] += 1
-        return dict(counter)
-
-    @staticmethod
-    def _mol_type_alpha(mol_type: int, alpha_prot: float, alpha_nucl: float, alpha_lig: float) -> float:
-        if mol_type == const.MOL_PROTEIN:
-            return alpha_prot
-        elif mol_type in (const.MOL_RNA, const.MOL_DNA):
-            return alpha_nucl
-        elif mol_type == const.MOL_NONPOLYMER:
-            return alpha_lig
-        return 1.0
-
-    @staticmethod
-    def _find_chain(rec: Record, chain_id: int):
-        for c in rec.chains:
-            if c.chain_id == chain_id:
-                return c
-        return None
+        self.weights = compute_cluster_weights(
+            records,
+            alpha_prot=alpha_prot,
+            alpha_nucl=alpha_nucl,
+            alpha_lig=alpha_lig,
+            beta_chain=beta_chain,
+            beta_interface=beta_interface,
+        )
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)

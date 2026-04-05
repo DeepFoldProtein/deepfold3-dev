@@ -55,11 +55,13 @@ class Trainer:
         train_cfg: TrainingConfig,
         records: list | None = None,
         eval_records: list | None = None,
+        distillation_records: list | None = None,
     ):
         self.model_cfg = model_cfg
         self.cfg = train_cfg
         self.records = records or []
         self.eval_records = eval_records or []
+        self.distillation_records = distillation_records or []
 
         # Will be set during setup
         self.model: DeepFold3 | None = None
@@ -227,23 +229,64 @@ class Trainer:
     def _init_dataloaders(self) -> tuple[DataLoader, DataLoader | None]:
         """Create training and optional evaluation dataloaders.
 
-        Uses ``WeightedClusterSampler`` when cluster IDs are available
-        in the manifest, falling back to ``DistributedSampler`` otherwise.
+        Supports multi-dataset training (PDB + distillation) when
+        ``distillation_data_dir`` is set. PDB uses cluster-weighted
+        sampling; distillation uses uniform sampling.
 
         Returns:
             Tuple of ``(train_dl, eval_dl)``.  ``eval_dl`` is ``None``
             when no evaluation records are provided.
         """
-        train_ds = TrainingDataset(
-            records=self.records,
-            data_dir=Path(self.cfg.data_dir),
+        ds_kwargs = dict(
             max_tokens=self.cfg.max_tokens,
             max_atoms=self.cfg.max_atoms,
             max_msa_seqs=self.cfg.max_msa_seqs,
         )
 
-        # Use cluster-weighted sampling if cluster IDs are real (not hash placeholders)
-        train_sampler = self._build_train_sampler(train_ds)
+        # Primary (PDB) dataset
+        pdb_ds = TrainingDataset(
+            records=self.records,
+            data_dir=Path(self.cfg.data_dir),
+            is_distillation=False,
+            **ds_kwargs,
+        )
+
+        # Distillation dataset (optional)
+        if self.cfg.distillation_data_dir and self.distillation_records:
+            from torch.utils.data import ConcatDataset
+
+            from deepfold3.data.sample.multi import MultiDatasetSampler
+
+            distill_ds = TrainingDataset(
+                records=self.distillation_records,
+                data_dir=Path(self.cfg.distillation_data_dir),
+                is_distillation=True,
+                **ds_kwargs,
+            )
+            train_ds = ConcatDataset([pdb_ds, distill_ds])
+
+            train_sampler = MultiDatasetSampler(
+                dataset_configs=[
+                    {
+                        "records": self.records,
+                        "dataset_len": len(pdb_ds),
+                        "weight": 1.0,
+                        "strategy": "weighted",
+                    },
+                    {
+                        "records": self.distillation_records,
+                        "dataset_len": len(distill_ds),
+                        "weight": self.cfg.distillation_weight,
+                        "strategy": "uniform",
+                    },
+                ],
+                num_replicas=self.world_size,
+                rank=self.rank,
+                seed=self.cfg.seed,
+            )
+        else:
+            train_ds = pdb_ds
+            train_sampler = self._build_train_sampler(pdb_ds)
 
         train_dl = DataLoader(
             train_ds,
@@ -261,9 +304,7 @@ class Trainer:
             eval_ds = TrainingDataset(
                 records=self.eval_records,
                 data_dir=Path(self.cfg.data_dir),
-                max_tokens=self.cfg.max_tokens,
-                max_atoms=self.cfg.max_atoms,
-                max_msa_seqs=self.cfg.max_msa_seqs,
+                **ds_kwargs,
             )
             eval_dl = DataLoader(
                 eval_ds,

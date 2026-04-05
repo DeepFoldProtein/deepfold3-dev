@@ -54,11 +54,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         max_tokens: int = 384,
         max_atoms: int = 4096,
         max_msa_seqs: int = const.MAX_MSA_ROWS,
+        is_distillation: bool = False,
     ):
         self.records = records
         self.data_dir = Path(data_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
+        self.is_distillation = is_distillation
         self.tokenizer = Tokenizer()
         self.cropper = Cropper()
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
@@ -100,6 +102,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         # Add resolution from manifest metadata (enables confidence loss gating)
         if record.structure_info and record.structure_info.resolution is not None:
             feats["resolution"] = torch.tensor(record.structure_info.resolution, dtype=torch.float32)
+
+        # Distillation flag: disables confidence/distogram losses
+        feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
 
         return feats
 

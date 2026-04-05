@@ -413,6 +413,12 @@ def training_loss(
             losses["bond"] = l_bond
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
 
+    # --- Distillation: skip distogram + confidence losses ---
+    is_distillation = features.get("is_distillation")
+    if is_distillation is not None and is_distillation.item():
+        losses["total"] = total
+        return total, losses
+
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]
     if rep_idx is not None:

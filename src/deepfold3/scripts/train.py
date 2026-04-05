@@ -198,11 +198,18 @@ def train(
     records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
     eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
 
+    # Load distillation records if configured
+    distillation_records = []
+    if train_cfg.distillation_data_dir:
+        distillation_records = discover_records(Path(train_cfg.distillation_data_dir))
+        log.info("Loaded %d distillation records from %s", len(distillation_records), train_cfg.distillation_data_dir)
+
     trainer = Trainer(
         model_cfg=model_cfg,
         train_cfg=train_cfg,
         records=records,
         eval_records=eval_records,
+        distillation_records=distillation_records,
     )
     trainer.run(resume_from=resume)
 

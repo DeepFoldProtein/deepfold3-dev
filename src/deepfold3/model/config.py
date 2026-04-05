@@ -451,6 +451,10 @@ class TrainingConfig:
     data_dir: str = ""
     params_path: str = ""
 
+    # Distillation dataset (optional)
+    distillation_data_dir: str = ""  # empty = disabled
+    distillation_weight: float = 0.25  # sampling weight relative to PDB (PDB gets 1.0)
+
     def __post_init__(self):
         """Validate configuration values."""
         if self.warmup_steps < 0:
