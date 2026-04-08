@@ -974,8 +974,15 @@ def _load_hhr_template_hits(
 
 
 def _read_mmcif_file(path: Path) -> str:
-    """Read an mmCIF file, transparently decompressing ``.gz`` files."""
-    if path.name.endswith(".gz"):
+    """Read an mmCIF file, transparently decompressing ``.gz`` and ``.zst`` files."""
+    s = str(path)
+    if s.endswith(".zst"):
+        import zstandard as zstd
+
+        dctx = zstd.ZstdDecompressor()
+        with open(path, "rb") as f:
+            return dctx.decompress(f.read()).decode("utf-8")
+    if s.endswith(".gz"):
         import gzip
 
         with gzip.open(path, "rt", encoding="utf-8") as gz:

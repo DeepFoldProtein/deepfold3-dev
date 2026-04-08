@@ -506,10 +506,10 @@ def _run_mmseqs(binary: str, args: list[str | Path]) -> None:
     cmd = [binary] + [str(a) for a in args]
     logger.info("Running: %s", " ".join(cmd))
     env = os.environ.copy()
-    env["MMSEQS_CALL_DEPTH"] = "1"
+    env["MMSEQS_CALL_DEPTH"] = "0" if _verbose_mmseqs else "1"
     if _verbose_mmseqs:
-        # Stream stderr to terminal in real time
-        result = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL)
+        # Stream both stdout and stderr to terminal in real time
+        result = subprocess.run(cmd, env=env)
     else:
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1180,6 +1180,9 @@ def search_local(
         raise FileNotFoundError(f"UniRef30 database not found at {db_dir}/uniref30_2302_db")
     if use_env and not (db_dir / "colabfold_envdb_202108_db.dbtype").is_file():
         raise FileNotFoundError(f"Environmental database not found at {db_dir}/colabfold_envdb_202108_db")
+
+    global _verbose_mmseqs
+    _verbose_mmseqs = verbose
 
     cleanup = tmpdir is None
     if tmpdir is None:

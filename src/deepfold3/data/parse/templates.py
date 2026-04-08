@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import zstandard as zstd
 
 try:
     import gemmi
@@ -203,10 +204,13 @@ def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     pdb_lower = pdb_id.lower()
     mid2 = pdb_lower[1:3]
     candidates = [
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.zst",
         pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.gz",
         pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / f"{pdb_lower}.cif.zst",
         pdb_mmcif_dir / f"{pdb_lower}.cif.gz",
         pdb_mmcif_dir / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.zst",
         pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.gz",
         pdb_mmcif_dir / mid2 / f"{pdb_id}.cif",
     ]
@@ -218,6 +222,9 @@ def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     if matches:
         return matches[0].resolve()
     matches = sorted(pdb_mmcif_dir.glob(f"{pdb_lower}*.cif.gz"))
+    if matches:
+        return matches[0].resolve()
+    matches = sorted(pdb_mmcif_dir.glob(f"{pdb_lower}*.cif.zst"))
     if matches:
         return matches[0].resolve()
     return None
@@ -246,11 +253,14 @@ def _find_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
     mid2 = pdb_lower[1:3]
 
     candidates = [
+        pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.zst",
         pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif.gz",
         pdb_mmcif_dir / mid2 / f"{pdb_lower}.cif",
+        pdb_mmcif_dir / f"{pdb_lower}.cif.zst",
         pdb_mmcif_dir / f"{pdb_lower}.cif.gz",
         pdb_mmcif_dir / f"{pdb_lower}.cif",
         # Also try uppercase variants
+        pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.zst",
         pdb_mmcif_dir / mid2 / f"{pdb_id}.cif.gz",
         pdb_mmcif_dir / mid2 / f"{pdb_id}.cif",
     ]
@@ -258,7 +268,12 @@ def _find_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
     for path in candidates:
         if path.is_file():
             logger.info("Found local template %s at %s", pdb_id, path)
-            if path.suffix == ".gz":
+            s = str(path)
+            if s.endswith(".zst"):
+                dctx = zstd.ZstdDecompressor()
+                with open(path, "rb") as f:
+                    return dctx.decompress(f.read()).decode("utf-8")
+            elif s.endswith(".gz"):
                 with gzip.open(path, "rt", encoding="utf-8") as f:
                     return f.read()
             else:

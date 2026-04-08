@@ -52,13 +52,21 @@ def parse_mmcif(path: Path) -> Structure:
 
     Parameters
     ----------
-    path : Path to .cif or .cif.gz file
+    path : Path to .cif, .cif.gz, or .cif.zst file
 
     Returns
     -------
     Structure with atoms, bonds, residues, chains arrays
     """
-    structure = gemmi.read_structure(str(path))
+    if str(path).endswith(".zst"):
+        import zstandard as zstd
+
+        dctx = zstd.ZstdDecompressor()
+        with open(path, "rb") as f:
+            text = dctx.decompress(f.read()).decode("utf-8")
+        structure = gemmi.make_structure_from_block(gemmi.cif.read_string(text)[0])
+    else:
+        structure = gemmi.read_structure(str(path))
     # Use first model
     model = structure[0]
 

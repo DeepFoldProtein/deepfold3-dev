@@ -126,6 +126,7 @@ _MAX_TEMPLATES_PER_CHAIN = 20
     default=False,
     help="Symlink template mmCIF files from --pdb-mmcif-dir instead of copying (requires --pdb-mmcif-dir)",
 )
+@click.option("--verbose", is_flag=True, default=False, help="Stream MMseqs2 stderr to terminal (local mode).")
 def msa_search(
     fasta: Path | None,
     sequence: str | None,
@@ -150,6 +151,7 @@ def msa_search(
     pdb_mmcif_dir: Path | None,
     template_cache: Path | None,
     link_templates: bool,
+    verbose: bool,
 ) -> None:
     """Search for MSAs using MMseqs2 (server or local).
 
@@ -224,6 +226,7 @@ def msa_search(
             gpu=gpu,
             gpu_server=gpu_server,
             cache_dir=cache_dir,
+            verbose=verbose,
         )
 
     # Map results back to all chains (duplicates get the same A3M)

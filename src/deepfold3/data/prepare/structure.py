@@ -13,6 +13,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+import zstandard as zstd
 
 try:
     import gemmi
@@ -42,12 +43,22 @@ _ELEMENT_D = gemmi.Element("D")
 _INTERFACE_DIST = 5.0
 
 
-def _read_cif_lenient(path: Path) -> gemmi.cif.Document:
-    """Read a CIF file, stripping duplicate loop blocks that gemmi rejects."""
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as f:
-        text = f.read()
+def _read_cif_text(path: Path) -> str:
+    """Read a CIF file as text, transparently decompressing ``.gz`` and ``.zst``."""
+    s = str(path)
+    if s.endswith(".zst"):
+        dctx = zstd.ZstdDecompressor()
+        with open(path, "rb") as f:
+            return dctx.decompress(f.read()).decode("utf-8")
+    elif s.endswith(".gz"):
+        with gzip.open(path, "rt") as f:
+            return f.read()
+    else:
+        return path.read_text()
 
+
+def _strip_duplicate_loops(text: str) -> gemmi.cif.Document:
+    """Parse CIF text, stripping duplicate loop blocks that gemmi rejects."""
     # Remove duplicate loop_ blocks: keep the first occurrence of each
     # category prefix (e.g. _chem_comp.), strip later duplicates.
     seen_categories: set[str] = set()
@@ -74,6 +85,11 @@ def _read_cif_lenient(path: Path) -> gemmi.cif.Document:
             in_dup = False
 
     return gemmi.cif.read_string("".join(result_parts))
+
+
+def _read_cif_lenient(path: Path) -> gemmi.cif.Document:
+    """Read a CIF file, stripping duplicate loop blocks that gemmi rejects."""
+    return _strip_duplicate_loops(_read_cif_text(path))
 
 
 def _extract_metadata(block: gemmi.cif.Block, resolution: float | None) -> StructureInfo:
@@ -170,21 +186,23 @@ def process_mmcif(
     """Process a PDB mmCIF file into a DeepFold3 Structure and Record.
 
     Args:
-        path: Path to .cif or .cif.gz file.
+        path: Path to .cif, .cif.gz, or .cif.zst file.
         use_assembly: If True, expand biological assembly (default: assembly 1).
         assembly_id: Which assembly to expand (default "1").
 
     Returns:
         Tuple of (Structure, Record).
     """
-    # Read CIF document once, extract both structure and metadata.
+    # Read CIF text once, then parse. Re-uses the cached text on retry so
+    # compressed files (.gz/.zst) are only decompressed once.
     # Some CIF files (e.g. PATCHR Atlas ModelCIF) have duplicate _chem_comp
     # loops; gemmi rejects these, so we strip duplicates on retry.
+    cif_text = _read_cif_text(path)
     try:
-        doc = gemmi.cif.read(str(path))
+        doc = gemmi.cif.read_string(cif_text)
     except RuntimeError as exc:
         if "duplicate tag" in str(exc):
-            doc = _read_cif_lenient(path)
+            doc = _strip_duplicate_loops(cif_text)
         else:
             raise
     st = gemmi.make_structure_from_block(doc[0])

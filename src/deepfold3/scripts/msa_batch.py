@@ -67,6 +67,7 @@ def _convert_a3m_to_npz(a3m_path: Path, npz_path: Path, mol_type: int = 0) -> bo
     default=False,
     help="Generate paired (cross-chain) MSAs for multimer complexes.",
 )
+@click.option("--verbose", is_flag=True, default=False, help="Stream MMseqs2 stderr to terminal.")
 def msa_batch(
     data_dir: Path,
     db_dir: Path,
@@ -79,6 +80,7 @@ def msa_batch(
     batch_size: int,
     convert_only: bool,
     use_pairing: bool,
+    verbose: bool,
 ) -> None:
     """Generate MSAs for all unique sequences in training data.
 
@@ -195,6 +197,7 @@ def msa_batch(
                 threads=threads,
                 gpu=gpu,
                 gpu_server=gpu_server,
+                verbose=verbose,
             )
 
             # Write A3M files
@@ -305,6 +308,7 @@ def msa_batch(
                     threads=threads,
                     gpu=gpu,
                     gpu_server=gpu_server,
+                    verbose=verbose,
                 )
 
                 # Write paired A3M + NPZ for each chain
