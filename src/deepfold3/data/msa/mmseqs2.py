@@ -498,15 +498,23 @@ def search_server(
 # ---------------------------------------------------------------------------
 
 
+_verbose_mmseqs = False
+
+
 def _run_mmseqs(binary: str, args: list[str | Path]) -> None:
     """Run an mmseqs subcommand, raising on failure."""
     cmd = [binary] + [str(a) for a in args]
     logger.info("Running: %s", " ".join(cmd))
     env = os.environ.copy()
     env["MMSEQS_CALL_DEPTH"] = "1"
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if _verbose_mmseqs:
+        # Stream stderr to terminal in real time
+        result = subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL)
+    else:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error("mmseqs stderr: %s", result.stderr)
+        if not _verbose_mmseqs and hasattr(result, "stderr"):
+            logger.error("mmseqs stderr: %s", result.stderr)
         raise RuntimeError(f"mmseqs {args[0]} failed with exit code {result.returncode}")
 
 
@@ -1124,6 +1132,7 @@ def search_local(
     gpu_server: bool = False,
     tmpdir: str | Path | None = None,
     cache_dir: Path | None = None,
+    verbose: bool = False,
 ) -> MsaResult:
     """Search for MSAs using a local MMseqs2 binary.
 
