@@ -362,4 +362,5 @@ class Cropper:
             structure=new_structure,
             paired_msa=_crop_msa_dict(data.paired_msa),
             unpaired_msa=_crop_msa_dict(data.unpaired_msa),
+            token_mask=data.token_mask.select(selected) if data.token_mask is not None else None,
         )

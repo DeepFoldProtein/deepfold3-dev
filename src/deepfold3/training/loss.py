@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F  # noqa: N812
 
+from deepfold3.data.masking import MASK_FIXED, MASK_REGION
 from deepfold3.model.config import TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -84,6 +85,7 @@ def diffusion_mse_loss(
     mol_type: torch.Tensor | None = None,  # [N] int64 (0=prot, 1=RNA, 2=DNA, 3=ligand)
     nucleotide_loss_weight: float = 5.0,
     ligand_loss_weight: float = 10.0,
+    region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
 
@@ -113,6 +115,10 @@ def diffusion_mse_loss(
         weight_mask = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
         weight_mask = mask
+
+    # Apply region-based loss weighting (e.g. CDR-H3 upweighting)
+    if region_weights is not None:
+        weight_mask = weight_mask * region_weights.unsqueeze(-1)  # [N, M]
 
     weight_mask = weight_mask.unsqueeze(-1)  # [N, M, 1]
     n_weighted = weight_mask.sum().clamp(min=1)
@@ -235,13 +241,24 @@ def pde_loss(
 def exp_resolved_loss(
     logits: torch.Tensor,  # [S, N, M * 2]
     atom_mask: torch.Tensor,  # [N, M] bool — ground truth resolved mask
+    fixed_mask: torch.Tensor | None = None,  # [N] float — 1.0 = experimental, 0.0 = generated
 ) -> torch.Tensor:
-    """Binary cross-entropy for experimentally-resolved prediction."""
+    """Binary cross-entropy for experimentally-resolved prediction.
+
+    When *fixed_mask* is provided (e.g. from PATCHR ATLAS distillation data),
+    atoms on tokens with ``fixed_mask < 1`` have their resolved target scaled
+    down, so model-generated atoms are trained towards "not resolved".
+    """
+    effective_mask = atom_mask.float()
+    if fixed_mask is not None:
+        effective_mask = effective_mask * fixed_mask.unsqueeze(-1)  # [N] → [N, M]
     M = atom_mask.shape[-1]
     logits_r = logits.reshape(*logits.shape[:2], M, 2)
-    target = atom_mask.long().unsqueeze(0).expand(logits_r.shape[:-1])
-    log_probs = F.log_softmax(logits_r.float(), dim=-1)  # fp32 for stability
-    nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+    # Soft target: interpolate between class 0 (not resolved) and class 1 (resolved)
+    p_resolved = effective_mask.unsqueeze(0).expand(logits_r.shape[:-1])  # [S, N, M]
+    log_probs = F.log_softmax(logits_r.float(), dim=-1)  # [S, N, M, 2]
+    # Soft cross-entropy: -(p * log_prob_1 + (1-p) * log_prob_0)
+    nll = -(p_resolved * log_probs[..., 1] + (1 - p_resolved) * log_probs[..., 0])
     return nll.mean()
 
 
@@ -345,6 +362,25 @@ def _compute_per_atom_lddt(
 
 
 # ---------------------------------------------------------------------------
+# Region → per-token weight mapping
+# ---------------------------------------------------------------------------
+
+
+def _region_to_weight(
+    region_label: torch.Tensor,  # [N] int
+    region_loss_weights: dict[int, float],
+) -> torch.Tensor:
+    """Convert region labels to per-token weight multipliers.
+
+    Tokens with region_id 0 (unset) or not in the mapping get weight 1.0.
+    """
+    weights = torch.ones_like(region_label, dtype=torch.float32)
+    for region_id, weight in region_loss_weights.items():
+        weights[region_label == int(region_id)] = weight
+    return weights
+
+
+# ---------------------------------------------------------------------------
 # Combined training loss
 # ---------------------------------------------------------------------------
 
@@ -372,6 +408,13 @@ def training_loss(
     losses: dict[str, torch.Tensor] = {}
     total = gt_pos.new_zeros(())
 
+    # --- Token mask channels ---
+    fixed_mask = features.get(f"mask_{MASK_FIXED}")  # [N] bool or None
+    region_label = features.get(f"mask_{MASK_REGION}")  # [N] int or None
+    region_weights: torch.Tensor | None = None
+    if region_label is not None and cfg.region_loss_weights:
+        region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
+
     # --- Diffusion loss ---
     if "denoised" in pred and cfg.alpha_diffusion > 0:
         denoised = pred["denoised"]  # [S, N, M, 3]
@@ -386,6 +429,7 @@ def training_loss(
             mol_type=features.get("mol_type"),
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
             ligand_loss_weight=cfg.ligand_loss_weight,
+            region_weights=region_weights,
         )
         losses["diffusion_mse"] = l_mse
 
@@ -487,7 +531,7 @@ def training_loss(
                 total = total + cfg.alpha_confidence * l_pde
 
             if "exp_resolved" in pred:
-                l_resolved = exp_resolved_loss(pred["exp_resolved"], atom_mask)
+                l_resolved = exp_resolved_loss(pred["exp_resolved"], atom_mask, fixed_mask=fixed_mask)
                 losses["exp_resolved"] = l_resolved
                 total = total + cfg.alpha_confidence * l_resolved
 

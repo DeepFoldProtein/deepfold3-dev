@@ -396,6 +396,9 @@ class TrainingConfig:
     nucleotide_loss_weight: float = 5.0
     ligand_loss_weight: float = 10.0
 
+    # Region-based loss weighting (region_id → weight multiplier, e.g. {3: 5.0} for CDR-H3)
+    region_loss_weights: dict[int, float] = field(default_factory=dict)
+
     # Smooth LDDT thresholds
     lddt_cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
     lddt_inclusion_radius: float = 30.0

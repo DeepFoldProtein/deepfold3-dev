@@ -9,8 +9,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from deepfold3.data.masking import TokenMask
 
 ATOM_DTYPE = np.dtype(
     [
@@ -277,6 +281,7 @@ class Input:
     structure: Structure
     paired_msa: dict[int, MSA]  # keyed by asym_id — paired (cross-chain) MSA
     unpaired_msa: dict[int, MSA]  # keyed by asym_id — unpaired (chain-specific) MSA
+    token_mask: TokenMask | None = None
 
     @classmethod
     def from_msa(cls, structure: Structure, msa: dict[int, MSA]) -> Input:
@@ -293,6 +298,13 @@ class Tokenized:
     structure: Structure
     paired_msa: dict[int, MSA]  # keyed by asym_id
     unpaired_msa: dict[int, MSA]  # keyed by asym_id
+    token_mask: TokenMask | None = None
+
+    def with_mask(self, token_mask: TokenMask) -> Tokenized:
+        """Return a copy with the given token mask attached."""
+        from dataclasses import replace
+
+        return replace(self, token_mask=token_mask)
 
 
 @dataclass
@@ -306,6 +318,7 @@ class ChainInfo:
     entity_id: str | int | None = None
     paired_msa_id: str | int | None = None  # separate file for paired (cross-chain) MSA
     valid: bool = True
+    auth_chain_name: str | None = None  # original chain name from input CIF (before assembly renaming)
 
 
 @dataclass
@@ -349,6 +362,7 @@ class Record:
                 "entity_id": c.entity_id,
                 "paired_msa_id": c.paired_msa_id,
                 "valid": c.valid,
+                **({"auth_chain_name": c.auth_chain_name} if c.auth_chain_name is not None else {}),
             }
             for c in self.chains
         ]

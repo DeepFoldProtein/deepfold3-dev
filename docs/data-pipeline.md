@@ -114,11 +114,13 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 **`Input`**: `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]` (both keyed by asym_id). Paired MSAs carry cross-chain co-evolutionary signal (same row = same species across chains). Use `Input.from_msa(structure, msa)` to treat all MSAs as unpaired (single-chain compat).
 
-**`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]`.
+**`Tokenized`** (frozen): `tokens` (TOKEN_DTYPE `[N]`), `bonds` (TOKEN_BOND_DTYPE), `structure: Structure`, `paired_msa: dict[int, MSA]`, `unpaired_msa: dict[int, MSA]`, `token_mask: TokenMask | None`. Use `with_mask(mask)` to attach a mask (returns a new instance).
 
 **`Record`**: `id: str`, `chains: list[ChainInfo]`, `interfaces: list[InterfaceInfo]`, `structure_info: StructureInfo | None` -- metadata for training dataset indexing. Has `to_dict()` / `from_dict()` for JSON serialization.
 
-**`ChainInfo`**: `chain_id`, `chain_name`, `mol_type`, `cluster_id`, `msa_id`, `num_residues`, `entity_id`, `valid: bool = True`. Chains failing quality filters are marked `valid=False`.
+**`ChainInfo`**: `chain_id`, `chain_name`, `mol_type`, `cluster_id`, `msa_id`, `num_residues`, `entity_id`, `valid: bool = True`, `auth_chain_name: str | None`. Chains failing quality filters are marked `valid=False`. `auth_chain_name` stores the original chain name from the input CIF (before assembly renaming), used for mask generation.
+
+**`TokenMask`** (`data/masking.py`): `channels: dict[str, np.ndarray]` — per-token mask channels for loss control. Reserved channels: `"fixed"` (float32, 1.0=experimental / 0.0=generated) and `"region"` (int16, semantic labels). Has `select(indices)` for cropping, `load(path)` for NPZ, and `fixed_from_patchr(json_path, tokens, chains, chain_infos)` for PATCHR ATLAS mask generation.
 
 **`InterfaceInfo`**: `chain_1`, `chain_2`, `valid: bool = True`.
 
@@ -611,6 +613,8 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `template_pseudo_beta_mask` | `[T, N]` | bool | Valid pseudo-beta mask |
 | `template_backbone_frame` | `[T, N, 3, 3]` | float32 | Template backbone frames (Gram-Schmidt from N/CA/C) |
 | `template_backbone_mask` | `[T, N]` | bool | Valid backbone frame mask |
+| `mask_fixed` | `[N]` | float32 | *(optional)* Token-level fixed mask: 1.0=experimental, 0.0=model-generated (e.g. PATCHR ATLAS). Scales `exp_resolved` loss target. |
+| `mask_region` | `[N]` | int16 | *(optional)* Region label (0=unset, 1+=app-defined, e.g. CDR-H1/H2/H3). Drives per-token `region_loss_weights` in diffusion MSE. |
 
 ### Reference Atom Augmentation
 

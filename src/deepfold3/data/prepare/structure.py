@@ -390,6 +390,7 @@ def process_mmcif(
                     msa_id=seq_hash,
                     num_residues=chain_res_count,
                     entity_id=entity_id,
+                    auth_chain_name=orig_label,
                 )
             )
 

@@ -141,6 +141,7 @@ src/deepfold3/
 ├── data/            # Data pipeline
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS, element_name_to_int(), get_res_type()
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
+│   ├── masking.py        # TokenMask (per-token mask channels for loss control: fixed, region)
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── msa/             # mmseqs2.py (server API + local binary + GPU-accelerated MSA search + template m8 parsing)
 │   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), hhr.py, json_input.py (4 dialects)
@@ -216,6 +217,23 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 | pLDDT, PDE, exp_resolved | `alpha_confidence` (1e-4) | Per-atom/pair confidence; gated on resolution ∈ [0.1, 4.0] |
 | PAE | `alpha_confidence × alpha_pae` (0) | Disabled in stage 1; set alpha_pae=1.0 for finetuning |
 
+### Token Masks (Loss Control)
+
+Per-token mask channels stored in `data_dir/masks/{pdb_id}.npz`, loaded automatically by `TrainingDataset`. Managed via `TokenMask` (`data/masking.py`). Two reserved channels:
+
+| Channel | Dtype | Effect |
+|---------|-------|--------|
+| `"fixed"` | float32 `[N]` | 1.0 = experimental, 0.0 = model-generated. Scales `exp_resolved` loss target (soft CE). For PATCHR ATLAS distillation. |
+| `"region"` | int16 `[N]` | Region label (0=unset, 1+=CDR-H1/H2/H3 etc.). Applies per-token weight via `region_loss_weights` config to diffusion MSE loss. |
+
+Generate PATCHR ATLAS masks from inpainting metadata JSON:
+
+```python
+from deepfold3.data.masking import TokenMask, MASK_FIXED
+fixed = TokenMask.fixed_from_patchr(json_path, tokens, chains, chain_infos=record.chains)
+np.savez(masks_dir / f"{pdb_id}.npz", **{MASK_FIXED: fixed})
+```
+
 ### Multi-Stage Training
 
 Stages are controlled by config overrides, not hardcoded presets. Use `--config` with stage JSON files or `--override key=value`:
@@ -239,10 +257,11 @@ deepfold3 train --data-dir /data/training --output runs/exp3 \
 data_dir/
 ├── manifest.json             # list of Record objects (id, chains, interfaces)
 ├── structures/               # {pdb_id}.npz — Structure (atoms, bonds, residues, chains)
-└── msa/                      # {msa_id}.npz — MSA (sequences, mask, deletion_matrix)
+├── msa/                      # {msa_id}.npz — MSA (sequences, mask, deletion_matrix)
+└── masks/                    # {pdb_id}.npz — TokenMask channels (optional, for loss control)
 ```
 
-Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the MSA file name (SHA256 hash of the chain sequence).
+Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the MSA file name (SHA256 hash of the chain sequence). `ChainInfo` also stores `auth_chain_name` (original chain name from input CIF, before assembly renaming) for accurate chain mapping in mask generation.
 
 ### Data Preprocessing Pipeline
 

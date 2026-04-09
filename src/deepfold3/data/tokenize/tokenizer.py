@@ -152,6 +152,7 @@ class Tokenizer:
             structure=structure,
             paired_msa=inp.paired_msa,
             unpaired_msa=inp.unpaired_msa,
+            token_mask=inp.token_mask,
         )
 
 

@@ -371,6 +371,13 @@ class Featurizer:
         # ------------------------------------------------------------------
         result.update(self._build_template_features(templates, N, tokens, template_feats_per_chain))
 
+        # ------------------------------------------------------------------
+        # Token mask channels (for loss control)
+        # ------------------------------------------------------------------
+        if data.token_mask is not None:
+            for name, arr in data.token_mask.channels.items():
+                result[f"mask_{name}"] = torch.tensor(arr)
+
         return result
 
     def _build_msa_features(

@@ -17,6 +17,7 @@ from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
+from deepfold3.data.masking import TokenMask
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
     ATOM_DTYPE,
@@ -64,6 +65,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.tokenizer = Tokenizer()
         self.cropper = Cropper()
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+        masks_dir = self.data_dir / "masks"
+        self._mask_ids = {p.stem for p in masks_dir.glob("*.npz")} if masks_dir.is_dir() else set()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -94,8 +97,13 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
 
-        # Tokenize -> crop -> featurize
+        # Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
+
+        if record.id in self._mask_ids:
+            mask_path = self.data_dir / "masks" / f"{record.id}.npz"
+            tokenized = tokenized.with_mask(TokenMask.load(str(mask_path)))
+
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
         feats = self.featurizer.process(tokenized, training=True, random_rot=True)
 
