@@ -6,6 +6,8 @@ InferenceInput:  builds features directly from a sequence string (no mmCIF neede
 
 from __future__ import annotations
 
+import logging
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
     from deepfold3.data.ccd import CcdMolecule
     from deepfold3.data.parse.templates import TemplateFeatures
 
+logger = logging.getLogger(__name__)
+
 
 class TrainingDataset(torch.utils.data.Dataset):
     """PyTorch dataset for DeepFold3 training.
@@ -56,6 +60,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         max_atoms: int = 4096,
         max_msa_seqs: int = const.MAX_MSA_ROWS,
         is_distillation: bool = False,
+        mmcif_dir: Path | None = None,
+        max_templates: int = 4,
     ):
         self.records = records
         self.data_dir = Path(data_dir)
@@ -67,6 +73,12 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
         masks_dir = self.data_dir / "masks"
         self._mask_ids = {p.stem for p in masks_dir.glob("*.npz")} if masks_dir.is_dir() else set()
+
+        # Template support
+        self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
+        self.max_templates = max_templates
+        templates_dir = self.data_dir / "templates"
+        self._template_ids = {p.stem for p in templates_dir.glob("*.json")} if templates_dir.is_dir() else set()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -97,6 +109,13 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
 
+        # Load multimer templates (randomly sample 0..max_templates)
+        template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
+        if self.mmcif_dir and record.id in self._template_ids:
+            n_templates = random.randint(0, self.max_templates)
+            if n_templates > 0:
+                template_feats_per_chain = self._load_multimer_templates(record, n_templates)
+
         # Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
 
@@ -105,7 +124,9 @@ class TrainingDataset(torch.utils.data.Dataset):
             tokenized = tokenized.with_mask(TokenMask.load(str(mask_path)))
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
-        feats = self.featurizer.process(tokenized, training=True, random_rot=True)
+        feats = self.featurizer.process(
+            tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
+        )
 
         # Add resolution from manifest metadata (enables confidence loss gating)
         if record.structure_info and record.structure_info.resolution is not None:
@@ -115,6 +136,81 @@ class TrainingDataset(torch.utils.data.Dataset):
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
 
         return feats
+
+    def _load_multimer_templates(self, record: Record, n_templates: int) -> dict[int, list[TemplateFeatures]] | None:
+        """Load multimer template features from pre-indexed JSON + PDB mmCIF.
+
+        Parses each template PDB once and reuses the gemmi Structure across
+        chain alignments to avoid redundant mmCIF parsing.
+        """
+        from deepfold3.data.parse.templates import (
+            _build_polymer_lookup,
+            _fill_template_features,
+            _get_chain_sequences,
+            _realign_mapping,
+            cigar_to_index_pairs,
+            parse_mmcif_structure,
+            read_pdb_mmcif_local,
+            select_template_chain,
+        )
+        from deepfold3.data.prepare.template_search import load_template_hits
+
+        template_path = self.data_dir / "templates" / f"{record.id}.json"
+        try:
+            hits = load_template_hits(template_path)
+        except Exception:
+            logger.debug("Failed to load template index for %s", record.id)
+            return None
+
+        if len(hits) > n_templates:
+            hits = random.sample(hits, n_templates)
+
+        result: dict[int, list[TemplateFeatures]] = {}
+        for hit in hits:
+            mmcif_text = read_pdb_mmcif_local(hit.template_pdb_id, self.mmcif_dir)
+            if mmcif_text is None:
+                continue
+
+            # Parse mmCIF once per template PDB
+            st = parse_mmcif_structure(mmcif_text, label=hit.template_pdb_id)
+            if st is None:
+                continue
+
+            # Per-chain dropout: randomly drop chain alignments so the model
+            # sees partial multimer context.  Always keep at least one chain.
+            alignments = hit.chain_alignments
+            if len(alignments) > 1:
+                alignments = [a for a in alignments if random.random() < 0.5]
+                if not alignments:
+                    alignments = [random.choice(hit.chain_alignments)]
+
+            for aln in alignments:
+                chain_info = record.chains[aln.query_chain_idx]
+                query_indices, seqres_indices = cigar_to_index_pairs(aln.cigar, aln.qstart, aln.tstart)
+                if not query_indices:
+                    continue
+                try:
+                    chain = select_template_chain(st, aln.template_chain_id, label=hit.template_pdb_id)
+                    if chain is None:
+                        continue
+                    query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
+                    seqres, struct_seq = _get_chain_sequences(st, chain)
+                    mapping = _realign_mapping(seqres, struct_seq, query_to_seqres)
+                    lookup = _build_polymer_lookup(chain, const.MAX_ATOMS_PER_TOKEN)
+                    feats, _ = _fill_template_features(
+                        lookup, mapping, chain_info.num_residues, const.MAX_ATOMS_PER_TOKEN
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to extract template %s chain %s for %s",
+                        hit.template_pdb_id,
+                        aln.template_chain_id,
+                        record.id,
+                    )
+                    continue
+                result.setdefault(chain_info.chain_id, []).append(feats)
+
+        return result if result else None
 
 
 def _tokenize_and_featurize(

@@ -454,6 +454,9 @@ class TrainingConfig:
     data_dir: str = ""
     params_path: str = ""
 
+    # Templates
+    mmcif_dir: str = ""  # PDB mmCIF mirror path; non-empty enables template loading
+
     # Distillation dataset (optional, legacy — prefer extra_datasets)
     distillation_data_dir: str = ""  # empty = disabled
     distillation_weight: float = 0.25  # sampling weight relative to PDB (PDB gets 1.0)

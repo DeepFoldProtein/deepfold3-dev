@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** MSA processing for training (A3M→NPZ), training-time template pipeline (HMM-based search with date cutoff).
+**Not yet implemented:** Training-time template date cutoff filtering.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.11+ (pinned in `.python-version`)
@@ -59,7 +59,10 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --conve
 deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
+deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8
+deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8 --max-templates 4 --workers 16
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
+deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors --mmcif-dir /data/pdb/mmcif
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --override alpha_pae=1.0 --override train_confidence_only=true
@@ -144,12 +147,12 @@ src/deepfold3/
 │   ├── masking.py        # TokenMask (per-token mask channels for loss control: fixed, region)
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── msa/             # mmseqs2.py (server API + local binary + GPU-accelerated MSA search + template m8 parsing)
-│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), hhr.py, json_input.py (4 dialects)
+│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
 │   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py, clustering.py
+│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py, clustering.py, template_search.py
 │   └── module/           # dataset.py (TrainingDataset, InferenceInput), collate.py (batch)
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
@@ -258,7 +261,8 @@ data_dir/
 ├── manifest.json             # list of Record objects (id, chains, interfaces)
 ├── structures/               # {pdb_id}.npz — Structure (atoms, bonds, residues, chains)
 ├── msa/                      # {msa_id}.npz — MSA (sequences, mask, deletion_matrix)
-└── masks/                    # {pdb_id}.npz — TokenMask channels (optional, for loss control)
+├── masks/                    # {pdb_id}.npz — TokenMask channels (optional, for loss control)
+└── templates/                # {pdb_id}.json — Multimer template hits (optional, for template embedding)
 ```
 
 Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the MSA file name (SHA256 hash of the chain sequence). `ChainInfo` also stores `auth_chain_name` (original chain name from input CIF, before assembly renaming) for accurate chain mapping in mask generation.
@@ -287,30 +291,26 @@ Steps:
 1. **Structure processing** (implemented): PDB mmCIF → `gemmi.make_assembly()` (assembly 1) → structure-level filters (resolution, method, date, chain count, residue count, polymer count) → chain-level filters (min/max residue count, all-unknown, consecutive CA distance, chain clashing) → Structure NPZ.
 2. **Sequence clustering** (implemented): `deepfold3 cluster` (MMseqs2 at 40% identity) or download pre-computed wwPDB `clusters-by-entity-40.txt`. Apply via `deepfold3 apply-clusters` or `--cluster-file` during prepare.
 3. **MSA generation** (implemented): `deepfold3 msa` for inference, `deepfold3 msa-batch` for training. Local MMseqs2 (GPU optional) against UniRef30/ColabFoldDB → A3M → NPZ per unique sequence. Resume support, batch splitting.
-4. **Template search** (not yet): `pdb_seqres.txt` → HMM database (hmmpress) → hmmsearch per query → template hits with date cutoff
+4. **Template discovery** (implemented): `deepfold3 prepare-templates` discovers multimer templates from per-chain m8 files (MMseqs2 SEQRES hits). Uses Hungarian algorithm for optimal chain pairing. Writes lightweight JSON index to `{data_dir}/templates/`.
 5. **ID filtering** (implemented): `--include-list` / `--exclude-list` text files for `deepfold3 train`
 6. **Manifest creation** (implemented): collect records/ → `manifest.json`
 
-Source: `src/deepfold3/data/prepare/` (structure.py, filters.py, manifest.py, clustering.py).
+Source: `src/deepfold3/data/prepare/` (structure.py, filters.py, manifest.py, clustering.py, template_search.py).
 
 PDB mmCIF mirror: `/scratch/pdb/mmCIF/` (layout: `{mid2}/{pdb_id}.cif.gz`, ~250k structures).
 
-### Template Pipeline Design
+### Template Pipeline
 
-Two separate search strategies for different purposes:
+Training-time template support uses pre-computed per-chain m8 files (MMseqs2 hits against PDB SEQRES):
 
-- **MSAs** (co-evolutionary signal): MMseqs2 — fast, sufficient sensitivity for MSA construction
-- **Templates** (structural homologs): hmmsearch against PDB HMM profiles — better sensitivity, proper E-value statistics, well-suited for finding distant structural homologs
+1. **Offline discovery**: `deepfold3 prepare-templates` reads m8 files, groups hits by template PDB ID, finds PDB entries covering ≥2 query chains, uses bipartite matching (Hungarian algorithm) for chain pairing, writes `{data_dir}/templates/{pdb_id}.json`.
+2. **Training-time loading**: `TrainingDataset` loads template JSON index, reads mmCIF from PDB mirror (`--mmcif-dir`), extracts `TemplateFeatures` via `extract_from_seqres_alignment()` (with seqres→structure realignment), passes `template_feats_per_chain` to featurizer.
+3. **Seqres realignment**: `template_realign.py` handles the mismatch between PDB SEQRES (used by search tools) and the actual mmCIF structure (which may have missing/different residues). Applied automatically in both the HHR inference path (`extract_template_features_from_hhr`) and the training CIGAR path (`extract_from_seqres_alignment`).
+4. **Template augmentation**: each sample randomly uses 0..max_templates from available hits (uniform). Per-chain dropout randomly drops chain alignments from multimer templates (50% per chain, always keeping ≥1), so the model sees full, partial, or no cross-chain template context.
+5. **Per-template pair mask**: Template embedding uses per-template coverage mask (`pb_mask[i] × pb_mask[j]`) instead of the query's `multichain_mask`. This allows multimer templates to provide cross-chain structural information (interface distances, relative orientations). Monomer templates naturally mask to intra-chain only since they cover a single chain.
+6. **Not yet implemented**: Date cutoff filtering to avoid data leakage.
 
-Training-time template pipeline (not yet implemented):
-
-1. Parse `pdb_seqres.txt` → extract all unique PDB polymer sequences
-2. Build per-sequence HMM profiles → `hmmpress` into a searchable HMM database
-3. For each training chain: `hmmsearch` query sequence against PDB HMM DB → ranked template hits
-4. Filter templates by date cutoff (avoid data leakage) and sequence identity
-5. Extract template features from matched PDB structures (backbone frames, pseudo-beta positions)
-
-The current template pipeline (`data/parse/templates.py`) supports per-chain HHR templates and whole-complex JSON templates for inference. The training-time pipeline needs: HMM-based search, date-cutoff filtering, and multi-chain template alignment for multimeric complexes.
+The inference template pipeline (`data/parse/templates.py`) supports per-chain HHR templates and whole-complex JSON templates.
 
 ## Confidence Metrics
 

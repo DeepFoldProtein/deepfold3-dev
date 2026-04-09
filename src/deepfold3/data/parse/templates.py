@@ -17,9 +17,11 @@ Template features (per template, aligned to query tokens):
 from __future__ import annotations
 
 import dataclasses
+import functools
 import gzip
 import json
 import logging
+import re
 import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,11 +36,14 @@ except ImportError:
 
 from deepfold3.data import const
 from deepfold3.data.parse.hhr import TemplateHit
+from deepfold3.data.parse.template_realign import AlignmentError, realign_hit_to_structure
 
 if TYPE_CHECKING:
     from deepfold3.data.types import Structure
 
 logger = logging.getLogger(__name__)
+
+_CIGAR_RE = re.compile(r"(\d+)([MID])")
 
 
 @dataclasses.dataclass
@@ -73,6 +78,47 @@ def empty_template_features(num_tokens: int, max_atoms: int = const.MAX_ATOMS_PE
         atom_positions=np.zeros((num_tokens, max_atoms, 3), dtype=np.float32),
         atom_mask=np.zeros((num_tokens, max_atoms), dtype=bool),
     )
+
+
+def cigar_to_index_pairs(
+    cigar: str,
+    qstart: int,
+    tstart: int,
+) -> tuple[list[int], list[int]]:
+    """Convert a CIGAR string and 1-based start positions to aligned index pairs.
+
+    Operations:
+        M — match/mismatch (both query and template advance)
+        I — insertion in query (query advances, template does not)
+        D — deletion in query (template advances, query does not)
+
+    Only M (match) positions are returned.
+
+    Args:
+        cigar: CIGAR alignment string (e.g. ``"24M"``, ``"346M3I30M"``).
+        qstart: 1-based query start position.
+        tstart: 1-based template start position.
+
+    Returns:
+        Tuple of (query_indices, template_indices), both 0-based.
+    """
+    query_indices: list[int] = []
+    template_indices: list[int] = []
+    qi = qstart - 1  # convert to 0-based
+    ti = tstart - 1
+    for length_str, op in _CIGAR_RE.findall(cigar):
+        length = int(length_str)
+        if op == "M":
+            for _ in range(length):
+                query_indices.append(qi)
+                template_indices.append(ti)
+                qi += 1
+                ti += 1
+        elif op == "I":
+            qi += length
+        elif op == "D":
+            ti += length
+    return query_indices, template_indices
 
 
 @dataclasses.dataclass
@@ -135,7 +181,7 @@ def template_hit_input_to_features(
         logger.warning("TemplateHitInput has neither hhr_hit nor index pairs nor structure")
         return empty_template_features(query_length, max_atoms)
 
-    return _extract_from_index_pairs(
+    return extract_from_index_pairs(
         hit_input.mmcif_text,
         hit_input.query_indices,
         hit_input.template_indices,
@@ -145,7 +191,7 @@ def template_hit_input_to_features(
     )
 
 
-def _extract_from_index_pairs(
+def extract_from_index_pairs(
     mmcif_text: str,
     query_indices: list[int],
     template_indices: list[int],
@@ -195,10 +241,55 @@ def _extract_from_index_pairs(
     return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr)
 
 
+def extract_from_seqres_alignment(
+    mmcif_text: str,
+    query_indices: list[int],
+    seqres_indices: list[int],
+    query_length: int,
+    chain_id: str | None = None,
+    max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+) -> TemplateFeatures:
+    """Extract template features using seqres-based alignment positions.
+
+    Unlike :func:`extract_from_index_pairs` which expects ``label_seq_id``
+    values, this function takes **0-based PDB seqres positions** (as produced
+    by :func:`cigar_to_index_pairs` from m8 hits) and automatically realigns
+    them to the resolved mmCIF structure.
+
+    This is the correct extraction path for search-derived alignments (MMseqs2,
+    HHsearch) where template positions reference the PDB SEQRES.
+
+    Args:
+        mmcif_text: mmCIF file contents.
+        query_indices: 0-based query token positions.
+        seqres_indices: 0-based positions in the PDB seqres sequence.
+        query_length: Total number of tokens in the query.
+        chain_id: Chain to use from the template (``None`` = first polymer).
+        max_atoms: Maximum atoms per residue.
+
+    Returns:
+        TemplateFeatures aligned to query tokens.
+    """
+    result = _parse_mmcif_chain(mmcif_text, chain_id=chain_id)
+    if result is None:
+        return empty_template_features(query_length, max_atoms)
+    st, target_chain = result
+
+    query_to_seqres = {qi: si for qi, si in zip(query_indices, seqres_indices, strict=True) if 0 <= qi < query_length}
+
+    seqres, struct_seq = _get_chain_sequences(st, target_chain)
+    mapping = _realign_mapping(seqres, struct_seq, query_to_seqres)
+
+    lookup = _build_polymer_lookup(target_chain, max_atoms)
+    feats, matched = _fill_template_features(lookup, mapping, query_length, max_atoms)
+    logger.info("Seqres-aligned template: %d/%d matched", matched, len(query_indices))
+    return feats
+
+
 def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     """Find the file path of a PDB mmCIF in a local PDB mirror.
 
-    Same search order as ``_find_pdb_mmcif_local`` but returns the ``Path``
+    Same search order as ``read_pdb_mmcif_local`` but returns the ``Path``
     instead of reading the file content.  Useful for creating symbolic links.
     """
     pdb_lower = pdb_id.lower()
@@ -230,7 +321,8 @@ def find_pdb_mmcif_path(pdb_id: str, pdb_mmcif_dir: Path) -> Path | None:
     return None
 
 
-def _find_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
+@functools.lru_cache(maxsize=64)
+def read_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
     """Look up a PDB mmCIF file in a local PDB mirror directory.
 
     Searches the standard PDB mirror layout::
@@ -314,7 +406,7 @@ def fetch_pdb_mmcif(
 
     # 1. Local PDB mirror
     if pdb_mmcif_dir is not None:
-        content = _find_pdb_mmcif_local(pdb_id, Path(pdb_mmcif_dir))
+        content = read_pdb_mmcif_local(pdb_id, Path(pdb_mmcif_dir))
         if content is not None:
             return content
         logger.debug("PDB ID %s not found in local mirror %s", pdb_id, pdb_mmcif_dir)
@@ -340,21 +432,11 @@ def fetch_pdb_mmcif(
     return content
 
 
-def _parse_mmcif_chain(
-    mmcif_text: str,
-    chain_id: str | None = None,
-    label: str = "template",
-) -> tuple | None:
-    """Parse an mmCIF string and select a target chain.
-
-    Args:
-        mmcif_text: mmCIF file contents.
-        chain_id: Specific chain to use. If None, the first polymer chain is used.
-        label: Label for log messages (e.g. PDB ID).
+def parse_mmcif_structure(mmcif_text: str, label: str = "template"):
+    """Parse mmCIF text into a gemmi Structure.
 
     Returns:
-        (gemmi_structure, target_chain) or None if the structure is empty or
-        the requested chain was not found.
+        gemmi Structure object, or ``None`` if empty.
     """
     if gemmi is None:
         raise ImportError("gemmi is required for template parsing: pip install gemmi")
@@ -366,30 +448,152 @@ def _parse_mmcif_chain(
     if len(st) == 0 or len(st[0]) == 0:
         logger.warning("Template %s has no models/chains", label)
         return None
+    return st
 
+
+def select_template_chain(st, chain_id: str | None = None, label: str = "template"):
+    """Select a polymer chain from a parsed gemmi Structure.
+
+    Returns:
+        gemmi Chain, or ``None`` if not found.
+    """
     model = st[0]
-
-    # Select target chain
-    target_chain = None
     if chain_id is not None:
         for ch in model:
             if ch.name == chain_id:
-                target_chain = ch
-                break
-        if target_chain is None:
-            logger.warning("Chain %s not found in template %s", chain_id, label)
-            return None
-    else:
-        # First polymer chain
-        for ch in model:
-            entity = st.get_entity_of(ch.get_polymer())
-            if entity is not None and entity.entity_type == gemmi.EntityType.Polymer:
-                target_chain = ch
-                break
-        if target_chain is None:
-            target_chain = model[0]
+                return ch
+        logger.warning("Chain %s not found in template %s", chain_id, label)
+        return None
+    for ch in model:
+        entity = st.get_entity_of(ch.get_polymer())
+        if entity is not None and entity.entity_type == gemmi.EntityType.Polymer:
+            return ch
+    return model[0]
 
-    return st, target_chain
+
+def _parse_mmcif_chain(
+    mmcif_text: str,
+    chain_id: str | None = None,
+    label: str = "template",
+) -> tuple | None:
+    """Parse mmCIF and select a chain (convenience wrapper)."""
+    st = parse_mmcif_structure(mmcif_text, label)
+    if st is None:
+        return None
+    ch = select_template_chain(st, chain_id, label)
+    if ch is None:
+        return None
+    return st, ch
+
+
+def _one_letter(info) -> str:
+    """Extract one-letter code from a gemmi ResidueInfo, defaulting to 'X'."""
+    c = info.one_letter_code
+    return c if c and c not in ("?", "\0") else "X"
+
+
+def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
+    """Get entity (seqres) and resolved structure sequences for a chain.
+
+    Returns:
+        ``(seqres_sequence, structure_sequence)`` where *seqres_sequence* is
+        ``None`` if the entity information is unavailable.
+    """
+    polymer = chain.get_polymer()
+    if not polymer:
+        return None, ""
+
+    struct_seq = "".join(_one_letter(gemmi.find_tabulated_residue(res.name)) for res in polymer)
+
+    entity = st.get_entity_of(polymer)
+    if entity is None or not entity.full_sequence:
+        return None, struct_seq
+
+    seqres = "".join(_one_letter(gemmi.find_tabulated_residue(item.mon)) for item in entity.full_sequence)
+    return seqres, struct_seq
+
+
+def _build_polymer_lookup(chain, max_atoms: int) -> dict[int, tuple[int, np.ndarray, np.ndarray]]:
+    """Build 0-based sequential index → residue features from a chain's polymer."""
+    return {idx: _extract_residue_features(res, max_atoms) for idx, res in enumerate(chain.get_polymer())}
+
+
+def _fill_template_features(
+    residue_lookup: dict[int, tuple[int, np.ndarray, np.ndarray]],
+    mapping: dict[int, int],
+    query_length: int,
+    max_atoms: int,
+) -> tuple[TemplateFeatures, int]:
+    """Fill feature arrays from a residue lookup and query→structure mapping.
+
+    Returns:
+        ``(TemplateFeatures, matched_count)``.
+    """
+    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
+    mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
+
+    matched = 0
+    for qi, si in mapping.items():
+        if 0 <= qi < query_length and si in residue_lookup:
+            aa, pos, msk = residue_lookup[si]
+            aatype_arr[qi] = aa
+            pos_arr[qi] = pos
+            mask_arr[qi] = msk
+            matched += 1
+
+    return TemplateFeatures(aatype=aatype_arr, atom_positions=pos_arr, atom_mask=mask_arr), matched
+
+
+def _realign_mapping(
+    seqres: str | None,
+    struct_seq: str,
+    query_to_seqres: dict[int, int],
+) -> dict[int, int]:
+    """Convert a query→seqres mapping to a query→structure mapping.
+
+    If the seqres and structure sequences have the same length (the common
+    case), the mapping is returned unchanged.  When lengths differ, the
+    realignment algorithm is applied to shift positions from seqres-space
+    into structure-space.
+
+    Args:
+        seqres: Full entity (SEQRES) sequence, or ``None`` if unavailable.
+        struct_seq: Sequence from resolved polymer residues.
+        query_to_seqres: Mapping from 0-based query positions to 0-based
+            seqres positions.
+
+    Returns:
+        Mapping from query positions to 0-based structure sequential indices.
+    """
+    if not query_to_seqres:
+        return {}
+
+    if seqres is None or len(seqres) == len(struct_seq):
+        # No length mismatch → positions map directly.
+        return query_to_seqres
+
+    # Determine the hit region in seqres
+    seqres_values = sorted(set(query_to_seqres.values()))
+    start = seqres_values[0]
+    end = seqres_values[-1] + 1
+    hit_subseq = seqres[start:end]
+
+    # Make mapping values relative to hit subsequence
+    relative: dict[int, int] = {q: s - start for q, s in query_to_seqres.items()}
+
+    try:
+        return realign_hit_to_structure(
+            hit_sequence=hit_subseq,
+            hit_start_index=start,
+            hit_end_index=end,
+            full_length=len(seqres),
+            structure_sequence=struct_seq,
+            query_to_hit_mapping=relative,
+        )
+    except AlignmentError as e:
+        logger.warning("Template realignment failed, using direct mapping: %s", e)
+        return query_to_seqres
 
 
 def extract_template_features(
@@ -534,6 +738,11 @@ def extract_template_features_from_hhr(
     this function uses the query-to-hit mapping from an HHR TemplateHit
     to place template atom features at the correct query positions.
 
+    When the PDB seqres sequence (used by HHsearch) differs from the
+    resolved mmCIF structure (missing residues, sequence corrections),
+    the hit indices are automatically realigned to point to the correct
+    structure positions.
+
     Args:
         mmcif_text: mmCIF file contents.
         hit: A TemplateHit from ``parse_hhr()``.
@@ -545,39 +754,17 @@ def extract_template_features_from_hhr(
     Returns:
         TemplateFeatures aligned to query tokens.
     """
-    N = query_length
     result = _parse_mmcif_chain(mmcif_text, chain_id=chain_id or hit.chain_id, label=hit.pdb_id)
     if result is None:
-        return empty_template_features(N, max_atoms)
-    _, target_chain = result
+        return empty_template_features(query_length, max_atoms)
+    st, target_chain = result
 
-    # Build sequential 0-based index -> residue features
-    # (HHR hit indices are 0-based sequential positions in the chain)
-    residue_by_seq_idx: dict[int, tuple[int, np.ndarray, np.ndarray]] = {}
-    for seq_idx, residue in enumerate(target_chain):
-        residue_by_seq_idx[seq_idx] = _extract_residue_features(residue, max_atoms)
+    seqres, struct_seq = _get_chain_sequences(st, target_chain)
+    mapping = _realign_mapping(seqres, struct_seq, hit.query_to_hit_mapping)
 
-    # Map query positions using HHR alignment
-    mapping = hit.query_to_hit_mapping
-
-    aatype_arr = np.full(N, 20, dtype=np.int64)
-    pos_arr = np.zeros((N, max_atoms, 3), dtype=np.float32)
-    mask_arr = np.zeros((N, max_atoms), dtype=bool)
-
-    for query_idx, hit_idx in mapping.items():
-        if query_idx >= N:
-            continue
-        if hit_idx in residue_by_seq_idx:
-            aa, pos, msk = residue_by_seq_idx[hit_idx]
-            aatype_arr[query_idx] = aa
-            pos_arr[query_idx] = pos
-            mask_arr[query_idx] = msk
-
-    return TemplateFeatures(
-        aatype=aatype_arr,
-        atom_positions=pos_arr,
-        atom_mask=mask_arr,
-    )
+    lookup = _build_polymer_lookup(target_chain, max_atoms)
+    feats, _ = _fill_template_features(lookup, mapping, query_length, max_atoms)
+    return feats
 
 
 def parse_hhr_templates(
@@ -708,7 +895,7 @@ def parse_json_templates(
                 continue
 
             mmcif_text = cif_path.read_text()
-            feats = _extract_from_index_pairs(
+            feats = extract_from_index_pairs(
                 mmcif_text,
                 query_indices,
                 template_indices,

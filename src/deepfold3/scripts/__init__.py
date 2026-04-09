@@ -30,6 +30,7 @@ def _register_commands() -> None:
         import_paired_msa,
         prepare,
     )
+    from deepfold3.scripts.prepare_templates import prepare_templates
     from deepfold3.scripts.train import train
 
     cli.add_command(inference)
@@ -43,6 +44,7 @@ def _register_commands() -> None:
     cli.add_command(import_of3)
     cli.add_command(import_paired_msa)
     cli.add_command(export_complexes)
+    cli.add_command(prepare_templates)
     cli.add_command(train)
 
 

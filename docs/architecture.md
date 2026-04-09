@@ -158,6 +158,7 @@ Processes structural templates (known PDB structures similar to the query) into 
   - Unit vectors (x, y, z) from backbone frames `[N, N, 1]`
   - Backbone mask `[N, N, 1]`, query pair `[N, N, 128]`
 - 2-layer `TemplatePairFormerBlock` stack + output LayerNorm
+- Uses per-template pair mask (`pb_mask[i] × pb_mask[j]`) derived from template coverage, not the query `multichain_mask`. This allows multimer templates to provide cross-chain features (interface distances, relative orientations)
 
 **`TemplatePairFormerBlock`** -- Simplified PairFormer (no single track):
 

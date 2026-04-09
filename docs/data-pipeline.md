@@ -469,6 +469,20 @@ def fetch_pdb_mmcif(pdb_id, cache_dir=None, pdb_mmcif_dir=None) -> str:
 - Unaligned positions are filled with zeros and aatype=20 (UNK)
 - `fetch_pdb_mmcif()` resolves template structures in order: (1) local PDB mirror `pdb_mmcif_dir` (layout: `{dir}/{mid2}/{id}.cif.gz`, supports gzip), (2) `cache_dir`, (3) RCSB download. CLI: `--pdb-mmcif-dir`
 - Template features are converted to pseudo-beta positions, backbone frames, and masks in the featurizer
+- `cigar_to_index_pairs(cigar, qstart, tstart)` converts m8 CIGAR strings + 1-based positions to 0-based aligned index pairs (M/I/D ops)
+
+**Training-time templates** (`data/prepare/template_search.py`):
+
+- `find_multimer_templates()` discovers multimer templates from pre-computed per-chain m8 files
+- Groups m8 hits across chains by template PDB ID; PDB IDs hitting ≥2 query chains are multimer template candidates
+- Uses `scipy.optimize.linear_sum_assignment` (Hungarian algorithm) for optimal query-to-template chain pairing
+- Self-hit exclusion: skips template PDB ID == training PDB ID
+- Offline preprocessing: `deepfold3 prepare-templates --data-dir ... --m8-dir ...` writes `{data_dir}/templates/{pdb_id}.json`
+- Training-time: `TrainingDataset` loads template JSON index, reads mmCIF from PDB mirror, extracts `TemplateFeatures` via existing `_extract_from_index_pairs()`
+- Template augmentation: each sample randomly uses 0..max_templates (uniform), sampling from available hits
+- Per-chain dropout: for multimer templates, each chain alignment is independently kept with 50% probability (at least 1 chain always kept), creating partial multimer context during training
+- Per-template pair mask: template embedding uses `template_pseudo_beta_mask[i] × template_pseudo_beta_mask[j]` instead of query `multichain_mask`, allowing multimer templates to provide cross-chain features (interface distances, relative orientations)
+- CLI: `deepfold3 train --mmcif-dir /path/to/pdb/mmcif`
 
 **JSON template hits format** (produced by tools like Protenix/Boltz):
 

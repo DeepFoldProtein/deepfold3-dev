@@ -88,6 +88,12 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
         "--dataset pdb2:/data/pdb2:1.0:weighted.  Can be repeated."
     ),
 )
+@click.option(
+    "--mmcif-dir",
+    default=None,
+    type=click.Path(exists=True),
+    help="PDB mmCIF mirror directory. Enables template loading during training.",
+)
 def train(
     data_dir: str,
     output: str,
@@ -106,6 +112,7 @@ def train(
     include_list: str | None,
     exclude_list: str | None,
     extra_datasets: tuple[str, ...],
+    mmcif_dir: str | None,
 ) -> None:
     """Train DeepFold3 model."""
     from deepfold3.model.config import ModelConfig, TrainingConfig
@@ -157,6 +164,8 @@ def train(
         train_cfg.dtype = dtype
     if wandb_project is not None:
         train_cfg.wandb_project = wandb_project
+    if mmcif_dir is not None:
+        train_cfg.mmcif_dir = mmcif_dir
 
     # Apply --override key=value pairs (supports int, float, bool, str)
     for kv in override:

@@ -105,6 +105,42 @@ class TemplateM8Hit:
     qend: int
     tstart: int
     tend: int
+    cigar: str = ""
+
+
+def _parse_m8_hit(parts: list[str]) -> TemplateM8Hit | None:
+    """Parse a single m8 line (split by tab) into a TemplateM8Hit."""
+    try:
+        target = parts[1]
+        identity = float(parts[2])
+        qstart = int(parts[6])
+        qend = int(parts[7])
+        tstart = int(parts[8])
+        tend = int(parts[9])
+        evalue = float(parts[10])
+    except (ValueError, IndexError):
+        return None
+
+    if "_" in target:
+        pdb_id = target[:4].upper()
+        chain_id_str = target[5:]
+    else:
+        pdb_id = target[:4].upper()
+        chain_id_str = "A"
+
+    cigar = parts[12] if len(parts) >= 13 else ""
+
+    return TemplateM8Hit(
+        pdb_id=pdb_id,
+        chain_id=chain_id_str,
+        identity=identity,
+        evalue=evalue,
+        qstart=qstart,
+        qend=qend,
+        tstart=tstart,
+        tend=tend,
+        cigar=cigar,
+    )
 
 
 def parse_m8(m8_text: str) -> dict[int, list[TemplateM8Hit]]:
@@ -122,38 +158,37 @@ def parse_m8(m8_text: str) -> dict[int, list[TemplateM8Hit]]:
             continue
         try:
             chain_idx = int(parts[0]) - 101
-            target = parts[1]
-            identity = float(parts[2])
-            qstart = int(parts[6])
-            qend = int(parts[7])
-            tstart = int(parts[8])
-            tend = int(parts[9])
-            evalue = float(parts[10])
         except (ValueError, IndexError):
             continue
-
-        # Parse PDB ID + chain from target (e.g. "1abc_A")
-        if "_" in target:
-            pdb_id = target[:4].upper()
-            chain_id_str = target[5:]
-        else:
-            pdb_id = target[:4].upper()
-            chain_id_str = "A"
-
+        hit = _parse_m8_hit(parts)
+        if hit is None:
+            continue
         if chain_idx not in hits:
             hits[chain_idx] = []
-        hits[chain_idx].append(
-            TemplateM8Hit(
-                pdb_id=pdb_id,
-                chain_id=chain_id_str,
-                identity=identity,
-                evalue=evalue,
-                qstart=qstart,
-                qend=qend,
-                tstart=tstart,
-                tend=tend,
-            )
-        )
+        hits[chain_idx].append(hit)
+    return hits
+
+
+def parse_m8_single(m8_text: str) -> list[TemplateM8Hit]:
+    """Parse a single-chain m8 file where the query ID is a hash string.
+
+    Unlike :func:`parse_m8` which handles ColabFold multi-chain format
+    (numeric query IDs like 101, 102, …), this parses m8 files produced by
+    ``mmseqs2 search`` against PDB SEQRES where column 0 is the query hash.
+
+    Returns:
+        Flat list of TemplateM8Hit (all belong to the same query chain).
+    """
+    hits: list[TemplateM8Hit] = []
+    for line in m8_text.strip().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 11:
+            continue
+        hit = _parse_m8_hit(parts)
+        if hit is not None:
+            hits.append(hit)
     return hits
 
 

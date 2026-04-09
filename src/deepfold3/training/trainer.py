@@ -242,6 +242,8 @@ class Trainer:
             max_tokens=self.cfg.max_tokens,
             max_atoms=self.cfg.max_atoms,
             max_msa_seqs=self.cfg.max_msa_seqs,
+            mmcif_dir=Path(self.cfg.mmcif_dir) if self.cfg.mmcif_dir else None,
+            max_templates=self.model_cfg.data.max_templates,
         )
 
         # Primary (PDB) dataset

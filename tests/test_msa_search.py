@@ -540,9 +540,9 @@ def test_link_templates():
 # ---------------------------------------------------------------------------
 
 
-def test_find_pdb_mmcif_local_gzipped():
+def test_read_pdb_mmcif_local_gzipped():
     """Find a gzip-compressed mmCIF in standard PDB mirror layout."""
-    from deepfold3.data.parse.templates import _find_pdb_mmcif_local
+    from deepfold3.data.parse.templates import read_pdb_mmcif_local
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mirror = Path(tmpdir)
@@ -553,14 +553,14 @@ def test_find_pdb_mmcif_local_gzipped():
         with gzip.open(subdir / "a3vb.cif.gz", "wt") as f:
             f.write(content)
 
-        result = _find_pdb_mmcif_local("A3VB", mirror)
+        result = read_pdb_mmcif_local("A3VB", mirror)
         assert result is not None
         assert result == content
 
 
-def test_find_pdb_mmcif_local_plain():
+def test_read_pdb_mmcif_local_plain():
     """Find an uncompressed mmCIF in PDB mirror layout."""
-    from deepfold3.data.parse.templates import _find_pdb_mmcif_local
+    from deepfold3.data.parse.templates import read_pdb_mmcif_local
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mirror = Path(tmpdir)
@@ -569,14 +569,14 @@ def test_find_pdb_mmcif_local_plain():
         content = "data_1ABC\n_entry.id 1ABC\n"
         (subdir / "1abc.cif").write_text(content)
 
-        result = _find_pdb_mmcif_local("1ABC", mirror)
+        result = read_pdb_mmcif_local("1ABC", mirror)
         assert result is not None
         assert result == content
 
 
-def test_find_pdb_mmcif_local_flat():
+def test_read_pdb_mmcif_local_flat():
     """Find mmCIF in flat layout (no mid2 subdirectory)."""
-    from deepfold3.data.parse.templates import _find_pdb_mmcif_local
+    from deepfold3.data.parse.templates import read_pdb_mmcif_local
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mirror = Path(tmpdir)
@@ -584,17 +584,17 @@ def test_find_pdb_mmcif_local_flat():
         with gzip.open(mirror / "2xyz.cif.gz", "wt") as f:
             f.write(content)
 
-        result = _find_pdb_mmcif_local("2XYZ", mirror)
+        result = read_pdb_mmcif_local("2XYZ", mirror)
         assert result is not None
         assert result == content
 
 
-def test_find_pdb_mmcif_local_missing():
+def test_read_pdb_mmcif_local_missing():
     """Return None when PDB ID not found."""
-    from deepfold3.data.parse.templates import _find_pdb_mmcif_local
+    from deepfold3.data.parse.templates import read_pdb_mmcif_local
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        result = _find_pdb_mmcif_local("9ZZZ", Path(tmpdir))
+        result = read_pdb_mmcif_local("9ZZZ", Path(tmpdir))
         assert result is None
 
 
