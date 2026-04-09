@@ -223,8 +223,17 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
 @cli.command()
 @click.option("--mmcif-dir", required=True, type=click.Path(exists=True), help="PDB mmCIF mirror directory.")
 @click.option("--output", required=True, type=click.Path(), help="Output directory for processed data.")
-@click.option("--pdb-ids", default=None, help="Comma-separated PDB IDs to process (e.g. 1pfe,8qy0). Mutually exclusive with --pdb-id-file.")
-@click.option("--pdb-id-file", default=None, type=click.Path(exists=True), help="Text file with one PDB ID per line. Mutually exclusive with --pdb-ids.")
+@click.option(
+    "--pdb-ids",
+    default=None,
+    help="Comma-separated PDB IDs to process (e.g. 1pfe,8qy0). Mutually exclusive with --pdb-id-file.",
+)
+@click.option(
+    "--pdb-id-file",
+    default=None,
+    type=click.Path(exists=True),
+    help="Text file with one PDB ID per line. Mutually exclusive with --pdb-ids.",
+)
 @click.option("--limit", default=None, type=int, help="Max number of structures to process (for sampling).")
 @click.option("--max-resolution", default=None, type=float, help="Max resolution in Å (e.g. 9.0). Disabled by default.")
 @click.option("--min-resolution", default=None, type=float, help="Min resolution in Å (e.g. 0.1). Disabled by default.")
@@ -236,7 +245,9 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
 @click.option("--max-date", default=None, help="Max release date YYYY-MM-DD (training cutoff). Disabled by default.")
 @click.option("--min-date", default=None, help="Min release date YYYY-MM-DD (validation set). Disabled by default.")
 @click.option("--max-chains", default=300, type=int, show_default=True, help="Max chains per structure.")
-@click.option("--max-total-residues", default=16384, type=int, show_default=True, help="Max total residues per structure.")
+@click.option(
+    "--max-total-residues", default=16384, type=int, show_default=True, help="Max total residues per structure."
+)
 @click.option("--min-polymer-chains", default=1, type=int, show_default=True, help="Min polymer chains per structure.")
 @click.option("--no-assembly", is_flag=True, help="Skip assembly expansion (use asymmetric unit).")
 @click.option(
@@ -611,6 +622,162 @@ def cluster(
     click.echo(f"Cluster file: {output_path} ({len(clusters)} clusters, {len(sequences)} sequences)")
 
 
+@cli.command("export-complexes")
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Training data directory (contains manifest.json and structures/).",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Output path for complexes.json.",
+)
+@click.option(
+    "--all-mol-types",
+    is_flag=True,
+    help="Include all chain types, not just protein.",
+)
+def export_complexes(data_dir: Path, output: Path, all_mol_types: bool) -> None:
+    """Export heteromeric complexes to a JSON file for paired MSA pipelines.
+
+    Reads the manifest, identifies multimer records (>1 qualifying chain),
+    extracts chain sequences, and writes a mapping::
+
+        {"complex_id": ["sequence_A", "sequence_B"], ...}
+
+    Examples::
+
+        deepfold3 export-complexes --data-dir /data/training --output complexes.json
+        deepfold3 export-complexes --data-dir /data/training --output complexes.json --all-mol-types
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    from deepfold3.data.prepare.manifest import discover_records
+    from deepfold3.data.prepare.sequences import build_complexes_json, save_complexes_json
+
+    records = discover_records(data_dir)
+    if not records:
+        click.echo("Error: no records found in data directory.", err=True)
+        sys.exit(1)
+
+    complexes = build_complexes_json(records, protein_only=not all_mol_types)
+
+    save_complexes_json(complexes, output)
+    total_chains = sum(len(seqs) for seqs in complexes.values())
+    log.info("Exported %d complexes (%d total chains) to %s", len(complexes), total_chains, output)
+    click.echo(f"Wrote {output}: {len(complexes)} complexes, {total_chains} chains")
+
+
+@cli.command("import-of3")
+@click.option(
+    "--of3-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="OpenFold 3 target_structures_directory (contains {pdb_id}/{pdb_id}.npz or flat *.npz).",
+)
+@click.option("--output", required=True, type=click.Path(), help="Output directory for DeepFold3 training data.")
+@click.option(
+    "--cache",
+    default=None,
+    type=click.Path(exists=True),
+    help="OpenFold 3 dataset_cache.json (provides resolution, cluster IDs, metadata).",
+)
+@click.option("--limit", default=None, type=int, help="Max number of structures to convert.")
+def import_of3(
+    of3_dir: str,
+    output: str,
+    cache: str | None,
+    limit: int | None,
+) -> None:
+    """Import OpenFold 3 preprocessed structures into DeepFold3 format.
+
+    Reads biotite AtomArray NPZ files from an OpenFold 3 dataset directory,
+    converts them to DeepFold3 Structure NPZ format, and writes a manifest.
+
+    Optionally reads an OF3 dataset_cache.json to import resolution,
+    experimental method, and cluster ID metadata.
+
+    Examples::
+
+        deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
+
+        deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training \\
+            --cache /data/of3/dataset_cache.json
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    from deepfold3.data.prepare.manifest import save_manifest
+    from deepfold3.data.prepare.openfold3 import (
+        convert_of3_structure_with_cache,
+        load_of3_dataset_cache,
+        scan_of3_structures,
+    )
+
+    of3_path = Path(of3_dir)
+    output_path = Path(output)
+    (output_path / "structures").mkdir(parents=True, exist_ok=True)
+
+    # Scan for NPZ files
+    entries = scan_of3_structures(of3_path)
+    if not entries:
+        click.echo("Error: no NPZ files found in OF3 directory.", err=True)
+        sys.exit(1)
+
+    if limit:
+        entries = entries[:limit]
+    log.info("Found %d structures in %s", len(entries), of3_path)
+
+    # Load optional dataset cache
+    cache_data: dict[str, dict] = {}
+    if cache:
+        cache_data = load_of3_dataset_cache(Path(cache))
+        log.info("Loaded dataset cache with %d entries.", len(cache_data))
+
+    records = []
+    failed = 0
+
+    for i, (pdb_id, npz_path) in enumerate(entries):
+        try:
+            cache_entry = cache_data.get(pdb_id)
+            structure, record = convert_of3_structure_with_cache(npz_path, cache_entry, pdb_id=pdb_id)
+            structure.save(output_path / "structures" / f"{record.id}.npz")
+            records.append(record)
+
+            if (i + 1) % 1000 == 0:
+                log.info(
+                    "[%d/%d] %s: %d chains, %d atoms",
+                    i + 1,
+                    len(entries),
+                    pdb_id,
+                    len(record.chains),
+                    len(structure.atoms),
+                )
+        except Exception as e:
+            failed += 1
+            if failed <= 10:
+                log.warning("[%d/%d] %s: failed (%s)", i + 1, len(entries), pdb_id, e)
+
+    # Save manifest
+    manifest_path = output_path / "manifest.json"
+    save_manifest(records, manifest_path)
+
+    log.info("Done: %d converted, %d failed.", len(records), failed)
+    click.echo(f"Converted {len(records)} structures to {output_path} ({failed} failed)")
+
+
 @cli.command("import-msa")
 @click.option(
     "--data-dir",
@@ -657,6 +824,142 @@ def import_msa(data_dir: str, msa_dir: str) -> None:
     unique_msa_ids = len({str(c.msa_id) for r in records for c in r.chains})
 
     log.info("Done: %d/%d unique sequences matched.", matched, unique_msa_ids)
+
+
+@cli.command("import-paired-msa")
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Training data directory (contains manifest.json and msa/).",
+)
+@click.option(
+    "--paired-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Directory of paired A3M files, organized as {record_id}/{chain_hash}.paired.a3m.",
+)
+def import_paired_msa(data_dir: str, paired_dir: str) -> None:
+    """Import externally-generated paired MSA files into a training dataset.
+
+    Expected directory layout::
+
+        paired_dir/
+            {record_id}/
+                {chain_hash}.paired.a3m
+                {chain_hash}.paired.a3m
+            {record_id}/
+                ...
+
+    Each subdirectory name matches a record ID in the manifest. Files are
+    named ``{msa_id}.paired.a3m`` where ``msa_id`` is the chain's sequence
+    SHA256 hash. The same chain hash can appear in multiple record
+    directories with different paired content (complex-specific pairing).
+
+    Paired A3M files follow MMseqs2 ``--msa-format-mode 5`` output: row *i*
+    across chains from the same complex corresponds to the same organism.
+
+    For each file, the command copies the A3M, converts to NPZ, and sets
+    ``paired_msa_id`` on the matching chain in the manifest.
+
+    Examples::
+
+        deepfold3 import-paired-msa --data-dir /data/training \\
+            --paired-dir /data/msa/pdb/merged/paired
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    import shutil
+
+    from deepfold3.data import const
+    from deepfold3.data.parse.a3m import parse_a3m
+    from deepfold3.data.prepare.manifest import discover_records, save_manifest
+
+    data_path = Path(data_dir)
+    paired_path = Path(paired_dir)
+    msa_out = data_path / "msa"
+    msa_out.mkdir(parents=True, exist_ok=True)
+
+    records = discover_records(data_path)
+    if not records:
+        click.echo("Error: no records found in data directory.", err=True)
+        sys.exit(1)
+
+    record_by_id: dict[str, object] = {r.id: r for r in records}
+
+    record_dirs = [d for d in sorted(paired_path.iterdir()) if d.is_dir()]
+    log.info("Found %d record directories in %s", len(record_dirs), paired_path)
+
+    imported = 0
+    skipped_no_record = 0
+    skipped_no_chain = 0
+    failed = 0
+    updated_records: set[str] = set()
+
+    for rec_dir in record_dirs:
+        record_id = rec_dir.name.lower()
+        record = record_by_id.get(record_id)
+        if record is None:
+            skipped_no_record += 1
+            continue
+
+        chain_by_msa_id: dict[str, object] = {}
+        for chain in record.chains:
+            if chain.valid:
+                chain_by_msa_id[str(chain.msa_id)] = chain
+
+        for a3m_file in rec_dir.glob("*.paired.a3m"):
+            chain_hash = a3m_file.name.split(".paired.a3m")[0]
+            chain = chain_by_msa_id.get(chain_hash)
+            if chain is None:
+                skipped_no_chain += 1
+                continue
+
+            paired_msa_id = f"{record_id}_paired_{chain_hash}"
+            dest_a3m = msa_out / f"{paired_msa_id}.a3m"
+            dest_npz = msa_out / f"{paired_msa_id}.npz"
+
+            if not dest_a3m.exists():
+                shutil.copy2(a3m_file, dest_a3m)
+
+            if not dest_npz.exists():
+                try:
+                    a3m_text = dest_a3m.read_text() if dest_a3m.exists() else a3m_file.read_text()
+                    msa = parse_a3m(a3m_text, mol_type=const.MOL_PROTEIN)
+                    msa.save(dest_npz)
+                except Exception as e:
+                    log.warning("Failed to convert %s/%s: %s", record_id, a3m_file.name, e)
+                    failed += 1
+                    continue
+
+            chain.paired_msa_id = paired_msa_id
+            updated_records.add(record_id)
+            imported += 1
+
+        if imported > 0 and imported % 1000 == 0:
+            log.info("  Progress: %d files imported, %d records updated...", imported, len(updated_records))
+
+    # Save updated manifest
+    if updated_records:
+        manifest_path = data_path / "manifest.json"
+        save_manifest(records, manifest_path)
+        log.info("Updated manifest at %s (%d records modified).", manifest_path, len(updated_records))
+
+    log.info(
+        "Done: %d paired MSAs imported, %d records updated, "
+        "%d dirs skipped (no record), %d files skipped (no chain), %d failed.",
+        imported,
+        len(updated_records),
+        skipped_no_record,
+        skipped_no_chain,
+        failed,
+    )
+    click.echo(f"Imported {imported} paired MSAs across {len(updated_records)} records.")
 
 
 # Allow running as module

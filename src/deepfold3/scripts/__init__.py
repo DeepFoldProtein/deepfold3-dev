@@ -22,7 +22,14 @@ def _register_commands() -> None:
     from deepfold3.scripts.msa_batch import msa_batch
     from deepfold3.scripts.msa_search import msa_search
     from deepfold3.scripts.plot_confidences import plot
-    from deepfold3.scripts.prepare import fetch_ccd, import_msa, prepare
+    from deepfold3.scripts.prepare import (
+        export_complexes,
+        fetch_ccd,
+        import_msa,
+        import_of3,
+        import_paired_msa,
+        prepare,
+    )
     from deepfold3.scripts.train import train
 
     cli.add_command(inference)
@@ -33,6 +40,9 @@ def _register_commands() -> None:
     cli.add_command(prepare)
     cli.add_command(fetch_ccd)
     cli.add_command(import_msa)
+    cli.add_command(import_of3)
+    cli.add_command(import_paired_msa)
+    cli.add_command(export_complexes)
     cli.add_command(train)
 
 

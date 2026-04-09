@@ -19,6 +19,14 @@ deepfold3 train --data-dir /data/training --output runs/exp1 \
 # With config overrides
 deepfold3 train --data-dir /data/training --output runs/exp1 \
     --config config.json --lr 0.001 --max-tokens 512
+
+# Multi-dataset training (primary PDB + distillation AFDB)
+deepfold3 train --data-dir /data/pdb --output runs/exp1 \
+    --dataset afdb:/data/afdb:0.5:uniform:true
+
+# Multi-dataset via JSON config
+deepfold3 train --data-dir /data/pdb --output runs/exp1 \
+    --config configs/multi_dataset.json
 ```
 
 ## Training Config
@@ -183,6 +191,62 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py`: rea
 
 **Preprocessing**: use `deepfold3 prepare` to generate the data directory from a PDB mmCIF mirror. See `docs/data-pipeline.md` § Data Preprocessing for details.
 
+### Multi-Dataset Training
+
+Train with multiple data sources (e.g. PDB experimental + AFDB distillation) by specifying extra datasets. Each dataset has its own `data_dir`, sampling weight, strategy, and distillation flag.
+
+**Via CLI** (`--dataset name:path[:weight[:strategy[:distill]]]`):
+
+```bash
+# PDB (primary, cluster-weighted) + AFDB (distillation, uniform, 25% weight)
+deepfold3 train --data-dir /data/pdb --output runs/exp1 \
+    --dataset afdb:/data/afdb:0.25:uniform:true
+
+# Three datasets
+deepfold3 train --data-dir /data/pdb --output runs/exp1 \
+    --dataset afdb:/data/afdb:0.25:uniform:true \
+    --dataset esmfold:/data/esmfold:0.1:uniform:true
+```
+
+**Via JSON config** (`extra_datasets` field):
+
+```json
+{
+  "training": {
+    "extra_datasets": [
+      {
+        "name": "afdb",
+        "data_dir": "/data/afdb",
+        "weight": 0.5,
+        "strategy": "uniform",
+        "is_distillation": true
+      },
+      {
+        "name": "pdb_highres",
+        "data_dir": "/data/pdb_highres",
+        "weight": 2.0,
+        "strategy": "weighted",
+        "is_distillation": false
+      }
+    ]
+  }
+}
+```
+
+**Fields per dataset:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | (required) | Identifier for logging |
+| `data_dir` | (required) | Path to `structures/` + `msa/` |
+| `weight` | 1.0 | Relative sampling probability (primary dataset always 1.0) |
+| `strategy` | `"uniform"` | `"weighted"` (cluster-balanced) or `"uniform"` |
+| `is_distillation` | `false` | If true, disables confidence/distogram losses for this dataset |
+
+The primary dataset (`--data-dir`) always uses cluster-weighted sampling when cluster IDs are available. Extra datasets are combined via `ConcatDataset` + `MultiDatasetSampler`, which draws samples from each dataset proportionally to weights.
+
+**Legacy compatibility**: `distillation_data_dir` and `distillation_weight` in `TrainingConfig` still work — they're internally converted to an `extra_datasets` entry.
+
 ### Sequence Clustering
 
 Cluster-balanced sampling requires integer cluster IDs in the manifest. Two options:
@@ -243,6 +307,20 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --conve
 
 The command extracts unique protein sequences from the manifest, deduplicates by `msa_id` (SHA256 of sequence), searches against UniRef30 + ColabFoldDB, and writes per-sequence A3M + NPZ files to `{data_dir}/msa/`. Requires local MMseqs2 databases (see `scripts/setup_databases.sh`).
 
+#### Paired MSAs for Multimers
+
+For multimer complexes (>1 protein chain), paired MSAs provide cross-chain co-evolutionary signal. Add `--use-pairing` to the batch command:
+
+```bash
+# Generate unpaired + paired MSAs
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ \
+    --use-pairing --gpu
+```
+
+This runs a two-phase pipeline: (1) unpaired search for all unique sequences, then (2) paired search per multimer record using MMseqs2's `pairaln` taxonomy-based pairing. Paired MSAs are written as `{record_id}_paired_{chain_idx}.npz` and referenced via `ChainInfo.paired_msa_id` in the manifest.
+
+The featurizer merges paired and unpaired MSAs into a single full-width `[S, N]` tensor: paired rows first (cross-chain aligned), then dense unpaired rows (all chains' row *i* on the same full-width row). See `docs/data-pipeline.md` § Paired MSA for the full row layout and comparison with OpenFold 3 and Protenix.
+
 ### Distillation Datasets (AFDB, ESMFold, etc.)
 
 Distillation databases like AFDB provide predicted structures (CIF) alongside pre-computed MSAs (A3M). The pipeline handles these without re-searching:
@@ -260,6 +338,29 @@ deepfold3 msa-batch --data-dir /data/distill --db-dir /data/mmseqs_dbs/ --gpu
 ```
 
 Both `--msa-dir` and `import-msa` match A3M files to chains by reading the query sequence from each A3M file, computing its SHA256 hash, and copying to `{data_dir}/msa/{msa_id}.a3m`. This works regardless of file naming convention (AFDB `AF-{uniprot}-F1-model_v4.a3m`, PDB-style, or custom).
+
+### Importing from OpenFold 3
+
+OpenFold 3 (Apache 2.0, AlQuraishi Laboratory) stores preprocessed structures as biotite AtomArray NPZ files. These can be converted to DeepFold3 format:
+
+```bash
+# Convert all OF3 preprocessed structures
+deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
+
+# With OF3 dataset cache (provides resolution, cluster IDs, metadata)
+deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training \
+    --cache /data/of3/dataset_cache.json
+
+# Then generate MSAs for the imported data
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
+```
+
+The converter handles mol-type mapping (OF3 uses `PROTEIN=0, RNA=1, DNA=2, LIGAND=3` while DeepFold3 uses `PROTEIN=0, DNA=1, RNA=2, NONPOLYMER=3`), bond remapping, and entity/chain grouping.
+
+Supported OF3 directory layouts:
+- Nested: `{pdb_id}/{pdb_id}.npz`
+- RODA monomer: `{id}/structure.npz`
+- Flat: `{pdb_id}.npz`
 
 The featurizer produces these training-specific features:
 

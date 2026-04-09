@@ -6,10 +6,13 @@ protein sequences from processed structures and cache them as FASTA.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
 import numpy as np
+
+from deepfold3.data.const import MOL_PROTEIN
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +121,7 @@ def extract_sequences_by_msa_id(
         for chain_info in record.chains:
             if not chain_info.valid:
                 continue
-            if protein_only and chain_info.mol_type != 0:
+            if protein_only and chain_info.mol_type != MOL_PROTEIN:
                 continue
             msa_id = str(chain_info.msa_id)
             if msa_id in seen:
@@ -131,6 +134,47 @@ def extract_sequences_by_msa_id(
             sequences[msa_id] = residue_types_to_sequence(res_types)
 
     return sequences
+
+
+def build_complexes_json(
+    records: list,
+    protein_only: bool = True,
+) -> dict[str, list[str]]:
+    """Build a complexes mapping from manifest records.
+
+    Returns a dict mapping complex ID to a list of ``msa_id`` values
+    (matching ``msa_sequences.fasta`` headers), suitable for paired MSA
+    pipelines. Only multimer complexes (>1 qualifying chain) are included.
+
+    Args:
+        records: List of Record objects (from manifest).
+        protein_only: If True, only include protein chains.
+
+    Returns:
+        Dict mapping complex ID (PDB ID) to list of msa_id strings.
+    """
+    complexes: dict[str, list[str]] = {}
+
+    for record in records:
+        chain_ids: list[str] = []
+        for chain_info in record.chains:
+            if not chain_info.valid:
+                continue
+            if protein_only and chain_info.mol_type != MOL_PROTEIN:
+                continue
+            chain_ids.append(str(chain_info.msa_id))
+
+        if len(chain_ids) > 1:
+            complexes[record.id] = chain_ids
+
+    return complexes
+
+
+def save_complexes_json(complexes: dict[str, list[str]], path: Path) -> None:
+    """Write complexes mapping to a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(complexes, f, indent=2)
 
 
 def extract_sequences_by_cluster_key(
@@ -159,7 +203,7 @@ def extract_sequences_by_cluster_key(
             continue
 
         for chain_info in record.chains:
-            if not chain_info.valid or chain_info.mol_type != 0:
+            if not chain_info.valid or chain_info.mol_type != MOL_PROTEIN:
                 continue
             entity_key = (record.id, chain_info.entity_id)
             if entity_key in seen_entities:

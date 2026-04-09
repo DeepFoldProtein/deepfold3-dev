@@ -57,11 +57,15 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu --use-pairing
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --convert-only
 deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
+deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
+deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --override alpha_pae=1.0 --override train_confidence_only=true
 deepfold3 train     --data-dir /data/training --output runs/exp1 --wandb deepfold3
+deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.25:uniform:true
+deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.5:uniform:true --dataset pdb2:/data/pdb2:1.0:weighted
 # Multi-GPU training via torchrun
 torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training --output runs/exp1
 ```

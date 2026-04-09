@@ -889,6 +889,58 @@ def _search_monomer(
         shutil.rmtree(work_dir / "tmp3", ignore_errors=True)
 
 
+def _pad_result_index(qdb: Path, result_db: Path) -> None:
+    """Pad a sparse MMseqs2 result .index to match qdb's key set.
+
+    ``mmseqs align -e 0.001`` can produce a sparse result DB (entries only
+    for queries that had hits).  ``pairaln`` accesses the result DB by
+    local ID (positional index), assuming 1:1 correspondence with QDB.
+    When the result has fewer entries, local IDs beyond its size cause
+    out-of-bounds errors.
+
+    This function rewrites ``{result_db}.index`` so that it contains every
+    key from ``{qdb}.index`` in the same order, inserting ``key\\t0\\t0``
+    (empty entry) for missing queries.  Alignment data is unchanged.
+    """
+    qdb_index = Path(f"{qdb}.index")
+    result_index = Path(f"{result_db}.index")
+
+    if not qdb_index.exists() or not result_index.exists():
+        logger.warning("_pad_result_index: missing index file (qdb=%s, result=%s)", qdb_index, result_index)
+        return
+
+    # Read result entries into a dict keyed by ID
+    result_entries: dict[str, str] = {}
+    for line in result_index.read_text().splitlines():
+        parts = line.split("\t")
+        if parts and parts[0]:
+            result_entries[parts[0]] = line
+
+    # Read qdb keys in order
+    qdb_keys: list[str] = []
+    for line in qdb_index.read_text().splitlines():
+        parts = line.split("\t")
+        if parts and parts[0]:
+            qdb_keys.append(parts[0])
+
+    # Skip if result already has all qdb keys (check key set, not just count)
+    if all(k in result_entries for k in qdb_keys):
+        return
+
+    # Rewrite index: same order as qdb, empty entries for missing keys
+    with result_index.open("w") as f:
+        for key in qdb_keys:
+            entry = result_entries.get(key)
+            f.write(f"{entry}\n" if entry else f"{key}\t0\t0\n")
+
+    logger.debug(
+        "Padded %s: %d → %d entries",
+        result_index.name,
+        len(result_entries),
+        len(qdb_keys),
+    )
+
+
 def _search_pair(
     binary: str,
     db_dir: Path,
@@ -997,6 +1049,9 @@ def _search_pair(
             str(threads),
         ],
     )
+    # Pad sparse result index so pairaln can access all QDB entries by local ID.
+    # align -e 0.001 drops queries with no hits, making the result DB sparse.
+    _pad_result_index(qdb, work_dir / "res_exp_realign")
     _run_mmseqs(
         binary,
         [
@@ -1032,6 +1087,8 @@ def _search_pair(
             str(threads),
         ],
     )
+    # Pad backtrace result index before second pairaln pass.
+    _pad_result_index(qdb, work_dir / "res_exp_realign_pair_bt")
     _run_mmseqs(
         binary,
         [

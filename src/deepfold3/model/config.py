@@ -451,9 +451,23 @@ class TrainingConfig:
     data_dir: str = ""
     params_path: str = ""
 
-    # Distillation dataset (optional)
+    # Distillation dataset (optional, legacy — prefer extra_datasets)
     distillation_data_dir: str = ""  # empty = disabled
     distillation_weight: float = 0.25  # sampling weight relative to PDB (PDB gets 1.0)
+
+    # Multi-dataset training: list of additional datasets beyond --data-dir.
+    # Each entry is a dict with keys:
+    #   name (str):          identifier for logging
+    #   data_dir (str):      path to data directory (structures/ + msa/)
+    #   weight (float):      sampling probability relative to primary dataset (1.0)
+    #   strategy (str):      "weighted" (cluster-balanced) or "uniform"
+    #   is_distillation (bool): if True, disables confidence/distogram losses
+    # Example JSON config:
+    #   {"training": {"extra_datasets": [
+    #       {"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5,
+    #        "strategy": "uniform", "is_distillation": true}
+    #   ]}}
+    extra_datasets: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate configuration values."""

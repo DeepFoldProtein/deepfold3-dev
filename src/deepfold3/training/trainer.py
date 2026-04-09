@@ -229,9 +229,10 @@ class Trainer:
     def _init_dataloaders(self) -> tuple[DataLoader, DataLoader | None]:
         """Create training and optional evaluation dataloaders.
 
-        Supports multi-dataset training (PDB + distillation) when
-        ``distillation_data_dir`` is set. PDB uses cluster-weighted
-        sampling; distillation uses uniform sampling.
+        Supports multi-dataset training via ``extra_datasets`` config or
+        the legacy ``distillation_data_dir`` option.  The primary dataset
+        (``--data-dir``) always uses cluster-weighted sampling when cluster
+        IDs are available; extra datasets specify their own strategy.
 
         Returns:
             Tuple of ``(train_dl, eval_dl)``.  ``eval_dl`` is ``None``
@@ -251,35 +252,80 @@ class Trainer:
             **ds_kwargs,
         )
 
-        # Distillation dataset (optional)
-        if self.cfg.distillation_data_dir and self.distillation_records:
+        # Collect extra datasets from config
+        extra_specs = list(self.cfg.extra_datasets)
+
+        # Legacy: convert distillation_data_dir to an extra_datasets entry
+        if (
+            self.cfg.distillation_data_dir
+            and self.distillation_records
+            and not any(s.get("name") == "_distillation" for s in extra_specs)
+        ):
+            extra_specs.append(
+                {
+                    "name": "_distillation",
+                    "data_dir": self.cfg.distillation_data_dir,
+                    "weight": self.cfg.distillation_weight,
+                    "strategy": "uniform",
+                    "is_distillation": True,
+                    "_records": self.distillation_records,
+                }
+            )
+
+        if extra_specs:
             from torch.utils.data import ConcatDataset
 
+            from deepfold3.data.prepare.manifest import discover_records
             from deepfold3.data.sample.multi import MultiDatasetSampler
 
-            distill_ds = TrainingDataset(
-                records=self.distillation_records,
-                data_dir=Path(self.cfg.distillation_data_dir),
-                is_distillation=True,
-                **ds_kwargs,
-            )
-            train_ds = ConcatDataset([pdb_ds, distill_ds])
+            datasets = [pdb_ds]
+            sampler_configs = [
+                {
+                    "records": self.records,
+                    "dataset_len": len(pdb_ds),
+                    "weight": 1.0,
+                    "strategy": "weighted",
+                },
+            ]
 
+            for spec in extra_specs:
+                # Load records: from pre-loaded _records or by discovering from data_dir
+                records = spec.get("_records")
+                if records is None:
+                    records = discover_records(Path(spec["data_dir"]))
+                if not records:
+                    logger.warning(
+                        "Extra dataset %r: no records found in %s, skipping.", spec.get("name", "?"), spec["data_dir"]
+                    )
+                    continue
+
+                ds = TrainingDataset(
+                    records=records,
+                    data_dir=Path(spec["data_dir"]),
+                    is_distillation=spec.get("is_distillation", False),
+                    **ds_kwargs,
+                )
+                datasets.append(ds)
+                sampler_configs.append(
+                    {
+                        "records": records,
+                        "dataset_len": len(ds),
+                        "weight": spec.get("weight", 1.0),
+                        "strategy": spec.get("strategy", "uniform"),
+                    }
+                )
+                logger.info(
+                    "Extra dataset %r: %d records, weight=%.2f, strategy=%s, distillation=%s",
+                    spec.get("name", "?"),
+                    len(records),
+                    spec.get("weight", 1.0),
+                    spec.get("strategy", "uniform"),
+                    spec.get("is_distillation", False),
+                )
+
+            train_ds = ConcatDataset(datasets)
             train_sampler = MultiDatasetSampler(
-                dataset_configs=[
-                    {
-                        "records": self.records,
-                        "dataset_len": len(pdb_ds),
-                        "weight": 1.0,
-                        "strategy": "weighted",
-                    },
-                    {
-                        "records": self.distillation_records,
-                        "dataset_len": len(distill_ds),
-                        "weight": self.cfg.distillation_weight,
-                        "strategy": "uniform",
-                    },
-                ],
+                dataset_configs=sampler_configs,
                 num_replicas=self.world_size,
                 rank=self.rank,
                 seed=self.cfg.seed,

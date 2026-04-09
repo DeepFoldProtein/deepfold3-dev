@@ -78,6 +78,16 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     type=click.Path(exists=True),
     help="Text file of PDB IDs to exclude (one per line). These records are skipped.",
 )
+@click.option(
+    "--dataset",
+    "extra_datasets",
+    multiple=True,
+    help=(
+        "Add an extra training dataset.  Format: name:path[:weight[:strategy[:distill]]].  "
+        "Examples: --dataset afdb:/data/afdb:0.5:uniform:true  "
+        "--dataset pdb2:/data/pdb2:1.0:weighted.  Can be repeated."
+    ),
+)
 def train(
     data_dir: str,
     output: str,
@@ -95,6 +105,7 @@ def train(
     ccd: str | None,
     include_list: str | None,
     exclude_list: str | None,
+    extra_datasets: tuple[str, ...],
 ) -> None:
     """Train DeepFold3 model."""
     from deepfold3.model.config import ModelConfig, TrainingConfig
@@ -198,11 +209,33 @@ def train(
     records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
     eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
 
-    # Load distillation records if configured
+    # Load distillation records if configured (legacy)
     distillation_records = []
     if train_cfg.distillation_data_dir:
         distillation_records = discover_records(Path(train_cfg.distillation_data_dir))
         log.info("Loaded %d distillation records from %s", len(distillation_records), train_cfg.distillation_data_dir)
+
+    # Parse --dataset CLI flags into extra_datasets config
+    for ds_spec in extra_datasets:
+        parts = ds_spec.split(":")
+        if len(parts) < 2:
+            raise click.BadParameter(f"--dataset format: name:path[:weight[:strategy[:distill]]], got: {ds_spec}")
+        entry = {
+            "name": parts[0],
+            "data_dir": parts[1],
+            "weight": float(parts[2]) if len(parts) > 2 else 1.0,
+            "strategy": parts[3] if len(parts) > 3 else "uniform",
+            "is_distillation": parts[4].lower() in ("true", "1", "yes") if len(parts) > 4 else False,
+        }
+        train_cfg.extra_datasets.append(entry)
+        log.info(
+            "CLI dataset: %s (dir=%s, weight=%.2f, strategy=%s, distill=%s)",
+            entry["name"],
+            entry["data_dir"],
+            entry["weight"],
+            entry["strategy"],
+            entry["is_distillation"],
+        )
 
     trainer = Trainer(
         model_cfg=model_cfg,

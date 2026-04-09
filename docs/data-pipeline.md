@@ -304,6 +304,121 @@ hits = parse_m8(result.m8_text)
 # hits[0] → list of TemplateM8Hit for chain 0
 ```
 
+### Paired MSA (Cross-Chain Co-Evolution)
+
+For multimer complexes, paired MSAs capture **cross-chain co-evolutionary signal**: if chain A and chain B interact, homologs of A and B from the same species are placed on the same MSA row. This allows the Evoformer to learn inter-chain contacts from evolutionary covariance.
+
+#### What Paired MSA Is
+
+A standard (unpaired) MSA is per-chain: each chain has its own `[S, L]` alignment. In a multimer, these are independent — row 3 in chain A's MSA has no relationship to row 3 in chain B's MSA.
+
+A **paired** MSA aligns sequences **across chains by species**: if organism X has homologs of both chain A and chain B, those homologs share the same MSA row. This creates cross-chain covariance signal that the model uses to predict inter-chain contacts.
+
+#### How Pairing Works
+
+The pairing algorithm relies on **MMseqs2's `pairaln` command**, which matches sequences across chains by their taxonomic origin:
+
+```
+1. SEARCH:     Each chain searched against UniRef30 (3-iteration profile search)
+2. EXPAND:     Cluster reps expanded to member sequences
+3. REALIGN:    Full profile alignment on expanded hits
+4. PAIRALN:    Match hits across chains by species/taxon ID
+               - pairing-mode 0 (greedy): faster, partial coverage
+               - pairing-mode 1 (complete): thorough, all pairings
+5. BACKTRACE:  Re-align paired hits
+6. PAIRALN:    Second pass with dummy mode (fills missing chains)
+7. RESULT2MSA: Convert to per-chain A3M files (msa-format-mode 5)
+```
+
+Each chain gets its own paired A3M file. Row *i* in chain A's paired A3M and row *i* in chain B's paired A3M correspond to the same species. This is the cross-chain alignment.
+
+For server mode (ColabFold API), the server runs `pairgreedy` or `paircomplete` modes internally and returns paired tar.gz alongside unpaired results.
+
+#### Storage
+
+Paired and unpaired MSAs are stored as **separate files**:
+
+```
+data_dir/msa/
+├── {msa_id}.npz              # Unpaired MSA (keyed by SHA256 of chain sequence)
+├── {msa_id}.a3m              # Unpaired A3M source
+├── {record_id}_paired_0.npz  # Paired MSA for chain 0 of this complex
+├── {record_id}_paired_0.a3m  # Paired A3M source
+├── {record_id}_paired_1.npz  # Paired MSA for chain 1
+└── ...
+```
+
+The manifest tracks both via `ChainInfo`:
+
+```python
+ChainInfo(
+    msa_id="abc123...",            # SHA256 hash → unpaired MSA file
+    paired_msa_id="1pfe_paired_0", # Complex-specific → paired MSA file
+)
+```
+
+Unpaired MSAs are deduplicated by sequence (shared across records with identical chain sequences). Paired MSAs are per-record because the pairing depends on which chains co-occur in the same complex.
+
+#### Full-Width MSA Construction (Featurizer)
+
+The featurizer merges per-chain paired and unpaired MSAs into a single **full-width** `[S, N]` tensor where `N` spans all tokens across all chains:
+
+```
+Row 0:         Query (from paired row 0 if available, else unpaired row 0 per chain)
+Rows 1..P:     Paired rows — cross-chain co-evolutionary signal
+               For each row i: chain A's paired row i fills columns [A_start:A_end],
+                               chain B's paired row i fills columns [B_start:B_end],
+                               other columns = gap (21)
+Rows P+1..S:   Dense unpaired rows — per-chain independent signal
+               For each row i: ALL chains' unpaired row i placed simultaneously
+               (NOT block-diagonal — same row has each chain's i-th sequence)
+               Chains with fewer unpaired rows have gap-filled trailing rows.
+```
+
+Cross-chain gap positions have `msa_mask=True` (AF3 treats alignment gaps as valid). Total rows capped at `MAX_MSA_ROWS` (16,384). Paired rows capped at `MAX_PAIRED_MSA_ROWS + 1` (8,192 including query).
+
+#### Generating Paired MSAs
+
+**Inference** (single complex):
+
+```bash
+# Auto-enables pairing for multimers
+deepfold3 msa --sequence SEQ1:SEQ2 --output msa_out/ --json
+
+# Explicit pairing strategy
+deepfold3 msa --sequence SEQ1:SEQ2 --output msa_out/ --pairing-strategy complete
+
+# Local mode with environmental pairing
+deepfold3 msa --sequence SEQ1:SEQ2 --output msa_out/ \
+    --mode local --db-dir /data/mmseqs_dbs/ --use-env-pairing
+```
+
+**Training** (batch, all multimer records):
+
+```bash
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ \
+    --use-pairing --gpu
+
+# Resume-safe: skips records where all paired NPZ files already exist
+# Updates manifest.json with paired_msa_id references
+```
+
+The batch command identifies all multimer records (>1 valid protein chain), runs the paired search for each, and writes per-chain paired A3M + NPZ files to `{data_dir}/msa/`.
+
+#### Comparison with Other Implementations
+
+| Aspect | DeepFold3 | OpenFold 3 | Protenix |
+|--------|-----------|------------|----------|
+| Pairing source | MMseqs2 `pairaln` (species-based) | Species-based alignment (custom) | Species-based alignment (custom) |
+| Storage | Separate paired/unpaired NPZ per chain | Single `MsaArrayCollection` (parsed/processed dicts) | Feature dict with `_all_seq` suffix |
+| Row layout | Paired (full-width) + unpaired (dense) | Query + paired + main (per-chain vstacked) | Paired (`_all_seq`) + unpaired (concatenated) |
+| Paired row count | `min(counts)` across chains, cap 8192 | `n_rows_paired_subsampled + 1` (includes query) | `prot_paired_num_alignments` (excludes query) |
+| Unpaired layout | Dense: row *i* has ALL chains' row *i* | Per-chain independent depth, padded | Padded to equal depth, then concat |
+| Partial pairing | Supported (missing chain = full gap row) | Configurable `min_chains_paired_partial` | All ≥2 chain species paired |
+| Subsampling | Global cap (`max_msa_seqs`) | Global `max_rows` split between paired/main | `max_size // 2` for paired, rest for unpaired |
+| Deduplication | Not explicit | Removes main rows present in paired | Removes unpaired rows present in paired |
+| Species sorting | MMseqs2 internal | Row-product ranking | Log-product ranking |
+
 ## Parsing Stage
 
 ### mmCIF (`data/parse/mmcif.py`)
