@@ -157,41 +157,37 @@ def msa_batch(
 
     # Phase 1: Search pending sequences via MMseqs2
     if need_search and not convert_only:
-        from deepfold3.data.msa.mmseqs2 import search_local
+        from deepfold3.data.msa.mmseqs2 import search_monomer_batch
 
-        # Build ordered lists for search
-        search_ids = need_search
-        search_seqs = [all_sequences[mid] for mid in search_ids]
+        # Build search dict: {msa_id: sequence}
+        search_seqs = {mid: all_sequences[mid] for mid in need_search}
 
         # Split into batches if requested
         if batch_size > 0:
-            batches = [
-                (search_ids[i : i + batch_size], search_seqs[i : i + batch_size])
-                for i in range(0, len(search_ids), batch_size)
-            ]
+            batch_keys = [need_search[i : i + batch_size] for i in range(0, len(need_search), batch_size)]
         else:
-            batches = [(search_ids, search_seqs)]
+            batch_keys = [need_search]
 
         log.info(
             "Searching %d sequences in %d batch(es) (gpu=%s, env=%s, filter=%s, threads=%d)",
-            len(search_ids),
-            len(batches),
+            len(search_seqs),
+            len(batch_keys),
             gpu,
             use_env,
             use_filter,
             threads,
         )
 
-        for batch_idx, (batch_ids, batch_seqs) in enumerate(batches):
-            if len(batches) > 1:
-                log.info("Batch %d/%d: %d sequences", batch_idx + 1, len(batches), len(batch_seqs))
+        for batch_idx, keys in enumerate(batch_keys):
+            if len(batch_keys) > 1:
+                log.info("Batch %d/%d: %d sequences", batch_idx + 1, len(batch_keys), len(keys))
 
-            result = search_local(
-                batch_seqs,
+            batch_dict = {k: search_seqs[k] for k in keys}
+            results = search_monomer_batch(
+                batch_dict,
                 mmseqs=mmseqs,
                 db_dir=str(db_dir),
                 use_env=use_env,
-                use_pairing=False,
                 use_templates=False,
                 filter=use_filter,
                 threads=threads,
@@ -202,13 +198,13 @@ def msa_batch(
 
             # Write A3M files
             written = 0
-            for i, msa_id in enumerate(batch_ids):
-                a3m_text = result.unpaired.get(i, "")
+            for msa_id, msa_result in results.items():
+                a3m_text = msa_result.unpaired.get(0, "")
                 if a3m_text:
                     (msa_dir / f"{msa_id}.a3m").write_text(a3m_text)
                     written += 1
 
-            log.info("Batch %d: wrote %d/%d A3M files.", batch_idx + 1, written, len(batch_ids))
+            log.info("Batch %d: wrote %d/%d A3M files.", batch_idx + 1, written, len(keys))
 
         # Move searched sequences to need_convert
         need_convert.extend(need_search)
@@ -245,99 +241,106 @@ def msa_batch(
     total_npz = sum(1 for mid in all_sequences if (msa_dir / f"{mid}.npz").exists())
     log.info("Unpaired MSA: %d/%d sequences have NPZ files.", total_npz, len(all_sequences))
 
-    # ── Phase 3: Paired MSA search ──────────────────────────────────────────
+    # ── Phase 3: Paired MSA search (batch) ───────────────────────────────────
     if use_pairing and not convert_only:
-        from deepfold3.data.msa.mmseqs2 import search_local
+        from deepfold3.data.msa.mmseqs2 import search_pair_batch
         from deepfold3.data.parse.a3m import parse_a3m
         from deepfold3.data.prepare.manifest import save_manifest
 
-        # Group records with >1 valid protein chain, pre-compute protein chains
-        multimer_items: list[tuple] = []
+        # Build complexes dict: {record_id: [msa_id, ...]} for multimers
+        # Also build a lookup from record_id -> record + protein_chains
+        complexes: dict[str, list[str]] = {}
+        record_lookup: dict[str, tuple] = {}
+        skipped = 0
+
         for record in records:
             protein_chains = [c for c in record.chains if c.valid and c.mol_type == 0]
-            if len(protein_chains) > 1:
-                multimer_items.append((record, protein_chains))
-
-        log.info(
-            "Paired MSA: %d multimer records (out of %d total).",
-            len(multimer_items),
-            len(records),
-        )
-
-        paired_done = 0
-        paired_skipped = 0
-        paired_failed = 0
-
-        for rec_idx, (record, protein_chains) in enumerate(multimer_items):
+            if len(protein_chains) <= 1:
+                continue
 
             # Check if already done (all chains have paired NPZ)
             paired_ids = [f"{record.id}_paired_{i}" for i in range(len(protein_chains))]
             if all((msa_dir / f"{pid}.npz").exists() for pid in paired_ids):
-                # Update manifest references in case they're missing
                 for i, chain in enumerate(protein_chains):
                     chain.paired_msa_id = paired_ids[i]
-                paired_skipped += 1
-                if (rec_idx + 1) % 500 == 0:
-                    log.info(
-                        "  [%d/%d] done=%d, skipped=%d, failed=%d",
-                        rec_idx + 1, len(multimer_items), paired_done, paired_skipped, paired_failed,
-                    )
+                skipped += 1
                 continue
 
-            # Collect chain sequences in order
-            chain_sequences = []
-            for chain in protein_chains:
-                seq = all_sequences.get(str(chain.msa_id))
-                if seq is None:
-                    break
-                chain_sequences.append(seq)
-
-            if len(chain_sequences) != len(protein_chains):
-                paired_failed += 1
+            chain_msa_ids = [str(c.msa_id) for c in protein_chains]
+            if not all(mid in all_sequences for mid in chain_msa_ids):
                 continue
 
-            try:
-                result = search_local(
-                    chain_sequences,
-                    mmseqs=mmseqs,
-                    db_dir=str(db_dir),
-                    use_env=use_env,
-                    use_pairing=True,
-                    use_templates=False,
-                    filter=use_filter,
-                    threads=threads,
-                    gpu=gpu,
-                    gpu_server=gpu_server,
-                    verbose=verbose,
-                )
-
-                # Write paired A3M + NPZ for each chain
-                for i, chain in enumerate(protein_chains):
-                    paired_msa_id = f"{record.id}_paired_{i}"
-                    a3m_text = result.paired.get(i, "")
-                    if a3m_text:
-                        a3m_path = msa_dir / f"{paired_msa_id}.a3m"
-                        a3m_path.write_text(a3m_text)
-                        npz_path = msa_dir / f"{paired_msa_id}.npz"
-                        msa = parse_a3m(a3m_text, mol_type=0)
-                        msa.save(npz_path)
-                    chain.paired_msa_id = paired_msa_id
-
-                paired_done += 1
-            except Exception as e:
-                log.warning("Paired search failed for %s: %s", record.id, e)
-                paired_failed += 1
-
-            if (rec_idx + 1) % 100 == 0:
-                log.info(
-                    "  [%d/%d] done=%d, skipped=%d, failed=%d",
-                    rec_idx + 1, len(multimer_items), paired_done, paired_skipped, paired_failed,
-                )
+            complexes[record.id] = chain_msa_ids
+            record_lookup[record.id] = (record, protein_chains)
 
         log.info(
-            "Paired MSA done: %d searched, %d skipped (cached), %d failed.",
-            paired_done, paired_skipped, paired_failed,
+            "Paired MSA: %d multimers to search, %d skipped (cached).",
+            len(complexes),
+            skipped,
         )
+
+        if complexes:
+            # Split into batches if requested
+            cplx_items = list(complexes.items())
+            pair_batch_size = batch_size if batch_size > 0 else len(cplx_items)
+            pair_batches = [
+                dict(cplx_items[i : i + pair_batch_size]) for i in range(0, len(cplx_items), pair_batch_size)
+            ]
+
+            paired_done = 0
+            paired_failed = 0
+
+            for pb_idx, batch_complexes in enumerate(pair_batches):
+                if len(pair_batches) > 1:
+                    log.info("Pair batch %d/%d: %d complexes", pb_idx + 1, len(pair_batches), len(batch_complexes))
+
+                try:
+                    # Only pass sequences referenced by this batch
+                    batch_seqs = {
+                        mid: all_sequences[mid]
+                        for chain_ids in batch_complexes.values()
+                        for mid in chain_ids
+                        if mid in all_sequences
+                    }
+                    pair_results = search_pair_batch(
+                        batch_complexes,
+                        batch_seqs,
+                        mmseqs=mmseqs,
+                        db_dir=str(db_dir),
+                        threads=threads,
+                        gpu=gpu,
+                        gpu_server=gpu_server,
+                        verbose=verbose,
+                    )
+                except Exception as e:
+                    log.warning("Pair batch %d failed: %s", pb_idx + 1, e)
+                    paired_failed += len(batch_complexes)
+                    continue
+
+                # Write paired A3M + NPZ for each complex
+                for cplx_id, chain_a3ms in pair_results.items():
+                    record, protein_chains = record_lookup[cplx_id]
+                    for i, chain in enumerate(protein_chains):
+                        paired_msa_id = f"{record.id}_paired_{i}"
+                        a3m_text = chain_a3ms.get(str(chain.msa_id), "")
+                        if a3m_text:
+                            a3m_path = msa_dir / f"{paired_msa_id}.a3m"
+                            a3m_path.write_text(a3m_text)
+                            npz_path = msa_dir / f"{paired_msa_id}.npz"
+                            msa = parse_a3m(a3m_text, mol_type=0)
+                            msa.save(npz_path)
+                        chain.paired_msa_id = paired_msa_id
+                    paired_done += 1
+
+                # Count complexes in batch that got no results
+                for cplx_id in batch_complexes:
+                    if cplx_id not in pair_results:
+                        paired_failed += 1
+
+            log.info(
+                "Paired MSA done: %d searched, %d skipped (cached), %d failed.",
+                paired_done, skipped, paired_failed,
+            )
 
         # Save updated manifest with paired_msa_id references
         manifest_path = data_dir / "manifest.json"

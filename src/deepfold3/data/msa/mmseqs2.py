@@ -27,6 +27,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# MMseqs2 database type constants (little-endian uint32)
+_DBTYPE_AMINO_ACID = b"\x00\x00\x00\x00"  # type 0
+_DBTYPE_GENERIC_DB = b"\x0c\x00\x00\x00"  # type 12 (headers)
+
+
+def _detect_db_mode(db_dir: Path, db_name: str = "uniref30_2302_db") -> tuple[str, str]:
+    """Detect MMseqs2 DB access mode and suffix.
+
+    Returns:
+        ``(db_load_mode, db_suffix)`` — e.g. ``("2", ".idx")`` or ``("0", "_seq")``.
+    """
+    if (db_dir / f"{db_name}.idx").is_file() or (db_dir / f"{db_name}.idx.index").is_file():
+        return "2", ".idx"
+    return "0", "_seq"
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -1206,6 +1221,433 @@ def _unpack_results(work_dir: Path, n_chains: int, use_pairing: bool, use_env_pa
             m8_parts.append(m8_path.read_text())
     m8_text = "".join(m8_parts)
     return MsaResult(unpaired=unpaired, paired=paired, m8_text=m8_text)
+
+
+# ---------------------------------------------------------------------------
+# Batch search — monomer + paired
+# ---------------------------------------------------------------------------
+
+
+def _build_pair_qdb(
+    complexes: dict[str, list[str]],
+    sequences: dict[str, str],
+    work_dir: Path,
+) -> dict[str, str]:
+    """Build a combined MMseqs2 query DB for batch paired search.
+
+    Creates ``qdb``, ``qdb_h``, and ``qdb.lookup`` in *work_dir*.
+    The ``file_number`` column in ``qdb.lookup`` encodes complex membership
+    so that ``mmseqs pairaln`` can group chains by complex.
+
+    Args:
+        complexes: Mapping of complex ID to list of chain IDs (sequence hashes).
+            Homomer-duplicate chains within a complex are deduplicated.
+        sequences: Mapping of chain ID to amino acid sequence.
+        work_dir: Directory to write qdb files.
+
+    Returns:
+        Mapping from complex index (str) to complex ID, for unpacking results.
+    """
+    key = 0
+    data_parts: list[bytes] = []
+    index_lines: list[str] = []
+    h_parts: list[bytes] = []
+    h_index_lines: list[str] = []
+    lookup_lines: list[str] = []
+    data_off = 0
+    h_off = 0
+    cplx_map: dict[str, str] = {}
+
+    for cplx_idx, (cplx_id, chain_ids) in enumerate(complexes.items()):
+        cplx_map[str(cplx_idx)] = cplx_id
+        seen: set[str] = set()
+        for chain_id in chain_ids:
+            if chain_id in seen:
+                continue
+            seen.add(chain_id)
+            seq = sequences.get(chain_id)
+            if seq is None:
+                continue
+            seq_bytes = (seq + "\n\0").encode()
+            data_parts.append(seq_bytes)
+            index_lines.append(f"{key}\t{data_off}\t{len(seq_bytes)}")
+            data_off += len(seq_bytes)
+
+            hdr = (chain_id + "\n\0").encode()
+            h_parts.append(hdr)
+            h_index_lines.append(f"{key}\t{h_off}\t{len(hdr)}")
+            h_off += len(hdr)
+
+            lookup_lines.append(f"{key}\t{chain_id}\t{cplx_idx}")
+            key += 1
+
+    qdb = work_dir / "qdb"
+    with open(qdb, "wb") as f:
+        for p in data_parts:
+            f.write(p)
+    with open(f"{qdb}.index", "w") as f:
+        f.write("\n".join(index_lines) + "\n")
+    with open(f"{qdb}.dbtype", "wb") as f:
+        f.write(_DBTYPE_AMINO_ACID)
+
+    with open(f"{qdb}_h", "wb") as f:
+        for p in h_parts:
+            f.write(p)
+    with open(f"{qdb}_h.index", "w") as f:
+        f.write("\n".join(h_index_lines) + "\n")
+    with open(f"{qdb}_h.dbtype", "wb") as f:
+        f.write(_DBTYPE_GENERIC_DB)
+
+    with open(f"{qdb}.lookup", "w") as f:
+        f.write("\n".join(lookup_lines) + "\n")
+
+    logger.info("Built pair qdb: %d entries from %d complexes", key, len(complexes))
+    return cplx_map
+
+
+def _unpack_pair_results(
+    work_dir: Path,
+    cplx_map: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    """Unpack batch paired A3M results into per-complex dicts.
+
+    Args:
+        work_dir: Directory containing ``pair.a3m`` result DB and ``qdb.lookup``.
+        cplx_map: Mapping from complex index (str) to complex ID.
+
+    Returns:
+        ``{complex_id: {chain_id: a3m_text}}``.
+    """
+    qdb_lookup = work_dir / "qdb.lookup"
+    pair_a3m_index = Path(f"{work_dir / 'pair.a3m'}.index")
+
+    # Parse lookup: key -> (chain_id, cplx_idx)
+    key_info: dict[str, tuple[str, str]] = {}
+    for line in qdb_lookup.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            key_info[parts[0]] = (parts[1], parts[2])
+
+    data = (work_dir / "pair.a3m").read_bytes()
+
+    results: dict[str, dict[str, str]] = {}
+    for line in pair_a3m_index.read_text().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        key, offset, length = parts[0], int(parts[1]), int(parts[2])
+        info = key_info.get(key)
+        if info is None:
+            continue
+        chain_id, cplx_idx = info
+        cplx_id = cplx_map.get(cplx_idx)
+        if cplx_id is None:
+            continue
+        content = data[offset : offset + length].rstrip(b"\x00").decode(errors="replace")
+        results.setdefault(cplx_id, {})[chain_id] = content
+
+    return results
+
+
+def search_pair_batch(
+    complexes: dict[str, list[str]],
+    sequences: dict[str, str],
+    *,
+    mmseqs: str = "mmseqs",
+    db_dir: str | Path,
+    pairing_strategy: int = 0,
+    threads: int = 8,
+    gpu: bool = False,
+    gpu_server: bool = False,
+    tmpdir: str | Path | None = None,
+    verbose: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Batch paired MSA search for multiple complexes.
+
+    Builds a combined query DB from all complexes, runs a single MMseqs2
+    search + two-pass ``pairaln`` pipeline, and unpacks results per complex.
+    Much more efficient than per-complex ``search_local`` calls because the
+    database is loaded only once.
+
+    Args:
+        complexes: ``{complex_id: [chain_id, ...]}``.  Chain IDs must match
+            keys in *sequences*.  Homomers (1 unique sequence) are skipped.
+        sequences: ``{chain_id: amino_acid_sequence}``.
+        mmseqs: Path to the ``mmseqs`` binary.
+        db_dir: Directory containing MMseqs2 databases.
+        pairing_strategy: Pairing mode for ``pairaln`` (0=greedy, 1=complete).
+        threads: Number of threads.
+        gpu: Use GPU acceleration.
+        gpu_server: Use dedicated GPU server.
+        tmpdir: Working directory (temporary if None).
+        verbose: Stream MMseqs2 stderr.
+
+    Returns:
+        ``{complex_id: {chain_id: paired_a3m_text}}``.
+    """
+    db_dir = Path(db_dir)
+    uniref_db = "uniref30_2302_db"
+
+    if not (db_dir / f"{uniref_db}.dbtype").is_file():
+        raise FileNotFoundError(f"UniRef30 database not found at {db_dir}/{uniref_db}")
+
+    global _verbose_mmseqs
+    _verbose_mmseqs = verbose
+
+    # Filter to heteromers only
+    hetero: dict[str, list[str]] = {}
+    for cplx_id, chain_ids in complexes.items():
+        unique_seqs = {cid for cid in chain_ids if cid in sequences}
+        if len(unique_seqs) >= 2:
+            hetero[cplx_id] = chain_ids
+
+    if not hetero:
+        logger.info("No heteromers to process")
+        return {}
+
+    logger.info("Batch pair search: %d heteromers (%d total input)", len(hetero), len(complexes))
+
+    cleanup = tmpdir is None
+    if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(prefix="deepfold3_pair_batch_")
+    work_dir = Path(tmpdir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Build combined qdb
+        cplx_map = _build_pair_qdb(hetero, sequences, work_dir)
+
+        qdb = work_dir / "qdb"
+
+        db_load_mode, db_suffix = _detect_db_mode(db_dir, uniref_db)
+
+        max_seqs = "100000" if gpu else "10000"
+        gpu_args: list[str | Path] = []
+        if gpu:
+            gpu_args = ["--gpu", "1", "--prefilter-mode", "1"]
+        if gpu_server:
+            gpu_args += ["--gpu-server", "1"]
+
+        logger.info("Batch pair: profile search (%d entries)", len(hetero))
+        _run_mmseqs(
+            mmseqs,
+            [
+                "search", qdb, db_dir / uniref_db, work_dir / "res", work_dir / "tmp",
+                "--num-iterations", "3", "-a", "-e", "0.1", "--max-seqs", max_seqs,
+                "--db-load-mode", db_load_mode, "--threads", str(threads),
+            ] + gpu_args,
+        )
+
+        for ext in ["", ".index", ".dbtype"]:
+            shutil.copy2(work_dir / f"tmp/latest/profile_1{ext}", work_dir / f"prof_res{ext}")
+        prof_lookup = work_dir / "tmp/latest/profile_1.lookup"
+        if prof_lookup.exists():
+            shutil.copy2(prof_lookup, work_dir / "prof_res.lookup")
+        for ext in ["", ".index", ".dbtype"]:
+            shutil.copy2(f"{qdb}_h{ext}", work_dir / f"prof_res_h{ext}")
+
+        logger.info("Batch pair: expandaln + align")
+        _run_mmseqs(
+            mmseqs,
+            [
+                "expandaln", qdb, db_dir / f"{uniref_db}{db_suffix}", work_dir / "res",
+                db_dir / f"{uniref_db}{db_suffix}", work_dir / "res_exp",
+                "--db-load-mode", db_load_mode, "--expansion-mode", "0",
+                "-e", "inf", "--expand-filter-clusters", "0", "--max-seq-id", "0.95",
+                "--threads", str(threads),
+            ],
+        )
+        _run_mmseqs(
+            mmseqs,
+            [
+                "align", work_dir / "prof_res", db_dir / f"{uniref_db}{db_suffix}",
+                work_dir / "res_exp", work_dir / "res_exp_realign",
+                "--db-load-mode", db_load_mode, "--alignment-mode", "1",
+                "-e", "0.001", "--max-accept", "1000000",
+                "--threads", str(threads),
+            ],
+        )
+        _pad_result_index(qdb, work_dir / "res_exp_realign")
+
+        logger.info("Batch pair: pairaln pass 1")
+        _run_mmseqs(
+            mmseqs,
+            [
+                "pairaln", qdb, db_dir / uniref_db, work_dir / "res_exp_realign",
+                work_dir / "res_pair", "--db-load-mode", db_load_mode,
+                "--pairing-mode", str(pairing_strategy), "--pairing-dummy-mode", "0",
+                "--threads", str(threads),
+            ],
+        )
+
+        logger.info("Batch pair: align backtrace")
+        _run_mmseqs(
+            mmseqs,
+            [
+                "align", work_dir / "prof_res", db_dir / f"{uniref_db}{db_suffix}",
+                work_dir / "res_pair", work_dir / "res_pair_bt",
+                "--db-load-mode", db_load_mode, "-e", "inf", "-a",
+                "--threads", str(threads),
+            ],
+        )
+        _pad_result_index(qdb, work_dir / "res_pair_bt")
+
+        logger.info("Batch pair: pairaln pass 2")
+        _run_mmseqs(
+            mmseqs,
+            [
+                "pairaln", qdb, db_dir / uniref_db, work_dir / "res_pair_bt",
+                work_dir / "res_final", "--db-load-mode", db_load_mode,
+                "--pairing-mode", str(pairing_strategy), "--pairing-dummy-mode", "1",
+                "--threads", str(threads),
+            ],
+        )
+
+        logger.info("Batch pair: result2msa")
+        _run_mmseqs(
+            mmseqs,
+            [
+                "result2msa", qdb, db_dir / f"{uniref_db}{db_suffix}", work_dir / "res_final",
+                work_dir / "pair.a3m", "--db-load-mode", db_load_mode,
+                "--msa-format-mode", "5", "--filter-msa", "0",
+                "--filter-min-enable", "1000", "--diff", "3000",
+                "--qid", "0.2,0.4,0.6,0.8,1.0", "--qsc", "0", "--max-seq-id", "0.95",
+                "--threads", str(threads),
+            ],
+        )
+
+        results = _unpack_pair_results(work_dir, cplx_map)
+        logger.info("Batch pair: unpacked %d complexes", len(results))
+
+    finally:
+        if cleanup:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return results
+
+
+def search_monomer_batch(
+    sequences: dict[str, str],
+    *,
+    mmseqs: str = "mmseqs",
+    db_dir: str | Path,
+    use_env: bool = True,
+    use_templates: bool = False,
+    filter: bool = True,
+    threads: int = 8,
+    gpu: bool = False,
+    gpu_server: bool = False,
+    tmpdir: str | Path | None = None,
+    verbose: bool = False,
+) -> dict[str, MsaResult]:
+    """Batch monomer MSA search for multiple sequences.
+
+    Builds a combined query DB, runs a single monomer search pipeline
+    (UniRef30 + optional envdb + optional template), and unpacks per-sequence
+    results.  Much more efficient than per-sequence ``search_local`` calls.
+
+    Args:
+        sequences: ``{sequence_id: amino_acid_sequence}``.
+        mmseqs: Path to the ``mmseqs`` binary.
+        db_dir: Directory containing MMseqs2 databases.
+        use_env: Search environmental database.
+        use_templates: Search PDB100 template database.
+        filter: Apply MSA filtering.
+        threads: Number of threads.
+        gpu: Use GPU acceleration.
+        gpu_server: Use dedicated GPU server.
+        tmpdir: Working directory (temporary if None).
+        verbose: Stream MMseqs2 stderr.
+
+    Returns:
+        ``{sequence_id: MsaResult}`` with per-sequence unpaired A3M (and m8).
+    """
+    db_dir = Path(db_dir)
+
+    if not (db_dir / "uniref30_2302_db.dbtype").is_file():
+        raise FileNotFoundError(f"UniRef30 database not found at {db_dir}/uniref30_2302_db")
+
+    global _verbose_mmseqs
+    _verbose_mmseqs = verbose
+
+    if not sequences:
+        return {}
+
+    logger.info("Batch monomer search: %d sequences", len(sequences))
+
+    cleanup = tmpdir is None
+    if tmpdir is None:
+        tmpdir = tempfile.mkdtemp(prefix="deepfold3_monomer_batch_")
+    work_dir = Path(tmpdir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    seq_ids = list(sequences.keys())
+
+    try:
+        # Build query FASTA and createdb
+        query_file = work_dir / "query.fas"
+        with open(query_file, "w") as f:
+            for seq_id in seq_ids:
+                f.write(f">{seq_id}\n{sequences[seq_id]}\n")
+        _run_mmseqs(mmseqs, ["createdb", query_file, work_dir / "qdb", "--shuffle", "0", "--dbtype", "1"])
+
+        # Write lookup: key -> seq_id, file_number=0 (all monomer)
+        with (work_dir / "qdb.lookup").open("w") as f:
+            for i, seq_id in enumerate(seq_ids):
+                f.write(f"{i}\t{seq_id}\t0\n")
+
+        # Run monomer search
+        _search_monomer(mmseqs, db_dir, work_dir, use_env, use_templates, filter, threads, gpu, gpu_server)
+
+        # Unpack results via mmseqs unpackdb (uses lookup for naming)
+        a3m_dir = work_dir / "a3m_out"
+        a3m_dir.mkdir(exist_ok=True)
+
+        uniref_a3m = work_dir / "uniref.a3m"
+        if uniref_a3m.exists():
+            shutil.copy2(str(work_dir / "qdb.lookup"), f"{uniref_a3m}.lookup")
+            _run_mmseqs(
+                mmseqs,
+                ["unpackdb", uniref_a3m, a3m_dir / "uniref", "--unpack-suffix", ".a3m", "--unpack-name-mode", "1"],
+            )
+
+        env_a3m = work_dir / "env.a3m"
+        if use_env and env_a3m.exists():
+            shutil.copy2(str(work_dir / "qdb.lookup"), f"{env_a3m}.lookup")
+            _run_mmseqs(
+                mmseqs,
+                ["unpackdb", env_a3m, a3m_dir / "env", "--unpack-suffix", ".a3m", "--unpack-name-mode", "1"],
+            )
+
+        pdb_m8 = work_dir / "pdb.m8"
+        if use_templates and pdb_m8.exists():
+            shutil.copy2(str(work_dir / "qdb.lookup"), f"{pdb_m8}.lookup")
+            _run_mmseqs(
+                mmseqs,
+                ["unpackdb", pdb_m8, a3m_dir / "m8", "--unpack-suffix", ".m8", "--unpack-name-mode", "1"],
+            )
+
+        # Assemble MsaResult per sequence
+        results: dict[str, MsaResult] = {}
+        for seq_id in seq_ids:
+            uniref_path = a3m_dir / "uniref" / f"{seq_id}.a3m"
+            env_path = a3m_dir / "env" / f"{seq_id}.a3m"
+            m8_path = a3m_dir / "m8" / f"{seq_id}.m8"
+
+            uniref_text = uniref_path.read_text() if uniref_path.exists() else ""
+            env_text = env_path.read_text() if use_env and env_path.exists() else ""
+            unpaired_text = uniref_text + env_text if env_text else uniref_text
+            m8_text = m8_path.read_text() if use_templates and m8_path.exists() else ""
+
+            results[seq_id] = MsaResult(unpaired={0: unpaired_text}, m8_text=m8_text)
+
+        logger.info("Batch monomer: unpacked %d sequences", len(results))
+
+    finally:
+        if cleanup:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    return results
 
 
 def search_local(
