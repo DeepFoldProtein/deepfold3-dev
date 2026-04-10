@@ -471,7 +471,77 @@ class Featurizer:
                     combined_masks.append(row_mask[None])
                     combined_dels.append(row_del[None])
 
-        # If no paired MSA, build query row from unpaired row 0
+        # --- 1b. Auto-synthesise paired rows for homo-multimer entities ---
+        # When ColabFold/MMseqs2 didn't produce a paired MSA for this record
+        # (typically because it's a homo-oligomer — pure A_n complexes are
+        # excluded from the paired-search pipeline since the pairing is
+        # trivial), reconstruct paired rows directly from the unpaired MSA:
+        # every chain in a homo entity shares the same sequence and therefore
+        # the same MSA, so unpaired row i of any one chain is, by
+        # construction, the species-aligned row i for every chain in that
+        # entity. The synthesised rows are placed in the same paired slot
+        # as a real paired MSA would occupy. Heteromer chains in the same
+        # crop pass through unchanged (their columns stay as gaps for the
+        # synthesised rows, identical to how real paired pipelines treat a
+        # missing-from-pairing chain).
+        #
+        # ``unpaired_skip[asym_id]`` records how many leading rows of each
+        # chain's unpaired MSA were already consumed by the paired
+        # synthesis, so the dense unpaired block below can advance past
+        # them and avoid duplicating rows. For chains not in any homo
+        # group it stays at the default of 1 (just the query row).
+        unpaired_skip: dict[int, int] = {}
+        if n_paired_rows == 0:
+            chain_to_entity: dict[int, int] = {}
+            for asym_id, positions in chain_pos_map.items():
+                if len(positions) == 0:
+                    continue
+                chain_to_entity[asym_id] = int(tokens[positions[0]]["entity_id"])
+
+            entity_to_chains: dict[int, list[int]] = {}
+            for asym_id, eid in chain_to_entity.items():
+                entity_to_chains.setdefault(eid, []).append(asym_id)
+
+            homo_groups: list[tuple[list[int], MSA]] = []
+            for group_chains in entity_to_chains.values():
+                if len(group_chains) <= 1:
+                    continue
+                shared_msa: MSA | None = None
+                for asym_id in group_chains:
+                    msa = data.unpaired_msa.get(asym_id)
+                    if msa is not None and msa.sequences.shape[0] > 0:
+                        shared_msa = msa
+                        break
+                if shared_msa is not None:
+                    homo_groups.append((group_chains, shared_msa))
+
+            if homo_groups:
+                max_depth = max(msa.sequences.shape[0] for _, msa in homo_groups)
+                n_paired_rows = min(max_depth, const.MAX_PAIRED_MSA_ROWS + 1)
+                for row_i in range(n_paired_rows):
+                    row_seq = np.full(N, const.MSA_GAP, dtype=np.int8)
+                    row_mask = np.ones(N, dtype=bool)
+                    row_del = np.zeros(N, dtype=np.int8)
+                    for group_chains, msa in homo_groups:
+                        if row_i >= msa.sequences.shape[0]:
+                            continue
+                        for asym_id in group_chains:
+                            chain_pos = chain_pos_map[asym_id]
+                            L = min(msa.sequences.shape[1], len(chain_pos))
+                            row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]
+                            row_mask[chain_pos[:L]] = msa.mask[row_i, :L]
+                            row_del[chain_pos[:L]] = msa.deletion_matrix[row_i, :L]
+                    combined_seqs.append(row_seq[None])
+                    combined_masks.append(row_mask[None])
+                    combined_dels.append(row_del[None])
+                # Mark the consumed prefix per homo chain so the dense
+                # unpaired block doesn't re-emit the same rows.
+                for group_chains, _ in homo_groups:
+                    for asym_id in group_chains:
+                        unpaired_skip[asym_id] = n_paired_rows
+
+        # If still no paired MSA (monomer or fully-hetero singleton crop),
+        # build query row from unpaired row 0 of every chain.
         if n_paired_rows == 0:
             query_seq = np.full(N, const.MSA_GAP, dtype=np.int8)
             query_mask = np.ones(N, dtype=bool)
@@ -494,23 +564,24 @@ class Featurizer:
         # number of rows.  Place each chain's data in its own columns and
         # gap-fill the rest.
         max_unpaired = self.max_msa_seqs - max(n_paired_rows, 1)
-        # Collect per-chain unpaired MSA (skip query row = row 0)
+        # Collect per-chain unpaired MSA (skip the query row + any rows the
+        # paired-synthesis branch already consumed for homo-multimer chains).
         chain_unpaired: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
         max_S_unpaired = 0
         for asym_id, msa in data.unpaired_msa.items():
-            if msa.sequences.shape[0] <= 1:
+            skip = unpaired_skip.get(int(asym_id), 1)
+            if msa.sequences.shape[0] <= skip:
                 continue
-            # Rows 1.. (skip query)
-            end = min(msa.sequences.shape[0], 1 + max_unpaired)
+            end = min(msa.sequences.shape[0], skip + max_unpaired)
             chain_unpaired.append(
                 (
                     int(asym_id),
-                    msa.sequences[1:end],
-                    msa.mask[1:end],
-                    msa.deletion_matrix[1:end],
+                    msa.sequences[skip:end],
+                    msa.mask[skip:end],
+                    msa.deletion_matrix[skip:end],
                 )
             )
-            max_S_unpaired = max(max_S_unpaired, end - 1)
+            max_S_unpaired = max(max_S_unpaired, end - skip)
 
         if max_S_unpaired > 0:
             # Build dense [max_S_unpaired, N] arrays — all chains on same rows
