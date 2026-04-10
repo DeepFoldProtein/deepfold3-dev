@@ -353,6 +353,16 @@ class Featurizer:
             result["atom_gt_positions"] = torch.from_numpy(atom_gt_positions)
             result["atom_gt_mask"] = torch.from_numpy(atom_gt_mask)
 
+            # Symmetric atom swap pairs (AlphaFold 3 §4.3): per-token
+            # ``(token_idx, M_a, M_b)`` triples for residues whose side chain
+            # has a 180° equivalence (ASP/GLU/ARG/PHE/TYR/HIS/LEU/VAL).
+            # Cheap to compute (microseconds for 12gs); the loss applies the
+            # best-of-two swap per (sample, pair).
+            from deepfold3.data.symmetry.atom_perms import compute_token_atom_symmetry_pairs
+
+            atom_swap_pairs = compute_token_atom_symmetry_pairs(data.structure, tokens)
+            result["atom_swap_pairs"] = torch.from_numpy(atom_swap_pairs)
+
             # Bond features for bond violation loss (Protenix-style: observed GT distances)
             bond_feats = self._build_bond_features(tokens, atom_gt_positions, atom_gt_mask, data.bonds, N, M)
             result.update(bond_feats)

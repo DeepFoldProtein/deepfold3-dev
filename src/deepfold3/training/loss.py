@@ -86,10 +86,17 @@ def diffusion_mse_loss(
     nucleotide_loss_weight: float = 5.0,
     ligand_loss_weight: float = 10.0,
     region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
+    atom_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] (token, M_a, M_b)
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
 
     Vectorized over S — single fused operation, no Python loop.
+
+    If ``atom_swap_pairs`` is provided, ground-truth coordinates of
+    symmetry-equivalent side-chain atoms (AlphaFold 3 §4.3) are first
+    permuted per-sample to minimise the per-pair MSE before the loss is
+    computed — otherwise the model is penalised for arbitrary labelling
+    of e.g. ASP OD1/OD2 or PHE CD1/CD2 atoms.
 
     Args:
         pred_pos: Denoised predictions [S, N, M, 3].
@@ -100,10 +107,19 @@ def diffusion_mse_loss(
         mol_type: Per-token molecule type [N].
         nucleotide_loss_weight: Weight multiplier for RNA/DNA atoms.
         ligand_loss_weight: Weight multiplier for ligand atoms.
+        region_weights: Per-token loss multiplier from region labels.
+        atom_swap_pairs: Optional ``[N_pairs, 3]`` int tensor produced by
+            ``compute_token_atom_symmetry_pairs`` and routed through the
+            featurizer (``"atom_swap_pairs"`` feature key).
 
     Returns:
         Scalar loss.
     """
+    if atom_swap_pairs is not None and len(atom_swap_pairs) > 0:
+        from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
+
+        gt_pos = apply_token_atom_permutation(pred_pos, gt_pos, atom_mask.bool(), atom_swap_pairs)
+
     mask = atom_mask.float()  # [N, M]
 
     # Build per-token loss weight based on molecule type
@@ -430,6 +446,7 @@ def training_loss(
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
             ligand_loss_weight=cfg.ligand_loss_weight,
             region_weights=region_weights,
+            atom_swap_pairs=features.get("atom_swap_pairs"),
         )
         losses["diffusion_mse"] = l_mse
 

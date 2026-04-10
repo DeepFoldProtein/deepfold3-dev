@@ -119,6 +119,113 @@ def compute_atom_symmetry_pairs(structure) -> np.ndarray:
     return np.asarray(pair_list, dtype=np.int32)
 
 
+def compute_token_atom_symmetry_pairs(
+    structure, tokens: np.ndarray
+) -> np.ndarray:
+    """Token-aware variant: emit ``(token_idx, M_a, M_b)`` swap triples.
+
+    The training loss receives atoms in the per-token ``[N, M, 3]`` layout
+    (one row per token, ``M=MAX_ATOMS_PER_TOKEN`` slots), not the flat
+    ``[N_atoms, 3]`` layout used by :func:`compute_atom_symmetry_pairs`.
+    This helper walks each token, looks up its residue type from the
+    token array (so it works post-crop where the residues table is
+    intentionally not re-indexed), and converts the residue's symmetry
+    pairs to local ``[0..M)`` atom slot indices that
+    :func:`apply_token_atom_permutation` can apply directly to the loss
+    tensors.
+
+    Polymer tokens span multiple atoms via ``token['atom_idx']`` and
+    ``token['atom_num']``, which point into ``structure.atoms`` (the
+    cropper keeps these consistent — atoms are sliced and atom_idx is
+    remapped). Ligand tokens carry one atom per token and have no
+    per-token symmetry; they are skipped.
+    """
+    import numpy as np
+
+    from deepfold3.data import const
+
+    pair_list: list[tuple[int, int, int]] = []
+    atom_names_bytes = structure.atoms["name"]
+
+    for token_idx, tok in enumerate(tokens):
+        atom_num = int(tok["atom_num"])
+        if atom_num <= 1:
+            continue
+        res_type = int(tok["res_type"])
+        res_name = const.RES_TYPE_INDEX_TO_NAME.get(res_type)
+        if res_name is None or res_name not in RESIDUE_ATOM_SYMMETRY_GROUPS:
+            continue
+        atom_idx = int(tok["atom_idx"])
+        atom_names = [
+            atom_names_bytes[atom_idx + i].decode("ascii", errors="replace").strip()
+            for i in range(atom_num)
+        ]
+        for a, b in build_residue_symmetry_pairs(res_name, atom_names):
+            pair_list.append((token_idx, a, b))
+    if not pair_list:
+        return np.empty((0, 3), dtype=np.int32)
+    return np.asarray(pair_list, dtype=np.int32)
+
+
+def apply_token_atom_permutation(
+    pred_pos: torch.Tensor,  # [..., N, M, 3]
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    swap_pairs: np.ndarray | torch.Tensor,  # [N_pairs, 3] (token, a, b)
+) -> torch.Tensor:
+    """Per-token best-swap atom permutation in the ``[..., N, M, 3]`` layout.
+
+    For each ``(token, a, b)`` triple, computes the per-pair squared
+    distance under both orderings and picks the one with the lower cost.
+    Decisions are made independently per leading dimension (so each
+    diffusion sample's per-rotation augmented GT picks its own swap).
+
+    Returns a tensor with the same shape as ``gt_pos``, detached.
+    """
+    import torch
+
+    if swap_pairs is None or len(swap_pairs) == 0:
+        return gt_pos.detach()
+
+    if not isinstance(swap_pairs, torch.Tensor):
+        pairs = torch.as_tensor(swap_pairs, dtype=torch.long, device=gt_pos.device)
+    else:
+        pairs = swap_pairs.to(dtype=torch.long, device=gt_pos.device)
+
+    permuted = gt_pos.clone()
+
+    tok_idx = pairs[:, 0]
+    a_idx = pairs[:, 1]
+    b_idx = pairs[:, 2]
+
+    pair_mask = atom_mask[tok_idx, a_idx] & atom_mask[tok_idx, b_idx]
+    if not pair_mask.any():
+        return permuted.detach()
+
+    # Gather per-pair atoms across all leading dims
+    pred_a = pred_pos[..., tok_idx, a_idx, :]  # [..., P, 3]
+    pred_b = pred_pos[..., tok_idx, b_idx, :]
+    gt_a = gt_pos[..., tok_idx, a_idx, :]
+    gt_b = gt_pos[..., tok_idx, b_idx, :]
+
+    identity_cost = (pred_a - gt_a).pow(2).sum(dim=-1) + (pred_b - gt_b).pow(2).sum(dim=-1)
+    swapped_cost = (pred_a - gt_b).pow(2).sum(dim=-1) + (pred_b - gt_a).pow(2).sum(dim=-1)
+
+    do_swap = pair_mask & (swapped_cost < identity_cost)  # [..., P]
+    if not do_swap.any():
+        return permuted.detach()
+
+    # For swapped pairs, write the swapped values back. Vectorise per-pair
+    # by gathering the (a, b) values and using ``torch.where`` to pick.
+    new_a = torch.where(do_swap.unsqueeze(-1), gt_b, gt_a)
+    new_b = torch.where(do_swap.unsqueeze(-1), gt_a, gt_b)
+
+    permuted[..., tok_idx, a_idx, :] = new_a
+    permuted[..., tok_idx, b_idx, :] = new_b
+
+    return permuted.detach()
+
+
 def apply_atom_permutation(
     pred_coords: torch.Tensor,  # [N_atoms, 3]
     gt_coords: torch.Tensor,  # [N_atoms, 3]
