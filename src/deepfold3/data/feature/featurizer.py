@@ -38,10 +38,16 @@ class Featurizer:
         max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
         max_msa_seqs: int = const.MAX_MSA_ROWS,
         max_templates: int = 4,
+        ligand_perm_cache: dict[str, list[list[int]]] | None = None,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
         self.max_templates = max_templates
+        # Optional CCD-keyed ligand automorphism cache (loaded once per
+        # process). When set, the featurizer emits ``ligand_swap_pairs``
+        # alongside ``atom_swap_pairs`` so the diffusion loss can apply
+        # ligand-atom permutations as well.
+        self.ligand_perm_cache = ligand_perm_cache
 
     def process(
         self,
@@ -358,10 +364,22 @@ class Featurizer:
             # has a 180° equivalence (ASP/GLU/ARG/PHE/TYR/HIS/LEU/VAL).
             # Cheap to compute (microseconds for 12gs); the loss applies the
             # best-of-two swap per (sample, pair).
-            from deepfold3.data.symmetry.atom_perms import compute_token_atom_symmetry_pairs
+            from deepfold3.data.symmetry.atom_perms import (
+                compute_ligand_token_swap_pairs,
+                compute_token_atom_symmetry_pairs,
+            )
 
             atom_swap_pairs = compute_token_atom_symmetry_pairs(data.structure, tokens)
             result["atom_swap_pairs"] = torch.from_numpy(atom_swap_pairs)
+
+            # Ligand inter-token swap pairs (CCD automorphism cache).
+            # Each ligand atom is its own token, so swaps are over (token_a,
+            # token_b) pairs at slot M=0. Empty when no cache is loaded or
+            # the crop has no symmetric ligands.
+            ligand_swap_pairs = compute_ligand_token_swap_pairs(
+                data.structure, tokens, self.ligand_perm_cache
+            )
+            result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
             # Bond features for bond violation loss (Protenix-style: observed GT distances)
             bond_feats = self._build_bond_features(tokens, atom_gt_positions, atom_gt_mask, data.bonds, N, M)

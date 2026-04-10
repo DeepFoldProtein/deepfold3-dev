@@ -86,7 +86,21 @@ class TrainingDataset(torch.utils.data.Dataset):
             interface_weight=interface_crop_weight,
             interface_distance=interface_distance,
         )
-        self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+        # Optional ligand symmetry cache (built once per data dir via
+        # ``deepfold3 build-ligand-cache``). Loaded lazily into memory and
+        # passed to the featurizer so the loss can apply ligand atom
+        # permutations during training.
+        ligand_cache_path = self.data_dir / "ligand_symmetry.json"
+        ligand_perm_cache: dict | None = None
+        if ligand_cache_path.exists():
+            import json as _json
+
+            try:
+                ligand_perm_cache = _json.loads(ligand_cache_path.read_text())
+                logger.info("Loaded ligand symmetry cache: %d CCDs", len(ligand_perm_cache))
+            except Exception:
+                logger.warning("Failed to load %s; ligand symmetry disabled", ligand_cache_path)
+        self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs, ligand_perm_cache=ligand_perm_cache)
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker
         # under DDP and is unnecessary — kernel dentry cache makes the per-record

@@ -167,6 +167,130 @@ def compute_token_atom_symmetry_pairs(
     return np.asarray(pair_list, dtype=np.int32)
 
 
+def compute_ligand_token_swap_pairs(
+    structure,
+    tokens: np.ndarray,
+    ligand_perm_cache: dict[str, list[list[int]]] | None,
+) -> np.ndarray:
+    """Token-pair swaps for ligand atoms via the precomputed CCD automorphism cache.
+
+    Each ligand atom in our layout occupies its own token (``atom_num=1``,
+    only slot ``M=0``), so ligand symmetries become **inter-token** swaps.
+    For every ligand chain we look up its CCD residue name, fetch the
+    automorphism group from ``ligand_perm_cache`` (the JSON dict produced
+    by ``deepfold3 build-ligand-cache``), extract the involution pairs
+    from each automorphism, and map them back to current token indices
+    via ``token['residue_index']`` — which the tokenizer sets to the
+    local-within-ligand atom index, so the mapping survives cropping.
+
+    Returns a ``[N_pairs, 2]`` int32 array of token index pairs.
+    Multi-cycle automorphisms (e.g. benzene's 6-fold rotation) are
+    decomposed into their pairwise involution components and
+    deduplicated; this captures the common O/N/C "swap" symmetries
+    without the full group machinery.
+    """
+    import numpy as np
+
+    from deepfold3.data import const
+
+    if not ligand_perm_cache:
+        return np.empty((0, 2), dtype=np.int32)
+
+    # Group cropped ligand tokens by asym_id; each group is one ligand
+    # chain (= one residue under our prepare pipeline).
+    ligand_groups: dict[int, dict[int, int]] = {}
+    for i, tok in enumerate(tokens):
+        if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
+            continue
+        asym = int(tok["asym_id"])
+        local_atom_idx = int(tok["residue_index"])
+        ligand_groups.setdefault(asym, {})[local_atom_idx] = i
+
+    if not ligand_groups:
+        return np.empty((0, 2), dtype=np.int32)
+
+    # asym_id -> CCD code via the structure.chains/residues lookup
+    chains = structure.chains
+    residues = structure.residues
+
+    pair_list: list[tuple[int, int]] = []
+    for asym, local_to_token in ligand_groups.items():
+        chain_rows = chains[chains["asym_id"] == asym]
+        if len(chain_rows) == 0:
+            continue
+        res_idx = int(chain_rows[0]["res_idx"])
+        if res_idx >= len(residues):
+            continue
+        ccd_code = residues[res_idx]["name"].decode("ascii", errors="replace").strip().upper()
+        perms = ligand_perm_cache.get(ccd_code)
+        if not perms or len(perms) <= 1:
+            continue
+        pair_set: set[tuple[int, int]] = set()
+        for perm in perms:
+            for i, j in enumerate(perm):
+                if j > i and 0 <= j < len(perm) and perm[j] == i:
+                    pair_set.add((i, j))
+        for local_a, local_b in pair_set:
+            tok_a = local_to_token.get(local_a)
+            tok_b = local_to_token.get(local_b)
+            if tok_a is not None and tok_b is not None:
+                pair_list.append((tok_a, tok_b))
+
+    if not pair_list:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.asarray(pair_list, dtype=np.int32)
+
+
+def apply_ligand_token_swap(
+    pred_pos: torch.Tensor,  # [..., N, M, 3]
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    swap_pairs: np.ndarray | torch.Tensor,  # [N_pairs, 2] token index pairs
+) -> torch.Tensor:
+    """Apply best-of-two ligand atom swaps in the token-atom layout.
+
+    Ligand atoms live at slot ``M=0`` of their own token, so the swap
+    is over (``token_a``, ``token_b``) row-pairs at position 0. Decisions
+    are made independently per leading dimension and per pair.
+    """
+    import torch
+
+    if swap_pairs is None or len(swap_pairs) == 0:
+        return gt_pos.detach()
+
+    if not isinstance(swap_pairs, torch.Tensor):
+        pairs = torch.as_tensor(swap_pairs, dtype=torch.long, device=gt_pos.device)
+    else:
+        pairs = swap_pairs.to(dtype=torch.long, device=gt_pos.device)
+
+    permuted = gt_pos.clone()
+    a_idx = pairs[:, 0]
+    b_idx = pairs[:, 1]
+
+    pair_mask = atom_mask[a_idx, 0] & atom_mask[b_idx, 0]
+    if not pair_mask.any():
+        return permuted.detach()
+
+    pred_a = pred_pos[..., a_idx, 0, :]
+    pred_b = pred_pos[..., b_idx, 0, :]
+    gt_a = gt_pos[..., a_idx, 0, :]
+    gt_b = gt_pos[..., b_idx, 0, :]
+
+    identity_cost = (pred_a - gt_a).pow(2).sum(dim=-1) + (pred_b - gt_b).pow(2).sum(dim=-1)
+    swapped_cost = (pred_a - gt_b).pow(2).sum(dim=-1) + (pred_b - gt_a).pow(2).sum(dim=-1)
+    do_swap = pair_mask & (swapped_cost < identity_cost)
+
+    if not do_swap.any():
+        return permuted.detach()
+
+    new_a = torch.where(do_swap.unsqueeze(-1), gt_b, gt_a)
+    new_b = torch.where(do_swap.unsqueeze(-1), gt_a, gt_b)
+    permuted[..., a_idx, 0, :] = new_a
+    permuted[..., b_idx, 0, :] = new_b
+
+    return permuted.detach()
+
+
 def apply_token_atom_permutation(
     pred_pos: torch.Tensor,  # [..., N, M, 3]
     gt_pos: torch.Tensor,  # [..., N, M, 3]

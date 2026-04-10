@@ -87,6 +87,7 @@ def diffusion_mse_loss(
     ligand_loss_weight: float = 10.0,
     region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
     atom_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] (token, M_a, M_b)
+    ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 2] (token_a, token_b) ligand swaps
     asym_id: torch.Tensor | None = None,  # [N] int — per-token chain id
     entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
 ) -> torch.Tensor:
@@ -151,6 +152,11 @@ def diffusion_mse_loss(
         from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
 
         gt_pos = apply_token_atom_permutation(pred_pos, gt_pos, atom_mask.bool(), atom_swap_pairs)
+
+    if ligand_swap_pairs is not None and len(ligand_swap_pairs) > 0:
+        from deepfold3.data.symmetry.atom_perms import apply_ligand_token_swap
+
+        gt_pos = apply_ligand_token_swap(pred_pos, gt_pos, atom_mask.bool(), ligand_swap_pairs)
 
     mask = atom_mask.float()  # [N, M]
 
@@ -479,6 +485,7 @@ def training_loss(
             ligand_loss_weight=cfg.ligand_loss_weight,
             region_weights=region_weights,
             atom_swap_pairs=features.get("atom_swap_pairs"),
+            ligand_swap_pairs=features.get("ligand_swap_pairs"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
         )
