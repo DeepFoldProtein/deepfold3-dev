@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** Training-time template date cutoff filtering.
+**Not yet implemented:** Training-time template date-cutoff filter (`Hit.keep`-style 60-day guard). The plumbing now exists — `enrich-manifest` populates each record's `structure_info.released` from a mmCIF walk, and `Record.structure_info` is loaded by the dataloader — so wiring it into the template loader is the remaining step.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.11+ (pinned in `.python-version`)
@@ -55,12 +55,18 @@ deepfold3 apply-clusters --manifest /data/training/manifest.json --cluster-file 
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu --use-pairing
-deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --convert-only
-deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms
+deepfold3 msa-batch --data-dir /data/training --convert-only
+deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms --workers 32
+deepfold3 import-paired-msa --data-dir /data/training --paired-dir /data/msa/paired --workers 32
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8 --max-templates 4 --workers 16
+deepfold3 scan-mmcif --mmcif-dir ~/deepfold3/pdb/divided --data-dir /data/training --output mmcif_meta.json --workers 32
+deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
+deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx --mmcif-cache mmcif_meta.json
+deepfold3 drop-obsolete --data-dir /data/training
+deepfold3 drop-obsolete --data-dir /data/training --delete-files
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors --mmcif-dir /data/pdb/mmcif
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
@@ -146,13 +152,14 @@ src/deepfold3/
 │   ├── types.py          # Structure, MSA, Input, Tokenized, Record dataclasses
 │   ├── masking.py        # TokenMask (per-token mask channels for loss control: fixed, region)
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
-│   ├── msa/             # mmseqs2.py (server API + local binary + GPU-accelerated MSA search + template m8 parsing)
-│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py, templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects)
+│   ├── paths.py          # shard(), structure_path, mask_path, template_path — sharded layout helpers
+│   ├── msa/             # mmseqs2.py (search) + paths.py (unpaired_msa_path, paired_msa_path)
+│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py (parse_a3m + convert_a3m_file_to_npz), templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
 │   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   ├── prepare/          # structure.py (mmCIF→NPZ), filters.py, manifest.py, clustering.py, template_search.py
+│   ├── prepare/          # structure.py (mmCIF→NPZ + AF3-aligned metadata extract), filters.py, manifest.py (atomic save), clustering.py, template_search.py, materialize.py (parallel A3M→NPZ runner), entries_idx.py (wwPDB TSV parser)
 │   └── module/           # dataset.py (TrainingDataset, InferenceInput), collate.py (batch)
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
@@ -166,11 +173,15 @@ src/deepfold3/
 │   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval, WandB)
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
 │   ├── __init__.py       # click.Group `cli` — unified entry point
+│   ├── _common.py        # setup_cli_logging(), require_manifest()
 │   ├── inference.py      # `deepfold3 inference`
 │   ├── msa_search.py     # `deepfold3 msa`
+│   ├── msa_batch.py      # `deepfold3 msa-batch`
 │   ├── convert_weights.py  # `deepfold3 convert`
 │   ├── plot_confidences.py # `deepfold3 plot`
-│   ├── prepare.py        # `deepfold3 prepare`
+│   ├── prepare.py        # `deepfold3 prepare`, `import-msa`, `import-paired-msa`, `import-of3`, `enrich-manifest`, `drop-obsolete`, etc.
+│   ├── prepare_templates.py # `deepfold3 prepare-templates`
+│   ├── scan_mmcif.py     # `deepfold3 scan-mmcif` (parallel mmCIF metadata cache)
 │   └── train.py          # `deepfold3 train`
 └── params.py        # read_af3_params() (zstd decompression)
 
@@ -256,16 +267,22 @@ deepfold3 train --data-dir /data/training --output runs/exp3 \
 
 ### Training Data Format
 
+Every persistent file is **sharded** by the first two characters of its id (256 buckets) so listing, rsync, and inode walks stay fast at 100k+ files. Path construction goes through the helpers in `data/paths.py` (`structure_path`, `mask_path`, `template_path`) and `data/msa/paths.py` (`unpaired_msa_path`, `paired_msa_path`) — never inline.
+
 ```
 data_dir/
-├── manifest.json             # list of Record objects (id, chains, interfaces)
-├── structures/               # {pdb_id}.npz — Structure (atoms, bonds, residues, chains)
-├── msa/                      # {msa_id}.npz — MSA (sequences, mask, deletion_matrix)
-├── masks/                    # {pdb_id}.npz — TokenMask channels (optional, for loss control)
-└── templates/                # {pdb_id}.json — Multimer template hits (optional, for template embedding)
+├── manifest.json                                # list of Record objects (atomic save with .old backup)
+├── structures/{ab}/{pdb_id}.npz                 # Structure (atoms, bonds, residues, chains)
+├── masks/{ab}/{pdb_id}.npz                      # TokenMask channels (optional)
+├── templates/{ab}/{pdb_id}.json                 # Multimer template hits (optional)
+└── msa/
+    ├── unpaired/{ab}/{msa_id}.npz               # per-sequence (SHA256 hash)
+    └── paired/{ab}/{record_id}_paired_{chain_hash}.npz  # per-complex
 ```
 
-Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the MSA file name (SHA256 hash of the chain sequence). `ChainInfo` also stores `auth_chain_name` (original chain name from input CIF, before assembly renaming) for accurate chain mapping in mask generation.
+Records are loaded via `discover_records()` from `data/prepare/manifest.py` (reads `manifest.json` or recursively scans `structures/`). Each `ChainInfo` has a `msa_id` that maps to the unpaired MSA file name (SHA256 of the chain sequence). `ChainInfo` also stores `auth_chain_name` (original chain name from input CIF, before assembly renaming) for accurate chain mapping in mask generation.
+
+`Record.structure_info` (`resolution`, `method`, `deposited`, `released`) can be populated either at prepare time (from mmCIF metadata) or after the fact via `deepfold3 enrich-manifest --idx entries.idx [--mmcif-cache mmcif_meta.json]`. Use `deepfold3 scan-mmcif` first to generate the cache from a local PDB mirror — that's the only canonical source for `released` (= earliest `_pdbx_audit_revision_history.revision_date`, matching AlphaFold 3's template date-cutoff convention).
 
 ### Data Preprocessing Pipeline
 

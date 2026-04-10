@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from deepfold3.data.types import Record
@@ -22,12 +23,43 @@ logger = logging.getLogger(__name__)
 
 
 def save_manifest(records: list[Record], path: Path) -> None:
-    """Save a list of Records to a JSON manifest file."""
+    """Atomically save a list of Records to a JSON manifest file.
+
+    Writes JSON to ``{path}.tmp``, fsyncs the file, swaps the previous
+    manifest to ``{path}.old`` (single-generation backup — each call
+    overwrites whatever was previously at ``.old``), then ``os.replace``s
+    the temporary file over ``path``. The parent directory is fsynced
+    afterwards so the renames themselves are durable. POSIX ``rename(2)``
+    on the same filesystem is atomic, so a concurrent reader always sees
+    the previous or the new manifest — never a half-written one.
+
+    Crash semantics:
+        * before tmp fsync → ``{path}.tmp`` may be partial; ``path`` intact.
+        * between renames and dir fsync → renames may not yet be on-disk;
+          on recovery you may see either the old or new manifest, but never
+          a partial one (the new content was already fsynced).
+        * after dir fsync → both new ``path`` and ``{path}.old`` durable.
+    """
     data = [r.to_dict() for r in records]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    if path.exists():
+        os.replace(path, path.with_suffix(path.suffix + ".old"))
+    os.replace(tmp, path)
+
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
     logger.info("Saved manifest with %d records to %s", len(records), path)
 
 

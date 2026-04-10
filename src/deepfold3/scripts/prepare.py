@@ -1052,6 +1052,257 @@ def import_paired_msa(data_dir: str, paired_dir: str, workers: int, keep_a3m: bo
     click.echo(f"Imported {imported} paired MSAs across {len(updated_records)} records.")
 
 
+_METADATA_FIELDS = ("resolution", "method", "deposited", "released")
+
+
+@cli.command("enrich-manifest")
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Training data directory containing manifest.json.",
+)
+@click.option(
+    "--idx",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Optional wwPDB derived_data/index/entries.idx file. "
+    "Fast TSV pass that fills resolution / method / deposited.",
+)
+@click.option(
+    "--mmcif-cache",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Optional JSON metadata cache produced by ``deepfold3 scan-mmcif``. "
+    "Provides ``released`` (and re-confirms the other fields) — the only "
+    "authoritative source for the initial release date.",
+)
+def enrich_manifest(data_dir: Path, idx: Path | None, mmcif_cache: Path | None) -> None:
+    """Fill ``structure_info`` fields in the manifest.
+
+    Two complementary sources, both optional but at least one required:
+
+    * ``--idx``: fast pass over wwPDB ``entries.idx``. Fills ``resolution``,
+      ``method``, and ``deposited``. The file does not carry release dates.
+    * ``--mmcif-cache``: precomputed JSON cache from ``scan-mmcif``. Fills
+      ``released`` (= the earliest ``_pdbx_audit_revision_history.revision_date``,
+      matching AlphaFold 3's template date-cutoff convention) and any other
+      blank field.
+
+    Existing non-null fields are kept; only blanks are filled. Both flags
+    can be passed together — idx runs first, cache fills whatever's left.
+
+    Examples::
+
+        wget -O entries.idx https://files.rcsb.org/pub/pdb/derived_data/index/entries.idx
+        deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
+
+        deepfold3 scan-mmcif --data-dir /data/training --mmcif-dir ~/deepfold3/pdb/divided \\
+            --output mmcif_meta.json --workers 32
+        deepfold3 enrich-manifest --data-dir /data/training --mmcif-cache mmcif_meta.json
+    """
+    from deepfold3.data.prepare.manifest import load_manifest, save_manifest
+    from deepfold3.data.types import StructureInfo
+    from deepfold3.scripts._common import require_manifest, setup_cli_logging
+
+    log = setup_cli_logging(__name__)
+
+    if idx is None and mmcif_cache is None:
+        click.echo("Error: pass --idx and/or --mmcif-cache.", err=True)
+        sys.exit(1)
+
+    manifest_path = require_manifest(data_dir)
+
+    records = load_manifest(manifest_path)
+    log.info("Loaded %d records.", len(records))
+
+    def _ensure_si(record):
+        if record.structure_info is None:
+            record.structure_info = StructureInfo(
+                num_chains=len(record.chains), num_interfaces=len(record.interfaces)
+            )
+        return record.structure_info
+
+    if idx is not None:
+        from deepfold3.data.prepare.entries_idx import parse_entries_idx
+
+        log.info("Parsing %s...", idx)
+        rows = parse_entries_idx(idx)
+        log.info("Loaded %d entries.idx rows.", len(rows))
+
+        matched = 0
+        filled = {"resolution": 0, "method": 0, "deposited": 0}
+        for record in records:
+            row = rows.get(record.id.lower())
+            if row is None:
+                continue
+            matched += 1
+            si = _ensure_si(record)
+            if si.resolution is None and row.resolution is not None:
+                si.resolution = row.resolution
+                filled["resolution"] += 1
+            if not si.method and row.method:
+                si.method = row.method
+                filled["method"] += 1
+            if not si.deposited and row.deposited:
+                si.deposited = row.deposited
+                filled["deposited"] += 1
+        log.info("entries.idx: matched %d/%d records. Filled %s.", matched, len(records), filled)
+
+    if mmcif_cache is not None:
+        log.info("Reading mmCIF metadata cache from %s", mmcif_cache)
+        raw_cache = json.loads(mmcif_cache.read_text())
+        cache = {k.lower(): v for k, v in raw_cache.items()}
+        log.info("Loaded %d cache entries.", len(cache))
+
+        matched = 0
+        filled = {k: 0 for k in _METADATA_FIELDS}
+        for record in records:
+            entry = cache.get(record.id.lower())
+            if entry is None:
+                continue
+            matched += 1
+            si = _ensure_si(record)
+            for key in _METADATA_FIELDS:
+                if not getattr(si, key) and entry.get(key):
+                    setattr(si, key, entry[key])
+                    filled[key] += 1
+        log.info("mmcif-cache: matched %d/%d records. Filled %s.", matched, len(records), filled)
+
+    save_manifest(records, manifest_path)
+    log.info("Saved manifest to %s", manifest_path)
+
+
+_OBSOLETE_DAT_URL = "https://files.wwpdb.org/pub/pdb/data/status/obsolete.dat"
+
+
+def _parse_obsolete_dat(text: str) -> set[str]:
+    """Parse the wwPDB ``obsolete.dat`` file into a set of lowercased PDB IDs.
+
+    Format: ``OBSLTE    {DD-MMM-YY}    {old_id}    [{new_id}]``, one per line,
+    plus a single header line. Only the obsoleted ``old_id`` is extracted —
+    successor IDs are ignored.
+    """
+    ids: set[str] = set()
+    for line in text.splitlines():
+        if not line.startswith("OBSLTE"):
+            continue
+        parts = line.split()
+        if len(parts) >= 3 and len(parts[2]) == 4:
+            ids.add(parts[2].lower())
+    return ids
+
+
+@cli.command("drop-obsolete")
+@click.option(
+    "--data-dir",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Training data directory containing manifest.json.",
+)
+@click.option(
+    "--ids-file",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="Optional local copy of obsolete.dat (or a JSON list of IDs). "
+    "If omitted, fetched from wwPDB.",
+)
+@click.option(
+    "--delete-files",
+    is_flag=True,
+    help="Also delete the dropped records' structure / mask / template / record files. "
+    "Default off — manifest is the source of truth and orphan files are harmless.",
+)
+def drop_obsolete(data_dir: Path, ids_file: Path | None, delete_files: bool) -> None:
+    """Drop manifest records that are listed as obsolete by wwPDB.
+
+    Fetches the canonical list from
+    ``https://files.wwpdb.org/pub/pdb/data/status/obsolete.dat`` (or reads
+    a local copy via ``--ids-file``) and removes any matching records from
+    ``{data_dir}/manifest.json``. Pass ``--delete-files`` to also unlink
+    the corresponding structures / masks / templates / records artifacts.
+
+    The local file may be either a wwPDB ``obsolete.dat`` text file or a
+    JSON array of PDB IDs (e.g. the RCSB
+    ``rest/v1/holdings/removed/entry_ids`` response).
+
+    Examples::
+
+        deepfold3 drop-obsolete --data-dir /data/training
+        deepfold3 drop-obsolete --data-dir /data/training --delete-files
+    """
+    from deepfold3.data.paths import mask_path, structure_path, template_path
+    from deepfold3.data.prepare.manifest import load_manifest, save_manifest
+    from deepfold3.scripts._common import require_manifest, setup_cli_logging
+
+    log = setup_cli_logging(__name__)
+    manifest_path = require_manifest(data_dir)
+
+    if ids_file is not None:
+        log.info("Reading removed entry IDs from %s", ids_file)
+        text = ids_file.read_text()
+    else:
+        from urllib.request import urlopen
+
+        log.info("Fetching obsolete entries from %s", _OBSOLETE_DAT_URL)
+        try:
+            with urlopen(_OBSOLETE_DAT_URL, timeout=30) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            click.echo(
+                f"Error: failed to fetch {_OBSOLETE_DAT_URL}: {e}\n"
+                "Pass --ids-file with a local copy if the network is unavailable.",
+                err=True,
+            )
+            sys.exit(1)
+
+    if text.lstrip().startswith("["):
+        removed_set = {str(x).lower() for x in json.loads(text)}
+    else:
+        removed_set = _parse_obsolete_dat(text)
+    if not removed_set:
+        click.echo("Error: parsed 0 obsolete IDs from input — schema change?", err=True)
+        sys.exit(1)
+    log.info("Loaded %d obsolete entry IDs.", len(removed_set))
+
+    from deepfold3.data.types import Record
+
+    records = load_manifest(manifest_path)
+    log.info("Loaded %d records.", len(records))
+
+    kept: list[Record] = []
+    dropped: list[Record] = []
+    for r in records:
+        (dropped if r.id.lower() in removed_set else kept).append(r)
+    log.info("Dropping %d obsolete records (kept %d).", len(dropped), len(kept))
+
+    # Save the new manifest first so a crash during file deletion can't
+    # leave the manifest referencing files that have already been removed.
+    save_manifest(kept, manifest_path)
+    log.info("Saved manifest to %s", manifest_path)
+
+    if delete_files and dropped:
+        # MSA NPZs are intentionally NOT deleted: they're keyed by sequence
+        # hash and are typically shared across many records, so deleting them
+        # would orphan unrelated entries.
+        deleted = 0
+        for r in dropped:
+            for p in (
+                structure_path(data_dir / "structures", r.id),
+                mask_path(data_dir / "masks", r.id),
+                template_path(data_dir / "templates", r.id),
+                data_dir / "records" / f"{r.id}.json",
+            ):
+                try:
+                    p.unlink()
+                    deleted += 1
+                except FileNotFoundError:
+                    pass
+        log.info("Deleted %d on-disk artifacts for dropped records.", deleted)
+
+    click.echo(f"Dropped {len(dropped)}/{len(records)} obsolete records.")
+
+
 # Allow running as module
 if __name__ == "__main__":
     prepare()

@@ -23,6 +23,8 @@ def _register_commands() -> None:
     from deepfold3.scripts.msa_search import msa_search
     from deepfold3.scripts.plot_confidences import plot
     from deepfold3.scripts.prepare import (
+        drop_obsolete,
+        enrich_manifest,
         export_complexes,
         fetch_ccd,
         import_msa,
@@ -31,6 +33,7 @@ def _register_commands() -> None:
         prepare,
     )
     from deepfold3.scripts.prepare_templates import prepare_templates
+    from deepfold3.scripts.scan_mmcif import scan_mmcif
     from deepfold3.scripts.train import train
 
     cli.add_command(inference)
@@ -44,6 +47,9 @@ def _register_commands() -> None:
     cli.add_command(import_of3)
     cli.add_command(import_paired_msa)
     cli.add_command(export_complexes)
+    cli.add_command(enrich_manifest)
+    cli.add_command(drop_obsolete)
+    cli.add_command(scan_mmcif)
     cli.add_command(prepare_templates)
     cli.add_command(train)
 

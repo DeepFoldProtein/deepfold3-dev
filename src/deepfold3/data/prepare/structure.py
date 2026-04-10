@@ -88,33 +88,108 @@ def _strip_duplicate_loops(text: str) -> gemmi.cif.Document:
 
 
 def _read_cif_lenient(path: Path) -> gemmi.cif.Document:
-    """Read a CIF file, stripping duplicate loop blocks that gemmi rejects."""
-    return _strip_duplicate_loops(_read_cif_text(path))
+    """Read a CIF file. Tries the fast path first; falls back to stripping
+    duplicate loop blocks only if gemmi rejects the file.
 
-
-def _extract_metadata(block: gemmi.cif.Block, resolution: float | None) -> StructureInfo:
-    """Extract resolution, method, dates from a CIF block."""
-    method = None
-    deposited = None
-    released = None
+    Most wwPDB mirror files parse cleanly, so the duplicate-loop scrub
+    should rarely run.
+    """
+    text = _read_cif_text(path)
     try:
-        method_val = block.find_value("_exptl.method")
-        if method_val:
-            method = gemmi.cif.as_string(method_val)
-        dep_val = block.find_value("_pdbx_database_status.recvd_initial_deposition_date")
-        if dep_val:
-            deposited = gemmi.cif.as_string(dep_val)
-        rel_val = block.find_value("_pdbx_audit_revision_history.revision_date")
-        if rel_val:
-            released = gemmi.cif.as_string(rel_val)
+        return gemmi.cif.read_string(text)
+    except (RuntimeError, ValueError):
+        return _strip_duplicate_loops(text)
+
+
+def _cif_loop_or_value(block: gemmi.cif.Block, tag: str) -> list[str]:
+    """Return all values of a CIF tag as a list, handling key-value or loop form.
+
+    ``gemmi.cif.Block.find_value`` returns ``None`` for loop columns and
+    ``find_loop`` returns an empty Table for key-value pairs, so neither one
+    handles both forms. This helper returns a list of strings (possibly empty)
+    in either case.
+    """
+    loop = list(block.find_loop(tag))
+    if loop:
+        return [gemmi.cif.as_string(v) for v in loop]
+    val = block.find_value(tag)
+    return [gemmi.cif.as_string(val)] if val else []
+
+
+# Resolution priority order from AlphaFold 3 (references/alphafold3/.../structure/mmcif.py:240-242)
+_RESOLUTION_KEYS = (
+    "_refine.ls_d_res_high",
+    "_em_3d_reconstruction.resolution",
+    "_reflns.d_resolution_high",
+)
+
+
+def _get_resolution(block: gemmi.cif.Block) -> float | None:
+    """Resolution from the first parseable mmCIF tag, AF3-style priority."""
+    for key in _RESOLUTION_KEYS:
+        for raw in _cif_loop_or_value(block, key):
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def _get_method(block: gemmi.cif.Block) -> str | None:
+    """Comma-joined lowercased ``_exptl.method`` list (matches AlphaFold 3)."""
+    methods = _cif_loop_or_value(block, "_exptl.method")
+    return ",".join(m.lower() for m in methods) if methods else None
+
+
+def _get_release_date(block: gemmi.cif.Block) -> str | None:
+    """Earliest ``_pdbx_audit_revision_history.revision_date`` (initial release).
+
+    Revision rows are stored as ISO 8601 ``YYYY-MM-DD``, so lexicographic
+    ``min`` is also chronological.
+    """
+    rows = _cif_loop_or_value(block, "_pdbx_audit_revision_history.revision_date")
+    return min(rows) if rows else None
+
+
+def _get_deposition_date(block: gemmi.cif.Block) -> str | None:
+    """``_pdbx_database_status.recvd_initial_deposition_date`` (single value)."""
+    rows = _cif_loop_or_value(block, "_pdbx_database_status.recvd_initial_deposition_date")
+    return rows[0] if rows else None
+
+
+def _extract_metadata(block: gemmi.cif.Block) -> StructureInfo:
+    """Extract resolution, method, and dates from a CIF block (AF3-aligned).
+
+    Always returns a ``StructureInfo`` (never ``None``) — fields that can't
+    be parsed are left as ``None`` so callers can rely on the dataclass
+    being present even when the underlying tags are missing or malformed.
+    """
+    try:
+        return StructureInfo(
+            resolution=_get_resolution(block),
+            method=_get_method(block),
+            deposited=_get_deposition_date(block),
+            released=_get_release_date(block),
+        )
     except Exception:
         logger.debug("Failed to extract some metadata fields", exc_info=True)
-    return StructureInfo(
-        resolution=resolution,
-        method=method,
-        deposited=deposited,
-        released=released,
-    )
+        return StructureInfo()
+
+
+def extract_mmcif_metadata(cif_path: Path) -> StructureInfo | None:
+    """Read just the metadata block of an mmCIF (or .cif.gz / .cif.zst).
+
+    Returns ``None`` if the file can't be parsed. Extracts resolution,
+    method, deposited, and released using the same convention as AlphaFold
+    3 (references/alphafold3/.../structure/mmcif.py:212-249) so the values
+    are directly comparable to AF3's template-cutoff logic.
+    """
+    try:
+        block = _read_cif_lenient(cif_path)[0]
+    except Exception:
+        logger.debug("Failed to read metadata from %s", cif_path, exc_info=True)
+        return None
+    return _extract_metadata(block)
 
 
 def _expand_assembly(st: gemmi.Structure, assembly_id: str = "1") -> gemmi.Model:
@@ -193,26 +268,16 @@ def process_mmcif(
     Returns:
         Tuple of (Structure, Record).
     """
-    # Read CIF text once, then parse. Re-uses the cached text on retry so
-    # compressed files (.gz/.zst) are only decompressed once.
     # Some CIF files (e.g. PATCHR Atlas ModelCIF) have duplicate _chem_comp
-    # loops; gemmi rejects these, so we strip duplicates on retry.
-    cif_text = _read_cif_text(path)
-    try:
-        doc = gemmi.cif.read_string(cif_text)
-    except RuntimeError as exc:
-        if "duplicate tag" in str(exc):
-            doc = _strip_duplicate_loops(cif_text)
-        else:
-            raise
+    # loops; _read_cif_lenient strips them as a fallback.
+    doc = _read_cif_lenient(path)
     st = gemmi.make_structure_from_block(doc[0])
     file_stem = Path(path).stem.split(".")[0].lower()
     # Use entry ID from CIF, but fall back to filename for generic IDs
     # (e.g. ModelCIF files use "_entry.id model")
     pdb_id = st.name.lower() if st.name and st.name.lower() != "model" else file_stem
 
-    resolution = st.resolution if st.resolution > 0 else None
-    metadata = _extract_metadata(doc[0], resolution)
+    metadata = _extract_metadata(doc[0])
 
     # Build entity → mol_type mapping
     entity_mol_type: dict[str, int] = {}

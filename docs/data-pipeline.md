@@ -338,17 +338,26 @@ For server mode (ColabFold API), the server runs `pairgreedy` or `paircomplete` 
 
 #### Storage
 
-Paired and unpaired MSAs are stored as **separate files**:
+Paired and unpaired MSAs are stored as **separate sharded NPZ trees**:
 
 ```
 data_dir/msa/
-├── {msa_id}.npz              # Unpaired MSA (keyed by SHA256 of chain sequence)
-├── {msa_id}.a3m              # Unpaired A3M source
-├── {record_id}_paired_0.npz  # Paired MSA for chain 0 of this complex
-├── {record_id}_paired_0.a3m  # Paired A3M source
-├── {record_id}_paired_1.npz  # Paired MSA for chain 1
-└── ...
+├── unpaired/
+│   └── {ab}/
+│       └── {msa_id}.npz                    # SHA256 of chain sequence
+└── paired/
+    └── {ab}/
+        └── {record_id}_paired_{chain_hash}.npz  # complex-specific
 ```
+
+`{ab}` is the first two characters of the file id (256 buckets), so each
+shard holds ~hundreds of files instead of tens of thousands. The path
+helpers in `data/msa/paths.py` (`unpaired_msa_path`, `paired_msa_path`)
+are the single source of truth — never construct `msa/{id}.npz` inline.
+
+By default the `.a3m` source is **not** copied alongside the NPZ
+(`import-msa` / `import-paired-msa` parse in place). Pass `--keep-a3m` to
+also write the A3M next to its NPZ.
 
 The manifest tracks both via `ChainInfo`:
 
@@ -589,7 +598,7 @@ After cropping, `_reindex()` rebuilds all token indices, filters bonds to those 
 
 ```python
 class Featurizer:
-    def __init__(self, max_atoms: int = 24, max_msa_seqs: int = 2048):
+    def __init__(self, max_atoms: int = 24, max_msa_seqs: int = const.MAX_MSA_ROWS):  # 16384
     def process(self, data: Tokenized, training: bool = True, random_rot: bool = True, ...) -> dict[str, Tensor]:
 ```
 
@@ -665,7 +674,7 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 - Creates a single-row MSA `[1, N]` with all-True mask
 - Tokenizes and featurizes with `training=False, random_rot=False`
 
-### `InferenceInput.from_a3m(a3m_text, mol_type="protein", max_msa_seqs=2048, templates=None)`
+### `InferenceInput.from_a3m(a3m_text, mol_type="protein", max_msa_seqs=16384, templates=None)`
 
 - Parses full A3M text via `parse_a3m()`
 - Reconstructs query sequence from MSA row 0 (skipping gap indices)
@@ -673,7 +682,7 @@ Returns `RefAtomData`: `positions [M, 3]`, `mask [M]`, `element [M]`, `charge [M
 - Tokenizes and featurizes with `training=False, random_rot=False`
 - Optional `templates: list[TemplateFeatures]` -- if provided, template features (aatype, pseudo-beta, backbone frames) are computed and included in output
 
-### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=2048, max_templates=4, template_cache_dir=None)`
+### `InferenceInput.from_json(json_path, job_index=0, max_msa_seqs=16384, max_templates=4, template_cache_dir=None)`
 
 - Parses JSON input via `parse_json_input()` (supports all four dialects) — all file I/O happens in `parse_json_input()`
 - MSA objects and template hits come pre-parsed from `JobInput` chain dataclasses — `from_json()` does only computation
@@ -691,10 +700,12 @@ All methods accept `mol_type` as `"protein"`, `"rna"`, or `"dna"` (case-insensit
 
 ```python
 class TrainingDataset(torch.utils.data.Dataset):
-    def __init__(self, records, data_dir, max_tokens=384, max_atoms=2048, max_msa_seqs=2048):
+    def __init__(self, records, data_dir, max_tokens=384, max_atoms=4096, max_msa_seqs=16384):
 ```
 
-- Loads `{data_dir}/structures/{record.id}.npz` and `{data_dir}/msa/{chain.msa_id}.npz`
+- Loads structure / MSA / mask / template files via the sharded path helpers
+  (`structure_path`, `unpaired_msa_path`, `paired_msa_path`, `mask_path`,
+  `template_path`)
 - Runs the full pipeline: tokenize -> crop -> featurize (with random rotation)
 
 ## Batch Collation (`data/module/collate.py`)
@@ -795,26 +806,66 @@ Two workflows:
 
 ### Batch MSA Generation (`scripts/msa_batch.py`)
 
-`deepfold3 msa-batch` extracts unique protein sequences from the manifest, searches via local MMseqs2 (GPU optional) against UniRef30 + ColabFoldDB, and writes per-sequence A3M + NPZ to `{data_dir}/msa/`. Resume-safe: skips sequences with existing NPZ; converts A3M-only without re-searching.
+`deepfold3 msa-batch` extracts unique protein sequences from the manifest, searches via local MMseqs2 (GPU optional) against UniRef30 + ColabFoldDB, and writes per-sequence A3M + NPZ to `{data_dir}/msa/unpaired/{ab}/`. Resume-safe: skips sequences with existing NPZ; converts A3M-only via the shared parallel materializer (`data/prepare/materialize.py`).
 
-### MSA Import for Distillation (`scripts/prepare.py`)
+### MSA Import (`scripts/prepare.py`)
 
-For distillation databases (AFDB, ESMFold, etc.) that provide pre-computed A3Ms:
+Two import commands share the same materialize machinery (parallel A3M parse → NPZ):
 
-- `deepfold3 prepare --msa-dir <dir>` — import during structure preprocessing
-- `deepfold3 import-msa --data-dir <dir> --msa-dir <dir>` — import into existing dataset
+- `deepfold3 import-msa --data-dir <dir> --msa-dir <a3m_dir> --workers N` — unpaired MSAs (e.g. AFDB / external dumps)
+- `deepfold3 import-paired-msa --data-dir <dir> --paired-dir <complex_dir> --workers N` — per-complex paired MSAs (record-specific)
 
-Matching is naming-convention-agnostic: reads the query sequence from each A3M file, computes SHA256, and copies to `{data_dir}/msa/{msa_id}.a3m`.
+Both:
+1. Try a direct filename lookup `{src}/{msa_id}.a3m` first (free for files already named by msa hash)
+2. Fall back to a content-hash index built from the source dir (slow, only used if filenames don't match)
+3. Parse A3M in place by default; pass `--keep-a3m` to also copy the source A3M alongside the NPZ
+4. Pre-create the 256 hex shard subdirectories upfront so per-file `mkdir` calls are skipped
+
+A3M parsing is the bottleneck (pure-Python char-by-char), so set `--workers N` for real datasets.
 
 ### Manifest (`data/prepare/manifest.py`)
 
 ```python
-def save_manifest(records, path): ...
+def save_manifest(records, path): ...      # atomic .tmp + os.replace + .old backup
 def load_manifest(path) -> list[Record]: ...
 def discover_records(data_dir) -> list[Record]: ...
-def load_id_list(path) -> set[str]: ...  # text file of PDB IDs
+def load_id_list(path) -> set[str]: ...     # text file of PDB IDs
 ```
 
-- `discover_records()` loads `manifest.json` if present, otherwise scans `structures/` for NPZ files and builds minimal records
+- `save_manifest` writes JSON to `{path}.tmp`, fsyncs the file, swaps the previous manifest to `{path}.old` (single-generation backup), `os.replace`s the new file into place, and fsyncs the parent directory. POSIX `rename(2)` is atomic, so concurrent readers always see either the previous or the new manifest — never a half-written one.
+- `discover_records()` loads `manifest.json` if present, otherwise scans `structures/` recursively (the layout is sharded — see below) and builds minimal records
 - `load_id_list()` loads a text file of PDB IDs (one per line, `#` comments) for `--include-list`/`--exclude-list` filtering
 - Used by `deepfold3 train` to find training data
+
+### Sharded On-Disk Layout (`data/paths.py`, `data/msa/paths.py`)
+
+Every persistent file in `{data_dir}/` is sharded by the first two characters of the file id (256 buckets) so listing, `rsync`, backups, and inode walks stay fast even with hundreds of thousands of files:
+
+```
+data_dir/
+├── manifest.json
+├── structures/
+│   └── {ab}/{pdb_id}.npz          # Structure NPZ
+├── masks/
+│   └── {ab}/{pdb_id}.npz          # TokenMask NPZ (optional)
+├── templates/
+│   └── {ab}/{pdb_id}.json         # Template hit index (optional)
+└── msa/
+    ├── unpaired/{ab}/{msa_id}.npz                       # per-sequence
+    └── paired/{ab}/{record_id}_paired_{chain_hash}.npz  # per-complex
+```
+
+Use the helpers in `data/paths.py` (`structure_path`, `mask_path`, `template_path`) and `data/msa/paths.py` (`unpaired_msa_path`, `paired_msa_path`) instead of constructing inline. The dataloader (`data/module/dataset.py`) and every writer (`scripts/prepare.py`, `scripts/msa_batch.py`, `scripts/prepare_templates.py`, `scripts/scan_mmcif.py`) share the same path rules.
+
+### Manifest Enrichment
+
+`deepfold3 enrich-manifest` fills `structure_info` (`resolution`, `method`, `deposited`, `released`) on every record. Two complementary sources, both optional but at least one required:
+
+- `--idx <entries.idx>` — fast TSV pass over the wwPDB ``entries.idx`` derived-data file. Fills ``resolution`` (X-ray entries only), ``method``, and ``deposited``. Does **not** carry release dates.
+- `--mmcif-cache <cache.json>` — JSON metadata cache produced by `deepfold3 scan-mmcif`. Fills ``released`` (= the earliest ``_pdbx_audit_revision_history.revision_date``, matching AlphaFold 3's template date-cutoff convention) and any other field still blank.
+
+`deepfold3 scan-mmcif --mmcif-dir <pdb_mirror> --data-dir <data_dir> --output cache.json --workers N` walks the local mirror (parallel gemmi parse) and dumps `{pdb_id: {resolution, method, deposited, released}}` JSON. AF3-aligned: tries `_refine.ls_d_res_high` → `_em_3d_reconstruction.resolution` → `_reflns.d_resolution_high` for resolution and lowercases the comma-joined `_exptl.method` list. Implementation: `data/prepare/structure.py:extract_mmcif_metadata`. The fast path constructs `{mid2}/{pdb_id}.cif.gz` directly to avoid `find_pdb_mmcif_path`'s 9-candidate stat scan per entry.
+
+### Dropping Obsolete Records
+
+`deepfold3 drop-obsolete --data-dir <dir> [--ids-file file] [--delete-files]` removes manifest records that wwPDB has marked obsolete. The default fetch is wwPDB's canonical `https://files.wwpdb.org/pub/pdb/data/status/obsolete.dat` (text format); `--ids-file` accepts either a local copy of `obsolete.dat` or a JSON array of PDB IDs (e.g. RCSB's `rest/v1/holdings/removed/entry_ids` response). Manifest is saved before any file deletion so a crash mid-delete cannot leave the manifest pointing at missing structures. MSA NPZs are intentionally **not** deleted — they're keyed by sequence hash and typically shared across many records.
