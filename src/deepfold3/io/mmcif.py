@@ -69,9 +69,7 @@ def asym_id_to_chain_name(asym_id: int) -> str:
     return letters[asym_id // n - 1] + letters[asym_id % n]
 
 
-def _decode_atom_name(chars: torch.Tensor) -> str:
-    """Decode 4-int atom name tensor (ord(c)-32 encoding) to string."""
-    return "".join(chr(int(c) + 32) for c in chars).strip()
+from deepfold3.data.feature.ref_atoms import decode_atom_name_chars as _decode_atom_name  # noqa: E402
 
 
 def _cif_quote(value: str) -> str:
@@ -261,14 +259,17 @@ def save_mmcif(
     num_plddt_bins: int = 50,
     entity_descriptions: dict[str, str] | None = None,
     title: str | None = None,
+    sample_idx: int | None = None,
 ) -> None:
     """Write predicted structure(s) to an mmCIF file.
 
     Converts model output to Structure objects (one per sample), then
     delegates to structure_to_mmcif() for mmCIF generation.
 
-    For multi-sample output, only the first sample is written (each sample
-    can be saved separately via prediction_to_structure + save_structure_mmcif).
+    If ``sample_idx`` is provided, a single-model mmCIF is written for
+    that sample index. Otherwise, when ``num_samples == 1`` the single
+    sample is written, and when ``num_samples > 1`` the legacy
+    multi-MODEL mmCIF writer is used (one MODEL block per sample).
 
     Parameters
     ----------
@@ -281,17 +282,27 @@ def save_mmcif(
     entity_descriptions : Optional mapping from chain name to description
                           string, written as _entity.pdbx_description.
     title :          Optional structure title, written as _struct.title.
+    sample_idx :     If provided, write only this single sample (one MODEL
+                     block). Used by the AF3-compatible per-(seed, sample)
+                     output layout.
     """
     from deepfold3.io.structure_builder import prediction_to_structure
     from deepfold3.io.structure_mmcif import save_structure_mmcif
 
     path = Path(path)
 
-    # Build one Structure per sample and write the first one
-    # (multi-model mmCIF with all samples from a single Structure would
-    # require merging, which is not yet supported — callers can save
-    # individual samples separately)
     num_samples = output.atom_positions.shape[0]
+
+    # Explicit sample_idx → always write single-model mmCIF via the
+    # Structure-based path.
+    if sample_idx is not None:
+        if sample_idx < 0 or sample_idx >= num_samples:
+            raise IndexError(f"sample_idx={sample_idx} out of range for {num_samples} samples")
+        structure = prediction_to_structure(
+            output, features, sample_idx=sample_idx, name=path.stem, num_plddt_bins=num_plddt_bins
+        )
+        save_structure_mmcif(path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title)
+        return
 
     if num_samples == 1:
         structure = prediction_to_structure(

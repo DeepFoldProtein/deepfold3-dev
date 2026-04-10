@@ -75,6 +75,7 @@ class Featurizer:
                 entity_id [N] int64, sym_id [N] int64,
                 seq_mask [N] bool, pair_mask [N,N] bool,
                 frames_mask [N] bool, token_to_rep_atom [N] int64,
+                frame_atom_index [N,3] int64,
                 ref_pos [N,M,3] float32, ref_mask [N,M] bool,
                 ref_element [N,M] int64, ref_charge [N,M] float32,
                 ref_atom_name_chars [N,M,4] int64,
@@ -244,22 +245,22 @@ class Featurizer:
 
         pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)  # [N, N]
 
-        # ------------------------------------------------------------------
-        # frames_mask: True for polymer tokens (which have backbone frames)
-        # Used for pTM/ipTM computation — excludes frameless tokens (ions, ligand atoms)
-        # ------------------------------------------------------------------
+        # frames_mask starts as the polymer mask and is tightened below if
+        # any of the three frame atoms is missing from the residue.
+        # Also drives frame-aligned PAE (AF3 §3.6.2, §3.7.5).
         mol_types = tokens["mol_type"]
-        frames_mask = torch.from_numpy(
-            ((mol_types == const.MOL_PROTEIN) | (mol_types == const.MOL_RNA) | (mol_types == const.MOL_DNA)).astype(
-                bool
-            )
-        )
+        frames_mask_np = (
+            (mol_types == const.MOL_PROTEIN) | (mol_types == const.MOL_RNA) | (mol_types == const.MOL_DNA)
+        ).astype(bool)
 
-        # ------------------------------------------------------------------
-        # token_to_rep_atom: index of representative atom per token
-        # CB for protein (CA for GLY), C1' for nucleic acids, 0 for ligand
-        # ------------------------------------------------------------------
+        # token_to_rep_atom: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand.
+        # frame_atom_index: indices of the three frame atoms — (N, CA, C) for
+        # proteins, (C1', C3', C4') for nucleic acids, (0, 0, 0) for ligand
+        # tokens (gated out via frames_mask).
+        from deepfold3.data.feature.ref_atoms import decode_atom_name_chars
+
         token_to_rep_atom = np.zeros(N, dtype=np.int64)
+        frame_atom_index = np.zeros((N, 3), dtype=np.int64)
         for i, tok in enumerate(tokens):
             mt = int(tok["mol_type"])
             rt = int(tok["res_type"])
@@ -268,16 +269,29 @@ class Featurizer:
                     token_to_rep_atom[i] = 1  # CA
                 else:
                     token_to_rep_atom[i] = 4 if ref_mask[i, 4] else 1  # CB if present, else CA
+                frame_atom_index[i] = (0, 1, 2)
+                if not (ref_mask[i, 0] and ref_mask[i, 1] and ref_mask[i, 2]):
+                    frames_mask_np[i] = False
             elif mt in (const.MOL_RNA, const.MOL_DNA):
-                # C1' — find its index in the ref atoms
+                c1_idx = c3_idx = c4_idx = -1
                 for j in range(M):
-                    if ref_mask[i, j]:
-                        name_ints = ref_atom_name_chars[i, j]
-                        name = "".join(chr(int(c) + 32) for c in name_ints).strip()
-                        if name == "C1'":
-                            token_to_rep_atom[i] = j
-                            break
-            # Ligand: default 0 (first/only atom)
+                    if not ref_mask[i, j]:
+                        continue
+                    name = decode_atom_name_chars(ref_atom_name_chars[i, j])
+                    if name == "C1'":
+                        c1_idx = j
+                    elif name == "C3'":
+                        c3_idx = j
+                    elif name == "C4'":
+                        c4_idx = j
+                if c1_idx >= 0:
+                    token_to_rep_atom[i] = c1_idx
+                if c1_idx >= 0 and c3_idx >= 0 and c4_idx >= 0:
+                    frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
+                else:
+                    frames_mask_np[i] = False
+
+        frames_mask = torch.from_numpy(frames_mask_np)
 
         # ------------------------------------------------------------------
         # mol_type: molecule type per token (protein/DNA/RNA/non-polymer)
@@ -313,6 +327,7 @@ class Featurizer:
             "pair_mask": pair_mask,
             "frames_mask": frames_mask,
             "token_to_rep_atom": torch.from_numpy(token_to_rep_atom),
+            "frame_atom_index": torch.from_numpy(frame_atom_index),
             "ref_pos": torch.from_numpy(ref_pos),
             "ref_mask": torch.from_numpy(ref_mask),
             "ref_element": torch.from_numpy(ref_element),
@@ -962,6 +977,7 @@ class Featurizer:
             "pair_mask": torch.zeros(0, 0, dtype=torch.bool),
             "frames_mask": torch.zeros(0, dtype=torch.bool),
             "token_to_rep_atom": torch.zeros(0, dtype=torch.int64),
+            "frame_atom_index": torch.zeros(0, 3, dtype=torch.int64),
             "ref_pos": torch.zeros(0, M, 3),
             "ref_mask": torch.zeros(0, M, dtype=torch.bool),
             "ref_element": torch.zeros(0, M, dtype=torch.int64),

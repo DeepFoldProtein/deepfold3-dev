@@ -9,10 +9,10 @@ uv run python -m deepfold3.scripts.inference \\
     --num-samples  5 \\
     --seed     42
 
-# Or from a Protenix-format JSON input:
+# Or from an AF3/Protenix-format JSON input:
 uv run python -m deepfold3.scripts.inference \\
     --json     path/to/input.json \\
-    --output   output/prediction.cif \\
+    --output   output_dir/ \\
     --params   resources/deepfold3.safetensors \\
     --template-cache /tmp/template_cache
 
@@ -21,13 +21,19 @@ Supported parameter formats:
   - ``.bin`` / ``.bin.zst`` — raw AF3 params (on-the-fly conversion;
     Fourier weights will be missing — run ``convert_weights.py`` first)
 
-The script produces one mmCIF file whose MODEL blocks are the requested
-diffusion samples.  Per-atom pLDDT is stored in the B-factor column.
+For ``--json`` input, the output directory is populated with one
+sub-directory per (seed, sample) pair named ``seed-{seed}_sample-{idx}/``
+containing ``model.cif`` and ``confidences.json``, plus a top-level
+``ranking_scores.csv`` and ``{job_name}_summary_confidences.json``
+mirroring the AlphaFold 3 output layout.
+
+For ``--msa`` / ``--sequence`` input, a single mmCIF file with all
+samples stacked as MODEL blocks is written to ``--output``.
+Per-atom pLDDT is stored in the B-factor column.
 """
 
 from __future__ import annotations
 
-import math
 import time
 from pathlib import Path
 
@@ -69,8 +75,18 @@ import torch
     help="Molecule type",
 )
 @click.option("--num-recycles", default=10, show_default=True, help="Evoformer recycling iterations")
-@click.option("--num-samples", default=1, show_default=True, help="Number of diffusion samples")
-@click.option("--seed", default=42, show_default=True, help="Random seed for diffusion sampling")
+@click.option("--num-samples", default=5, show_default=True, help="Number of diffusion samples per seed")
+@click.option(
+    "--seed",
+    default=None,
+    type=int,
+    help=(
+        "Random seed for diffusion sampling. For --json input, this is "
+        "prepended to the JSON's modelSeeds list (all seeds are run). "
+        "Defaults to 42 for --msa/--sequence input, and to the JSON's "
+        "modelSeeds otherwise."
+    ),
+)
 @click.option("--device", default=None, help="Torch device (e.g. 'cuda', 'cpu'). Auto-detected if omitted.")
 @click.option(
     "--templates",
@@ -105,7 +121,7 @@ def inference(
     mol_type: str,
     num_recycles: int,
     num_samples: int,
-    seed: int,
+    seed: int | None,
     device: str | None,
     templates: Path | None,
     template_cache: Path | None,
@@ -264,142 +280,133 @@ def inference(
     feats = {k: v.to(dev) for k, v in feats.items()}
 
     # ------------------------------------------------------------------
-    # Inference
+    # Determine seed list. JSON inputs honour the JSON's modelSeeds
+    # (with --seed prepended if explicitly passed); MSA/sequence inputs
+    # use a single seed (default 42).
     # ------------------------------------------------------------------
-    click.echo(f"[inference] running model  (recycles={num_recycles}, samples={num_samples}, seed={seed}) …")
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        model_output = model(
-            feats,
-            seed=seed,
-            num_recycles=num_recycles,
-            num_samples=num_samples,
-        )
+    if json_input is not None:
+        json_seeds = list(job.model_seeds) if job.model_seeds else [42]
+        if seed is not None:
+            seed_list = [seed] + [s for s in json_seeds if s != seed]
+        else:
+            seed_list = json_seeds
+    else:
+        seed_list = [seed if seed is not None else 42]
 
-    # Remove bucket padding from output and feats
-    if use_bucket and original_n < feats["res_type"].shape[0]:
-        from deepfold3.model.bucket import unpad_features, unpad_output
-
-        model_output = unpad_output(model_output, original_n)
-        feats = unpad_features(feats, original_n)
-
-    elapsed = time.perf_counter() - t0
-    click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
-
-    # ------------------------------------------------------------------
-    # Confidence metrics + save
-    # ------------------------------------------------------------------
     from deepfold3.io.confidences import (
-        compute_iptm,
-        compute_pde,
-        compute_plddt,
-        compute_ptm,
-        compute_ranking_score,
-        fraction_disordered,
-        has_clash,
         save_confidences_json,
+        save_ranking_scores_csv,
+        save_summary_confidences_json,
     )
-
-    atom_mask = model_output.atom_mask[0].float()  # [N, M] — same for all samples
-    seq_mask = feats["seq_mask"].float().to(dev)
-    pair_mask = feats["pair_mask"].float().to(dev)
-    asym_id = feats["asym_id"].to(dev)
-    seq_mask_cpu = feats["seq_mask"].float().cpu()
-    seq_mask_sum = seq_mask_cpu.sum().clamp(min=1)
-
-    # Use frames_mask for pTM/ipTM (excludes frameless tokens like ions/ligands)
-    if "frames_mask" in feats:
-        tm_mask = feats["frames_mask"].float().to(dev)
-        tm_pair_mask = (tm_mask.unsqueeze(-1) * tm_mask.unsqueeze(-2)) * pair_mask
-    else:
-        tm_mask = seq_mask
-        tm_pair_mask = pair_mask
-
-    # Compute pLDDT once for all samples
-    per_token_plddt = None
-    if model_output.plddt is not None:
-        _, per_token_plddt = compute_plddt(model_output.plddt, atom_mask)
-
-    # Polymer mask for clash/disorder
-    polymer_mask = feats["frames_mask"].to(dev) if "frames_mask" in feats else seq_mask.bool()
-
-    sample_rankings: list[tuple[float, int]] = []  # (ranking_score, sample_idx)
-
-    for s in range(num_samples):
-        metrics = []
-
-        if per_token_plddt is not None:
-            mean_plddt = float((per_token_plddt[s].cpu() * seq_mask_cpu).sum() / seq_mask_sum)
-            metrics.append(f"pLDDT={mean_plddt:.1f}")
-
-        ptm = 0.0
-        iptm = float("nan")
-        if model_output.pae is not None:
-            ptm = compute_ptm(model_output.pae[s], tm_mask, tm_pair_mask)
-            iptm = compute_iptm(model_output.pae[s], tm_mask, tm_pair_mask, asym_id)
-            metrics.append(f"pTM={ptm:.3f}")
-            if not math.isnan(iptm):
-                metrics.append(f"ipTM={iptm:.3f}")
-
-        if model_output.pde is not None:
-            _, avg_pde = compute_pde(model_output.pde, pair_mask)
-            metrics.append(f"gPDE={float(avg_pde[s]):.2f}")
-
-        frac_disorder = 0.0
-        if per_token_plddt is not None:
-            frac_disorder = fraction_disordered(per_token_plddt[s].to(dev), polymer_mask)
-        sample_clash = has_clash(
-            model_output.atom_positions[s],
-            atom_mask,
-            feats["residue_index"].to(dev),
-            asym_id,
-            polymer_mask,
-        )
-        ranking = compute_ranking_score(ptm, iptm, frac_disorder, sample_clash)
-        metrics.append(f"disorder={frac_disorder:.3f}")
-        if sample_clash:
-            metrics.append("CLASH")
-        metrics.append(f"ranking={ranking:.3f}")
-
-        sample_rankings.append((ranking, s))
-        click.echo(f"  sample {s}: {', '.join(metrics)}")
-
-    # Print ranked summary
-    if num_samples > 1:
-        sample_rankings.sort(reverse=True)
-        click.echo("[inference] ranking:")
-        for rank, (score, s_idx) in enumerate(sample_rankings, 1):
-            name = f"{job_name}_sample{s_idx}" if job_name else f"sample_{s_idx}"
-            click.echo(f"  #{rank}  {name}  ranking_score={score:.4f}")
-
-    # Determine output paths
-    if job_name is not None:
-        # JSON input: output is a directory, filenames from job name
-        output_dir = output
-        output_dir.mkdir(parents=True, exist_ok=True)
-        cif_path = output_dir / f"{job_name}.cif"
-    else:
-        # MSA input: output is a .cif file path
-        cif_path = output
-        output_dir = cif_path.parent
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save mmCIF
-    click.echo(f"[inference] writing {cif_path} …")
     from deepfold3.io.mmcif import save_mmcif
 
-    save_mmcif(cif_path, model_output, feats, entity_descriptions=entity_descriptions, title=job_title)
-    click.echo(f"  saved  {cif_path.resolve()}")
+    if json_input is not None:
+        output_dir = output
+    else:
+        cif_path = output
+        output_dir = cif_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save confidences JSON (per sample)
-    for s in range(num_samples):
-        stem = job_name if job_name is not None else cif_path.stem
-        if num_samples == 1:
-            json_path = output_dir / f"{stem}_confidences.json"
-        else:
-            json_path = output_dir / f"{stem}_sample{s}_confidences.json"
-        save_confidences_json(json_path, model_output, feats, sample_idx=s, seed=seed)
-        click.echo(f"  saved  {json_path.resolve()}")
+    summaries: list[dict] = []  # one entry per (seed, sample), augmented with seed/sample
+
+    for current_seed in seed_list:
+        click.echo(
+            f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, "
+            f"samples={num_samples}) …"
+        )
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            model_output = model(
+                feats,
+                seed=current_seed,
+                num_recycles=num_recycles,
+                num_samples=num_samples,
+            )
+
+        iter_feats = feats
+        if use_bucket and original_n < feats["res_type"].shape[0]:
+            from deepfold3.model.bucket import unpad_features, unpad_output
+
+            model_output = unpad_output(model_output, original_n)
+            iter_feats = unpad_features(feats, original_n)
+
+        elapsed = time.perf_counter() - t0
+        click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
+
+        # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
+        # per-sample directories.  Either way, save_confidences_json
+        # returns the per-sample summary used for ranking.
+        if json_input is None:
+            click.echo(f"[inference] writing {cif_path} …")
+            save_mmcif(
+                cif_path,
+                model_output,
+                iter_feats,
+                entity_descriptions=entity_descriptions,
+                title=job_title,
+            )
+            click.echo(f"  saved  {cif_path.resolve()}")
+
+        for s in range(num_samples):
+            if json_input is not None:
+                sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
+                sample_dir.mkdir(parents=True, exist_ok=True)
+                save_mmcif(
+                    sample_dir / "model.cif",
+                    model_output,
+                    iter_feats,
+                    entity_descriptions=entity_descriptions,
+                    title=job_title,
+                    sample_idx=s,
+                )
+                conf_path = sample_dir / "confidences.json"
+            else:
+                stem = cif_path.stem
+                conf_path = output_dir / (
+                    f"{stem}_confidences.json" if num_samples == 1 else f"{stem}_sample{s}_confidences.json"
+                )
+
+            summary = save_confidences_json(
+                conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed)
+            )
+            summary = {**summary, "seed": int(current_seed), "sample": int(s)}
+            summaries.append(summary)
+
+            iptm_str = (
+                f", ipTM={summary['iptm']:.3f}"
+                if summary.get("iptm") is not None
+                else ""
+            )
+            clash_str = ", CLASH" if summary["has_clash"] else ""
+            click.echo(
+                f"  seed {current_seed} sample {s}: "
+                f"pLDDT={summary['mean_plddt']:.1f}, pTM={summary['ptm']:.3f}{iptm_str}, "
+                f"gPDE={summary['average_pde']:.2f}, disorder={summary['fraction_disordered']:.3f}"
+                f"{clash_str}, ranking={summary['ranking_score']:.3f}"
+            )
+            click.echo(f"  saved  {conf_path.resolve()}")
+
+    # ------------------------------------------------------------------
+    # Aggregate ranking outputs (JSON input only)
+    # ------------------------------------------------------------------
+    if json_input is not None and summaries:
+        ranking_csv = output_dir / "ranking_scores.csv"
+        save_ranking_scores_csv(ranking_csv, summaries)
+        click.echo(f"  saved  {ranking_csv.resolve()}")
+
+        summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
+        summary_path = output_dir / summary_name
+        save_summary_confidences_json(summary_path, summaries, job_name=job_name)
+        click.echo(f"  saved  {summary_path.resolve()}")
+
+        if len(summaries) > 1:
+            ranked = sorted(summaries, key=lambda r: r["ranking_score"], reverse=True)
+            click.echo("[inference] ranking:")
+            for rank, row in enumerate(ranked, 1):
+                click.echo(
+                    f"  #{rank}  seed-{row['seed']}_sample-{row['sample']}  "
+                    f"ranking_score={row['ranking_score']:.4f}"
+                )
 
 
 if __name__ == "__main__":

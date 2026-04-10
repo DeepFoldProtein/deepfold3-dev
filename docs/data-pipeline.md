@@ -618,8 +618,9 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `token_res_name` | `[N, 5]` | int8 | Residue name as ASCII bytes (e.g. "ALA", "PCG"), 0-padded |
 | `seq_mask` | `[N]` | bool | Valid token mask |
 | `pair_mask` | `[N, N]` | bool | `seq_mask[:, None] & seq_mask[None, :]` |
-| `frames_mask` | `[N]` | bool | True for polymer tokens with backbone frames (protein/RNA/DNA) |
+| `frames_mask` | `[N]` | bool | True for polymer tokens with a complete rigid frame (protein/RNA/DNA, all three frame atoms present) |
 | `token_to_rep_atom` | `[N]` | int64 | Representative atom index: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand |
+| `frame_atom_index` | `[N, 3]` | int64 | Indices of the three atoms used to build each token's rigid frame: (N, CA, C) for proteins, (C1', C3', C4') for nucleic acids, zeros for ligand tokens (gated out by `frames_mask`). Used by the frame-aligned PAE loss (AF3 §3.6.2/§3.7.5). |
 | `ref_pos` | `[N, M, 3]` | float32 | Reference atom positions (CCD ideal coords) |
 | `ref_mask` | `[N, M]` | bool | Valid atom mask |
 | `ref_element` | `[N, M]` | int64 | Atomic number (0-127 via `ELEMENT_TO_INT`) |

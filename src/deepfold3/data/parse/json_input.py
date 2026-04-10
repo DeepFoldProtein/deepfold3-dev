@@ -59,6 +59,10 @@ class ProteinChainInput:
         paired_msa: Parsed paired MSA object (optional).
         unpaired_msa: Parsed unpaired MSA object (optional).
         template_hits: Parsed template hits ready for feature extraction.
+        modifications: Post-translational modifications as ``(ccd_code, position)``
+            tuples where ``position`` is 1-based within the chain. The residue
+            at ``position`` should be assembled using ``ccd_code`` (e.g. ``"SEP"``)
+            instead of the canonical amino acid.
         description: Optional textual description of this chain.
     """
 
@@ -67,6 +71,7 @@ class ProteinChainInput:
     paired_msa: MSA | None = None
     unpaired_msa: MSA | None = None
     template_hits: list[TemplateHitInput] = field(default_factory=list)
+    modifications: list[tuple[str, int]] = field(default_factory=list)
     description: str | None = None
 
 
@@ -80,6 +85,9 @@ class NucleotideChainInput:
         mol_type: const.MOL_DNA or const.MOL_RNA.
         paired_msa: Parsed paired MSA object (optional).
         unpaired_msa: Parsed unpaired MSA object (optional).
+        modifications: Modified-base substitutions as ``(ccd_code, position)``
+            tuples where ``position`` is 1-based within the chain (e.g.
+            ``("5MC", 4)`` for 5-methylcytosine at position 4).
         description: Optional textual description of this chain.
     """
 
@@ -88,6 +96,7 @@ class NucleotideChainInput:
     mol_type: int
     paired_msa: MSA | None = None
     unpaired_msa: MSA | None = None
+    modifications: list[tuple[str, int]] = field(default_factory=list)
     description: str | None = None
 
 
@@ -110,6 +119,10 @@ class LigandChainInput:
     description: str | None = None
 
 
+BondedAtom = tuple[str, int, str]  # (chain_id, residue_index_1based, atom_name)
+BondedAtomPair = tuple[BondedAtom, BondedAtom]
+
+
 @dataclasses.dataclass
 class JobInput:
     """A single prediction job from JSON input.
@@ -121,6 +134,13 @@ class JobInput:
         rna_chains: List of RNA chain inputs.
         ligand_chains: List of ligand chain inputs.
         model_seeds: List of random seeds for diffusion sampling.
+        bonded_atom_pairs: Explicit covalent bonds between atoms, as pairs of
+            ``(chain_id, residue_index_1based, atom_name)`` tuples. Used for
+            inter-entity links like Cys–Cys disulfides, glycan attachments,
+            and metal coordination.
+        user_ccd: Inline mmCIF text defining custom CCD component(s) for
+            ligands not in the standard Chemical Component Dictionary. May
+            contain multiple ``data_<NAME>`` blocks.
         description: Optional job description (written as _struct.title in mmCIF).
     """
 
@@ -130,6 +150,8 @@ class JobInput:
     rna_chains: list[NucleotideChainInput]
     ligand_chains: list[LigandChainInput] = field(default_factory=list)
     model_seeds: list[int] = field(default_factory=lambda: [42])
+    bonded_atom_pairs: list[BondedAtomPair] = field(default_factory=list)
+    user_ccd: str | None = None
     description: str | None = None
 
 
@@ -275,6 +297,7 @@ def _parse_af3_entry(
                 tmpl_hits = _resolve_template_hits(
                     base_dir, p.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir
                 )
+            mods = _parse_modifications(p.get("modifications"))
             desc = p.get("description")
             for _ in ids or [None]:
                 protein_chains.append(
@@ -284,6 +307,7 @@ def _parse_af3_entry(
                         paired_msa=paired,
                         unpaired_msa=unpaired,
                         template_hits=tmpl_hits,
+                        modifications=list(mods),
                         description=desc,
                     )
                 )
@@ -293,6 +317,7 @@ def _parse_af3_entry(
             seq = d["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_DNA, d.get("unpairedMsaPath"), d.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_DNA, d.get("pairedMsaPath"), d.get("pairedMsa"))
+            mods = _parse_modifications(d.get("modifications"))
             desc = d.get("description")
             for _ in ids or [None]:
                 dna_chains.append(
@@ -302,6 +327,7 @@ def _parse_af3_entry(
                         mol_type=const.MOL_DNA,
                         paired_msa=paired,
                         unpaired_msa=unpaired,
+                        modifications=list(mods),
                         description=desc,
                     )
                 )
@@ -311,6 +337,7 @@ def _parse_af3_entry(
             seq = r["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_RNA, r.get("unpairedMsaPath"), r.get("unpairedMsa"))
             paired = _resolve_msa(base_dir, const.MOL_RNA, r.get("pairedMsaPath"), r.get("pairedMsa"))
+            mods = _parse_modifications(r.get("modifications"))
             desc = r.get("description")
             for _ in ids or [None]:
                 rna_chains.append(
@@ -320,6 +347,7 @@ def _parse_af3_entry(
                         mol_type=const.MOL_RNA,
                         paired_msa=paired,
                         unpaired_msa=unpaired,
+                        modifications=list(mods),
                         description=desc,
                     )
                 )
@@ -338,6 +366,9 @@ def _parse_af3_entry(
     if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")
 
+    bonded_atom_pairs = _parse_bonded_atom_pairs(entry.get("bondedAtomPairs"))
+    user_ccd = _resolve_user_ccd(base_dir, entry.get("userCCD"), entry.get("userCCDPath"))
+
     return JobInput(
         name=name,
         protein_chains=protein_chains,
@@ -345,6 +376,8 @@ def _parse_af3_entry(
         rna_chains=rna_chains,
         ligand_chains=ligand_chains,
         model_seeds=model_seeds,
+        bonded_atom_pairs=bonded_atom_pairs,
+        user_ccd=user_ccd,
         description=entry.get("description"),
     )
 
@@ -458,20 +491,26 @@ def _parse_alphafoldserver_entry(
     raw_seeds = entry.get("modelSeeds", [])
     model_seeds = [int(s) for s in raw_seeds] if raw_seeds else [_random.randint(0, 2**32 - 1)]
 
-    # First pass: collect chain specs (sequence, count, type) in order
-    chain_specs: list[tuple[str, str, int]] = []  # (sequence, entity_type, count)
+    # First pass: collect chain specs (sequence, count, type, modifications) in order
+    chain_specs: list[tuple[str, str, int, list[tuple[str, int]]]] = []
     ligand_chains: list[LigandChainInput] = []
 
     for seq_item in entry.get("sequences", []):
         if "proteinChain" in seq_item:
             pc = seq_item["proteinChain"]
-            chain_specs.append((pc["sequence"], "protein", pc.get("count", 1)))
+            chain_specs.append(
+                (pc["sequence"], "protein", pc.get("count", 1), _parse_modifications(pc.get("modifications")))
+            )
         elif "rnaSequence" in seq_item:
             rc = seq_item["rnaSequence"]
-            chain_specs.append((rc["sequence"], "rna", rc.get("count", 1)))
+            chain_specs.append(
+                (rc["sequence"], "rna", rc.get("count", 1), _parse_modifications(rc.get("modifications")))
+            )
         elif "dnaSequence" in seq_item:
             dc = seq_item["dnaSequence"]
-            chain_specs.append((dc["sequence"], "dna", dc.get("count", 1)))
+            chain_specs.append(
+                (dc["sequence"], "dna", dc.get("count", 1), _parse_modifications(dc.get("modifications")))
+            )
         elif "ion" in seq_item:
             ion = seq_item["ion"]
             ion_code = ion.get("ion", "")
@@ -488,16 +527,16 @@ def _parse_alphafoldserver_entry(
                     ligand_chains.append(LigandChainInput(ccd_ids=[ccd_code], count=1))
 
     # Expand chain_specs by count, tracking unique protein sequences for MSA
-    expanded: list[tuple[str, str, int]] = []  # (sequence, entity_type, spec_idx)
-    for spec_idx, (seq, etype, count) in enumerate(chain_specs):
+    expanded: list[tuple[str, str, int, list[tuple[str, int]]]] = []  # (sequence, entity_type, spec_idx, mods)
+    for spec_idx, (seq, etype, count, mods) in enumerate(chain_specs):
         for _ in range(count):
-            expanded.append((seq, etype, spec_idx))
+            expanded.append((seq, etype, spec_idx, mods))
 
     if not expanded and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")
 
     # Run MSA search for all unique protein sequences
-    protein_seqs = list(dict.fromkeys(seq for seq, etype, _ in expanded if etype == "protein"))
+    protein_seqs = list(dict.fromkeys(seq for seq, etype, _, _ in expanded if etype == "protein"))
     msa_cache = _run_msa_search(protein_seqs, max_templates, cache_dir, pdb_mmcif_dir)
 
     # Build chain inputs
@@ -505,7 +544,7 @@ def _parse_alphafoldserver_entry(
     dna_chains: list[NucleotideChainInput] = []
     rna_chains: list[NucleotideChainInput] = []
 
-    for seq, etype, _ in expanded:
+    for seq, etype, _, mods in expanded:
         if etype == "protein":
             cached = msa_cache.get(seq)
             protein_chains.append(
@@ -515,12 +554,20 @@ def _parse_alphafoldserver_entry(
                     paired_msa=cached.paired_msa if cached else None,
                     unpaired_msa=cached.unpaired_msa if cached else None,
                     template_hits=cached.template_hits if cached else [],
+                    modifications=list(mods),
                 )
             )
         elif etype == "rna":
-            rna_chains.append(NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_RNA))
+            rna_chains.append(
+                NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_RNA, modifications=list(mods))
+            )
         elif etype == "dna":
-            dna_chains.append(NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_DNA))
+            dna_chains.append(
+                NucleotideChainInput(sequence=seq, count=1, mol_type=const.MOL_DNA, modifications=list(mods))
+            )
+
+    bonded_atom_pairs = _parse_bonded_atom_pairs(entry.get("bondedAtomPairs"))
+    user_ccd = _resolve_user_ccd(base_dir, entry.get("userCCD"), entry.get("userCCDPath"))
 
     return JobInput(
         name=name,
@@ -529,6 +576,8 @@ def _parse_alphafoldserver_entry(
         rna_chains=rna_chains,
         ligand_chains=ligand_chains,
         model_seeds=model_seeds,
+        bonded_atom_pairs=bonded_atom_pairs,
+        user_ccd=user_ccd,
     )
 
 
@@ -577,6 +626,7 @@ def _parse_protenix_entry(
                             paired_path = str(pairing_file)
                         if non_pairing_file.exists():
                             unpaired_path = str(non_pairing_file)
+            mods = _parse_modifications(pc.get("modifications"))
             for _ in range(count):
                 protein_chains.append(
                     ProteinChainInput(
@@ -587,6 +637,7 @@ def _parse_protenix_entry(
                         template_hits=_resolve_template_hits(
                             base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir
                         ),
+                        modifications=list(mods),
                         description=pc.get("description"),
                     )
                 )
@@ -594,6 +645,7 @@ def _parse_protenix_entry(
             key = next(k for k in _DNA_KEYS if k in seq_item)
             dc = seq_item[key]
             count = dc.get("count", 1)
+            mods = _parse_modifications(dc.get("modifications"))
             for _ in range(count):
                 dna_chains.append(
                     NucleotideChainInput(
@@ -602,6 +654,7 @@ def _parse_protenix_entry(
                         mol_type=const.MOL_DNA,
                         paired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("pairedMsaPath"), None),
                         unpaired_msa=_resolve_msa(base_dir, const.MOL_DNA, dc.get("unpairedMsaPath"), None),
+                        modifications=list(mods),
                         description=dc.get("description"),
                     )
                 )
@@ -619,6 +672,7 @@ def _parse_protenix_entry(
                         non_pairing_file = resolved_dir / "non_pairing.a3m"
                         if non_pairing_file.exists():
                             unpaired_path = str(non_pairing_file)
+            mods = _parse_modifications(rc.get("modifications"))
             for _ in range(count):
                 rna_chains.append(
                     NucleotideChainInput(
@@ -626,6 +680,7 @@ def _parse_protenix_entry(
                         count=1,
                         mol_type=const.MOL_RNA,
                         unpaired_msa=_resolve_msa(base_dir, const.MOL_RNA, unpaired_path, None),
+                        modifications=list(mods),
                         description=rc.get("description"),
                     )
                 )
@@ -657,6 +712,8 @@ def _parse_protenix_entry(
         rna_chains=rna_chains,
         ligand_chains=ligand_chains,
         model_seeds=model_seeds,
+        bonded_atom_pairs=_parse_bonded_atom_pairs(entry.get("bondedAtomPairs")),
+        user_ccd=_resolve_user_ccd(base_dir, entry.get("userCCD"), entry.get("userCCDPath")),
         description=entry.get("description"),
     )
 
@@ -673,10 +730,10 @@ def _parse_deepfold3_entry(
 
     DeepFold3 format is our superset dialect that accepts both AF3-style keys
     (``protein``, ``dna``, ``rna``, ``ligand`` with ``id``) and Protenix-style
-    keys (``proteinChain``, ``dnaSequence``, ``rnaSequence``).  All MSA and
-    template formats are supported.
+    keys (``proteinChain``, ``dnaSequence``, ``rnaSequence``).  Both
+    underlying parsers honour ``modifications`` / ``bondedAtomPairs`` /
+    ``userCCD`` so the dialect needs no additional overlay step.
     """
-    # Detect which key style is used and delegate
     has_af3_keys = False
     has_protenix_keys = False
     for seq_item in entry.get("sequences", []):
@@ -687,10 +744,7 @@ def _parse_deepfold3_entry(
 
     if has_af3_keys and not has_protenix_keys:
         return _parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
-    if has_protenix_keys and not has_af3_keys:
-        return _parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
-
-    # Mixed or ambiguous: try to parse with the protenix parser (more permissive)
+    # Pure Protenix or mixed: protenix parser is the more permissive one.
     return _parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_mmcif_dir)
 
 
@@ -704,6 +758,88 @@ def _ensure_id_list(ids: str | list[str]) -> list[str]:
     if isinstance(ids, str):
         return [ids]
     return list(ids)
+
+
+def _parse_modifications(raw: list | None) -> list[tuple[str, int]]:
+    """Parse a ``modifications`` JSON list into ``(ccd_code, 1-based position)`` tuples.
+
+    Accepts the AF3 schema ``[{"ptmType": "SEP", "ptmPosition": 3}, ...]``.
+    Invalid entries are skipped with a warning.
+    """
+    if not raw:
+        return []
+    result: list[tuple[str, int]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            logger.warning("Skipping non-dict modification entry: %r", entry)
+            continue
+        ccd_code = entry.get("ptmType") or entry.get("modificationType")
+        position = entry.get("ptmPosition")
+        if position is None:
+            position = entry.get("modificationPosition")
+        if not ccd_code or position is None:
+            logger.warning("Skipping modification missing ptmType/ptmPosition: %r", entry)
+            continue
+        try:
+            result.append((str(ccd_code).strip().upper(), int(position)))
+        except (TypeError, ValueError):
+            logger.warning("Skipping modification with non-integer position: %r", entry)
+    return result
+
+
+def _parse_bonded_atom_pairs(raw: list | None) -> list[BondedAtomPair]:
+    """Parse ``bondedAtomPairs`` JSON into a list of atom-pair tuples.
+
+    Expects the AF3 schema::
+
+        [[[chain_id, res_idx_1based, atom_name], [chain_id, res_idx_1based, atom_name]], ...]
+
+    Invalid entries are skipped with a warning.
+    """
+    if not raw:
+        return []
+    pairs: list[BondedAtomPair] = []
+    for entry in raw:
+        if not isinstance(entry, list | tuple) or len(entry) != 2:
+            logger.warning("Skipping bondedAtomPairs entry (expected 2-element list): %r", entry)
+            continue
+        a, b = entry
+        if not (isinstance(a, list | tuple) and isinstance(b, list | tuple) and len(a) == 3 and len(b) == 3):
+            logger.warning("Skipping bondedAtomPairs entry (atoms must be 3-element lists): %r", entry)
+            continue
+        try:
+            pair: BondedAtomPair = (
+                (str(a[0]), int(a[1]), str(a[2])),
+                (str(b[0]), int(b[1]), str(b[2])),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Skipping malformed bondedAtomPairs entry: %r", entry)
+            continue
+        pairs.append(pair)
+    return pairs
+
+
+def _resolve_user_ccd(base_dir: Path, user_ccd: str | None, user_ccd_path: str | None) -> str | None:
+    """Resolve ``userCCD`` (inline mmCIF text) / ``userCCDPath`` (file path) to mmCIF text.
+
+    If both are set, ``userCCD`` wins and a warning is logged.
+    """
+    if user_ccd and user_ccd_path:
+        logger.warning("Both userCCD and userCCDPath are set; using userCCD (inline text)")
+        user_ccd_path = None
+    if user_ccd:
+        return user_ccd
+    if user_ccd_path:
+        resolved = _resolve_path(base_dir, user_ccd_path)
+        if resolved is None or not resolved.exists():
+            logger.warning("userCCDPath not found: %s", user_ccd_path)
+            return None
+        try:
+            return _read_mmcif_file(resolved)
+        except OSError as e:
+            logger.warning("Failed to read userCCDPath %s: %s", resolved, e)
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -287,19 +287,81 @@ def _pairwise_binned_loss(
     return (nll * pair_mask.unsqueeze(0)).sum() / (n_pairs * logits.shape[0])
 
 
+def express_coordinates_in_frame(
+    rep_pos: torch.Tensor,  # [..., N, 3] — representative atom per token
+    frame_pos: torch.Tensor,  # [..., N, 3, 3] — 3 frame atoms (N/CA/C or C1'/C3'/C4')
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """``expressCoordinatesInFrame`` from AF3 supplement Algorithm 29 (§4.3.2).
+
+    For every ordered token pair ``(i, j)`` returns the coordinates of token
+    ``j``'s representative atom in token ``i``'s local rigid frame, built from
+    the three frame atoms ``(a, b, c)`` of token ``i`` (proteins: (N, CA, C);
+    nucleic acids: (C1', C3', C4'); ``b`` is the origin).
+
+    Args:
+        rep_pos: Representative atom positions ``[..., N, 3]``.
+        frame_pos: Frame atom positions ``[..., N, 3, 3]`` where the middle
+            dim indexes the three frame atoms ``(a, b, c)``.
+        eps: Stabilization constant for vector normalization.
+
+    Returns:
+        Local-frame coordinates ``[..., N, N, 3]`` where entry ``[i, j]`` is
+        ``R_i^T @ (rep[j] - b_i)``.
+    """
+    a = frame_pos[..., 0, :]
+    b = frame_pos[..., 1, :]
+    c = frame_pos[..., 2, :]
+
+    w1 = F.normalize(a - b, dim=-1, eps=eps)
+    w2 = F.normalize(c - b, dim=-1, eps=eps)
+    e1 = F.normalize(w1 + w2, dim=-1, eps=eps)
+    e2 = F.normalize(w2 - w1, dim=-1, eps=eps)
+    e3 = torch.cross(e1, e2, dim=-1)
+
+    # R has basis vectors as columns; stacking on dim -2 yields R^T (rows).
+    r_transposed = torch.stack([e1, e2, e3], dim=-2)  # [..., N, 3, 3]
+    rel = rep_pos.unsqueeze(-3) - b.unsqueeze(-2)  # [..., N, N, 3]
+    return torch.einsum("...ikl,...ijl->...ijk", r_transposed, rel)
+
+
 def pae_loss(
     logits: torch.Tensor,  # [S, N, N, num_bins]
-    pred_pos: torch.Tensor,  # [S, N, 3] representative atoms
-    gt_pos: torch.Tensor,  # [N, 3] representative atoms
-    token_mask: torch.Tensor,  # [N]
-    max_error: float = 31.0,
+    pred_rep: torch.Tensor,  # [S, N, 3] representative atoms
+    pred_frames: torch.Tensor,  # [S, N, 3, 3] frame atoms in pred space
+    gt_rep: torch.Tensor,  # [N, 3] representative atoms
+    gt_frames: torch.Tensor,  # [N, 3, 3] frame atoms in GT space
+    pae_mask: torch.Tensor,  # [N, N] float — frames_mask[i] & pair_mask[i, j]
     num_bins: int = 64,
+    max_error_bin: float = 31.0,
 ) -> torch.Tensor:
-    """Predicted aligned error cross-entropy loss."""
-    pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
-    diff = pred_pos - gt_pos.unsqueeze(0)  # [S, N, 3]
-    error = torch.cdist(diff, diff)  # [S, N, N]
-    return _pairwise_binned_loss(logits, error, pair_mask, max_error, num_bins)
+    """Frame-aligned predicted aligned error (PAE) cross-entropy loss.
+
+    AF3 §3.6.2 / §3.7.5. For every ordered pair ``(i, j)``, projects token
+    ``j``'s representative atom into token ``i``'s local rigid frame for
+    both prediction and ground truth, takes the L2 distance, bucketises into
+    ``num_bins`` bins over ``[0, max_error_bin]`` (last bin is catch-all),
+    and computes cross-entropy against the predicted bin logits.
+
+    ``pae_mask`` is a float mask gating which (i, j) pairs contribute. The
+    caller is expected to AND ``frames_mask[i]`` with ``pair_mask[i, j]``
+    so frameless rows (ligands, single-atom entities) drop out. Frame
+    validity on the target token ``j`` is intentionally not enforced —
+    frameless-j can still be aligned *into* a valid-i frame.
+    """
+    S = logits.shape[0]
+
+    pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
+    gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
+    error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
+
+    bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=logits.device)
+    target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
+
+    n_valid = pae_mask.sum().clamp(min=1)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [S, N, N]
+    return (nll * pae_mask.unsqueeze(0)).sum() / (n_valid * S)
 
 
 def pde_loss(
@@ -622,23 +684,45 @@ def training_loss(
                 total = total + cfg.alpha_confidence * l_resolved
 
             if cfg.alpha_pae > 0:
-                if "pae_features" in pred:
-                    from deepfold3.training.fused_loss import pae_loss_fused
+                frame_idx = features.get("frame_atom_index")  # [N, 3] int
+                frames_mask = features.get("frames_mask")  # [N] bool
+                if frame_idx is not None and frames_mask is not None:
+                    arange_n3 = torch.arange(N, device=gt_pos.device).unsqueeze(-1).expand(N, 3)
+                    gt_frames_atoms = gt_pos[arange_n3, frame_idx]  # [N, 3, 3]
+                    mini_frames_atoms = mini_pos[:, arange_n3, frame_idx]  # [S, N, 3, 3]
 
-                    l_pae = pae_loss_fused(
-                        pred["pae_features"],
-                        pred["pae_weight"],
-                        mini_rep,
-                        gt_rep,
-                        seq_mask,
-                        chunk_n=cfg.fused_ce_chunk_n,
-                    )
-                    losses["pae"] = l_pae
-                    total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
-                elif "pae" in pred:
-                    l_pae = pae_loss(pred["pae"], mini_rep, gt_rep, seq_mask)
-                    losses["pae"] = l_pae
-                    total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
+                    pair_mask_feat = features.get("pair_mask")
+                    if pair_mask_feat is None:
+                        pair_mask_feat = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)
+                    pae_mask = (frames_mask.bool().unsqueeze(-1) & pair_mask_feat.bool()).float()
+
+                    if "pae_features" in pred:
+                        from deepfold3.training.fused_loss import pae_loss_fused
+
+                        l_pae = pae_loss_fused(
+                            pred["pae_features"],
+                            pred["pae_weight"],
+                            mini_rep,
+                            mini_frames_atoms,
+                            gt_rep,
+                            gt_frames_atoms,
+                            pae_mask,
+                            chunk_n=cfg.fused_ce_chunk_n,
+                        )
+                    elif "pae" in pred:
+                        l_pae = pae_loss(
+                            pred["pae"],
+                            mini_rep,
+                            mini_frames_atoms,
+                            gt_rep,
+                            gt_frames_atoms,
+                            pae_mask,
+                        )
+                    else:
+                        l_pae = None
+                    if l_pae is not None:
+                        losses["pae"] = l_pae
+                        total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
 
     losses["total"] = total
     return total, losses

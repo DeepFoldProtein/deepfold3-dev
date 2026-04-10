@@ -114,7 +114,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 | pLDDT | `alpha_confidence` (1e-4) | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å |
 | PDE | `alpha_confidence` (1e-4) | Predicted distance error cross-entropy |
 | exp_resolved | `alpha_confidence` (1e-4) | Binary resolved/unresolved classification |
-| PAE | `alpha_confidence × alpha_pae` (0) | Predicted aligned error (disabled in stage 1) |
+| PAE | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §3.6.2 / §4.3.2 Algorithm 29 — disabled in stage 1) |
 
 ### LR Schedule
 

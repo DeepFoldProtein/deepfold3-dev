@@ -545,6 +545,12 @@ class InferenceInput:
             chain_tuples.append((seq, mt, chr(ord("A") + next_chain_idx)))
             next_chain_idx += 1
 
+        # TODO: structure builder must consume chain.modifications (per-residue
+        # CCD substitutions for PTMs / modified bases), job.bonded_atom_pairs
+        # (explicit covalent inter-entity bonds), and job.user_ccd (inline mmCIF
+        # block registering custom CCD components).  Currently parsed by
+        # parse_json_input() but silently ignored during structure assembly.
+
         # Build ligand molecules
         ligand_mol_chains: list[tuple[CcdMolecule, str]] = []
         if job.ligand_chains:
@@ -936,9 +942,7 @@ def _sequence_to_msa(sequence: str, mol_type: int) -> MSA:
     return MSA(sequences=sequences, mask=mask, deletion_matrix=deletion_matrix)
 
 
-def _atom_name_from_chars(chars: np.ndarray) -> str:
-    """Decode 4-int atom name encoding back to string."""
-    return "".join(chr(int(c) + 32) for c in chars).strip()
+from deepfold3.data.feature.ref_atoms import decode_atom_name_chars as _atom_name_from_chars  # noqa: E402, F401
 
 
 def _msa_indices_to_sequence(encoded: np.ndarray, mol_type: int) -> str:

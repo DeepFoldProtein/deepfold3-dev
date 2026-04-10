@@ -115,17 +115,77 @@ class TestPairwiseBinnedLoss:
         assert logits.grad is not None
 
 
+def _make_pae_mask(frames_mask: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
+    return (frames_mask.bool().unsqueeze(-1) & pair_mask.bool()).float()
+
+
 class TestPaeLoss:
     def test_scalar_output(self):
         logits = _randn(S, N, N, NUM_BINS, grad=True)
-        pred_pos = _randn(S, N, 3)
-        gt_pos = _randn(N, 3)
+        pred_rep = _randn(S, N, 3)
+        pred_frames = _randn(S, N, 3, 3)
+        gt_rep = _randn(N, 3)
+        gt_frames = _randn(N, 3, 3)
         _, seq_mask = _masks()
-        loss = pae_loss(logits, pred_pos, gt_pos, seq_mask, num_bins=NUM_BINS)
+        pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)
+        pae_mask = _make_pae_mask(seq_mask, pair_mask)
+        loss = pae_loss(logits, pred_rep, pred_frames, gt_rep, gt_frames, pae_mask, num_bins=NUM_BINS)
         assert loss.shape == ()
         assert loss.isfinite()
         loss.backward()
         assert logits.grad is not None
+
+    def test_identity_case(self):
+        """When pred == gt the frame-aligned error is 0 for all pairs.
+
+        With uniform-random logits, the loss should match
+        ``-log_softmax[..., 0].mean()`` exactly.
+        """
+        torch.manual_seed(0)
+        n = 16
+        num_bins = 64
+        rep = torch.randn(n, 3)
+        frames = torch.randn(n, 3, 3)
+        pred_rep = rep.unsqueeze(0)
+        pred_frames = frames.unsqueeze(0)
+        logits = torch.randn(1, n, n, num_bins, requires_grad=True)
+        pae_mask = torch.ones(n, n)
+
+        loss = pae_loss(logits, pred_rep, pred_frames, rep, frames, pae_mask, num_bins=num_bins)
+
+        log_probs = torch.nn.functional.log_softmax(logits.detach().float(), dim=-1)
+        expected = -log_probs[..., 0].mean()
+        assert torch.allclose(loss, expected, atol=1e-5)
+        import math
+
+        assert abs(loss.item() - math.log(num_bins)) < 1.5
+
+    def test_monotonic_in_perturbation(self):
+        """Perturbing the prediction should not decrease the loss when
+        logits concentrate mass on bin 0 (identity target)."""
+        torch.manual_seed(1)
+        n = 8
+        num_bins = 64
+        rep = torch.randn(n, 3)
+        frames = torch.randn(n, 3, 3)
+        pae_mask = torch.ones(n, n)
+
+        logits = torch.zeros(1, n, n, num_bins)
+        logits[..., 0] = 10.0
+
+        loss_identity = pae_loss(
+            logits, rep.unsqueeze(0), frames.unsqueeze(0), rep, frames, pae_mask, num_bins=num_bins
+        )
+        loss_perturbed = pae_loss(
+            logits,
+            rep.unsqueeze(0) + 3.0,
+            frames.unsqueeze(0) + 3.0,
+            rep,
+            frames,
+            pae_mask,
+            num_bins=num_bins,
+        )
+        assert loss_perturbed.item() > loss_identity.item()
 
 
 class TestPdeLoss:

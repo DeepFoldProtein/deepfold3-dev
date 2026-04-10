@@ -207,30 +207,41 @@ def distogram_loss_fused(
 def pae_loss_fused(
     features: torch.Tensor,
     weight: torch.Tensor,
-    pred_pos: torch.Tensor,
-    gt_pos: torch.Tensor,
-    token_mask: torch.Tensor,
-    max_error: float = 31.0,
+    pred_rep: torch.Tensor,
+    pred_frames: torch.Tensor,
+    gt_rep: torch.Tensor,
+    gt_frames: torch.Tensor,
+    pae_mask: torch.Tensor,
+    max_error_bin: float = 31.0,
     num_bins: int = 64,
     chunk_n: int = 32,
 ) -> torch.Tensor:
-    """PAE CE loss with chunked linear (no symmetrization).
+    """Frame-aligned PAE CE loss with chunked linear (no symmetrization).
+
+    Frame-alignment math is delegated to
+    :func:`deepfold3.training.loss.express_coordinates_in_frame`; only the
+    logits projection and cross-entropy are fused via chunked linear.
 
     Args:
         features: Post-LN pair features ``[S, N, N, H]`` (pre-projection).
         weight: PAE logits weight ``[num_bins, H]``.
-        pred_pos: Predicted representative positions ``[S, N, 3]``.
-        gt_pos: Ground-truth representative positions ``[N, 3]``.
-        token_mask: Valid token mask ``[N]``.
+        pred_rep: Predicted representative atom positions ``[S, N, 3]``.
+        pred_frames: Predicted frame atom positions ``[S, N, 3, 3]``.
+        gt_rep: Ground-truth representative atom positions ``[N, 3]``.
+        gt_frames: Ground-truth frame atom positions ``[N, 3, 3]``.
+        pae_mask: Float mask ``[N, N]`` already AND-combining frames-mask
+            and pair-mask (built once by the caller).
     """
-    pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
-    diff = pred_pos - gt_pos.unsqueeze(0)
-    error = torch.cdist(diff, diff)
+    from deepfold3.training.loss import express_coordinates_in_frame
 
-    bin_edges = torch.linspace(0, max_error, num_bins - 1, device=features.device)
+    pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
+    gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
+    error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
+
+    bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=features.device)
     target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
 
-    mask_s = pair_mask.unsqueeze(0).expand(features.shape[0], -1, -1)
+    mask_s = pae_mask.unsqueeze(0).expand(features.shape[0], -1, -1)
 
     return chunked_linear_cross_entropy(
         features,

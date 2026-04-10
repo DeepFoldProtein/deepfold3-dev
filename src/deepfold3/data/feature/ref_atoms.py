@@ -107,6 +107,15 @@ def _encode_atom_name(name: str) -> list[int]:
     return [max(0, ord(c) - 32) for c in padded]
 
 
+def decode_atom_name_chars(chars) -> str:
+    """Decode the ``ord(c)-32`` 4-int encoding back to a stripped atom name.
+
+    Inverse of :func:`_encode_atom_name`. Accepts any iterable of ints
+    (numpy array, torch tensor, list).
+    """
+    return "".join(chr(int(c) + 32) for c in chars).strip()
+
+
 def get_ref_atoms(
     res_name: str,
     mol_type: int,

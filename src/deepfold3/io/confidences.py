@@ -592,3 +592,60 @@ def save_confidences_json(
     path.write_text(json.dumps(_sanitize_for_json(result), indent=2))
 
     return summary
+
+
+def save_ranking_scores_csv(path: str | Path, summaries: list[dict]) -> None:
+    """Write ``ranking_scores.csv`` for a list of per-(seed, sample) summaries.
+
+    Each summary dict should be the value returned by :func:`save_confidences_json`
+    augmented with ``seed`` and ``sample`` keys. Rows are sorted by
+    ``ranking_score`` descending. The first three columns
+    (``seed, sample, ranking_score``) match the AlphaFold 3 output layout;
+    extra columns are appended for richer downstream analysis.
+    """
+    import csv
+
+    path = Path(path)
+    sorted_rows = sorted(summaries, key=lambda r: r["ranking_score"], reverse=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["seed", "sample", "ranking_score", "ptm", "iptm", "fraction_disordered", "has_clash"]
+        )
+        for row in sorted_rows:
+            iptm = row.get("iptm")
+            iptm_str = "" if iptm is None or (isinstance(iptm, float) and math.isnan(iptm)) else f"{iptm:.4f}"
+            writer.writerow(
+                [
+                    row["seed"],
+                    row["sample"],
+                    f"{row['ranking_score']:.4f}",
+                    f"{row['ptm']:.4f}",
+                    iptm_str,
+                    f"{row['fraction_disordered']:.4f}",
+                    int(row["has_clash"]),
+                ]
+            )
+
+
+def save_summary_confidences_json(
+    path: str | Path, summaries: list[dict], job_name: str | None = None
+) -> None:
+    """Write a top-level ``summary_confidences.json`` aggregating all predictions.
+
+    Each entry in ``summaries`` is the value returned by
+    :func:`save_confidences_json` augmented with ``seed`` and ``sample``.
+    The output payload contains ``job_name``, ``num_predictions``,
+    ``best`` (highest-ranking entry), and ``predictions`` (sorted descending).
+    """
+    path = Path(path)
+    sorted_entries = sorted(summaries, key=lambda e: e["ranking_score"], reverse=True)
+    payload = {
+        "job_name": job_name,
+        "num_predictions": len(sorted_entries),
+        "best": sorted_entries[0] if sorted_entries else None,
+        "predictions": sorted_entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_sanitize_for_json(payload), indent=2))
