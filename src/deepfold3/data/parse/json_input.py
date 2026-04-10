@@ -43,7 +43,7 @@ from pathlib import Path
 
 from deepfold3.data import const
 from deepfold3.data.parse.a3m import parse_a3m
-from deepfold3.data.parse.templates import TemplateHitInput, fetch_pdb_mmcif
+from deepfold3.data.parse.templates import TemplateHitInput, fetch_pdb_mmcif, release_date_from_mmcif_text
 from deepfold3.data.types import MSA
 
 logger = logging.getLogger(__name__)
@@ -141,6 +141,11 @@ class JobInput:
         user_ccd: Inline mmCIF text defining custom CCD component(s) for
             ligands not in the standard Chemical Component Dictionary. May
             contain multiple ``data_<NAME>`` blocks.
+        max_template_date: ISO ``YYYY-MM-DD`` cutoff; template hits with a
+            PDB initial release date strictly later than this are dropped
+            during post-parse filtering. ``None`` disables the filter.
+            Mirrors AlphaFold 3's ``--max_template_date`` CLI flag (set
+            from the top-level ``maxTemplateDate`` JSON field).
         description: Optional job description (written as _struct.title in mmCIF).
     """
 
@@ -152,6 +157,7 @@ class JobInput:
     model_seeds: list[int] = field(default_factory=lambda: [42])
     bonded_atom_pairs: list[BondedAtomPair] = field(default_factory=list)
     user_ccd: str | None = None
+    max_template_date: str | None = None
     description: str | None = None
 
 
@@ -201,13 +207,16 @@ def parse_json_input(
     for entry in data:
         dialect = _detect_dialect(entry)
         if dialect == "alphafold3":
-            jobs.append(_parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+            job = _parse_af3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir)
         elif dialect == "alphafoldserver":
-            jobs.append(_parse_alphafoldserver_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+            job = _parse_alphafoldserver_entry(entry, base_dir, max_templates, cache_dir, pdb_dir)
         elif dialect == "protenix":
-            jobs.append(_parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+            job = _parse_protenix_entry(entry, base_dir, max_templates, cache_dir, pdb_dir)
         else:  # deepfold3
-            jobs.append(_parse_deepfold3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir))
+            job = _parse_deepfold3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir)
+        job.max_template_date = _parse_max_template_date(entry.get("maxTemplateDate"))
+        _filter_template_hits_by_date(job)
+        jobs.append(job)
 
     return jobs
 
@@ -819,6 +828,46 @@ def _parse_bonded_atom_pairs(raw: list | None) -> list[BondedAtomPair]:
     return pairs
 
 
+def _parse_max_template_date(raw) -> str | None:
+    """Validate a ``maxTemplateDate`` JSON value as ``YYYY-MM-DD``.
+
+    Returns ``None`` if the value is missing, empty, or not a parseable
+    ISO 8601 date. Warns on malformed values.
+    """
+    if raw in (None, ""):
+        return None
+    import datetime as _dt
+
+    try:
+        return _dt.date.fromisoformat(str(raw).strip()).isoformat()
+    except (TypeError, ValueError):
+        logger.warning("Ignoring malformed maxTemplateDate %r (expected YYYY-MM-DD)", raw)
+        return None
+
+
+def _filter_template_hits_by_date(job: JobInput) -> None:
+    """Drop template hits released strictly after ``job.max_template_date``.
+
+    Hits with ``release_date is None`` are kept (we cannot verify them);
+    callers relying on strict filtering should prefer template sources
+    that populate ``release_date``. Mirrors AlphaFold 3's inference-time
+    template cutoff behaviour.
+    """
+    cutoff = job.max_template_date
+    if cutoff is None:
+        return
+    for chain in job.protein_chains:
+        before = len(chain.template_hits)
+        chain.template_hits = [
+            h for h in chain.template_hits if h.release_date is None or h.release_date <= cutoff
+        ]
+        dropped = before - len(chain.template_hits)
+        if dropped:
+            logger.info(
+                "Filtered %d template hit(s) past cutoff %s on chain %s", dropped, cutoff, chain.sequence[:20]
+            )
+
+
 def _resolve_user_ccd(base_dir: Path, user_ccd: str | None, user_ccd_path: str | None) -> str | None:
     """Resolve ``userCCD`` (inline mmCIF text) / ``userCCDPath`` (file path) to mmCIF text.
 
@@ -940,6 +989,7 @@ def _resolve_af3_templates(
                 mmcif_text=mmcif_text,
                 query_indices=query_indices,
                 template_indices=template_indices,
+                release_date=release_date_from_mmcif_text(mmcif_text),
             )
         )
 
@@ -1045,6 +1095,7 @@ def _load_json_template_hits(json_path: Path, max_templates: int) -> list[Templa
                     query_indices=query_indices,
                     template_indices=template_indices,
                     chain_id=hit.get("chainId"),
+                    release_date=hit.get("releaseDate") or release_date_from_mmcif_text(mmcif_text),
                 )
             )
             logger.info("Loaded JSON template hit %s", cif_name)
@@ -1089,6 +1140,7 @@ def _load_hhr_template_hits(
                     mmcif_text=mmcif_text,
                     hhr_hit=hit,
                     chain_id=hit.chain_id,
+                    release_date=release_date_from_mmcif_text(mmcif_text),
                 )
             )
             logger.info(

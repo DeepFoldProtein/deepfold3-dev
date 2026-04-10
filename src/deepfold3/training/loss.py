@@ -319,10 +319,13 @@ def express_coordinates_in_frame(
     e2 = F.normalize(w2 - w1, dim=-1, eps=eps)
     e3 = torch.cross(e1, e2, dim=-1)
 
-    # R has basis vectors as columns; stacking on dim -2 yields R^T (rows).
+    # Stack basis as rows → R_i^T. Broadcast over the j-axis so each
+    # (i, j) pair multiplies rel[i, j] by its own R_i^T via a single
+    # batched matmul (faster than einsum on cuBLAS/rocBLAS).
     r_transposed = torch.stack([e1, e2, e3], dim=-2)  # [..., N, 3, 3]
     rel = rep_pos.unsqueeze(-3) - b.unsqueeze(-2)  # [..., N, N, 3]
-    return torch.einsum("...ikl,...ijl->...ijk", r_transposed, rel)
+    # matmul: [..., N, 1, 3, 3] @ [..., N, N, 3, 1] → [..., N, N, 3, 1]
+    return torch.matmul(r_transposed.unsqueeze(-3), rel.unsqueeze(-1)).squeeze(-1)
 
 
 def pae_loss(
@@ -361,7 +364,9 @@ def pae_loss(
     n_valid = pae_mask.sum().clamp(min=1)
     log_probs = F.log_softmax(logits.float(), dim=-1)
     nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [S, N, N]
-    return (nll * pae_mask.unsqueeze(0)).sum() / (n_valid * S)
+    # Reduce over samples first so the mask multiply is done on an
+    # [N, N] tensor instead of [S, N, N].
+    return (nll.sum(0) * pae_mask).sum() / (n_valid * S)
 
 
 def pde_loss(

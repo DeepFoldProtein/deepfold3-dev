@@ -138,6 +138,31 @@ class TemplateHitInput:
     chain_id: str | None = None
     structure: Structure | None = None  # Structure object (Structure mode)
     query_to_template: dict[int, int] | None = None  # query pos → template residue index
+    release_date: str | None = None  # ISO 8601 ``YYYY-MM-DD`` (initial release), if known
+
+
+def release_date_from_mmcif_text(mmcif_text: str) -> str | None:
+    """Extract the earliest ``_pdbx_audit_revision_history.revision_date``.
+
+    Returns the PDB initial release date as an ISO ``YYYY-MM-DD`` string, or
+    ``None`` if the tag is missing / unparseable. Matches the training-path
+    release-date definition in :mod:`deepfold3.data.prepare.structure`.
+    """
+    if gemmi is None or not mmcif_text:
+        return None
+    try:
+        doc = gemmi.cif.read_string(mmcif_text)
+        if len(doc) == 0:
+            return None
+        block = doc[0]
+        tag = "_pdbx_audit_revision_history.revision_date"
+        rows = [gemmi.cif.as_string(v) for v in block.find_loop(tag)]
+        if not rows:
+            val = block.find_value(tag)
+            rows = [gemmi.cif.as_string(val)] if val else []
+        return min(rows) if rows else None
+    except Exception:
+        return None
 
 
 def template_hit_input_to_features(

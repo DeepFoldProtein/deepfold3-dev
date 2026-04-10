@@ -241,8 +241,19 @@ def compute_iptm(
 ) -> float:
     """Compute interface predicted TM-score (ipTM) for a single sample.
 
-    Uses per-chain-pair d0 following AF3: d0[i,j] = f(N_chain_i + N_chain_j)
-    rather than d0 = f(N_total).
+    Follows the AlphaFold 3 reference implementation exactly
+    (``confidence_head._get_tmscore_adjusted_pae`` +
+    ``confidences.predicted_tm_score`` with ``interface=True``). The
+    per-pair d0 uses::
+
+        x = same_chain_mask
+        num_chain_tokens[i] = sum_j(x_ij * pair_mask_ij)
+        num_interface_tokens[i, j] = num_chain_tokens[i] + num_chain_tokens[j]
+                                      - x_ij * (num_interface_tokens[i, j] // 2)
+
+    The ``// 2`` correction folds same-chain pairs back to a single chain
+    size; they are subsequently masked out by the cross-chain pair mask.
+    Retained here for byte-for-byte parity with the AF3 source.
 
     Args:
         pae_logits: [N, N, num_bins] logits.
@@ -253,23 +264,22 @@ def compute_iptm(
     Returns:
         ipTM score (scalar). NaN if single-chain.
     """
-    # Cross-chain mask
-    cross_chain = (asym_id.unsqueeze(-1) != asym_id.unsqueeze(-2)).float()
+    same_chain = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)  # [N, N] bool
+    cross_chain = (~same_chain).float()
     interface_mask = pair_mask * cross_chain
-
     if interface_mask.sum() == 0:
         return float("nan")
 
-    # Per-chain-pair token counts: N_chain_i + N_chain_j for each (i, j) pair
-    same_chain = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)  # [N, N]
-    chain_sizes = (same_chain.float() * seq_mask.unsqueeze(0)).sum(-1)  # [N] — size of each token's chain
-    interface_n = chain_sizes.unsqueeze(-1) + chain_sizes.unsqueeze(-2)  # [N, N]
+    x = same_chain.float()
+    num_chain_tokens = (x * pair_mask).sum(dim=-1)  # [N]
+    num_interface_tokens = num_chain_tokens.unsqueeze(0) + num_chain_tokens.unsqueeze(-1)  # [N, N]
+    num_interface_tokens = num_interface_tokens - x * (num_interface_tokens.long() // 2).float()
+    num_interface_tokens = num_interface_tokens * pair_mask
 
-    tm_adj = _compute_tm_adjusted_pae(pae_logits, interface_n, max_error_bin, num_bins)
+    tm_adj = _compute_tm_adjusted_pae(pae_logits, num_interface_tokens, max_error_bin, num_bins)
 
     denom = interface_mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     normed_mask = interface_mask / denom
-
     per_alignment = (tm_adj * normed_mask).sum(dim=-1)  # [N]
     per_alignment = per_alignment * seq_mask
     return float(per_alignment.max().item())
