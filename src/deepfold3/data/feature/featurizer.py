@@ -414,22 +414,28 @@ class Featurizer:
 
         # --- 1. Paired rows: zip across chains (up to MAX_PAIRED_MSA_ROWS) ---
         # Row 0 is the query (from paired MSA or, if absent, from unpaired).
+        # Use the deepest available chain; chains with shorter or absent paired
+        # MSAs leave their columns as gaps for the rows they don't cover.
         n_paired_rows = 0
         if data.paired_msa:
-            paired_counts = []
-            paired_chain_ids = []
-            for asym_id, msa in data.paired_msa.items():
-                if int(asym_id) in chain_pos_map and len(chain_pos_map[int(asym_id)]) > 0:
-                    paired_counts.append(msa.sequences.shape[0])
-                    paired_chain_ids.append(int(asym_id))
-            if paired_counts and min(paired_counts) > 0:
-                n_paired_rows = min(min(paired_counts), const.MAX_PAIRED_MSA_ROWS + 1)
+            paired_chain_ids = [
+                int(asym_id)
+                for asym_id, msa in data.paired_msa.items()
+                if int(asym_id) in chain_pos_map
+                and len(chain_pos_map[int(asym_id)]) > 0
+                and msa.sequences.shape[0] > 0
+            ]
+            if paired_chain_ids:
+                max_depth = max(data.paired_msa[a].sequences.shape[0] for a in paired_chain_ids)
+                n_paired_rows = min(max_depth, const.MAX_PAIRED_MSA_ROWS + 1)
                 for row_i in range(n_paired_rows):
                     row_seq = np.full(N, 21, dtype=np.int8)
                     row_mask = np.ones(N, dtype=bool)
                     row_del = np.zeros(N, dtype=np.int8)
                     for asym_id in paired_chain_ids:
                         msa = data.paired_msa[asym_id]
+                        if row_i >= msa.sequences.shape[0]:
+                            continue
                         chain_pos = chain_pos_map[asym_id]
                         L = min(msa.sequences.shape[1], len(chain_pos))
                         row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]

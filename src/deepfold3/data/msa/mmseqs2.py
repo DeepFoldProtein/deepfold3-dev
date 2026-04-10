@@ -1305,15 +1305,48 @@ def _build_pair_qdb(
     return cplx_map
 
 
+def _gap_only_paired_a3m(chain_id: str, sequence: str, n_pairs: int) -> str:
+    """Build a gap-only paired A3M for a chain that got no pairaln results.
+
+    Used as a fallback so all chains in a complex have the same row count.
+    The query line uses the chain's sequence; subsequent rows are ``>DUMMY``
+    headers with all-gap sequences matching the query length.
+    """
+    gap_line = "-" * len(sequence)
+    parts = [f">{chain_id}", sequence]
+    for _ in range(n_pairs):
+        parts.append(">DUMMY")
+        parts.append(gap_line)
+    return "\n".join(parts) + "\n"
+
+
+def _count_paired_rows(a3m_text: str) -> int:
+    """Count non-query rows in a paired A3M (i.e., depth - 1)."""
+    n = 0
+    for line in a3m_text.splitlines():
+        if line.startswith(">"):
+            n += 1
+    return max(0, n - 1)
+
+
 def _unpack_pair_results(
     work_dir: Path,
     cplx_map: dict[str, str],
+    complexes: dict[str, list[str]],
+    sequences: dict[str, str],
 ) -> dict[str, dict[str, str]]:
     """Unpack batch paired A3M results into per-complex dicts.
+
+    Chains that received no pairaln output are filled with gap-only rows
+    matching the depth of sibling chains in the same complex, so that all
+    chains in a complex have aligned paired MSAs of the same row count.
 
     Args:
         work_dir: Directory containing ``pair.a3m`` result DB and ``qdb.lookup``.
         cplx_map: Mapping from complex index (str) to complex ID.
+        complexes: Original ``{complex_id: [chain_id, ...]}`` input, used to
+            detect chains missing from the result.
+        sequences: ``{chain_id: amino_acid_sequence}`` for gap-fill fallback.
 
     Returns:
         ``{complex_id: {chain_id: a3m_text}}``.
@@ -1321,7 +1354,6 @@ def _unpack_pair_results(
     qdb_lookup = work_dir / "qdb.lookup"
     pair_a3m_index = Path(f"{work_dir / 'pair.a3m'}.index")
 
-    # Parse lookup: key -> (chain_id, cplx_idx)
     key_info: dict[str, tuple[str, str]] = {}
     for line in qdb_lookup.read_text().splitlines():
         parts = line.split("\t")
@@ -1345,6 +1377,24 @@ def _unpack_pair_results(
             continue
         content = data[offset : offset + length].rstrip(b"\x00").decode(errors="replace")
         results.setdefault(cplx_id, {})[chain_id] = content
+
+    # Fill missing chains with gap-only rows
+    filled = 0
+    for cplx_id, chain_ids in complexes.items():
+        chain_a3ms = results.get(cplx_id)
+        if not chain_a3ms:
+            continue
+        present = set(chain_a3ms.keys())
+        missing = [cid for cid in chain_ids if cid not in present and cid in sequences]
+        if not missing:
+            continue
+        # Use depth from any present sibling
+        n_pairs = max((_count_paired_rows(t) for t in chain_a3ms.values()), default=0)
+        for cid in missing:
+            chain_a3ms[cid] = _gap_only_paired_a3m(cid, sequences[cid], n_pairs)
+            filled += 1
+    if filled:
+        logger.info("Gap-filled %d missing paired chains", filled)
 
     return results
 
@@ -1516,7 +1566,7 @@ def search_pair_batch(
             ],
         )
 
-        results = _unpack_pair_results(work_dir, cplx_map)
+        results = _unpack_pair_results(work_dir, cplx_map, hetero, sequences)
         logger.info("Batch pair: unpacked %d complexes", len(results))
 
     finally:
