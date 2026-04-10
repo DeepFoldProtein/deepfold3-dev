@@ -446,8 +446,12 @@ class TrainingConfig:
     skip_load_step: bool = False
 
     # Experiment tracking
-    wandb_project: str = ""  # empty = disabled
-    wandb_run_name: str = ""
+    wandb_enabled: bool = False  # explicit on/off; takes precedence over wandb_project
+    wandb_project: str = ""
+    # Optional explicit run name. ``None`` (or empty string) → derive from
+    # ``output_dir`` and append a YYYYMMDD-HHMMSS timestamp so re-runs are
+    # never accidentally collapsed under one wandb run.
+    wandb_run_name: str | None = None
 
     # Paths (set at runtime)
     output_dir: str = "output"
@@ -511,7 +515,25 @@ class DistogramConfig:
 class DataConfig:
     max_templates: int = 4
     max_neighborhood: int = 40
-    spatial_crop_prob: float = 0.5
+    # Cropping mixture weights (Protenix-style:
+    # ContiguousCropping / SpatialCropping / SpatialInterfaceCropping).
+    contiguous_crop_weight: float = 0.2
+    spatial_crop_weight: float = 0.4
+    interface_crop_weight: float = 0.4
+    # Distance threshold (Å) for "interface" tokens used by the
+    # interface-seeded spatial cropper.
+    interface_distance: float = 15.0
+    # AlphaFold 3 §2.4 template release-date guard: a template's release
+    # date must precede the query example's release by at least this many
+    # days (default 60 for PDB training data).
+    template_cutoff_days: int = 60
+    # Optional global hard cap on template release dates (ISO YYYY-MM-DD).
+    # AF3 uses 2018-04-30 for distillation and the training cutoff for
+    # inference; leave None to skip the global cap.
+    max_template_date: str | None = None
+    # Prefer per-sequence monomer templates over per-record multimer
+    # templates when both directories are present.
+    prefer_monomer_templates: bool = True
 
 
 @dataclass
@@ -525,4 +547,7 @@ class ModelConfig:
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     num_recycles: int = 10
-    msa_crop_size: int = 1024  # MSA rows sampled per recycle
+    # MSA rows fed to the Evoformer per recycle. Defaults to AF3's
+    # Nmsa = 16384 (the same cap used by the featurizer), so per-recycle
+    # subsampling is a no-op when the featurizer already capped.
+    msa_crop_size: int = 16_384

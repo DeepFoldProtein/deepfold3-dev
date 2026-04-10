@@ -54,5 +54,16 @@ def mask_path(masks_dir: Path, pdb_id: str) -> Path:
 
 
 def template_path(templates_dir: Path, pdb_id: str) -> Path:
-    """Path to a template-index JSON under the sharded layout."""
+    """Path to a multimer-template index JSON under the sharded layout (per record)."""
     return Path(templates_dir) / shard(pdb_id) / f"{pdb_id}.json"
+
+
+def monomer_template_path(monomer_templates_dir: Path, msa_id: str) -> Path:
+    """Path to a monomer-template index JSON under the sharded layout (per sequence).
+
+    Monomer templates are deduplicated by chain ``msa_id`` (sequence hash),
+    so the same JSON serves every record that contains this sequence. The
+    release-date cutoff is applied at training time by the dataloader, not
+    at prepare time.
+    """
+    return Path(monomer_templates_dir) / shard(msa_id) / f"{msa_id}.json"

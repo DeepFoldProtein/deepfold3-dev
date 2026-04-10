@@ -17,6 +17,7 @@ def cli() -> None:
 
 
 def _register_commands() -> None:
+    from deepfold3.scripts.build_ligand_cache import build_ligand_cache
     from deepfold3.scripts.convert_weights import convert
     from deepfold3.scripts.inference import inference
     from deepfold3.scripts.msa_batch import msa_batch
@@ -50,6 +51,7 @@ def _register_commands() -> None:
     cli.add_command(enrich_manifest)
     cli.add_command(drop_obsolete)
     cli.add_command(scan_mmcif)
+    cli.add_command(build_ligand_cache)
     cli.add_command(prepare_templates)
     cli.add_command(train)
 

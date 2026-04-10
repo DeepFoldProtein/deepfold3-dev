@@ -21,7 +21,7 @@ from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
 from deepfold3.data.masking import TokenMask
 from deepfold3.data.msa.paths import paired_msa_path, unpaired_msa_path
-from deepfold3.data.paths import mask_path, structure_path, template_path
+from deepfold3.data.paths import mask_path, monomer_template_path, structure_path, template_path
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
     ATOM_DTYPE,
@@ -64,6 +64,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         is_distillation: bool = False,
         mmcif_dir: Path | None = None,
         max_templates: int = 4,
+        template_cutoff_days: int = 60,
+        max_template_date: str | None = None,
+        prefer_monomer_templates: bool = True,
+        max_neighborhood: int = 40,
+        contiguous_crop_weight: float = 0.2,
+        spatial_crop_weight: float = 0.4,
+        interface_crop_weight: float = 0.4,
+        interface_distance: float = 15.0,
     ):
         self.records = records
         self.data_dir = Path(data_dir)
@@ -71,7 +79,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_atoms = max_atoms
         self.is_distillation = is_distillation
         self.tokenizer = Tokenizer()
-        self.cropper = Cropper()
+        self.cropper = Cropper(
+            max_neighborhood=max_neighborhood,
+            contiguous_weight=contiguous_crop_weight,
+            spatial_weight=spatial_crop_weight,
+            interface_weight=interface_crop_weight,
+            interface_distance=interface_distance,
+        )
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker
@@ -80,7 +94,11 @@ class TrainingDataset(torch.utils.data.Dataset):
         self._has_masks = (self.data_dir / "masks").is_dir()
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
         self.max_templates = max_templates
+        self.template_cutoff_days = template_cutoff_days
+        self.max_template_date = max_template_date
+        self.prefer_monomer_templates = prefer_monomer_templates
         self._has_templates = (self.data_dir / "templates").is_dir()
+        self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -112,14 +130,18 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
 
-        # Load multimer templates (randomly sample 0..max_templates)
+        # Load templates: prefer per-sequence monomer (AF3 §2.4) when
+        # available, fall back to multimer otherwise.
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
-        if self.mmcif_dir and self._has_templates:
-            tpl_index = template_path(self.data_dir / "templates", record.id)
-            if tpl_index.exists():
-                n_templates = random.randint(0, self.max_templates)
-                if n_templates > 0:
-                    template_feats_per_chain = self._load_multimer_templates(record, n_templates)
+        if self.mmcif_dir:
+            if self.prefer_monomer_templates and self._has_monomer_templates:
+                template_feats_per_chain = self._load_monomer_templates(record)
+            elif self._has_templates:
+                tpl_index = template_path(self.data_dir / "templates", record.id)
+                if tpl_index.exists():
+                    n_templates = random.randint(0, self.max_templates)
+                    if n_templates > 0:
+                        template_feats_per_chain = self._load_multimer_templates(record, n_templates)
 
         # Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
@@ -142,6 +164,118 @@ class TrainingDataset(torch.utils.data.Dataset):
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
 
         return feats
+
+    def _load_monomer_templates(self, record: Record) -> dict[int, list[TemplateFeatures]] | None:
+        """Load per-chain monomer template features (AlphaFold 3 §2.4).
+
+        For each protein chain in the record:
+
+        1. Load the precomputed ``monomer_templates/{ab}/{msa_id}.json`` list
+           of single-chain hits (already filtered by AF3 per-hit criteria at
+           prepare time, sorted by e-value, capped at 20).
+        2. Apply the **training-time** release-date cutoff:
+           ``min(max_template_date, record.released - cutoff_days)``. The
+           cutoff is per-record because the same sequence can appear in
+           records with different release dates.
+        3. Drop self-hits whose ``template_pdb_id`` matches the record id.
+        4. Sample ``k = min(Uniform[0, n], max_templates)`` random hits, then
+           extract template features from the local PDB mmCIF mirror.
+        """
+        import datetime
+
+        from deepfold3.data.parse.templates import (
+            _build_polymer_lookup,
+            _fill_template_features,
+            _get_chain_sequences,
+            _realign_mapping,
+            cigar_to_index_pairs,
+            parse_mmcif_structure,
+            read_pdb_mmcif_local,
+            select_template_chain,
+        )
+        from deepfold3.data.prepare.template_search import load_monomer_template_hits
+
+        templates_root = self.data_dir / "monomer_templates"
+        record_id_upper = record.id.upper()
+
+        # Effective cutoff = min(max_template_date, record.released - N days)
+        cutoff: str | None = self.max_template_date
+        query_release = record.structure_info.released if record.structure_info else None
+        if query_release is not None:
+            try:
+                d = datetime.date.fromisoformat(query_release) - datetime.timedelta(days=self.template_cutoff_days)
+                query_minus = d.isoformat()
+                cutoff = query_minus if cutoff is None else min(cutoff, query_minus)
+            except ValueError:
+                pass
+
+        result: dict[int, list[TemplateFeatures]] = {}
+        for chain_info in record.chains:
+            if not chain_info.valid or chain_info.mol_type != const.MOL_PROTEIN:
+                continue
+            tpl_path = monomer_template_path(templates_root, str(chain_info.msa_id))
+            if not tpl_path.exists():
+                continue
+            try:
+                hits = load_monomer_template_hits(tpl_path)
+            except Exception:
+                logger.debug("Failed to load monomer template index for %s", chain_info.msa_id)
+                continue
+
+            # Date cutoff (per-record) + drop self-hits
+            filtered = [
+                h
+                for h in hits
+                if h.template_pdb_id.upper() != record_id_upper
+                and (cutoff is None or (h.release_date is not None and h.release_date <= cutoff))
+            ]
+            if not filtered:
+                continue
+
+            # AF3: k ~ min(Uniform[0, n], max_templates)
+            n_avail = len(filtered)
+            k = min(random.randint(0, n_avail), self.max_templates)
+            if k == 0:
+                continue
+            sampled = random.sample(filtered, k)
+
+            chain_feats: list[TemplateFeatures] = []
+            for hit in sampled:
+                mmcif_text = read_pdb_mmcif_local(hit.template_pdb_id, self.mmcif_dir)
+                if mmcif_text is None:
+                    continue
+                st = parse_mmcif_structure(mmcif_text, label=hit.template_pdb_id)
+                if st is None:
+                    continue
+                try:
+                    query_indices, seqres_indices = cigar_to_index_pairs(hit.cigar, hit.qstart, hit.tstart)
+                    if not query_indices:
+                        continue
+                    chain = select_template_chain(st, hit.template_chain_id, label=hit.template_pdb_id)
+                    if chain is None:
+                        continue
+                    query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
+                    seqres, struct_seq = _get_chain_sequences(st, chain)
+                    mapping = _realign_mapping(seqres, struct_seq, query_to_seqres)
+                    lookup = _build_polymer_lookup(chain, const.MAX_ATOMS_PER_TOKEN)
+                    feats, _ = _fill_template_features(
+                        lookup, mapping, chain_info.num_residues, const.MAX_ATOMS_PER_TOKEN
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to extract monomer template %s chain %s for %s/%s",
+                        hit.template_pdb_id,
+                        hit.template_chain_id,
+                        record.id,
+                        chain_info.chain_name,
+                    )
+                    continue
+                chain_feats.append(feats)
+
+            if chain_feats:
+                result[chain_info.chain_id] = chain_feats
+
+        return result if result else None
 
     def _load_multimer_templates(self, record: Record, n_templates: int) -> dict[int, list[TemplateFeatures]] | None:
         """Load multimer template features from pre-indexed JSON + PDB mmCIF.

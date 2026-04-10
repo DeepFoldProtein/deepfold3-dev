@@ -204,21 +204,38 @@ class Trainer:
                 logger.info(f"Loaded pretrained weights from {p}")
 
     def _init_wandb(self) -> None:
-        """Initialize Weights & Biases logging if configured."""
-        if not self.cfg.wandb_project or not self.is_main:
+        """Initialize Weights & Biases logging if configured.
+
+        Gated on ``wandb_enabled`` (explicit on/off) and ``wandb_project``
+        (the W&B project name). The run name is either the user-provided
+        ``wandb_run_name`` *as-is*, or — when unset — ``{output_dir}_{ts}``
+        where ``ts = YYYYMMDD-HHMMSS`` so multiple runs into the same
+        output directory don't collapse into one wandb run.
+        """
+        if not self.cfg.wandb_enabled or not self.is_main:
+            return
+        if not self.cfg.wandb_project:
+            logger.warning("wandb_enabled=True but wandb_project is empty; skipping wandb init")
             return
         try:
             import dataclasses
+            import datetime
 
             import wandb
+
+            if self.cfg.wandb_run_name:
+                run_name = self.cfg.wandb_run_name
+            else:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                run_name = f"{Path(self.cfg.output_dir).name}_{timestamp}"
 
             self._wandb = wandb
             wandb.init(
                 project=self.cfg.wandb_project,
-                name=self.cfg.wandb_run_name or None,
+                name=run_name,
                 config=dataclasses.asdict(self.cfg),
             )
-            logger.info(f"WandB initialized: project={self.cfg.wandb_project}")
+            logger.info(f"WandB initialized: project={self.cfg.wandb_project}, run={run_name}")
         except ImportError:
             logger.warning("wandb not installed, skipping experiment tracking")
 
@@ -244,6 +261,14 @@ class Trainer:
             max_msa_seqs=self.cfg.max_msa_seqs,
             mmcif_dir=Path(self.cfg.mmcif_dir) if self.cfg.mmcif_dir else None,
             max_templates=self.model_cfg.data.max_templates,
+            template_cutoff_days=self.model_cfg.data.template_cutoff_days,
+            max_template_date=self.model_cfg.data.max_template_date,
+            prefer_monomer_templates=self.model_cfg.data.prefer_monomer_templates,
+            max_neighborhood=self.model_cfg.data.max_neighborhood,
+            contiguous_crop_weight=self.model_cfg.data.contiguous_crop_weight,
+            spatial_crop_weight=self.model_cfg.data.spatial_crop_weight,
+            interface_crop_weight=self.model_cfg.data.interface_crop_weight,
+            interface_distance=self.model_cfg.data.interface_distance,
         )
 
         # Primary (PDB) dataset

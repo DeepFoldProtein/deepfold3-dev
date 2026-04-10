@@ -13,7 +13,7 @@ import torch
 
 from deepfold3.data import const
 from deepfold3.data.feature.ref_atoms import _encode_atom_name, get_ref_atoms
-from deepfold3.data.types import Tokenized
+from deepfold3.data.types import MSA, Tokenized
 
 if TYPE_CHECKING:
     from deepfold3.data.parse.templates import TemplateFeatures
@@ -417,7 +417,7 @@ class Featurizer:
         # MSAs leave their columns as gaps for the rows they don't cover.
         n_paired_rows = 0
         if data.paired_msa:
-            paired_chains: list[tuple[int, "Msa"]] = []
+            paired_chains: list[tuple[int, MSA]] = []
             for asym_id, msa in data.paired_msa.items():
                 aid = int(asym_id)
                 if aid in chain_pos_map and len(chain_pos_map[aid]) > 0 and msa.sequences.shape[0] > 0:
@@ -509,12 +509,19 @@ class Featurizer:
             mask_arr = np.concatenate(combined_masks, axis=0)
             del_arr = np.concatenate(combined_dels, axis=0)
 
-        # Cap total rows at max_msa_seqs
+        # Cap total rows at max_msa_seqs via uniform subsampling.
+        # Always keep row 0 (the query) and uniformly sample the rest. AF3
+        # §2.3 specifies the final MSA stack as exactly Nmsa = 16384 rows.
         S = msa_arr.shape[0]
         if S > self.max_msa_seqs:
-            msa_arr = msa_arr[: self.max_msa_seqs]
-            mask_arr = mask_arr[: self.max_msa_seqs]
-            del_arr = del_arr[: self.max_msa_seqs]
+            keep = self.max_msa_seqs - 1
+            rng = np.random.default_rng()
+            sel = rng.choice(S - 1, size=keep, replace=False) + 1  # indices 1..S-1
+            sel.sort()
+            idx = np.concatenate([[0], sel])
+            msa_arr = msa_arr[idx]
+            mask_arr = mask_arr[idx]
+            del_arr = del_arr[idx]
 
         return (
             torch.from_numpy(msa_arr.astype(np.int16)),

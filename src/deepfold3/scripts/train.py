@@ -164,6 +164,7 @@ def train(
         train_cfg.dtype = dtype
     if wandb_project is not None:
         train_cfg.wandb_project = wandb_project
+        train_cfg.wandb_enabled = True
     if mmcif_dir is not None:
         train_cfg.mmcif_dir = mmcif_dir
 
