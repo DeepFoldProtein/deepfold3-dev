@@ -38,6 +38,7 @@ def _process_one(
 ) -> dict | str:
     """Process a single PDB entry. Returns record dict or skip reason string."""
     from deepfold3.data.parse.templates import find_pdb_mmcif_path
+    from deepfold3.data.paths import structure_path
     from deepfold3.data.prepare.filters import filter_structure, filter_structure_metadata
     from deepfold3.data.prepare.structure import process_mmcif
 
@@ -67,8 +68,9 @@ def _process_one(
         detail = "; ".join(f"{name}: {reason}" for name, reason in reasons.items())
         return f"all chains filtered ({detail})"
 
-    # Save structure NPZ
-    structure.save(output_dir / "structures" / f"{record.id}.npz")
+    struct_path = structure_path(output_dir / "structures", record.id)
+    struct_path.parent.mkdir(parents=True, exist_ok=True)
+    structure.save(struct_path)
 
     # Save individual record JSON
     record_dict = record.to_dict()
@@ -166,40 +168,92 @@ def _read_a3m_query_sequence(path: Path) -> str | None:
 
 def _import_msa_files(
     records: list,
-    a3m_index: dict[str, Path],
+    src_dir: Path,
     output_msa_dir: Path,
-) -> int:
-    """Import matching A3M files for manifest records.
+    protein_only: bool = True,
+    workers: int = 1,
+    keep_a3m: bool = False,
+) -> tuple[int, int]:
+    """Import matching A3M files for manifest records and convert to NPZ.
 
-    Copies A3M files from the source directory to ``output_msa_dir/{msa_id}.a3m``
-    for each chain whose ``msa_id`` matches a hash in the index.
+    For each unique chain ``msa_id``:
 
-    Returns the number of chains matched.
+    1. Try a direct filename lookup ``src_dir/{msa_id}.a3m`` — works when
+       the source files were named with the manifest's ``msa_id`` scheme
+       (``SHA256("|".join(3-letter residue names))``). Essentially free.
+    2. For any unresolved msa_ids, fall back to a content-hash index built
+       from the source directory (``SHA256(uppercase 1-letter sequence)``).
+       Handles external A3M dumps (e.g. AFDB) where filenames don't match.
+
+    The training dataloader only reads NPZs, so by default the A3M is parsed
+    in place (no copy) and only the ``.npz`` is written. Pass ``keep_a3m=True``
+    to also keep the A3M alongside it.
+
+    Resume-safe: an existing ``{msa_id}.npz`` skips the work entirely.
+
+    Returns ``(matched, total)`` where ``total`` is the number of unique
+    qualifying msa_ids referenced by the manifest.
     """
-    import shutil
+    from deepfold3.data.msa.paths import unpaired_msa_path, unpaired_msa_root
+    from deepfold3.data.prepare.materialize import MaterializeTask, precreate_shards, run_materialize
+    from deepfold3.data.prepare.sequences import unique_msa_ids
 
     output_msa_dir.mkdir(parents=True, exist_ok=True)
-    matched = 0
-    seen: set[str] = set()
+    precreate_shards(unpaired_msa_root(output_msa_dir))
+    log = logging.getLogger(__name__)
 
-    for record in records:
-        for chain in record.chains:
-            msa_id = str(chain.msa_id)
-            if msa_id in seen:
-                continue
-            seen.add(msa_id)
+    msa_ids = unique_msa_ids(records, protein_only=protein_only)
+    total = len(msa_ids)
+    log.info("Resolving %d unique msa_ids (workers=%d, keep_a3m=%s)...", total, workers, keep_a3m)
 
-            dest = output_msa_dir / f"{msa_id}.a3m"
-            if dest.exists():
-                matched += 1
-                continue
+    work: list[MaterializeTask] = []
+    already = 0
+    unresolved: list[str] = []
+    for mid in msa_ids:
+        dest_npz = unpaired_msa_path(output_msa_dir, mid)
+        if dest_npz.exists():
+            already += 1
+            continue
+        candidate = src_dir / f"{mid}.a3m"
+        if candidate.exists():
+            work.append(MaterializeTask(msa_id=mid, src=str(candidate), dest_npz=str(dest_npz)))
+        else:
+            unresolved.append(mid)
 
-            src = a3m_index.get(msa_id)
-            if src is not None:
-                shutil.copy2(src, dest)
-                matched += 1
+    log.info(
+        "Filename lookup: %d already done, %d to materialize, %d unresolved.",
+        already,
+        len(work),
+        len(unresolved),
+    )
 
-    return matched
+    ok, failed = run_materialize(work, workers, log, label="materialized", keep_a3m=keep_a3m)
+    matched = already + ok
+    if work:
+        log.info("Materialize done: %d ok, %d failed.", ok, failed)
+
+    if unresolved:
+        log.info(
+            "Building content-hash index for %d unresolved msa_ids (scans every source A3M)...",
+            len(unresolved),
+        )
+        a3m_index = _build_a3m_index(src_dir)
+        fallback_work = [
+            MaterializeTask(msa_id=mid, src=str(a3m_index[mid]), dest_npz=str(unpaired_msa_path(output_msa_dir, mid)))
+            for mid in unresolved
+            if mid in a3m_index
+        ]
+        log.info(
+            "Content-hash fallback: %d/%d msa_ids resolved by content.",
+            len(fallback_work),
+            len(unresolved),
+        )
+        ok2, _ = run_materialize(
+            fallback_work, workers, log, label="materialized (fallback)", keep_a3m=keep_a3m
+        )
+        matched += ok2
+
+    return matched, total
 
 
 def _apply_clusters(records: list, cluster_file: Path) -> int:
@@ -392,10 +446,10 @@ def prepare(
 
     # Import pre-existing A3M files if provided
     if msa_dir:
-        a3m_index = _build_a3m_index(Path(msa_dir))
-        matched = _import_msa_files(manifest_records, a3m_index, output_path / "msa")
-        unique_msa_ids = len({str(c.msa_id) for r in manifest_records for c in r.chains})
-        log.info("MSA import: %d/%d unique sequences matched.", matched, unique_msa_ids)
+        matched, total = _import_msa_files(
+            manifest_records, Path(msa_dir), output_path / "msa", workers=workers
+        )
+        log.info("MSA import: %d/%d unique sequences matched.", matched, total)
 
     manifest_path = output_path / "manifest.json"
     save_manifest(manifest_records, manifest_path)
@@ -719,6 +773,7 @@ def import_of3(
     )
     log = logging.getLogger(__name__)
 
+    from deepfold3.data.paths import structure_path
     from deepfold3.data.prepare.manifest import save_manifest
     from deepfold3.data.prepare.openfold3 import (
         convert_of3_structure_with_cache,
@@ -753,7 +808,9 @@ def import_of3(
         try:
             cache_entry = cache_data.get(pdb_id)
             structure, record = convert_of3_structure_with_cache(npz_path, cache_entry, pdb_id=pdb_id)
-            structure.save(output_path / "structures" / f"{record.id}.npz")
+            dest = structure_path(output_path / "structures", record.id)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            structure.save(dest)
             records.append(record)
 
             if (i + 1) % 1000 == 0:
@@ -791,13 +848,27 @@ def import_of3(
     type=click.Path(exists=True),
     help="Directory of A3M files to import (scanned recursively).",
 )
-def import_msa(data_dir: str, msa_dir: str) -> None:
+@click.option(
+    "--workers",
+    default=1,
+    type=int,
+    show_default=True,
+    help="Parallel workers for A3M parse + NPZ conversion (the bottleneck).",
+)
+@click.option(
+    "--keep-a3m",
+    is_flag=True,
+    help="Also copy the A3M alongside the NPZ. Default off — the dataloader only reads NPZ.",
+)
+def import_msa(data_dir: str, msa_dir: str, workers: int, keep_a3m: bool) -> None:
     """Import pre-existing A3M files into a training dataset.
 
     Scans the A3M directory, reads the query sequence from each file,
-    computes its SHA256 hash, and copies matching files into
-    ``{data_dir}/msa/{msa_id}.a3m``. Works with any naming convention
-    (AFDB, PDB, custom).
+    computes its SHA256 hash, and for each chain ``msa_id`` referenced in
+    the manifest copies the matching A3M to ``{data_dir}/msa/{msa_id}.a3m``
+    and writes the parsed ``{data_dir}/msa/{msa_id}.npz`` (the format the
+    training dataloader reads). Works with any naming convention
+    (AFDB, PDB, custom). Existing files are left in place (resume-safe).
 
     Examples::
 
@@ -818,12 +889,12 @@ def import_msa(data_dir: str, msa_dir: str) -> None:
         click.echo("Error: no records found in data directory.", err=True)
         sys.exit(1)
 
-    a3m_index = _build_a3m_index(Path(msa_dir))
     output_msa_dir = data_path / "msa"
-    matched = _import_msa_files(records, a3m_index, output_msa_dir)
-    unique_msa_ids = len({str(c.msa_id) for r in records for c in r.chains})
+    matched, total = _import_msa_files(
+        records, Path(msa_dir), output_msa_dir, workers=workers, keep_a3m=keep_a3m
+    )
 
-    log.info("Done: %d/%d unique sequences matched.", matched, unique_msa_ids)
+    log.info("Done: %d/%d unique sequences matched.", matched, total)
 
 
 @cli.command("import-paired-msa")
@@ -839,7 +910,19 @@ def import_msa(data_dir: str, msa_dir: str) -> None:
     type=click.Path(exists=True),
     help="Directory of paired A3M files, organized as {record_id}/{chain_hash}.paired.a3m.",
 )
-def import_paired_msa(data_dir: str, paired_dir: str) -> None:
+@click.option(
+    "--workers",
+    default=1,
+    type=int,
+    show_default=True,
+    help="Parallel workers for A3M parse + NPZ conversion (the bottleneck).",
+)
+@click.option(
+    "--keep-a3m",
+    is_flag=True,
+    help="Also copy the A3M alongside the NPZ. Default off — the dataloader only reads NPZ.",
+)
+def import_paired_msa(data_dir: str, paired_dir: str, workers: int, keep_a3m: bool) -> None:
     """Import externally-generated paired MSA files into a training dataset.
 
     Expected directory layout::
@@ -852,20 +935,25 @@ def import_paired_msa(data_dir: str, paired_dir: str) -> None:
                 ...
 
     Each subdirectory name matches a record ID in the manifest. Files are
-    named ``{msa_id}.paired.a3m`` where ``msa_id`` is the chain's sequence
-    SHA256 hash. The same chain hash can appear in multiple record
+    named ``{chain_hash}.paired.a3m`` where ``chain_hash`` is the chain's
+    ``msa_id``. The same chain hash can appear in multiple record
     directories with different paired content (complex-specific pairing).
 
     Paired A3M files follow MMseqs2 ``--msa-format-mode 5`` output: row *i*
     across chains from the same complex corresponds to the same organism.
 
-    For each file, the command copies the A3M, converts to NPZ, and sets
-    ``paired_msa_id`` on the matching chain in the manifest.
+    For each file, the command parses the A3M and writes
+    ``{data_dir}/msa/{record_id}_paired_{chain_hash}.npz``, then sets
+    ``paired_msa_id`` on the matching chain in the manifest. By default the
+    A3M is parsed in place (no copy) since the dataloader only reads NPZ;
+    pass ``--keep-a3m`` to also copy it.
+
+    Resume-safe: existing NPZs are skipped.
 
     Examples::
 
         deepfold3 import-paired-msa --data-dir /data/training \\
-            --paired-dir /data/msa/pdb/merged/paired
+            --paired-dir /data/msa/pdb/merged/paired --workers 32
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -874,32 +962,30 @@ def import_paired_msa(data_dir: str, paired_dir: str) -> None:
     )
     log = logging.getLogger(__name__)
 
-    import shutil
-
-    from deepfold3.data import const
-    from deepfold3.data.parse.a3m import parse_a3m
+    from deepfold3.data.msa.paths import paired_msa_path, paired_msa_root
     from deepfold3.data.prepare.manifest import discover_records, save_manifest
+    from deepfold3.data.prepare.materialize import MaterializeTask, precreate_shards, run_materialize
+    from deepfold3.data.types import ChainInfo, Record
 
     data_path = Path(data_dir)
     paired_path = Path(paired_dir)
     msa_out = data_path / "msa"
-    msa_out.mkdir(parents=True, exist_ok=True)
+    precreate_shards(paired_msa_root(msa_out))
 
     records = discover_records(data_path)
     if not records:
         click.echo("Error: no records found in data directory.", err=True)
         sys.exit(1)
 
-    record_by_id: dict[str, object] = {r.id: r for r in records}
+    record_by_id: dict[str, Record] = {r.id: r for r in records}
 
     record_dirs = [d for d in sorted(paired_path.iterdir()) if d.is_dir()]
     log.info("Found %d record directories in %s", len(record_dirs), paired_path)
 
-    imported = 0
+    work: list[MaterializeTask] = []
+    assignments: list[tuple[str, ChainInfo, str]] = []
     skipped_no_record = 0
     skipped_no_chain = 0
-    failed = 0
-    updated_records: set[str] = set()
 
     for rec_dir in record_dirs:
         record_id = rec_dir.name.lower()
@@ -908,10 +994,9 @@ def import_paired_msa(data_dir: str, paired_dir: str) -> None:
             skipped_no_record += 1
             continue
 
-        chain_by_msa_id: dict[str, object] = {}
-        for chain in record.chains:
-            if chain.valid:
-                chain_by_msa_id[str(chain.msa_id)] = chain
+        chain_by_msa_id: dict[str, ChainInfo] = {
+            str(c.msa_id): c for c in record.chains if c.valid
+        }
 
         for a3m_file in rec_dir.glob("*.paired.a3m"):
             chain_hash = a3m_file.name.split(".paired.a3m")[0]
@@ -921,30 +1006,35 @@ def import_paired_msa(data_dir: str, paired_dir: str) -> None:
                 continue
 
             paired_msa_id = f"{record_id}_paired_{chain_hash}"
-            dest_a3m = msa_out / f"{paired_msa_id}.a3m"
-            dest_npz = msa_out / f"{paired_msa_id}.npz"
+            assignments.append((record_id, chain, paired_msa_id))
 
-            if not dest_a3m.exists():
-                shutil.copy2(a3m_file, dest_a3m)
+            dest_npz = paired_msa_path(msa_out, paired_msa_id)
+            if dest_npz.exists():
+                continue
+            work.append(MaterializeTask(msa_id=paired_msa_id, src=str(a3m_file), dest_npz=str(dest_npz)))
 
-            if not dest_npz.exists():
-                try:
-                    a3m_text = dest_a3m.read_text() if dest_a3m.exists() else a3m_file.read_text()
-                    msa = parse_a3m(a3m_text, mol_type=const.MOL_PROTEIN)
-                    msa.save(dest_npz)
-                except Exception as e:
-                    log.warning("Failed to convert %s/%s: %s", record_id, a3m_file.name, e)
-                    failed += 1
-                    continue
+    log.info(
+        "Plan: %d paired MSAs total (%d already done, %d to materialize), "
+        "%d dirs skipped (no record), %d files skipped (no chain).",
+        len(assignments),
+        len(assignments) - len(work),
+        len(work),
+        skipped_no_record,
+        skipped_no_chain,
+    )
 
-            chain.paired_msa_id = paired_msa_id
-            updated_records.add(record_id)
-            imported += 1
+    ok, failed = run_materialize(work, workers, log, label="paired-materialized", keep_a3m=keep_a3m)
+    log.info("Materialize done: %d ok, %d failed.", ok, failed)
 
-        if imported > 0 and imported % 1000 == 0:
-            log.info("  Progress: %d files imported, %d records updated...", imported, len(updated_records))
+    updated_records: set[str] = set()
+    imported = 0
+    for record_id, chain, paired_msa_id in assignments:
+        if not paired_msa_path(msa_out, paired_msa_id).exists():
+            continue
+        chain.paired_msa_id = paired_msa_id
+        updated_records.add(record_id)
+        imported += 1
 
-    # Save updated manifest
     if updated_records:
         manifest_path = data_path / "manifest.json"
         save_manifest(records, manifest_path)

@@ -5,10 +5,15 @@ Converts raw A3M text into an MSA dataclass.
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import numpy as np
 
 from deepfold3.data import const
 from deepfold3.data.types import MSA
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_sequence(seq: str, mol_type: int) -> tuple[list[int], list[int]]:
@@ -121,3 +126,25 @@ def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
             mask[i, L:] = False  # padding beyond sequence length
 
     return MSA(sequences=sequences, mask=mask, deletion_matrix=deletion_matrix)
+
+
+def convert_a3m_file_to_npz(
+    a3m_path: Path,
+    npz_path: Path,
+    mol_type: int = const.MOL_PROTEIN,
+) -> bool:
+    """Parse an A3M file and write the resulting MSA as a compressed NPZ.
+
+    Single source of truth for the A3M → MSA NPZ conversion used by
+    ``msa-batch``, ``import-msa``, and ``import-paired-msa``. Failures
+    are logged at WARNING and reported as a False return so batch
+    callers can tally a count.
+    """
+    try:
+        a3m_text = Path(a3m_path).read_text()
+        msa = parse_a3m(a3m_text, mol_type=mol_type)
+        msa.save(Path(npz_path))
+        return True
+    except Exception:
+        logger.warning("convert_a3m_file_to_npz failed for %s", a3m_path, exc_info=True)
+        return False

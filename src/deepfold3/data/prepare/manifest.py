@@ -75,7 +75,7 @@ def discover_records(data_dir: Path) -> list[Record]:
     if manifest_path.exists():
         return load_manifest(manifest_path)
 
-    # Fallback: scan structures/ directory
+    # Fallback: scan structures/ recursively
     structures_dir = data_dir / "structures"
     if not structures_dir.exists():
         logger.warning("No manifest.json or structures/ directory found in %s", data_dir)
@@ -84,7 +84,7 @@ def discover_records(data_dir: Path) -> list[Record]:
     from deepfold3.data.types import ChainInfo, Structure
 
     records = []
-    for npz_path in sorted(structures_dir.glob("*.npz")):
+    for npz_path in sorted(structures_dir.rglob("*.npz")):
         pdb_id = npz_path.stem
         try:
             structure = Structure.load(npz_path)

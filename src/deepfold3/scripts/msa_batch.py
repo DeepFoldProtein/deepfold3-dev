@@ -24,6 +24,9 @@ from pathlib import Path
 
 import click
 
+from deepfold3.data.msa.paths import paired_msa_path, paired_msa_root, unpaired_msa_path, unpaired_msa_root
+from deepfold3.data.parse.a3m import convert_a3m_file_to_npz
+from deepfold3.data.prepare.materialize import MaterializeTask, precreate_shards, run_materialize
 from deepfold3.data.prepare.sequences import (
     extract_sequences_by_msa_id,
     load_fasta,
@@ -32,22 +35,14 @@ from deepfold3.data.prepare.sequences import (
 from deepfold3.scripts import cli
 
 
-def _convert_a3m_to_npz(a3m_path: Path, npz_path: Path, mol_type: int = 0) -> bool:
-    """Convert a single A3M file to MSA NPZ. Returns True on success."""
-    from deepfold3.data.parse.a3m import parse_a3m
-
-    try:
-        a3m_text = a3m_path.read_text()
-        msa = parse_a3m(a3m_text, mol_type=mol_type)
-        msa.save(npz_path)
-        return True
-    except Exception:
-        return False
-
-
 @cli.command("msa-batch")
 @click.option("--data-dir", required=True, type=click.Path(exists=True, path_type=Path), help="Training data directory.")
-@click.option("--db-dir", required=True, type=click.Path(exists=True, path_type=Path), help="MMseqs2 database directory.")
+@click.option(
+    "--db-dir",
+    default=None,
+    type=click.Path(exists=True, path_type=Path),
+    help="MMseqs2 database directory. Required unless --convert-only is set.",
+)
 @click.option("--mmseqs", default="mmseqs", help="Path to mmseqs binary.")
 @click.option("--threads", default=8, type=int, show_default=True, help="Threads for MMseqs2 search.")
 @click.option("--gpu/--no-gpu", default=False, help="Use GPU-accelerated search.")
@@ -70,7 +65,7 @@ def _convert_a3m_to_npz(a3m_path: Path, npz_path: Path, mol_type: int = 0) -> bo
 @click.option("--verbose", is_flag=True, default=False, help="Stream MMseqs2 stderr to terminal.")
 def msa_batch(
     data_dir: Path,
-    db_dir: Path,
+    db_dir: Path | None,
     mmseqs: str,
     threads: int,
     gpu: bool,
@@ -103,6 +98,10 @@ def msa_batch(
     )
     log = logging.getLogger(__name__)
 
+    if not convert_only and db_dir is None:
+        click.echo("Error: --db-dir is required unless --convert-only is set.", err=True)
+        sys.exit(1)
+
     from deepfold3.data.prepare.manifest import discover_records
 
     records = discover_records(data_dir)
@@ -131,15 +130,15 @@ def msa_batch(
 
     # Partition: done (NPZ exists), a3m-only (A3M exists, needs conversion), pending (needs search)
     msa_dir = data_dir / "msa"
-    msa_dir.mkdir(parents=True, exist_ok=True)
+    precreate_shards(unpaired_msa_root(msa_dir))
 
     done = []
     need_convert = []  # have A3M, need NPZ
     need_search = []  # need both
 
     for msa_id in all_sequences:
-        npz_path = msa_dir / f"{msa_id}.npz"
-        a3m_path = msa_dir / f"{msa_id}.a3m"
+        npz_path = unpaired_msa_path(msa_dir, msa_id)
+        a3m_path = npz_path.with_suffix(".a3m")
         if npz_path.exists():
             done.append(msa_id)
         elif a3m_path.exists():
@@ -196,12 +195,13 @@ def msa_batch(
                 verbose=verbose,
             )
 
-            # Write A3M files
+            # Write A3M files; shards already pre-created
             written = 0
             for msa_id, msa_result in results.items():
                 a3m_text = msa_result.unpaired.get(0, "")
                 if a3m_text:
-                    (msa_dir / f"{msa_id}.a3m").write_text(a3m_text)
+                    a3m_path = unpaired_msa_path(msa_dir, msa_id).with_suffix(".a3m")
+                    a3m_path.write_text(a3m_text)
                     written += 1
 
             log.info("Batch %d: wrote %d/%d A3M files.", batch_idx + 1, written, len(keys))
@@ -217,35 +217,26 @@ def msa_batch(
     to_convert = need_convert
     if to_convert:
         log.info("Converting %d A3M files to NPZ...", len(to_convert))
-        converted = 0
-        failed = 0
-        for i, msa_id in enumerate(to_convert):
-            a3m_path = msa_dir / f"{msa_id}.a3m"
-            npz_path = msa_dir / f"{msa_id}.npz"
-            if npz_path.exists():
-                converted += 1
+        work = []
+        for msa_id in to_convert:
+            npz_path = unpaired_msa_path(msa_dir, msa_id)
+            a3m_path = npz_path.with_suffix(".a3m")
+            if npz_path.exists() or not a3m_path.exists():
                 continue
-            if not a3m_path.exists():
-                failed += 1
-                continue
-            if _convert_a3m_to_npz(a3m_path, npz_path):
-                converted += 1
-            else:
-                failed += 1
-            if (i + 1) % 1000 == 0:
-                log.info("  converted %d/%d...", i + 1, len(to_convert))
-
-        log.info("Conversion done: %d succeeded, %d failed.", converted, failed)
+            work.append(MaterializeTask(msa_id=msa_id, src=str(a3m_path), dest_npz=str(npz_path)))
+        ok, failed = run_materialize(work, threads, log, label="converted")
+        log.info("Conversion done: %d succeeded, %d failed.", ok, failed)
 
     # Summary (unpaired)
-    total_npz = sum(1 for mid in all_sequences if (msa_dir / f"{mid}.npz").exists())
+    total_npz = sum(1 for mid in all_sequences if unpaired_msa_path(msa_dir, mid).exists())
     log.info("Unpaired MSA: %d/%d sequences have NPZ files.", total_npz, len(all_sequences))
 
     # ── Phase 3: Paired MSA search (batch) ───────────────────────────────────
     if use_pairing and not convert_only:
         from deepfold3.data.msa.mmseqs2 import search_pair_batch
-        from deepfold3.data.parse.a3m import parse_a3m
         from deepfold3.data.prepare.manifest import save_manifest
+
+        precreate_shards(paired_msa_root(msa_dir))
 
         # Build complexes dict: {record_id: [msa_id, ...]} for multimers
         # Also build a lookup from record_id -> record + protein_chains
@@ -260,7 +251,7 @@ def msa_batch(
 
             # Check if already done (all chains have paired NPZ)
             paired_ids = [f"{record.id}_paired_{i}" for i in range(len(protein_chains))]
-            if all((msa_dir / f"{pid}.npz").exists() for pid in paired_ids):
+            if all(paired_msa_path(msa_dir, pid).exists() for pid in paired_ids):
                 for i, chain in enumerate(protein_chains):
                     chain.paired_msa_id = paired_ids[i]
                 skipped += 1
@@ -317,18 +308,19 @@ def msa_batch(
                     paired_failed += len(batch_complexes)
                     continue
 
-                # Write paired A3M + NPZ for each complex
+                # Write paired A3M + NPZ for each complex (paired pool is small per
+                # batch — search is the bottleneck, conversion stays serial here)
                 for cplx_id, chain_a3ms in pair_results.items():
                     record, protein_chains = record_lookup[cplx_id]
                     for i, chain in enumerate(protein_chains):
                         paired_msa_id = f"{record.id}_paired_{i}"
                         a3m_text = chain_a3ms.get(str(chain.msa_id), "")
                         if a3m_text:
-                            a3m_path = msa_dir / f"{paired_msa_id}.a3m"
+                            npz_path = paired_msa_path(msa_dir, paired_msa_id)
+                            a3m_path = npz_path.with_suffix(".a3m")
                             a3m_path.write_text(a3m_text)
-                            npz_path = msa_dir / f"{paired_msa_id}.npz"
-                            msa = parse_a3m(a3m_text, mol_type=0)
-                            msa.save(npz_path)
+                            if not convert_a3m_file_to_npz(a3m_path, npz_path):
+                                paired_failed += 1
                         chain.paired_msa_id = paired_msa_id
                     paired_done += 1
 

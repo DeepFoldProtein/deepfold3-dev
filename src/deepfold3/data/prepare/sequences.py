@@ -94,6 +94,29 @@ def residue_types_to_sequence(res_types: np.ndarray) -> str:
     return "".join(rt_map.get(int(rt), "X") for rt in res_types)
 
 
+def unique_msa_ids(records: list, protein_only: bool = True) -> list[str]:
+    """Return the deduplicated list of qualifying chain ``msa_id`` values.
+
+    A chain qualifies if ``chain.valid`` is True and (when ``protein_only``
+    is set, the default) its ``mol_type`` is ``MOL_PROTEIN``. Order matches
+    first appearance across the records list.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for record in records:
+        for chain in record.chains:
+            if not chain.valid:
+                continue
+            if protein_only and chain.mol_type != MOL_PROTEIN:
+                continue
+            mid = str(chain.msa_id)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append(mid)
+    return out
+
+
 def extract_sequences_by_msa_id(
     records: list,
     structures_dir: Path,
@@ -103,13 +126,14 @@ def extract_sequences_by_msa_id(
 
     Used by ``msa-batch`` for MSA search — one sequence per unique hash.
     """
+    from deepfold3.data.paths import structure_path
     from deepfold3.data.types import Structure
 
     sequences: dict[str, str] = {}
     seen: set[str] = set()
 
     for record in records:
-        npz_path = structures_dir / f"{record.id}.npz"
+        npz_path = structure_path(structures_dir, record.id)
         if not npz_path.exists():
             continue
         try:
@@ -186,6 +210,7 @@ def extract_sequences_by_cluster_key(
 
     Used by ``cluster`` for MMseqs2 clustering — one sequence per unique entity.
     """
+    from deepfold3.data.paths import structure_path
     from deepfold3.data.prepare.clustering import sequence_to_cluster_key
     from deepfold3.data.types import Structure
 
@@ -193,7 +218,7 @@ def extract_sequences_by_cluster_key(
     seen_entities: set[tuple[str, str | int | None]] = set()
 
     for record in records:
-        npz_path = structures_dir / f"{record.id}.npz"
+        npz_path = structure_path(structures_dir, record.id)
         if not npz_path.exists():
             continue
         try:

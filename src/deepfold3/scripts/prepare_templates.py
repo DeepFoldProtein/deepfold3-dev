@@ -34,9 +34,10 @@ def _process_one(
     overwrite: bool = False,
 ) -> str | None:
     """Process a single record.  Returns skip reason or None on success."""
+    from deepfold3.data.paths import template_path
     from deepfold3.data.prepare.template_search import find_multimer_templates, save_template_hits
 
-    out_path = output_dir / f"{record_id}.json"
+    out_path = template_path(output_dir, record_id)
     if out_path.exists() and not overwrite:
         return "exists"
 
@@ -50,6 +51,7 @@ def _process_one(
     if not hits:
         return "no_hits"
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     save_template_hits(hits, out_path)
     return None
 
@@ -87,13 +89,14 @@ def prepare_templates(
         logger.error("No records found in %s", data_dir)
         return
 
+    from deepfold3.data.paths import template_path
+
     output_dir = data_dir / "templates"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build work items: (record_id, chain_msa_ids)
     work: list[tuple[str, list[str]]] = []
     for record in records:
-        if not overwrite and (output_dir / f"{record.id}.json").exists():
+        if not overwrite and template_path(output_dir, record.id).exists():
             continue
         msa_ids = [str(c.msa_id) for c in record.chains]
         work.append((record.id, msa_ids))

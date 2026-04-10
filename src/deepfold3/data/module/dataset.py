@@ -20,6 +20,8 @@ from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
 from deepfold3.data.masking import TokenMask
+from deepfold3.data.msa.paths import paired_msa_path, unpaired_msa_path
+from deepfold3.data.paths import mask_path, structure_path, template_path
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
     ATOM_DTYPE,
@@ -71,14 +73,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.tokenizer = Tokenizer()
         self.cropper = Cropper()
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
-        masks_dir = self.data_dir / "masks"
-        self._mask_ids = {p.stem for p in masks_dir.glob("*.npz")} if masks_dir.is_dir() else set()
-
-        # Template support
+        # Mask/template availability is checked lazily per record at __getitem__
+        # time. Pre-scanning would walk hundreds of thousands of files per worker
+        # under DDP and is unnecessary — kernel dentry cache makes the per-record
+        # exists() effectively free after the first hit.
+        self._has_masks = (self.data_dir / "masks").is_dir()
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
         self.max_templates = max_templates
-        templates_dir = self.data_dir / "templates"
-        self._template_ids = {p.stem for p in templates_dir.glob("*.json")} if templates_dir.is_dir() else set()
+        self._has_templates = (self.data_dir / "templates").is_dir()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -87,23 +89,24 @@ class TrainingDataset(torch.utils.data.Dataset):
         record = self.records[idx]
 
         # Load structure
-        structure_path = self.data_dir / "structures" / f"{record.id}.npz"
-        if not structure_path.exists():
-            raise FileNotFoundError(f"Structure file not found: {structure_path}")
-        structure = Structure.load(structure_path)
+        struct_path = structure_path(self.data_dir / "structures", record.id)
+        if not struct_path.exists():
+            raise FileNotFoundError(f"Structure file not found: {struct_path}")
+        structure = Structure.load(struct_path)
 
         # Load per-chain MSAs (unpaired + optional paired)
+        msa_dir = self.data_dir / "msa"
         unpaired_msa: dict[int, MSA] = {}
         paired_msa: dict[int, MSA] = {}
         for chain_info in record.chains:
             # Unpaired MSA
-            msa_path = self.data_dir / "msa" / f"{chain_info.msa_id}.npz"
+            msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
             if msa_path.exists():
                 unpaired_msa[chain_info.chain_id] = MSA.load(msa_path)
 
             # Paired MSA (cross-chain co-evolutionary signal)
             if chain_info.paired_msa_id is not None:
-                paired_path = self.data_dir / "msa" / f"{chain_info.paired_msa_id}.npz"
+                paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():
                     paired_msa[chain_info.chain_id] = MSA.load(paired_path)
 
@@ -111,17 +114,20 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         # Load multimer templates (randomly sample 0..max_templates)
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
-        if self.mmcif_dir and record.id in self._template_ids:
-            n_templates = random.randint(0, self.max_templates)
-            if n_templates > 0:
-                template_feats_per_chain = self._load_multimer_templates(record, n_templates)
+        if self.mmcif_dir and self._has_templates:
+            tpl_index = template_path(self.data_dir / "templates", record.id)
+            if tpl_index.exists():
+                n_templates = random.randint(0, self.max_templates)
+                if n_templates > 0:
+                    template_feats_per_chain = self._load_multimer_templates(record, n_templates)
 
         # Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
 
-        if record.id in self._mask_ids:
-            mask_path = self.data_dir / "masks" / f"{record.id}.npz"
-            tokenized = tokenized.with_mask(TokenMask.load(str(mask_path)))
+        if self._has_masks:
+            mp = mask_path(self.data_dir / "masks", record.id)
+            if mp.exists():
+                tokenized = tokenized.with_mask(TokenMask.load(str(mp)))
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
         feats = self.featurizer.process(
@@ -155,9 +161,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         )
         from deepfold3.data.prepare.template_search import load_template_hits
 
-        template_path = self.data_dir / "templates" / f"{record.id}.json"
+        tpl_path = template_path(self.data_dir / "templates", record.id)
         try:
-            hits = load_template_hits(template_path)
+            hits = load_template_hits(tpl_path)
         except Exception:
             logger.debug("Failed to load template index for %s", record.id)
             return None
