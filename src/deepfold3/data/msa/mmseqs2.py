@@ -1313,20 +1313,8 @@ def _gap_only_paired_a3m(chain_id: str, sequence: str, n_pairs: int) -> str:
     headers with all-gap sequences matching the query length.
     """
     gap_line = "-" * len(sequence)
-    parts = [f">{chain_id}", sequence]
-    for _ in range(n_pairs):
-        parts.append(">DUMMY")
-        parts.append(gap_line)
-    return "\n".join(parts) + "\n"
-
-
-def _count_paired_rows(a3m_text: str) -> int:
-    """Count non-query rows in a paired A3M (i.e., depth - 1)."""
-    n = 0
-    for line in a3m_text.splitlines():
-        if line.startswith(">"):
-            n += 1
-    return max(0, n - 1)
+    dummy_block = f"\n>DUMMY\n{gap_line}" * n_pairs
+    return f">{chain_id}\n{sequence}{dummy_block}\n"
 
 
 def _unpack_pair_results(
@@ -1363,6 +1351,7 @@ def _unpack_pair_results(
     data = (work_dir / "pair.a3m").read_bytes()
 
     results: dict[str, dict[str, str]] = {}
+    cplx_max_pairs: dict[str, int] = {}
     for line in pair_a3m_index.read_text().splitlines():
         parts = line.split("\t")
         if len(parts) < 3:
@@ -1377,6 +1366,10 @@ def _unpack_pair_results(
             continue
         content = data[offset : offset + length].rstrip(b"\x00").decode(errors="replace")
         results.setdefault(cplx_id, {})[chain_id] = content
+        # Depth = number of '>' headers minus the query row
+        n_pairs = max(0, content.count(">") - 1)
+        if n_pairs > cplx_max_pairs.get(cplx_id, 0):
+            cplx_max_pairs[cplx_id] = n_pairs
 
     # Fill missing chains with gap-only rows
     filled = 0
@@ -1384,13 +1377,10 @@ def _unpack_pair_results(
         chain_a3ms = results.get(cplx_id)
         if not chain_a3ms:
             continue
-        present = set(chain_a3ms.keys())
-        missing = [cid for cid in chain_ids if cid not in present and cid in sequences]
-        if not missing:
-            continue
-        # Use depth from any present sibling
-        n_pairs = max((_count_paired_rows(t) for t in chain_a3ms.values()), default=0)
-        for cid in missing:
+        n_pairs = cplx_max_pairs.get(cplx_id, 0)
+        for cid in chain_ids:
+            if cid in chain_a3ms or cid not in sequences:
+                continue
             chain_a3ms[cid] = _gap_only_paired_a3m(cid, sequences[cid], n_pairs)
             filled += 1
     if filled:

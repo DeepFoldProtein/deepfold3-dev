@@ -63,6 +63,9 @@ RES_TYPE_ORDER: dict[str, int] = {
 # Reverse map (index → canonical code)
 RES_TYPE_INDEX_TO_NAME: dict[int, str] = {v: k for k, v in RES_TYPE_ORDER.items()}
 
+# MSA gap token (matches ``"-"`` in RES_TYPE_ORDER)
+MSA_GAP = 21
+
 # Non-standard / alternate names that map to a standard residue
 _NONSTANDARD_TO_STANDARD: dict[str, str] = {
     "MSE": "MET",  # selenomethionine

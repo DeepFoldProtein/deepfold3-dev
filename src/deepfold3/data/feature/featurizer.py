@@ -413,30 +413,26 @@ class Featurizer:
         combined_dels: list[np.ndarray] = []
 
         # --- 1. Paired rows: zip across chains (up to MAX_PAIRED_MSA_ROWS) ---
-        # Row 0 is the query (from paired MSA or, if absent, from unpaired).
         # Use the deepest available chain; chains with shorter or absent paired
         # MSAs leave their columns as gaps for the rows they don't cover.
         n_paired_rows = 0
         if data.paired_msa:
-            paired_chain_ids = [
-                int(asym_id)
-                for asym_id, msa in data.paired_msa.items()
-                if int(asym_id) in chain_pos_map
-                and len(chain_pos_map[int(asym_id)]) > 0
-                and msa.sequences.shape[0] > 0
-            ]
-            if paired_chain_ids:
-                max_depth = max(data.paired_msa[a].sequences.shape[0] for a in paired_chain_ids)
+            paired_chains: list[tuple[int, "Msa"]] = []
+            for asym_id, msa in data.paired_msa.items():
+                aid = int(asym_id)
+                if aid in chain_pos_map and len(chain_pos_map[aid]) > 0 and msa.sequences.shape[0] > 0:
+                    paired_chains.append((aid, msa))
+            if paired_chains:
+                max_depth = max(msa.sequences.shape[0] for _, msa in paired_chains)
                 n_paired_rows = min(max_depth, const.MAX_PAIRED_MSA_ROWS + 1)
                 for row_i in range(n_paired_rows):
-                    row_seq = np.full(N, 21, dtype=np.int8)
+                    row_seq = np.full(N, const.MSA_GAP, dtype=np.int8)
                     row_mask = np.ones(N, dtype=bool)
                     row_del = np.zeros(N, dtype=np.int8)
-                    for asym_id in paired_chain_ids:
-                        msa = data.paired_msa[asym_id]
+                    for aid, msa in paired_chains:
                         if row_i >= msa.sequences.shape[0]:
                             continue
-                        chain_pos = chain_pos_map[asym_id]
+                        chain_pos = chain_pos_map[aid]
                         L = min(msa.sequences.shape[1], len(chain_pos))
                         row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]
                         row_mask[chain_pos[:L]] = msa.mask[row_i, :L]
@@ -447,7 +443,7 @@ class Featurizer:
 
         # If no paired MSA, build query row from unpaired row 0
         if n_paired_rows == 0:
-            query_seq = np.full(N, 21, dtype=np.int8)
+            query_seq = np.full(N, const.MSA_GAP, dtype=np.int8)
             query_mask = np.ones(N, dtype=bool)
             query_del = np.zeros(N, dtype=np.int8)
             for asym_id, msa in data.unpaired_msa.items():
@@ -488,7 +484,7 @@ class Featurizer:
 
         if max_S_unpaired > 0:
             # Build dense [max_S_unpaired, N] arrays — all chains on same rows
-            dense_seqs = np.full((max_S_unpaired, N), 21, dtype=np.int8)
+            dense_seqs = np.full((max_S_unpaired, N), const.MSA_GAP, dtype=np.int8)
             dense_masks = np.ones((max_S_unpaired, N), dtype=bool)
             dense_dels = np.zeros((max_S_unpaired, N), dtype=np.int8)
             for asym_id, seqs, masks, dels in chain_unpaired:
@@ -505,7 +501,7 @@ class Featurizer:
             combined_dels.append(dense_dels)
 
         if not combined_seqs:
-            msa_arr = np.full((1, N), 21, dtype=np.int8)
+            msa_arr = np.full((1, N), const.MSA_GAP, dtype=np.int8)
             mask_arr = np.ones((1, N), dtype=bool)
             del_arr = np.zeros((1, N), dtype=np.int8)
         else:
