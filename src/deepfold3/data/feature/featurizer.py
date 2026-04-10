@@ -382,7 +382,9 @@ class Featurizer:
             result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
             # Bond features for bond violation loss (Protenix-style: observed GT distances)
-            bond_feats = self._build_bond_features(tokens, atom_gt_positions, atom_gt_mask, data.bonds, N, M)
+            bond_feats = self._build_bond_features(
+                tokens, data.structure.atoms, atom_gt_positions, atom_gt_mask, data.bonds, N, M
+            )
             result.update(bond_feats)
 
         # Bond matrix: only allocated when ligand bonds exist (polymer-only → skip)
@@ -580,6 +582,7 @@ class Featurizer:
     @staticmethod
     def _build_bond_features(
         tokens: np.ndarray,
+        structure_atoms: np.ndarray,  # ATOM_DTYPE from Structure
         atom_gt_positions: np.ndarray,  # [N, M, 3]
         atom_gt_mask: np.ndarray,  # [N, M]
         token_bonds: np.ndarray,  # TOKEN_BOND_DTYPE from Tokenized
@@ -590,11 +593,14 @@ class Featurizer:
 
         Collects three types of bonds:
 
-        1. **Intra-residue backbone** (polymer): N-CA (atoms 0-1),
-           CA-C (atoms 1-2) within each polymer token.
-        2. **Inter-residue peptide/phosphodiester**: C[i]-N[i+1] for
-           protein (atom 2 of token i → atom 0 of token i+1),
-           O3'→P for nucleic acids.
+        1. **Intra-residue backbone** (polymer):
+           - Protein: N-CA (atoms 0-1), CA-C (atoms 1-2) within each token.
+           - RNA/DNA: P-O5', O5'-C5', C5'-C4', C4'-C3', C3'-O3' within each
+             token (looked up by atom name since 5'-terminal nucleotides
+             may lack the phosphate group).
+        2. **Inter-residue peptide/phosphodiester**:
+           - Protein: C[i] (atom 2) → N[i+1] (atom 0).
+           - RNA/DNA: O3'[i] → P[i+1] (looked up by name).
         3. **Ligand-ligand bonds**: from ``Tokenized.bonds`` (token-level,
            atom index 0 for each single-atom ligand token).
 
@@ -610,11 +616,35 @@ class Featurizer:
         """
         bonds: list[tuple[int, int, int, int]] = []  # (t1, a1, t2, a2)
 
+        # Per-token cache of atom-name → local atom index (only for nucleic
+        # tokens, to avoid the overhead for protein-only complexes).
+        nucleic_name_map: dict[int, dict[str, int]] = {}
+
+        def _nucleic_atom_map(tok_idx: int) -> dict[str, int]:
+            cached = nucleic_name_map.get(tok_idx)
+            if cached is not None:
+                return cached
+            m = _token_atom_name_map(tokens[tok_idx], structure_atoms, M)
+            nucleic_name_map[tok_idx] = m
+            return m
+
+        # Intra-residue nucleic backbone bond list (names lookup).
+        # C4'–O4' and O4'–C1' etc. are intentionally omitted — the five
+        # bonds below define the main-chain phosphate–sugar backbone that
+        # the bond violation loss needs to constrain.
+        _NUC_INTRA_BONDS: tuple[tuple[str, str], ...] = (
+            ("P", "O5'"),
+            ("O5'", "C5'"),
+            ("C5'", "C4'"),
+            ("C4'", "C3'"),
+            ("C3'", "O3'"),
+        )
+
         # --- 1. Intra-residue backbone bonds ---
         # Protein: N(0)-CA(1), CA(1)-C(2)
-        # RNA/DNA: handled via CCD atom ordering, but the first 3 backbone
-        # atoms (P, OP1, OP2 or similar) vary — skip nucleic intra-residue
-        # for now, rely on inter-residue bonds.
+        # RNA/DNA: P-O5', O5'-C5', C5'-C4', C4'-C3', C3'-O3' (by atom name;
+        # 5'-terminal nucleotides lack the phosphate group so P may be
+        # missing — those bonds are silently skipped).
         for i in range(N):
             mt = int(tokens[i]["mol_type"])
             if mt == const.MOL_PROTEIN:
@@ -622,6 +652,14 @@ class Featurizer:
                 bonds.append((i, 0, i, 1))
                 # CA-C bond (atoms 1-2)
                 bonds.append((i, 1, i, 2))
+            elif mt in (const.MOL_RNA, const.MOL_DNA):
+                amap = _nucleic_atom_map(i)
+                for a_name, b_name in _NUC_INTRA_BONDS:
+                    a_idx = amap.get(a_name)
+                    b_idx = amap.get(b_name)
+                    if a_idx is None or b_idx is None:
+                        continue
+                    bonds.append((i, a_idx, i, b_idx))
 
         # --- 2. Inter-residue backbone bonds ---
         for i in range(N - 1):
@@ -640,11 +678,15 @@ class Featurizer:
                 # C[i] (atom 2) → N[i+1] (atom 0)
                 bonds.append((i, 2, i + 1, 0))
             elif mt_i in (const.MOL_RNA, const.MOL_DNA) and mt_j in (const.MOL_RNA, const.MOL_DNA):
-                # O3'[i] → P[i+1]: find O3' in token i, P in token i+1
-                # Standard nucleic backbone: O3' is typically atom index ~8-10
-                # P is typically atom 0. We use a simple heuristic: scan for
-                # the atom names. If not found, skip.
-                pass  # TODO: nucleic backbone bonds (need atom name lookup)
+                # O3'[i] → P[i+1] (phosphodiester linkage). Either atom
+                # may be missing at chain termini or when the residue
+                # lacks the phosphate group — skip those cases.
+                amap_i = _nucleic_atom_map(i)
+                amap_j = _nucleic_atom_map(i + 1)
+                o3_idx = amap_i.get("O3'")
+                p_idx = amap_j.get("P")
+                if o3_idx is not None and p_idx is not None:
+                    bonds.append((i, o3_idx, i + 1, p_idx))
 
         # --- 3. Ligand-ligand bonds from tokenizer ---
         for bond in token_bonds:
@@ -866,6 +908,42 @@ class Featurizer:
             "template_backbone_frame": torch.zeros(0, 0, 3, 3),
             "template_backbone_mask": torch.zeros(0, 0, dtype=torch.bool),
         }
+
+
+def _token_atom_name_map(
+    token: np.void,
+    structure_atoms: np.ndarray,
+    M: int,
+) -> dict[str, int]:
+    """Return a mapping from atom name → local atom index within a token.
+
+    Normalizes the trailing ``*`` prime convention (``O3*``) to the canonical
+    ``O3'`` form, so nucleic-acid atom lookups work regardless of the source
+    naming style. Only the first ``min(atom_num, M)`` atoms are considered —
+    anything past the per-token slot budget is silently dropped (matching
+    the rest of the featurizer's token-atom handling).
+    """
+    atom_idx = int(token["atom_idx"])
+    atom_num = int(token["atom_num"])
+    n = min(atom_num, M)
+    out: dict[str, int] = {}
+    total = len(structure_atoms)
+    for j in range(n):
+        a_idx = atom_idx + j
+        if a_idx >= total:
+            break
+        raw = structure_atoms[a_idx]["name"].decode("ascii", errors="replace").strip()
+        if not raw:
+            continue
+        out[raw] = j
+        # Be defensive about the prime vs star convention used in legacy PDB
+        # files: structure.py normalizes to one form, but we accept both so
+        # lookups for "O3'" still find an "O3*" entry (and vice versa).
+        if "*" in raw:
+            out[raw.replace("*", "'")] = j
+        elif "'" in raw:
+            out[raw.replace("'", "*")] = j
+    return out
 
 
 def _find_res_name(data: Tokenized, atom_idx: int) -> str:

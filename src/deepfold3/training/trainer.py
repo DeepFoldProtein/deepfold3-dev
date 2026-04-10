@@ -391,18 +391,27 @@ class Trainer:
         return train_dl, eval_dl
 
     def _build_train_sampler(self, train_ds: TrainingDataset):
-        """Build training sampler — weighted or distributed."""
+        """Build training sampler — weighted or distributed.
+
+        For ``WeightedClusterSampler`` we also attach the sampler's flat
+        ``rows`` table to ``train_ds.sampling_rows`` so the dataset's
+        ``__getitem__`` can resolve each sampled index back to a record
+        and the chain/interface anchor that earned the draw — closing
+        the loop the AF3 §2.5.6 sampler depends on.
+        """
         has_real_clusters = any(isinstance(c.cluster_id, int) for r in self.records for c in r.chains)
 
         if has_real_clusters:
             from deepfold3.data.sample.weighted import WeightedClusterSampler
 
-            return WeightedClusterSampler(
+            sampler = WeightedClusterSampler(
                 records=self.records,
                 num_replicas=self.world_size,
                 rank=self.rank,
                 seed=self.cfg.seed,
             )
+            train_ds.sampling_rows = sampler.rows
+            return sampler
 
         if self.world_size > 1:
             return DistributedSampler(

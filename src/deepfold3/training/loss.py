@@ -27,20 +27,32 @@ def smooth_lddt_loss(
     gt_pos: torch.Tensor,  # [N, M, 3]
     atom_mask: torch.Tensor,  # [N, M] bool
     cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0),
-    inclusion_radius: float = 30.0,
+    inclusion_radius: float = 15.0,  # non-nucleotide pairs
+    nucleotide_inclusion_radius: float = 30.0,  # nucleotide-nucleotide pairs
     min_distance: float = 1e-3,
+    mol_type: torch.Tensor | None = None,  # [N] per-token mol type
 ) -> torch.Tensor:
     """Smooth LDDT loss between predicted and ground-truth atom positions.
 
     Vectorized over S samples — no Python loops over diffusion dimension.
+
+    Pair-inclusion radius (AlphaFold 3 supplement eq. 6, Protenix
+    ``loss.py:457``): nucleotide-nucleotide atom pairs use the larger
+    ``nucleotide_inclusion_radius`` (30 Å), all other pairs use
+    ``inclusion_radius`` (15 Å). When ``mol_type`` is not provided, the
+    smaller radius is used for every pair (the safer default).
 
     Args:
         pred_pos: Predicted positions [S, N, M, 3].
         gt_pos: Ground-truth positions [N, M, 3].
         atom_mask: Valid atom mask [N, M].
         cutoffs: Distance error thresholds in Angstroms.
-        inclusion_radius: Only score pairs within this radius in GT.
+        inclusion_radius: Pair inclusion radius for non-nucleotide pairs.
+        nucleotide_inclusion_radius: Pair inclusion radius for
+            nucleotide-nucleotide pairs.
         min_distance: Minimum GT distance for pair inclusion.
+        mol_type: Per-token molecule type ``[N]`` (0=prot, 1=RNA, 2=DNA,
+            3=ligand). Used to choose the per-pair inclusion radius.
 
     Returns:
         Scalar loss (1 - smooth_lddt), averaged over samples.
@@ -53,7 +65,21 @@ def smooth_lddt_loss(
     S = pred_pos.shape[0]
     gt_flat = gt_pos.reshape(-1, 3)[flat_mask]  # [A, 3]
     gt_dist = torch.cdist(gt_flat, gt_flat)  # [A, A]
-    pair_mask = (gt_dist < inclusion_radius) & (gt_dist > min_distance)  # [A, A]
+
+    if mol_type is not None:
+        # Broadcast per-token mol_type to per-atom (each token holds M atoms).
+        N, M = atom_mask.shape
+        per_atom_mol_type = mol_type.view(N, 1).expand(N, M).reshape(-1)[flat_mask]  # [A]
+        is_nuc = (per_atom_mol_type == 1) | (per_atom_mol_type == 2)
+        nuc_pair = is_nuc.unsqueeze(0) & is_nuc.unsqueeze(1)  # [A, A]
+        radius = torch.where(
+            nuc_pair,
+            gt_dist.new_full((), nucleotide_inclusion_radius),
+            gt_dist.new_full((), inclusion_radius),
+        )
+        pair_mask = (gt_dist < radius) & (gt_dist > min_distance)
+    else:
+        pair_mask = (gt_dist < inclusion_radius) & (gt_dist > min_distance)
     n_pairs = pair_mask.sum().clamp(min=1)
 
     # Batch over S: [S, A, 3]
@@ -497,7 +523,9 @@ def training_loss(
             atom_mask,
             cutoffs=cfg.lddt_cutoffs,
             inclusion_radius=cfg.lddt_inclusion_radius,
+            nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
             min_distance=cfg.lddt_min_distance,
+            mol_type=features.get("mol_type"),
         )
         losses["smooth_lddt"] = l_lddt
 

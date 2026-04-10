@@ -1,16 +1,26 @@
 """Cluster-balanced weighted sampler for training data.
 
-Implements AF3-style cluster-balanced sampling (§2.5.6):
-  w_chain     = beta_chain / cluster_size * (alpha_prot * is_prot + alpha_nucl * is_nucl + alpha_lig * is_lig)
-  w_interface = beta_interface / cluster_size * (alpha_prot * n_prot + alpha_nucl * n_nucl + alpha_lig * n_lig)
+Implements AlphaFold 3 §2.5.6 cluster-balanced sampling. Following AF3 /
+Protenix / OpenFold-3, the sampling table is **flattened** so each
+``(record, anchor)`` candidate is its own row:
 
-Each record's weight is the sum of its chain and interface weights, normalized
-to a probability distribution. Samples are drawn with replacement.
+* one row per **valid chain** of every record
+  ``w_chain     = beta_chain / cluster_size * alpha(mol_type)``
+* one row per **valid interface** of every record
+  ``w_interface = beta_interface / sqrt(cluster_size_1 * cluster_size_2)
+                  * (alpha(c1.mol_type) + alpha(c2.mol_type))``
+
+Sampling a row tells the dataloader BOTH which record to load AND which
+chain/interface should anchor the crop. This is critical: a 20-chain
+multimer should generate ~20 chain-anchor draws and many interface
+draws so each chain/interface gets training time, instead of being
+collapsed into a single per-record weight that the cropper then ignores.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 
 import numpy as np
 from torch.utils.data import Sampler
@@ -19,59 +29,20 @@ from deepfold3.data import const
 from deepfold3.data.types import Record
 
 
-def compute_cluster_weights(
-    records: list[Record],
-    alpha_prot: float = 3.0,
-    alpha_nucl: float = 3.0,
-    alpha_lig: float = 1.0,
-    beta_chain: float = 0.5,
-    beta_interface: float = 1.0,
-) -> np.ndarray:
-    """Compute AF3-style cluster-balanced sampling weights for records.
+@dataclass(frozen=True)
+class SamplingRow:
+    """One row in the flattened ``(record, anchor)`` sampling table.
 
-    Returns:
-        Normalized probability array of shape ``(len(records),)``.
+    ``anchor_kind`` is ``"chain"`` (anchor_a is the chain id, anchor_b is
+    -1) or ``"interface"`` (anchor_a, anchor_b are the two chain ids).
+    The dataloader uses ``anchor_kind`` + ``anchor_a`` (+ ``anchor_b``)
+    to seed the cropper.
     """
-    cluster_sizes = _compute_cluster_sizes(records)
-    weights = np.zeros(len(records), dtype=np.float64)
 
-    for i, rec in enumerate(records):
-        w = 0.0
-        for chain in rec.chains:
-            if not chain.valid:
-                continue
-            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
-            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
-            w += beta_chain * alpha / cs
-
-        for iface in rec.interfaces:
-            if not iface.valid:
-                continue
-            c1 = _find_chain(rec, iface.chain_1)
-            c2 = _find_chain(rec, iface.chain_2)
-            if c1 is None or c2 is None:
-                continue
-            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
-            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
-            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
-                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
-            )
-            cs = max((cs1 * cs2) ** 0.5, 1)
-            w += beta_interface * alpha_sum / cs
-
-        weights[i] = w
-
-    total = weights.sum()
-    return weights / total if total > 0 else np.ones(len(records)) / len(records)
-
-
-def _compute_cluster_sizes(records: list[Record]) -> dict:
-    counter: Counter = Counter()
-    for rec in records:
-        for chain in rec.chains:
-            if chain.valid:
-                counter[chain.cluster_id] += 1
-    return dict(counter)
+    record_idx: int
+    anchor_kind: str  # "chain" | "interface"
+    anchor_a: int
+    anchor_b: int = -1
 
 
 def _mol_type_alpha(mol_type: int, alpha_prot: float, alpha_nucl: float, alpha_lig: float) -> float:
@@ -91,20 +62,132 @@ def _find_chain(rec: Record, chain_id: int):
     return None
 
 
-class WeightedClusterSampler(Sampler[int]):
-    """Cluster-balanced sampler for training datasets.
+def _compute_cluster_sizes(records: list[Record]) -> dict:
+    counter: Counter = Counter()
+    for rec in records:
+        for chain in rec.chains:
+            if chain.valid:
+                counter[chain.cluster_id] += 1
+    return dict(counter)
 
-    Compatible with ``DistributedDataParallel``: each rank draws its own
-    shard of ``epoch_size // num_replicas`` samples per epoch.
+
+def build_sampling_rows(
+    records: list[Record],
+    alpha_prot: float = 3.0,
+    alpha_nucl: float = 3.0,
+    alpha_lig: float = 1.0,
+    beta_chain: float = 0.5,
+    beta_interface: float = 1.0,
+) -> tuple[list[SamplingRow], np.ndarray]:
+    """Flatten records into one sampling row per chain + interface.
+
+    Returns ``(rows, weights)`` where ``weights`` is a normalised
+    probability distribution of length ``len(rows)``. Records with no
+    valid chains contribute no rows. Cluster sizes are computed across
+    all valid chains in the dataset (matching AF3 §2.5.6).
+    """
+    cluster_sizes = _compute_cluster_sizes(records)
+    rows: list[SamplingRow] = []
+    weight_list: list[float] = []
+
+    for record_idx, rec in enumerate(records):
+        for chain in rec.chains:
+            if not chain.valid:
+                continue
+            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
+            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
+            w = beta_chain * alpha / cs
+            if w > 0:
+                rows.append(SamplingRow(record_idx, "chain", chain.chain_id))
+                weight_list.append(w)
+
+        for iface in rec.interfaces:
+            if not iface.valid:
+                continue
+            c1 = _find_chain(rec, iface.chain_1)
+            c2 = _find_chain(rec, iface.chain_2)
+            if c1 is None or c2 is None or not c1.valid or not c2.valid:
+                continue
+            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
+            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
+            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
+                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
+            )
+            cs = max((cs1 * cs2) ** 0.5, 1.0)
+            w = beta_interface * alpha_sum / cs
+            if w > 0:
+                rows.append(SamplingRow(record_idx, "interface", c1.chain_id, c2.chain_id))
+                weight_list.append(w)
+
+    if not rows:
+        # Degenerate fallback: one uniform row per record so the dataloader
+        # can still iterate (e.g. tests with no valid chains).
+        rows = [SamplingRow(i, "chain", -1) for i in range(len(records))]
+        weight_list = [1.0] * len(records)
+
+    weights = np.asarray(weight_list, dtype=np.float64)
+    total = weights.sum()
+    return rows, weights / total if total > 0 else np.ones(len(rows)) / len(rows)
+
+
+def compute_cluster_weights(
+    records: list[Record],
+    alpha_prot: float = 3.0,
+    alpha_nucl: float = 3.0,
+    alpha_lig: float = 1.0,
+    beta_chain: float = 0.5,
+    beta_interface: float = 1.0,
+) -> np.ndarray:
+    """Per-record weights (legacy helper).
+
+    Aggregates the chain + interface weights of every record into a single
+    record-level draw probability. Kept for backward compatibility with
+    callers that don't need the per-anchor flat layout. New code should
+    use :func:`build_sampling_rows` instead.
+    """
+    cluster_sizes = _compute_cluster_sizes(records)
+    weights = np.zeros(len(records), dtype=np.float64)
+
+    for i, rec in enumerate(records):
+        w = 0.0
+        for chain in rec.chains:
+            if not chain.valid:
+                continue
+            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
+            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
+            w += beta_chain * alpha / cs
+        for iface in rec.interfaces:
+            if not iface.valid:
+                continue
+            c1 = _find_chain(rec, iface.chain_1)
+            c2 = _find_chain(rec, iface.chain_2)
+            if c1 is None or c2 is None:
+                continue
+            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
+            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
+            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
+                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
+            )
+            cs = max((cs1 * cs2) ** 0.5, 1)
+            w += beta_interface * alpha_sum / cs
+        weights[i] = w
+    total = weights.sum()
+    return weights / total if total > 0 else np.ones(len(records)) / len(records)
+
+
+class WeightedClusterSampler(Sampler[int]):
+    """Cluster-balanced sampler that yields **flat sampling row indices**.
+
+    The yielded ``int`` is an index into ``self.rows``; the dataset is
+    expected to look up ``rows[idx]`` and dispatch the cropper using the
+    row's ``anchor_kind`` / ``anchor_a`` / ``anchor_b``. Compatible with
+    DDP — each rank takes ``indices[rank::num_replicas]``.
 
     Args:
         records: List of Record objects with chain/interface metadata.
         epoch_size: Number of samples per synthetic epoch.
-        alpha_prot: Weight multiplier for protein chains.
-        alpha_nucl: Weight multiplier for nucleic acid chains.
-        alpha_lig: Weight multiplier for ligand chains.
-        beta_chain: Weight multiplier for chain-level contributions.
-        beta_interface: Weight multiplier for interface-level contributions.
+        alpha_prot, alpha_nucl, alpha_lig: Molecule-type weight multipliers.
+        beta_chain, beta_interface: Chain vs interface weight balance.
         num_replicas: Total number of DDP replicas.
         rank: Rank of this replica.
         seed: Random seed.
@@ -130,7 +213,7 @@ class WeightedClusterSampler(Sampler[int]):
         self.seed = seed
         self.epoch = 0
 
-        self.weights = compute_cluster_weights(
+        self.rows, self.weights = build_sampling_rows(
             records,
             alpha_prot=alpha_prot,
             alpha_nucl=alpha_nucl,
@@ -141,9 +224,7 @@ class WeightedClusterSampler(Sampler[int]):
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
-        # Draw epoch_size samples, then shard by rank
-        indices = rng.choice(len(self.records), size=self.epoch_size, replace=True, p=self.weights)
-        # Each rank gets its slice
+        indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
         shard = indices[self.rank :: self.num_replicas]
         yield from shard.tolist()
 

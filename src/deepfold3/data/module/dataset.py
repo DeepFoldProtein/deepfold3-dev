@@ -72,8 +72,15 @@ class TrainingDataset(torch.utils.data.Dataset):
         spatial_crop_weight: float = 0.4,
         interface_crop_weight: float = 0.4,
         interface_distance: float = 15.0,
+        sampling_rows: list | None = None,
     ):
         self.records = records
+        # Optional flat sampling-row table from ``WeightedClusterSampler``.
+        # When set, ``__getitem__`` interprets the index as a row id and
+        # routes the row's anchor (chain or interface) into the cropper.
+        # When unset (DistributedSampler / no sampler) the index is a
+        # plain record index.
+        self.sampling_rows = sampling_rows
         self.data_dir = Path(data_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
@@ -115,10 +122,20 @@ class TrainingDataset(torch.utils.data.Dataset):
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
 
     def __len__(self) -> int:
+        if self.sampling_rows is not None:
+            return len(self.sampling_rows)
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        record = self.records[idx]
+        # Resolve idx → record + optional crop anchor
+        crop_anchor: tuple[str, int, int] | None = None
+        if self.sampling_rows is not None:
+            row = self.sampling_rows[idx]
+            record = self.records[row.record_idx]
+            if row.anchor_a >= 0:
+                crop_anchor = (row.anchor_kind, int(row.anchor_a), int(row.anchor_b))
+        else:
+            record = self.records[idx]
 
         # Load structure
         struct_path = structure_path(self.data_dir / "structures", record.id)
@@ -165,7 +182,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             if mp.exists():
                 tokenized = tokenized.with_mask(TokenMask.load(str(mp)))
 
-        tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
+        tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         feats = self.featurizer.process(
             tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
         )

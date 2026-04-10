@@ -399,9 +399,12 @@ class TrainingConfig:
     # Region-based loss weighting (region_id → weight multiplier, e.g. {3: 5.0} for CDR-H3)
     region_loss_weights: dict[int, float] = field(default_factory=dict)
 
-    # Smooth LDDT thresholds
+    # Smooth LDDT thresholds. AlphaFold 3 supplement eq. 6 / Protenix
+    # ``loss.py``: nucleotide-nucleotide pairs use 30 Å, everything else
+    # uses 15 Å.
     lddt_cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0)
-    lddt_inclusion_radius: float = 30.0
+    lddt_inclusion_radius: float = 15.0
+    lddt_nucleotide_inclusion_radius: float = 30.0
     lddt_min_distance: float = 1e-3  # minimum GT distance for LDDT pair inclusion
 
     # Confidence resolution gating

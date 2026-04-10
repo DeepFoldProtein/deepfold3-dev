@@ -34,6 +34,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _kabsch_rmsd_np(p: np.ndarray, q: np.ndarray) -> float:
+    """Squared RMSD of ``q`` optimally aligned onto ``p`` (Kabsch 1976).
+
+    Both inputs are ``[K, 3]`` float64 numpy arrays with matching row
+    order — the ``k``-th row of ``q`` is the correspondence of the
+    ``k``-th row of ``p``. Uses the textbook Kabsch SVD construction
+    with a determinant-sign flip to guard against reflections. Returns
+    the **squared** RMSD as a Python float.
+
+    Implemented with numpy rather than torch because LAPACK's 3×3 SVD
+    has much lower per-call overhead via numpy than through
+    ``torch.linalg.svd`` (~10× faster for a 200-atom pair), which
+    matters because this is called inside a nested Python loop over
+    chain pairs.
+    """
+    import numpy as np
+
+    p_mean = p.mean(axis=0)
+    q_mean = q.mean(axis=0)
+    p_c = p - p_mean
+    q_c = q - q_mean
+
+    # 3×3 cross-covariance. Order chosen so R maps q_c → p_c.
+    h = q_c.T @ p_c
+    u, _s, vt = np.linalg.svd(h)
+
+    # Reflection fix: ensure det(R) = +1.
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    diag = np.eye(3, dtype=p.dtype)
+    diag[2, 2] = d
+    r = vt.T @ diag @ u.T
+
+    q_aligned = q_c @ r.T + p_mean
+    diff = p - q_aligned
+    return float((diff * diff).sum() / p.shape[0])
+
+
 def compute_chain_permutation(
     pred_coords: torch.Tensor,  # [N_atoms, 3]
     gt_coords: torch.Tensor,  # [N_atoms, 3]
@@ -42,20 +79,23 @@ def compute_chain_permutation(
 ) -> dict[int, int]:
     """Find the optimal pred-to-GT chain mapping for a multimer.
 
-    Chains are grouped by ``entity_id``. For each entity group with more
-    than one copy, an ``N×N`` cost matrix is built where
-    ``cost[i, j]`` is the squared distance between the resolved-atom
-    centroids of pred chain ``i`` and GT chain ``j``. Pairs whose chain
-    lengths differ (should not happen when ``entity_id`` is derived from
-    the sequence, but handled defensively) are masked to ``+inf``. The
-    optimal assignment is then obtained from
-    :func:`scipy.optimize.linear_sum_assignment`.
+    Chains are grouped by ``entity_id``. For each entity group with
+    more than one copy, an ``N×N`` cost matrix is built where
+    ``cost[i, j]`` is the squared per-atom RMSD of GT chain ``j``
+    optimally aligned (Kabsch 1976) onto pred chain ``i`` over the
+    resolved heavy atoms. Pairs whose chain lengths differ (should not
+    happen when ``entity_id`` is derived from the sequence, but handled
+    defensively) are masked to ``+inf``. The optimal assignment is then
+    obtained from :func:`scipy.optimize.linear_sum_assignment`.
 
-    The centroid-distance cost is a coarse but effective surrogate for
-    the per-atom RMSD suggested in AlphaFold 3 §4.2: it is invariant to
-    the arbitrary intra-chain atom labelling and avoids fitting a
-    per-pair Kabsch transform, which would be wasteful for what is
-    ultimately just a discrete assignment decision.
+    The Kabsch-aligned RMSD cost (AlphaFold 3 §4.2) is necessary for
+    symmetric oligomers (C4, D2, ...) whose chain centroids coincide
+    near the symmetry axis: a centroid-distance surrogate collapses to
+    a near-zero, nearly-constant matrix and the Hungarian solver
+    returns an arbitrary assignment. Fitting a per-pair rotation lets
+    the cost distinguish chains that differ only by rotation. Pairs
+    with fewer than three resolved atoms (where Kabsch is degenerate)
+    or where the SVD fails fall back to the squared centroid distance.
 
     Parameters
     ----------
@@ -108,43 +148,64 @@ def compute_chain_permutation(
             atom_starts = [int(r["atom_idx"]) for r in group_rows]
             atom_nums = [int(r["atom_num"]) for r in group_rows]
 
-            # Pre-compute per-chain pred and GT centroids (resolved atoms only).
+            # Pre-extract per-chain resolved pred/GT atom blocks.
+            pred_blocks: list[torch.Tensor | None] = []
+            gt_blocks: list[torch.Tensor | None] = []
             pred_centroids: list[torch.Tensor | None] = []
             gt_centroids: list[torch.Tensor | None] = []
             for start, num in zip(atom_starts, atom_nums, strict=True):
                 end = start + num
                 m = gt_mask[start:end]
                 if num == 0 or not bool(m.any()):
+                    pred_blocks.append(None)
+                    gt_blocks.append(None)
                     pred_centroids.append(None)
                     gt_centroids.append(None)
                     continue
-                m_f = m.to(pred_coords.dtype)
-                denom = m_f.sum().clamp_min(1.0)
-                pred_c = (pred_coords[start:end] * m_f.unsqueeze(-1)).sum(dim=0) / denom
-                gt_c = (gt_coords[start:end] * m_f.unsqueeze(-1)).sum(dim=0) / denom
-                pred_centroids.append(pred_c)
-                gt_centroids.append(gt_c)
+                p_block = pred_coords[start:end][m]
+                g_block = gt_coords[start:end][m]
+                pred_blocks.append(p_block)
+                gt_blocks.append(g_block)
+                pred_centroids.append(p_block.mean(dim=0))
+                gt_centroids.append(g_block.mean(dim=0))
 
             inf = float("inf")
             cost = np.full((n, n), inf, dtype=np.float64)
             for i in range(n):
-                if pred_centroids[i] is None:
+                if pred_blocks[i] is None:
                     continue
                 for j in range(n):
-                    if gt_centroids[j] is None:
+                    if gt_blocks[j] is None:
                         continue
                     # Defensive length check — same entity should imply same
                     # length, but we drop mismatches rather than crash.
                     if atom_nums[i] != atom_nums[j]:
                         continue
-                    diff = pred_centroids[i] - gt_centroids[j]
-                    cost[i, j] = float((diff * diff).sum().item())
+                    p_block = pred_blocks[i]
+                    g_block = gt_blocks[j]
+                    # Kabsch needs matching correspondences: resolved-atom
+                    # sets must also agree. If not, fall back to centroid.
+                    if p_block.shape[0] != g_block.shape[0]:
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
+                        continue
+                    if p_block.shape[0] < 3:
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
+                        continue
+                    try:
+                        p_np = p_block.detach().cpu().numpy().astype(np.float64, copy=False)
+                        g_np = g_block.detach().cpu().numpy().astype(np.float64, copy=False)
+                        cost[i, j] = _kabsch_rmsd_np(p_np, g_np)
+                    except Exception as exc:  # pragma: no cover - SVD failure is rare
+                        logger.debug("chain_perm: Kabsch fallback i=%d j=%d: %s", i, j, exc)
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
 
             if not np.isfinite(cost).any():
                 # Entire group is unresolved — fall back to identity.
                 logger.debug(
-                    "chain_perm: entity_id=%s has no resolvable pairs; "
-                    "using identity mapping",
+                    "chain_perm: entity_id=%s has no resolvable pairs; using identity mapping",
                     entity_id,
                 )
                 continue
@@ -266,9 +327,13 @@ def compute_chain_permutation_tokens(
     contiguous tokens) and chains are grouped into permutation classes
     by ``entity_id``. For each entity class with multiple chains, the
     optimal pred → GT chain assignment is computed via Hungarian on a
-    centroid-distance cost matrix; chains whose token counts disagree
+    squared per-atom RMSD cost matrix obtained by Kabsch (1976)
+    alignment of each candidate GT chain onto each pred chain over
+    their resolved heavy atoms. Chains whose token counts disagree
     (e.g. cropped on different boundaries) are left in place since the
-    token-by-token correspondence isn't well defined.
+    token-by-token correspondence isn't well defined. Pairs with fewer
+    than three resolved atoms, or where the SVD fails, fall back to
+    the squared centroid distance.
 
     Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in
     singleton entity classes or for length-mismatched groups.
@@ -309,39 +374,62 @@ def compute_chain_permutation_tokens(
             if n <= 1:
                 continue
 
-            # Per-chain centroids over (token × atom) pairs that are valid.
+            # Per-chain resolved atom blocks over (token × atom) pairs.
+            pred_blocks: list[torch.Tensor | None] = []
+            gt_blocks: list[torch.Tensor | None] = []
             pred_centroids: list[torch.Tensor | None] = []
             gt_centroids: list[torch.Tensor | None] = []
             token_counts: list[int] = []
             for asym in asym_list:
-                tok_idx = torch.as_tensor(
-                    chain_token_indices[asym], dtype=torch.long, device=pred_pos.device
-                )
+                tok_idx = torch.as_tensor(chain_token_indices[asym], dtype=torch.long, device=pred_pos.device)
                 token_counts.append(int(tok_idx.numel()))
-                m = atom_mask[tok_idx]  # [n_tok, M]
+                m = atom_mask[tok_idx]  # [n_tok, M] bool
                 if not m.any():
+                    pred_blocks.append(None)
+                    gt_blocks.append(None)
                     pred_centroids.append(None)
                     gt_centroids.append(None)
                     continue
-                m_f = m.to(pred_pos.dtype)
-                denom = m_f.sum().clamp_min(1.0)
-                pred_c = (pred_pos[tok_idx] * m_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
-                gt_c = (gt_pos[tok_idx] * m_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
-                pred_centroids.append(pred_c)
-                gt_centroids.append(gt_c)
+                # Flatten (token × atom) → [K, 3] over resolved atoms only.
+                pred_flat = pred_pos[tok_idx][m]  # [K, 3]
+                gt_flat = gt_pos[tok_idx][m]  # [K, 3]
+                pred_blocks.append(pred_flat)
+                gt_blocks.append(gt_flat)
+                pred_centroids.append(pred_flat.mean(dim=0))
+                gt_centroids.append(gt_flat.mean(dim=0))
 
             inf = float("inf")
             cost = np.full((n, n), inf, dtype=np.float64)
             for i in range(n):
-                if pred_centroids[i] is None:
+                if pred_blocks[i] is None:
                     continue
                 for j in range(n):
-                    if gt_centroids[j] is None:
+                    if gt_blocks[j] is None:
                         continue
                     if token_counts[i] != token_counts[j]:
                         continue
-                    diff = pred_centroids[i] - gt_centroids[j]
-                    cost[i, j] = float((diff * diff).sum().item())
+                    p_block = pred_blocks[i]
+                    g_block = gt_blocks[j]
+                    # Kabsch needs matching correspondences. The mask is
+                    # shared between pred and GT in this code path, so
+                    # the two blocks are always the same length; guard
+                    # anyway and fall back to centroid distance.
+                    if p_block.shape[0] != g_block.shape[0]:
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
+                        continue
+                    if p_block.shape[0] < 3:
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
+                        continue
+                    try:
+                        p_np = p_block.detach().cpu().numpy().astype(np.float64, copy=False)
+                        g_np = g_block.detach().cpu().numpy().astype(np.float64, copy=False)
+                        cost[i, j] = _kabsch_rmsd_np(p_np, g_np)
+                    except Exception as exc:  # pragma: no cover - SVD failure is rare
+                        logger.debug("chain_perm_tokens: Kabsch fallback i=%d j=%d: %s", i, j, exc)
+                        diff = pred_centroids[i] - gt_centroids[j]
+                        cost[i, j] = float((diff * diff).sum().item())
 
             if not np.isfinite(cost).any():
                 continue

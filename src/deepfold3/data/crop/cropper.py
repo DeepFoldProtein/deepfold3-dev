@@ -47,6 +47,7 @@ class Cropper:
         max_tokens: int,
         max_atoms: int,
         chain_id: int | None = None,
+        anchor: tuple[str, int, int] | None = None,
         seed: int | None = None,
     ) -> Tokenized:
         """Crop tokens to ≤ max_tokens and ≤ max_atoms.
@@ -56,7 +57,15 @@ class Cropper:
         data :       Tokenized input
         max_tokens : Maximum number of tokens
         max_atoms :  Maximum number of atoms (across all tokens)
-        chain_id :   If given, force contiguous crop from this chain (asym_id)
+        chain_id :   Legacy: if given, force contiguous crop from this chain.
+        anchor :     ``(kind, anchor_a, anchor_b)`` from the weighted sampler.
+            ``kind="chain"`` → contiguous crop on ``anchor_a``;
+            ``kind="interface"`` → interface-seeded spatial crop using
+            tokens at the interface between ``anchor_a`` and ``anchor_b``;
+            ``None`` → fall back to weighted random strategy choice. AF3
+            §2.5.5 + Protenix's design route the sampler's chosen
+            chain/interface directly to the cropper so the per-anchor
+            weighting actually drives crop coverage.
         seed :       Random seed
 
         Returns
@@ -78,8 +87,18 @@ class Cropper:
 
         if chain_id is not None:
             selected = self._contiguous_crop(tokens, max_tokens, max_atoms, chain_id, rng)
+        elif anchor is not None:
+            kind, a, b = anchor
+            if kind == "chain":
+                selected = self._contiguous_crop(tokens, max_tokens, max_atoms, a, rng)
+            elif kind == "interface":
+                selected = self._interface_spatial_crop(
+                    tokens, max_tokens, max_atoms, rng, anchor_chains=(a, b)
+                )
+            else:
+                selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
         else:
-            # Weighted random choice among three strategies
+            # Weighted random choice among three strategies (no anchor)
             r = rng.random()
             if r < self.contiguous_weight:
                 selected = self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
@@ -197,12 +216,16 @@ class Cropper:
         max_tokens: int,
         max_atoms: int,
         rng: random.Random,
+        anchor_chains: tuple[int, int] | None = None,
     ) -> np.ndarray:
         """Spatial crop seeded from interface tokens (near another chain).
 
         Finds tokens whose representative atom is within ``interface_distance``
-        of a token from a different chain, then picks a random seed among those
-        and expands spatially. Falls back to standard spatial crop if no
+        of a token from a different chain. If ``anchor_chains`` is given,
+        the candidate seeds are restricted to interface tokens **between
+        those two specific chains** so the sampler's interface choice
+        actually drives the crop. Without an anchor, all interfaces are
+        eligible. Falls back to standard spatial crop if no qualifying
         interface tokens exist.
         """
         try:
@@ -226,20 +249,34 @@ class Cropper:
         centroid = coords[valid].mean(axis=0)
         coords[~valid] = centroid
 
-        # Find interface tokens: tokens within interface_distance of another chain
+        # Find interface tokens: tokens within interface_distance of another chain.
+        # When ``anchor_chains`` is given, only count tokens of those two
+        # specific chains as eligible seeds (the sampler's interface
+        # selection drives which interface gets cropped).
         asym_ids = tokens["asym_id"]
         tree = KDTree(coords)
         interface_indices: list[int] = []
 
-        for i in range(len(tokens)):
-            if not valid[i]:
-                continue
-            # Query neighbors within interface_distance
-            neighbors = tree.query_ball_point(coords[i], self.interface_distance)
-            for j in neighbors:
-                if asym_ids[j] != asym_ids[i]:
+        if anchor_chains is not None:
+            a, b = anchor_chains
+            for i in range(len(tokens)):
+                if not valid[i]:
+                    continue
+                if asym_ids[i] not in (a, b):
+                    continue
+                neighbors = tree.query_ball_point(coords[i], self.interface_distance)
+                other = b if asym_ids[i] == a else a
+                if any(asym_ids[j] == other for j in neighbors):
                     interface_indices.append(i)
-                    break
+        else:
+            for i in range(len(tokens)):
+                if not valid[i]:
+                    continue
+                neighbors = tree.query_ball_point(coords[i], self.interface_distance)
+                for j in neighbors:
+                    if asym_ids[j] != asym_ids[i]:
+                        interface_indices.append(i)
+                        break
 
         if not interface_indices:
             return self._spatial_crop(tokens, max_tokens, max_atoms, rng)

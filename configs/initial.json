@@ -37,7 +37,8 @@
     "region_loss_weights": {},
 
     "lddt_cutoffs": [0.5, 1.0, 2.0, 4.0],
-    "lddt_inclusion_radius": 30.0,
+    "lddt_inclusion_radius": 15.0,
+    "lddt_nucleotide_inclusion_radius": 30.0,
     "lddt_min_distance": 1e-3,
     "min_resolution": 0.1,
     "max_resolution": 4.0,

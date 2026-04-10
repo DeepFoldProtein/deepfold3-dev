@@ -8,7 +8,7 @@ DeepFold3 is a PyTorch biomolecular complex structure prediction system, archite
 
 The project has a working inference pipeline and a core training pipeline — model, data, I/O, training, and scripts are implemented in `src/`.
 
-**Not yet implemented:** Training-time template date-cutoff filter (`Hit.keep`-style 60-day guard). The plumbing now exists — `enrich-manifest` populates each record's `structure_info.released` from a mmCIF walk, and `Record.structure_info` is loaded by the dataloader — so wiring it into the template loader is the remaining step.
+**Status:** Training-time template date-cutoff filter is implemented (`dataset.py:_load_monomer_templates` applies `min(max_template_date, record.released - cutoff_days)` per record). Symmetry alignment for AA / chain / ligand permutation is implemented (`data/symmetry/`). Sampler currently aggregates per-record, not per-(chain|interface) — see `docs/training.md` for the divergence list.
 
 - **Package manager**: `uv` (lockfile present as `uv.lock`)
 - **Python version**: 3.11+ (pinned in `.python-version`)
