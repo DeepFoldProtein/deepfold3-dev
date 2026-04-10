@@ -24,16 +24,20 @@ from deepfold3.data.symmetry.atom_perms import (
 )
 from deepfold3.data.symmetry.chain_perm import (
     apply_chain_permutation,
+    apply_chain_permutation_tokens,
     compute_chain_permutation,
+    compute_chain_permutation_tokens,
 )
 
 __all__ = [
     "RESIDUE_ATOM_SYMMETRY_GROUPS",
     "apply_atom_permutation",
     "apply_chain_permutation",
+    "apply_chain_permutation_tokens",
     "apply_token_atom_permutation",
     "build_residue_symmetry_pairs",
     "compute_atom_symmetry_pairs",
     "compute_chain_permutation",
+    "compute_chain_permutation_tokens",
     "compute_token_atom_symmetry_pairs",
 ]

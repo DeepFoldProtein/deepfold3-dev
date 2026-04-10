@@ -87,16 +87,27 @@ def diffusion_mse_loss(
     ligand_loss_weight: float = 10.0,
     region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
     atom_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] (token, M_a, M_b)
+    asym_id: torch.Tensor | None = None,  # [N] int — per-token chain id
+    entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
 
     Vectorized over S — single fused operation, no Python loop.
 
-    If ``atom_swap_pairs`` is provided, ground-truth coordinates of
-    symmetry-equivalent side-chain atoms (AlphaFold 3 §4.3) are first
-    permuted per-sample to minimise the per-pair MSE before the loss is
-    computed — otherwise the model is penalised for arbitrary labelling
-    of e.g. ASP OD1/OD2 or PHE CD1/CD2 atoms.
+    Permutation alignments (AlphaFold 3 §4.2 / §4.3) are applied to the
+    ground truth before the loss is computed:
+
+    1. **Chain permutation** (when ``asym_id`` and ``entity_id`` are
+       provided): chains in the same entity class are reassigned via
+       Hungarian on per-chain centroid distances. The decision is made
+       per diffusion sample because each augmented GT carries a different
+       random rotation. Skipped for crops where same-entity chains have
+       different token counts (the token-by-token correspondence is
+       not well defined).
+    2. **Atom permutation** (when ``atom_swap_pairs`` is provided):
+       symmetry-equivalent side-chain atoms (ASP OD1/OD2, PHE CD1/CD2,
+       etc.) are swapped per (sample, pair) to whichever ordering
+       minimises that pair's MSE.
 
     Args:
         pred_pos: Denoised predictions [S, N, M, 3].
@@ -111,10 +122,31 @@ def diffusion_mse_loss(
         atom_swap_pairs: Optional ``[N_pairs, 3]`` int tensor produced by
             ``compute_token_atom_symmetry_pairs`` and routed through the
             featurizer (``"atom_swap_pairs"`` feature key).
+        asym_id, entity_id: Per-token chain identifiers; both required
+            to enable chain permutation alignment.
 
     Returns:
         Scalar loss.
     """
+    if asym_id is not None and entity_id is not None and gt_pos.dim() >= 4:
+        from deepfold3.data.symmetry.chain_perm import (
+            apply_chain_permutation_tokens,
+            compute_chain_permutation_tokens,
+        )
+
+        S = gt_pos.shape[0]
+        permuted_chunks: list[torch.Tensor] = []
+        atom_mask_bool = atom_mask.bool()
+        for s in range(S):
+            chain_assign = compute_chain_permutation_tokens(
+                pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id
+            )
+            new_gt, _ = apply_chain_permutation_tokens(
+                gt_pos[s], atom_mask_bool, asym_id, chain_assign
+            )
+            permuted_chunks.append(new_gt)
+        gt_pos = torch.stack(permuted_chunks, dim=0)
+
     if atom_swap_pairs is not None and len(atom_swap_pairs) > 0:
         from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
 
@@ -447,6 +479,8 @@ def training_loss(
             ligand_loss_weight=cfg.ligand_loss_weight,
             region_weights=region_weights,
             atom_swap_pairs=features.get("atom_swap_pairs"),
+            asym_id=features.get("asym_id"),
+            entity_id=features.get("entity_id"),
         )
         losses["diffusion_mse"] = l_mse
 

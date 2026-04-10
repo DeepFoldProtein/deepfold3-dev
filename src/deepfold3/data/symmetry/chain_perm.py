@@ -245,3 +245,161 @@ def apply_chain_permutation(
     permuted_coords = coords.index_select(0, index).detach()
     permuted_mask = mask.index_select(0, index).detach()
     return permuted_coords, permuted_mask
+
+
+# ---------------------------------------------------------------------------
+# Token-aware variants for the diffusion loss path
+# ---------------------------------------------------------------------------
+
+
+def compute_chain_permutation_tokens(
+    pred_pos: torch.Tensor,  # [N, M, 3]
+    gt_pos: torch.Tensor,  # [N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    asym_id: torch.Tensor,  # [N] int
+    entity_id: torch.Tensor,  # [N] int
+) -> dict[int, int]:
+    """Token-layout version of :func:`compute_chain_permutation`.
+
+    Operates on the per-token ``[N, M, 3]`` layout used by the diffusion
+    loss. Tokens are grouped by ``asym_id`` (each chain is one group of
+    contiguous tokens) and chains are grouped into permutation classes
+    by ``entity_id``. For each entity class with multiple chains, the
+    optimal pred → GT chain assignment is computed via Hungarian on a
+    centroid-distance cost matrix; chains whose token counts disagree
+    (e.g. cropped on different boundaries) are left in place since the
+    token-by-token correspondence isn't well defined.
+
+    Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in
+    singleton entity classes or for length-mismatched groups.
+    """
+    import numpy as np
+    import torch
+    from scipy.optimize import linear_sum_assignment
+
+    asym_ids_np = asym_id.detach().cpu().numpy()
+    entity_ids_np = entity_id.detach().cpu().numpy()
+
+    # Iterate chains in first-appearance order to keep results stable
+    seen: set[int] = set()
+    chain_order: list[int] = []
+    for a in asym_ids_np.tolist():
+        if a in seen:
+            continue
+        seen.add(a)
+        chain_order.append(int(a))
+
+    chain_token_indices: dict[int, np.ndarray] = {}
+    chain_entity: dict[int, int] = {}
+    for asym in chain_order:
+        idx = np.where(asym_ids_np == asym)[0]
+        chain_token_indices[asym] = idx
+        chain_entity[asym] = int(entity_ids_np[idx[0]])
+
+    assignment: dict[int, int] = {a: a for a in chain_order}
+
+    # Group by entity_id
+    entity_to_chains: dict[int, list[int]] = {}
+    for asym in chain_order:
+        entity_to_chains.setdefault(chain_entity[asym], []).append(asym)
+
+    with torch.no_grad():
+        for asym_list in entity_to_chains.values():
+            n = len(asym_list)
+            if n <= 1:
+                continue
+
+            # Per-chain centroids over (token × atom) pairs that are valid.
+            pred_centroids: list[torch.Tensor | None] = []
+            gt_centroids: list[torch.Tensor | None] = []
+            token_counts: list[int] = []
+            for asym in asym_list:
+                tok_idx = torch.as_tensor(
+                    chain_token_indices[asym], dtype=torch.long, device=pred_pos.device
+                )
+                token_counts.append(int(tok_idx.numel()))
+                m = atom_mask[tok_idx]  # [n_tok, M]
+                if not m.any():
+                    pred_centroids.append(None)
+                    gt_centroids.append(None)
+                    continue
+                m_f = m.to(pred_pos.dtype)
+                denom = m_f.sum().clamp_min(1.0)
+                pred_c = (pred_pos[tok_idx] * m_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
+                gt_c = (gt_pos[tok_idx] * m_f.unsqueeze(-1)).sum(dim=(0, 1)) / denom
+                pred_centroids.append(pred_c)
+                gt_centroids.append(gt_c)
+
+            inf = float("inf")
+            cost = np.full((n, n), inf, dtype=np.float64)
+            for i in range(n):
+                if pred_centroids[i] is None:
+                    continue
+                for j in range(n):
+                    if gt_centroids[j] is None:
+                        continue
+                    if token_counts[i] != token_counts[j]:
+                        continue
+                    diff = pred_centroids[i] - gt_centroids[j]
+                    cost[i, j] = float((diff * diff).sum().item())
+
+            if not np.isfinite(cost).any():
+                continue
+
+            finite_mask = np.isfinite(cost)
+            row_ok = finite_mask.any(axis=1)
+            if not finite_mask.all():
+                big = cost[finite_mask].max() * 1e3 + 1.0
+                cost = np.where(finite_mask, cost, big)
+
+            row_ind, col_ind = linear_sum_assignment(cost)
+            for i, j in zip(row_ind, col_ind, strict=True):
+                if not row_ok[i]:
+                    continue
+                assignment[asym_list[i]] = asym_list[j]
+
+    return assignment
+
+
+def apply_chain_permutation_tokens(
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    asym_id: torch.Tensor,  # [N] int
+    chain_assignment: dict[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder GT token rows according to a chain assignment.
+
+    For each pred chain, the rows whose ``asym_id`` matches the pred
+    chain are replaced with the rows of the GT chain given by the
+    assignment. Length-mismatched groups are skipped (the assignment
+    builder already does this so this branch is defensive). Returns the
+    permuted ``gt_pos`` and matching mask, both detached.
+    """
+    import torch
+
+    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return gt_pos.detach(), atom_mask.detach()
+
+    n_tokens = gt_pos.shape[-3]
+    asym_ids_t = asym_id.to(dtype=torch.long, device=gt_pos.device)
+    index = torch.arange(n_tokens, dtype=torch.long, device=gt_pos.device)
+
+    # Pre-build asym -> token index list for the source side
+    chain_by_asym: dict[int, torch.Tensor] = {}
+    for a in chain_assignment.values():
+        a_int = int(a)
+        if a_int not in chain_by_asym:
+            chain_by_asym[a_int] = torch.where(asym_ids_t == a_int)[0]
+
+    for pred_asym, gt_asym in chain_assignment.items():
+        if int(pred_asym) == int(gt_asym):
+            continue
+        pred_idx = torch.where(asym_ids_t == int(pred_asym))[0]
+        gt_idx = chain_by_asym.get(int(gt_asym), pred_idx)
+        if pred_idx.numel() != gt_idx.numel():
+            continue
+        index[pred_idx] = gt_idx
+
+    permuted = gt_pos.index_select(-3, index).detach()
+    permuted_mask = atom_mask.index_select(0, index).detach()
+    return permuted, permuted_mask
