@@ -323,11 +323,11 @@ class OuterProductMean(nn.Module):
         chunk = self._chunk_size
         N = a.shape[2]
         if chunk > 0 and chunk < N:
-            from deepfold3.model.tiled_linear import _TiledOPMContractFn
+            from deepfold3.model.tiled_linear import tiled_opm_contract
 
             num_shards = max(1, math.ceil(N / chunk))
             if self.training and a.requires_grad:
-                act = _TiledOPMContractFn.apply(a, b, self._outer_product_contract, num_shards)
+                act = tiled_opm_contract(a, b, self._outer_product_contract, num_shards)
             else:
                 # Inference: 2D chunked forward — chunk both i and j to keep
                 # intermediate at [B, chunk, chunk, c_h, c_h] (constant in N).

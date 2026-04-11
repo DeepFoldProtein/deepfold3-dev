@@ -66,7 +66,11 @@ def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> Ato
     """Build flat atom subset indices from ref_mask [N, M].
 
     1. Flatten ref_mask → find real atom indices in [N*M]
-    2. Pad to next multiple of Q → num_atoms_padded, S = padded // Q
+    2. Pad to next multiple of Q based on the FIXED total slot count [N*M]
+       (not based on the data-dependent ``num_real``), so ``S`` is constant
+       across all samples in a training run. This is required for non-reentrant
+       gradient checkpointing under DDP — different samples must produce
+       identical saved-tensor shapes inside the encoder.
     3. Build query/key gather indices and scatter-back indices
     """
     device = ref_mask.device
@@ -75,13 +79,19 @@ def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> Ato
     # Find real atom indices in flattened [N*M] space
     flat_mask = ref_mask.reshape(-1).bool()  # [N*M]
     real_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # [num_real]
-    num_real = real_indices.shape[0]
+    num_real = int(real_indices.shape[0])
 
-    # Pad to next multiple of Q
-    num_padded = ((num_real + Q - 1) // Q) * Q
+    # Pad to next multiple of Q based on the constant [N*M] capacity, not
+    # ``num_real``. ``num_padded`` and ``S`` are now constants for the entire
+    # training run (function only of the input shape), so subset-layout tensors
+    # have data-independent shapes.
+    total_slots = N * M
+    num_padded = ((total_slots + Q - 1) // Q) * Q
     S = num_padded // Q
 
-    # ta_to_q_idx: [S*Q] indices into [N*M], padded slots point to 0
+    # padded_indices: [num_padded] indices into [N*M]. Real atoms are packed
+    # into the first ``num_real`` slots; remaining slots point to index 0 and
+    # are masked out via ``padded_mask`` so they contribute zero.
     padded_indices = torch.zeros(num_padded, dtype=torch.long, device=device)
     padded_indices[:num_real] = real_indices
     padded_mask = torch.zeros(num_padded, dtype=torch.bool, device=device)
@@ -90,20 +100,22 @@ def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> Ato
     ta_to_q_idx = padded_indices.reshape(S, Q)  # [S, Q]
     ta_to_q_mask = padded_mask.reshape(S, Q)  # [S, Q]
 
-    # Key windows: for each subset s, center at (s*Q + Q/2), take K atoms
-    # Key indices are into the flat query space [S*Q]
-    # AF3 uses window shifting (not clamping) at boundaries to avoid duplicate atoms
+    # Key windows: for each subset s, center at (s*Q + Q/2), take K atoms.
+    # Key indices are into the flat query space [S*Q]. AF3 uses window
+    # shifting (not clamping) at boundaries to avoid duplicate atoms.
+    # The shift bound is ``num_padded - 1`` (constant) rather than
+    # ``num_real - 1`` (data-dependent) so the resulting indices have a
+    # data-independent layout. Padded slots that get attended to are zeroed
+    # out via ``q_to_k_mask`` below.
     centers = torch.arange(Q // 2, num_padded, Q, device=device)  # [S]
     key_offsets = torch.arange(-(K // 2), K // 2, device=device)  # [K]
     key_flat_idx = centers.unsqueeze(1) + key_offsets.unsqueeze(0)  # [S, K]
 
-    # Shift entire windows to stay within [0, num_real-1] (matching AF3 boundary handling)
-    # This ensures each key position is a unique atom — no duplicate boundary atoms
-    left_overflow = (-key_flat_idx[:, 0]).clamp(min=0)  # [S] — how much window extends below 0
-    right_overflow = (key_flat_idx[:, -1] - (num_real - 1)).clamp(min=0)  # [S] — above num_real-1
-    shift = left_overflow - right_overflow  # positive = shift right, negative = shift left
+    left_overflow = (-key_flat_idx[:, 0]).clamp(min=0)  # [S]
+    right_overflow = (key_flat_idx[:, -1] - (num_padded - 1)).clamp(min=0)  # [S]
+    shift = left_overflow - right_overflow
     key_flat_idx = key_flat_idx + shift.unsqueeze(1)
-    key_flat_idx = key_flat_idx.clamp(0, num_padded - 1)  # safety clamp for degenerate K > num_real
+    key_flat_idx = key_flat_idx.clamp(0, num_padded - 1)
 
     # q_to_k_mask: valid if the key position has a real atom
     q_to_k_mask = padded_mask[key_flat_idx]  # [S, K]

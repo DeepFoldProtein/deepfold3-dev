@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -118,10 +120,40 @@ def train(
     from deepfold3.model.config import ModelConfig, TrainingConfig
     from deepfold3.training.trainer import Trainer
 
+    # Auto-create a per-run subdirectory under the user-supplied output path.
+    # Layout:  runs/<name>/<YYYYMMDD_HHMMSS>/{train.log, checkpoint_*.pt, ...}
+    # - Rank 0 creates the subdir and writes INFO to stdout + train.log.
+    # - Other ranks only emit WARNING/ERROR to stdout (prevents 8× duplication on DDP).
+    # - When resuming, we respect the existing --output if it already looks like a
+    #   timestamped run dir (contains a checkpoint or train.log).
+    rank = int(os.environ.get("RANK", "0"))
+    requested_output = Path(output)
+    timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S")
+
+    is_existing_run = requested_output.is_dir() and any(
+        p.name == "train.log" or p.name.startswith("checkpoint_") for p in requested_output.iterdir()
+    )
+    if resume is not None or is_existing_run:
+        run_dir = requested_output
+    else:
+        run_dir = requested_output / timestamp
+
+    if rank == 0:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Best-effort broadcast via filesystem: other ranks read the same path.
+    # Update ``output`` so the Trainer checkpoints into the run dir.
+    output = str(run_dir)
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if rank == 0:
+        log_file = run_dir / "train.log"
+        handlers.append(logging.FileHandler(log_file))
+
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        level=logging.INFO if rank == 0 else logging.WARNING,
+        format=f"%(asctime)s [%(levelname)s] [rank{rank}] %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
     )
 
     # Load bulk CCD if provided

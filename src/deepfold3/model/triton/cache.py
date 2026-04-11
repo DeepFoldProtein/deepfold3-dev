@@ -46,7 +46,7 @@ def get_gpu_fingerprint() -> dict[str, Any] | None:
             "name": props.name,
             "major": props.major,
             "minor": props.minor,
-            "total_memory_gb": math.ceil(props.total_mem / (1024**3)),
+            "total_memory_gb": math.ceil(props.total_memory / (1024**3)),
             "multi_processor_count": props.multi_processor_count,
         }
     except Exception as e:
@@ -140,11 +140,40 @@ class CacheManager:
     _init_lock = threading.Lock()
 
     def __init__(self):
-        self.gpu_info = get_gpu_fingerprint()
-        self.gpu_key = _hash_gpu_info(self.gpu_info) if self.gpu_info else "nogpu"
+        # Lazy GPU fingerprint: do NOT call torch.cuda here. CacheManager.get()
+        # is invoked at module-import time (via @persistent_autotune decorators
+        # on Triton JIT functions), which can be BEFORE CUDA is initialized in
+        # the host process — especially under torchrun where the device isn't
+        # set until ``torch.cuda.set_device(local_rank)`` runs much later.
+        # Fingerprinting prematurely would record ``gpu_info=None`` and write
+        # caches under the ``nogpu`` key with file suffix ``.0.0.json``,
+        # bypassing all per-GPU tuning. Defer until first ``_resolve_gpu()``.
+        self._gpu_resolved = False
+        self.gpu_info: dict[str, Any] | None = None
+        self.gpu_key: str = "nogpu"
         self._caches: dict[str, dict[str, Any]] = {}  # kernel -> {input_key -> {...}}
         self._dirty: set[str] = set()
         self._cache_dir = _get_cache_dir()
+
+    def _resolve_gpu(self) -> None:
+        """Fetch GPU fingerprint on first use, retrying until CUDA is ready.
+
+        Triton kernels can be defined (decorator runs) before CUDA is set up.
+        Once an actual kernel call happens, CUDA is guaranteed to be live, so
+        this is the right moment to record the device identity.
+        """
+        if self._gpu_resolved:
+            return
+        info = get_gpu_fingerprint()
+        if info is not None:
+            self.gpu_info = info
+            self.gpu_key = _hash_gpu_info(info)
+            self._gpu_resolved = True
+            logger.debug(
+                f"Triton cache: resolved GPU "
+                f"sm_{info.get('major', '?')}{info.get('minor', '?')} "
+                f"({info.get('name', '?')}, {info.get('multi_processor_count', '?')} SMs)"
+            )
 
     @classmethod
     def get(cls) -> CacheManager:
@@ -157,6 +186,7 @@ class CacheManager:
 
     def _json_path(self, kernel_name: str) -> Path:
         """Path to the JSON cache file for a kernel."""
+        self._resolve_gpu()
         if self.gpu_info:
             major, minor = self.gpu_info["major"], self.gpu_info["minor"]
         else:
@@ -282,16 +312,68 @@ def make_input_key(args: dict, key_args: list[str]) -> str:
     return "_".join(parts)
 
 
+"""B200 (sm_10.0) pre-tuned configs.
+
+These were captured by running ``deepfold3 train`` once on a single B200 (after
+the lazy GPU fingerprint fix) and reading ``~/.cache/deepfold3-triton/*.10.0.json``.
+Hardcoded here so the cache file is not required for first-call performance —
+``persistent_autotune`` consults this table when cache is empty and skips the
+expensive ``triton.autotune`` benchmark phase entirely.
+
+Format: ``{kernel_name: {input_shape_key: config_dict}}``. Keys (kernel_name,
+input_shape_key) match what ``persistent_autotune`` writes to disk.
+"""
+B200_PRETUNED: dict[str, dict[str, dict[str, Any]]] = {
+    "_attn_fwd": {
+        "SEQ_LEN384_DIM32": {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_KV": 32, "num_warps": 4, "num_stages": 1},
+    },
+    "_attn_bwd_dq": {
+        "SEQ_LEN384_DIM32": {"BLOCK_SIZE_Q": 16, "BLOCK_SIZE_KV": 64, "num_warps": 4, "num_stages": 3},
+    },
+    "_attn_bwd_dk_dv": {
+        "SEQ_LEN384_DIM32": {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_KV": 16, "num_warps": 4, "num_stages": 3},
+    },
+    "_fused_dual_gemm_fwd_kernel": {
+        "M147456_N256_K128": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 2,
+        },
+    },
+    "_fused_dual_gemm_bwd_pregemm_kernel": {
+        "M147456_N256_K128": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 8,
+            "num_stages": 2,
+        },
+    },
+}
+
+
+def _b200_pretuned_lookup(kernel_name: str, input_key: str) -> dict[str, Any] | None:
+    """Return a pre-tuned config dict for (kernel, input_key) on B200, or None."""
+    return B200_PRETUNED.get(kernel_name, {}).get(input_key)
+
+
 def persistent_autotune(configs: list, key: list[str], kernel_name: str | None = None):
     """Decorator that wraps triton.autotune with persistent cache.
 
     On first call for a new (kernel, input_shape) combination:
     1. Check cache — if found, use cached config directly
-    2. If not cached, run normal triton.autotune, then save the winner
+    2. If not cached but a B200 pre-tuned config exists, seed the cache with
+       it (skipping the expensive ``triton.autotune`` benchmark)
+    3. Otherwise, run normal ``triton.autotune`` and persist the winner
 
     This is NOT a replacement for triton.autotune — it wraps it. The
     triton.autotune mechanism still handles the actual benchmarking;
-    we just persist the results across process restarts.
+    we just persist the results across process restarts and seed B200 entries
+    from the hardcoded ``B200_PRETUNED`` table.
 
     Args:
         configs: List of triton.Config objects (same as triton.autotune).
@@ -337,6 +419,15 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
 
         # Load any existing cache for this kernel
         mgr.load(fn_name)
+
+        # Seed cache with B200 pre-tuned entries (if any) so the first run on
+        # a fresh cache directory does not pay the autotune benchmark cost.
+        # Only applies when the running GPU is sm_10.0 (B200).
+        mgr._resolve_gpu()
+        if mgr.gpu_info and mgr.gpu_info.get("major") == 10 and mgr.gpu_info.get("minor") == 0:
+            for input_key, cfg in B200_PRETUNED.get(fn_name, {}).items():
+                if mgr.get_config(fn_name, input_key) is None:
+                    mgr.set_config(fn_name, input_key, cfg)
 
         # Apply standard triton.autotune
         autotuned_fn = triton.autotune(configs=configs, key=key)(fn)

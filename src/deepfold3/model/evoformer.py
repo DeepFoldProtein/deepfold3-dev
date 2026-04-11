@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 
 from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
 from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
@@ -173,6 +174,7 @@ class Evoformer(nn.Module):
         optim: OptimConfig | None = None,
     ):
         super().__init__()
+        self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
         c_msa = cfg.msa_channel
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
@@ -272,21 +274,28 @@ class Evoformer(nn.Module):
         if bond_matrix is not None:
             pair = pair + self.bond_embedding(bond_matrix)
 
-        # Template embedding (after bonds, before MSA stack — matches AF3 pipeline)
-        if self.template_embedding is not None and template_aatype is not None and template_aatype.shape[0] > 0:
-            if multichain_mask is None:
-                N = pair.shape[-2]
-                multichain_mask = torch.ones(N, N, device=pair.device, dtype=pair.dtype)
-            pair = pair + self.template_embedding(
-                query_pair=pair,
-                template_aatype=template_aatype,
-                template_pseudo_beta=template_pseudo_beta,
-                template_pseudo_beta_mask=template_pseudo_beta_mask,
-                template_backbone_frame=template_backbone_frame,
-                template_backbone_mask=template_backbone_mask,
-                pair_mask=pair_mask,
-                multichain_mask=multichain_mask,
-            )
+        # Template embedding (after bonds, before MSA stack — matches AF3 pipeline).
+        # ``TemplateEmbedding`` and ``SingleTemplateEmbedding`` natively support
+        # batched ``[B?, N, ...]`` inputs (template axis is the dim before N).
+        if self.template_embedding is not None and template_aatype is not None:
+            t_axis = 1 if template_aatype.dim() == 3 else 0  # [B,T,N] vs [T,N]
+            if template_aatype.shape[t_axis] > 0:
+                if multichain_mask is None:
+                    N = pair.shape[-2]
+                    if pair.dim() == 4:
+                        multichain_mask = torch.ones(pair.shape[0], N, N, device=pair.device, dtype=pair.dtype)
+                    else:
+                        multichain_mask = torch.ones(N, N, device=pair.device, dtype=pair.dtype)
+                pair = pair + self.template_embedding(
+                    query_pair=pair,
+                    template_aatype=template_aatype,
+                    template_pseudo_beta=template_pseudo_beta,
+                    template_pseudo_beta_mask=template_pseudo_beta_mask,
+                    template_backbone_frame=template_backbone_frame,
+                    template_backbone_mask=template_backbone_mask,
+                    pair_mask=pair_mask,
+                    multichain_mask=multichain_mask,
+                )
 
         # Initial single activations
         single = self.single_activations(target_feat)
@@ -298,13 +307,24 @@ class Evoformer(nn.Module):
         msa_act = self.msa_activations(msa_feat)
         msa_act = msa_act + self.extra_msa_target_feat(target_feat).unsqueeze(-3)
 
-        # MSA stack
+        # MSA stack (optionally checkpointed per block during training).
+        use_ckpt = self._grad_checkpoint and torch.is_grad_enabled()
         for layer in self.msa_stack:
-            msa_act, pair = layer(msa_act, pair, msa_mask, pair_mask)
+            if use_ckpt:
+                msa_act, pair = torch.utils.checkpoint.checkpoint(
+                    layer, msa_act, pair, msa_mask, pair_mask, use_reentrant=False
+                )
+            else:
+                msa_act, pair = layer(msa_act, pair, msa_mask, pair_mask)
 
-        # PairFormer stack
+        # PairFormer stack (optionally checkpointed per block during training)
         for layer in self.trunk_pairformer:
-            pair, single = layer(pair, single, pair_mask, seq_mask)
+            if use_ckpt:
+                pair, single = torch.utils.checkpoint.checkpoint(
+                    layer, pair, single, pair_mask, seq_mask, use_reentrant=False
+                )
+            else:
+                pair, single = layer(pair, single, pair_mask, seq_mask)
 
         return {
             "pair": pair,

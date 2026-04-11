@@ -198,7 +198,11 @@ class LayerNormTransposeFunction(torch.autograd.Function):
         else:
             out = out_flat.view(B, N1, N2, C)
 
-        ctx.save_for_backward(x_flat, weight, mean, rstd)
+        # Save x in its original 4D shape so non-reentrant gradient
+        # checkpointing sees matching metadata between original and recomputed
+        # forward. The flat buffer is contiguous; .view() shares storage and
+        # we re-flatten in backward for free.
+        ctx.save_for_backward(x_flat.view(B, N1, N2, C), weight, mean, rstd)
         ctx.N1 = N1
         ctx.N2 = N2
         ctx.C = C
@@ -209,9 +213,11 @@ class LayerNormTransposeFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, grad_out):
-        x_flat, weight, mean, rstd = ctx.saved_tensors
+        x_orig, weight, mean, rstd = ctx.saved_tensors
         N1, N2, C = ctx.N1, ctx.N2, ctx.C
-        M = x_flat.shape[0]
+        B = x_orig.shape[0]
+        M = B * N1 * N2
+        x_flat = x_orig.reshape(M, C).contiguous()
 
         grad_out_flat = grad_out.reshape(M, C).contiguous()
         grad_x_flat = torch.empty_like(x_flat)
@@ -248,7 +254,6 @@ class LayerNormTransposeFunction(torch.autograd.Function):
             num_warps=num_warps,
         )
 
-        B = M // (N1 * N2)
         grad_x = grad_x_flat.view(B, N1, N2, C)
 
         if ctx.has_affine:

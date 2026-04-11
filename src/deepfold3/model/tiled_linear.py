@@ -1,13 +1,23 @@
 """Tiled linear computation for memory-efficient pair transitions.
 
 Chunks input along a spatial dimension and processes each chunk independently.
-During training, intermediates are not stored — each chunk's forward is
-recomputed during backward to compute gradients on-demand (Liger-Kernel style).
+During training, each chunk's forward is wrapped in
+``torch.utils.checkpoint.checkpoint(use_reentrant=False)`` so the chunk's
+activations are released between chunks and recomputed during backward.
 During inference, chunking reduces peak memory for very long sequences.
 
 All operations in TransitionBlock (LayerNorm, Linear, SwiGLU) act on the last
 dimension independently per spatial position, so chunking along dim=-2 produces
 bitwise identical results to the full forward pass.
+
+Implementation note: an earlier version used a custom ``torch.autograd.Function``
+that ran each chunk under ``torch.no_grad()`` in forward and ``torch.enable_grad()``
+in backward. That pattern is incompatible with an *outer* non-reentrant
+gradient checkpoint (the saved-tensor hooks see different module-level state
+between the original forward and the recompute, producing
+``CheckpointError: Recomputed values have different metadata``). The current
+implementation uses ``torch.utils.checkpoint.checkpoint`` per chunk, which
+composes correctly with outer non-reentrant checkpointing.
 """
 
 from __future__ import annotations
@@ -16,6 +26,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 def _auto_shards(x: torch.Tensor) -> int:
@@ -27,127 +38,56 @@ def _auto_shards(x: torch.Tensor) -> int:
     return max(1, math.ceil(x.shape[-2] / x.shape[-1]))
 
 
-class _TiledForwardFn(torch.autograd.Function):
-    """Tiled forward with recomputation-based backward.
+def _tiled_forward(x: torch.Tensor, module: nn.Module, num_shards: int) -> torch.Tensor:
+    """Tiled forward of ``module(chunk)`` along ``dim=-2``."""
+    chunks = x.chunk(num_shards, dim=-2)
+    if torch.is_grad_enabled() and x.requires_grad:
+        outputs = [torch_checkpoint(module, chunk, use_reentrant=False) for chunk in chunks]
+    else:
+        outputs = [module(chunk) for chunk in chunks]
+    return torch.cat(outputs, dim=-2)
 
-    Forward: chunks input along dim=-2, runs each through module with no_grad.
-    Backward: recomputes each chunk's forward to get gradients on-demand.
-    Parameter gradients accumulate across chunks automatically.
+
+def _tiled_ada_forward(
+    x: torch.Tensor, cond: torch.Tensor, module: nn.Module, num_shards: int
+) -> torch.Tensor:
+    """Tiled forward of ``module(chunk_x, chunk_cond)`` along ``dim=-2``."""
+    chunks_x = x.chunk(num_shards, dim=-2)
+    chunks_c = cond.chunk(num_shards, dim=-2)
+    if torch.is_grad_enabled() and (x.requires_grad or cond.requires_grad):
+        outputs = [
+            torch_checkpoint(module, xc, cc, use_reentrant=False)
+            for xc, cc in zip(chunks_x, chunks_c, strict=True)
+        ]
+    else:
+        outputs = [module(xc, cc) for xc, cc in zip(chunks_x, chunks_c, strict=True)]
+    return torch.cat(outputs, dim=-2)
+
+
+def tiled_opm_contract(
+    a: torch.Tensor, b: torch.Tensor, contract_fn, num_shards: int
+) -> torch.Tensor:
+    """2D-tiled outer product contraction.
+
+    Chunks both ``a`` (dim=2, rows) and ``b`` (dim=2, cols) so the intermediate
+    is ``[B, chunk_i, chunk_j, c_h, c_h]`` — constant in N. Each (i, j) chunk's
+    contract is wrapped in a non-reentrant checkpoint when grad is enabled.
     """
+    chunks_a = a.chunk(num_shards, dim=2)
+    chunks_b = b.chunk(num_shards, dim=2)
+    use_ckpt = torch.is_grad_enabled() and (a.requires_grad or b.requires_grad)
 
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, module: nn.Module, num_shards: int) -> torch.Tensor:
-        ctx.module = module
-        ctx.num_shards = num_shards
-        ctx.save_for_backward(x)
-
-        chunks = x.chunk(num_shards, dim=-2)
-        with torch.no_grad():
-            outputs = [module(chunk) for chunk in chunks]
-        return torch.cat(outputs, dim=-2)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (x,) = ctx.saved_tensors
-        chunks_x = x.chunk(ctx.num_shards, dim=-2)
-        chunks_grad = grad_output.chunk(ctx.num_shards, dim=-2)
-
-        grad_inputs = []
-        for x_chunk, g_chunk in zip(chunks_x, chunks_grad, strict=True):
-            x_chunk = x_chunk.detach().requires_grad_(True)
-            with torch.enable_grad():
-                out = ctx.module(x_chunk)
-            torch.autograd.backward(out, g_chunk)
-            grad_inputs.append(x_chunk.grad)
-
-        return torch.cat(grad_inputs, dim=-2), None, None
-
-
-class _TiledAdaForwardFn(torch.autograd.Function):
-    """Tiled forward for modules that take (x, cond) — e.g. AdaTransitionBlock.
-
-    Both x and cond are chunked along dim=-2 (they share spatial layout).
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, cond: torch.Tensor, module: nn.Module, num_shards: int) -> torch.Tensor:
-        ctx.module = module
-        ctx.num_shards = num_shards
-        ctx.save_for_backward(x, cond)
-
-        chunks_x = x.chunk(num_shards, dim=-2)
-        chunks_c = cond.chunk(num_shards, dim=-2)
-        with torch.no_grad():
-            outputs = [module(xc, cc) for xc, cc in zip(chunks_x, chunks_c, strict=True)]
-        return torch.cat(outputs, dim=-2)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        x, cond = ctx.saved_tensors
-        chunks_x = x.chunk(ctx.num_shards, dim=-2)
-        chunks_c = cond.chunk(ctx.num_shards, dim=-2)
-        chunks_grad = grad_output.chunk(ctx.num_shards, dim=-2)
-
-        grad_inputs = []
-        grad_conds = []
-        for x_chunk, c_chunk, g_chunk in zip(chunks_x, chunks_c, chunks_grad, strict=True):
-            x_chunk = x_chunk.detach().requires_grad_(True)
-            c_chunk = c_chunk.detach().requires_grad_(True)
-            with torch.enable_grad():
-                out = ctx.module(x_chunk, c_chunk)
-            torch.autograd.backward(out, g_chunk)
-            grad_inputs.append(x_chunk.grad)
-            grad_conds.append(c_chunk.grad)
-
-        return torch.cat(grad_inputs, dim=-2), torch.cat(grad_conds, dim=-2), None, None
-
-
-class _TiledOPMContractFn(torch.autograd.Function):
-    """2D-tiled outer product mean contraction with recomputation-based backward.
-
-    Chunks both `a` (dim=2, rows) and `b` (dim=2, cols) so the intermediate
-    is [B, chunk_i, chunk_j, c_h, c_h] — constant in N.
-    """
-
-    @staticmethod
-    def forward(ctx, a: torch.Tensor, b: torch.Tensor, contract_fn, num_shards: int) -> torch.Tensor:
-        ctx.contract_fn = contract_fn
-        ctx.num_shards = num_shards
-        ctx.save_for_backward(a, b)
-
-        chunks_a = a.chunk(num_shards, dim=2)
-        chunks_b = b.chunk(num_shards, dim=2)
-        with torch.no_grad():
-            row_outputs = []
-            for a_chunk in chunks_a:
-                col_outputs = [contract_fn(a_chunk, b_chunk) for b_chunk in chunks_b]
-                row_outputs.append(torch.cat(col_outputs, dim=2))  # cat along j
-            return torch.cat(row_outputs, dim=1)  # cat along i
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        a, b = ctx.saved_tensors
-        chunks_a = a.chunk(ctx.num_shards, dim=2)
-        chunks_b = b.chunk(ctx.num_shards, dim=2)
-        # Output is [B, N, N, c_z], chunked along dim=1 (i) and dim=2 (j)
-        chunks_grad_i = grad_output.chunk(ctx.num_shards, dim=1)
-
-        grad_a_chunks = []
-        grad_b_chunks = [torch.zeros_like(bc) for bc in chunks_b]
-        for a_chunk, g_row in zip(chunks_a, chunks_grad_i, strict=True):
-            chunks_grad_ij = g_row.chunk(ctx.num_shards, dim=2)
-            grad_a_accum = torch.zeros_like(a_chunk)
-            for j, (b_chunk, g_chunk) in enumerate(zip(chunks_b, chunks_grad_ij, strict=True)):
-                a_det = a_chunk.detach().requires_grad_(True)
-                b_det = b_chunk.detach().requires_grad_(True)
-                with torch.enable_grad():
-                    out = ctx.contract_fn(a_det, b_det)
-                torch.autograd.backward(out, g_chunk)
-                grad_a_accum += a_det.grad
-                grad_b_chunks[j] += b_det.grad
-            grad_a_chunks.append(grad_a_accum)
-
-        return torch.cat(grad_a_chunks, dim=2), torch.cat(grad_b_chunks, dim=2), None, None
+    row_outputs = []
+    for a_chunk in chunks_a:
+        col_outputs = []
+        for b_chunk in chunks_b:
+            if use_ckpt:
+                out = torch_checkpoint(contract_fn, a_chunk, b_chunk, use_reentrant=False)
+            else:
+                out = contract_fn(a_chunk, b_chunk)
+            col_outputs.append(out)
+        row_outputs.append(torch.cat(col_outputs, dim=2))  # cat along j
+    return torch.cat(row_outputs, dim=1)  # cat along i
 
 
 class _TransparentWrapper(nn.Module):
@@ -206,10 +146,9 @@ class TiledLinear(_TransparentWrapper):
             return self.inner(x)
 
         if self.training and x.requires_grad:
-            return _TiledForwardFn.apply(x, self.inner, shards)
+            return _tiled_forward(x, self.inner, shards)
 
         if self._tile_inference or self.training:
-            # Chunked forward (no recomputation needed without grad)
             chunks = x.chunk(shards, dim=-2)
             return torch.cat([self.inner(chunk) for chunk in chunks], dim=-2)
 
@@ -238,7 +177,7 @@ class TiledAdaLinear(_TransparentWrapper):
             return self.inner(x, cond)
 
         if self.training and x.requires_grad:
-            return _TiledAdaForwardFn.apply(x, cond, self.inner, shards)
+            return _tiled_ada_forward(x, cond, self.inner, shards)
 
         if self._tile_inference or self.training:
             chunks_x = x.chunk(shards, dim=-2)

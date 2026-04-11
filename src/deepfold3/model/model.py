@@ -366,6 +366,9 @@ class DeepFold3(nn.Module):
         mini_rollout_samples: int = 1,
         seed: int = 0,
         fused_ce: bool = False,
+        diffusion_chunk_size: int = 0,
+        backward_fn=None,
+        loss_cfg=None,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -384,25 +387,45 @@ class DeepFold3(nn.Module):
             mini_rollout_steps: Denoising steps for the confidence mini-rollout.
             mini_rollout_samples: Diffusion samples in the mini-rollout.
             seed: Random seed for MSA subsampling.
+            fused_ce: Whether to defer cross-entropy projection (for fused loss).
+            diffusion_chunk_size: If >0 and divides ``diffusion_batch_size``,
+                run diffusion in chunks of this size, computing the per-chunk
+                loss and back-propping it via ``backward_fn`` before the next
+                chunk's forward. Reduces peak memory by ~``diffusion_batch_size
+                / diffusion_chunk_size``×. Requires ``backward_fn`` and
+                ``loss_cfg`` to be set.
+            backward_fn: Callable ``(loss: Tensor) -> None`` used by the
+                chunked path to back-prop each chunk's diffusion loss. The
+                trainer wraps ``self.scaler.scale(loss / accumulate).backward``.
+            loss_cfg: ``TrainingConfig`` instance — needed by the chunked path
+                to compute per-chunk diffusion losses via ``diffusion_only_loss``.
 
         Returns:
-            Dict with keys: ``denoised``, ``gt_augmented``, ``noise_levels``,
-            ``mini_rollout_pos``, ``plddt``, ``pae``, ``pde``, ``exp_resolved``,
-            ``distogram``.
+            Dict. In the unchunked path, contains ``denoised``, ``gt_augmented``,
+            ``noise_levels`` plus the confidence/distogram outputs. In the
+            chunked path, the diffusion-loss components are stashed under
+            ``__diffusion_logged__`` (already back-propped); ``denoised`` etc.
+            are not returned.
         """
         ref_kwargs = self._ref_kwargs(features)
 
-        # --- 1. Evoformer trunk (gradient only on last cycle) ---
-        if num_recycles > 1:
+        # --- 1. Evoformer trunk (gradient only on the FINAL pass) ---
+        # AF3 convention: ``num_recycles`` is the number of *additional*
+        # trunk passes after the first. Total trunk forwards = num_recycles + 1.
+        #   num_recycles=0 → 1 pass (just initial, no recycling)
+        #   num_recycles=N → N warmup passes (no_grad) + 1 grad pass
+        # Warmup passes update ``prev_pair``/``prev_single`` to seed the
+        # final grad pass.
+        if num_recycles > 0:
             with torch.no_grad():
                 embeddings_det, _, _, _, _ = self.run_evoformer(features, num_recycles - 1, seed=seed)
-            # Pass warm-start buffers via features for the final (grad-enabled) recycle.
+            # Pass warm-start buffers via features for the final (grad-enabled) pass.
             # No .detach() needed — tensors from no_grad() context already lack grad_fn.
             features["_prev_pair"] = embeddings_det["pair"]
             features["_prev_single"] = embeddings_det["single"]
 
         embeddings, rel_feat, target_feat, seq_mask, pair_mask = self.run_evoformer(
-            features, 1, seed=seed + num_recycles - 1
+            features, 0, seed=seed + num_recycles
         )
         # Clean up side-channel keys to avoid stale references
         features.pop("_prev_pair", None)
@@ -412,18 +435,114 @@ class DeepFold3(nn.Module):
         pred: dict[str, torch.Tensor] = {}
 
         # --- 2. Diffusion training step ---
-        gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
-            gt_positions=features["atom_gt_positions"],
-            gt_mask=features["atom_gt_mask"],
-            embeddings=embeddings,
-            seq_mask=seq_mask,
-            rel_feat=rel_feat,
-            num_samples=diffusion_batch_size,
-            **ref_kwargs,
+        chunked = (
+            diffusion_chunk_size > 0
+            and backward_fn is not None
+            and loss_cfg is not None
+            and diffusion_batch_size % diffusion_chunk_size == 0
         )
-        pred["denoised"] = denoised
-        pred["gt_augmented"] = gt_aug
-        pred["noise_levels"] = noise_levels
+        if chunked:
+            # Detach trunk outputs into leaves so each chunk's backward can
+            # run with ``retain_graph=False`` and free its activations
+            # without dragging the (much larger) trunk graph with it. After
+            # the chunk loop, accumulated leaf grads are flowed back through
+            # the trunk in one walk. ``retain_graph=True`` keeps the trunk
+            # graph alive for the distogram backward (which still uses the
+            # attached ``embeddings["pair"]``).
+            from deepfold3.training.loss import diffusion_only_loss
+
+            pair_real = embeddings["pair"]
+            single_real = embeddings["single"]
+            target_feat_real = target_feat
+
+            pair_det = pair_real.detach().requires_grad_(True)
+            single_det = single_real.detach().requires_grad_(True)
+            target_feat_det = target_feat_real.detach().requires_grad_(True)
+
+            emb_det = {
+                "pair": pair_det,
+                "single": single_det,
+                "target_feat": target_feat_det,
+            }
+
+            num_chunks = diffusion_batch_size // diffusion_chunk_size
+            logged: dict[str, torch.Tensor] = {}
+            weighted_total: torch.Tensor = pair_real.new_zeros(())
+            # ``diffusion_only_loss`` (and the per-loss helpers it calls) assume
+            # unbatched ``[N, ...]`` features. With ``B > 1`` we slice the
+            # chunk's per-sample tensors and average per batch element. Trunk
+            # + diffusion forward stayed batched — only the loss computation
+            # pays the per-element cost.
+            B_pair = pair_real.shape[0] if pair_real.dim() == 4 else 1
+            slice_loss_per_batch = B_pair > 1
+
+            for _ in range(num_chunks):
+                gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
+                    gt_positions=features["atom_gt_positions"],
+                    gt_mask=features["atom_gt_mask"],
+                    embeddings=emb_det,
+                    seq_mask=seq_mask,
+                    rel_feat=rel_feat,
+                    num_samples=diffusion_chunk_size,
+                    **ref_kwargs,
+                )
+                chunk_pred = {
+                    "denoised": denoised_c,
+                    "gt_augmented": gt_aug_c,
+                    "noise_levels": noise_levels_c,
+                }
+                if slice_loss_per_batch:
+                    # chunk_pred shapes:
+                    #   denoised, gt_augmented: [B, S_chunk, N, M, 3]
+                    #   noise_levels: [B, S_chunk]
+                    # features shapes: [B, ...] (batched dataloader output)
+                    chunk_loss = pair_real.new_zeros(())
+                    chunk_components: dict[str, torch.Tensor] = {}
+                    for b in range(B_pair):
+                        chunk_pred_b = {
+                            "denoised": denoised_c[b],
+                            "gt_augmented": gt_aug_c[b],
+                            "noise_levels": noise_levels_c[b],
+                        }
+                        features_b = {
+                            k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
+                            for k, v in features.items()
+                        }
+                        loss_b, comp_b = diffusion_only_loss(chunk_pred_b, features_b, loss_cfg)
+                        chunk_loss = chunk_loss + loss_b / B_pair
+                        for k, v in comp_b.items():
+                            chunk_components[k] = chunk_components.get(k, v.new_zeros(())) + v / B_pair
+                else:
+                    chunk_loss, chunk_components = diffusion_only_loss(chunk_pred, features, loss_cfg)
+                # Each chunk contributes 1/num_chunks of the full diffusion
+                # loss; the accumulated grads on emb_det / diffusion params
+                # equal the unchunked equivalent.
+                backward_fn(chunk_loss / num_chunks)
+                weighted_total = weighted_total + chunk_loss.detach() / num_chunks
+                for k, v in chunk_components.items():
+                    logged[k] = logged.get(k, v.new_zeros(())) + v / num_chunks
+
+            torch.autograd.backward(
+                tensors=[pair_real, single_real, target_feat_real],
+                grad_tensors=[pair_det.grad, single_det.grad, target_feat_det.grad],
+                retain_graph=True,
+            )
+
+            pred["__diffusion_total__"] = weighted_total
+            pred["__diffusion_logged__"] = logged
+        else:
+            gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
+                gt_positions=features["atom_gt_positions"],
+                gt_mask=features["atom_gt_mask"],
+                embeddings=embeddings,
+                seq_mask=seq_mask,
+                rel_feat=rel_feat,
+                num_samples=diffusion_batch_size,
+                **ref_kwargs,
+            )
+            pred["denoised"] = denoised
+            pred["gt_augmented"] = gt_aug
+            pred["noise_levels"] = noise_levels
 
         # --- 3. Mini-rollout (no gradient) ---
         with torch.no_grad():
@@ -441,23 +560,23 @@ class DeepFold3(nn.Module):
         pred["mini_rollout_pos"] = mini_result["atom_positions"].detach()
 
         # --- 4. Confidence head ---
-        # When trunk is frozen (confidence-only training), detach to avoid
-        # storing autograd graph through frozen Evoformer parameters.
-        conf_pair = embeddings["pair"]
-        conf_single = embeddings["single"]
-        if not conf_pair.requires_grad:
-            conf_pair = conf_pair.detach()
-            conf_single = conf_single.detach()
+        # AF3 §3.7: confidence head trains over fixed (detached) trunk
+        # outputs and the (already-detached) mini-rollout positions, so
+        # confidence-loss gradients update only confidence-head parameters.
+        # ConfidenceHead supports batched ``[B?, N, ...]`` inputs natively
+        # (PairFormer + projection ops are all batch-aware) — pass straight
+        # through whether ``B == 1`` or ``B > 1``.
         conf_out = self.confidence_head(
-            pair=conf_pair,
-            single=conf_single,
+            pair=embeddings["pair"].detach(),
+            single=embeddings["single"].detach(),
             pair_mask=pair_mask,
             seq_mask=seq_mask,
-            target_feat=target_feat,
+            target_feat=target_feat.detach(),
             atom_positions=pred["mini_rollout_pos"],
             rep_atom_index=features.get("token_to_rep_atom"),
             return_pre_logits=fused_ce,
         )
+
         pred["plddt"] = conf_out["plddt_logits"]
         pred["exp_resolved"] = conf_out["exp_resolved_logits"]
 

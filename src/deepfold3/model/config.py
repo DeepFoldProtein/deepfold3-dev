@@ -204,6 +204,14 @@ class OptimConfig:
     # Saves ~3.6 GB at N=768. 0 = disabled, >0 = chunk size (128 recommended).
     tiled_opm_chunk: int = 0
 
+    # Gradient checkpointing on the 4-layer Evoformer (MSA) stack and the
+    # 48-layer PairFormer trunk. Essential for training — without it, 48 layers
+    # of [N,N,128] pair activations accumulate and peak memory easily exceeds
+    # 100+ GB at N=384. Each block is individually recomputed in the backward
+    # pass. Adds ~30% runtime overhead but drops activations from O(L) to O(1).
+    # No effect on inference (only applied when grad is enabled).
+    use_gradient_checkpointing: bool = False
+
     # Substrings that identify derived fused-kernel parameters in state dicts.
     # These keys are excluded from checkpoints (they are re-synced from base
     # weights on load) and from EMA shadow copies.
@@ -376,8 +384,10 @@ class TrainingConfig:
     max_atoms: int = 4096
     max_msa_seqs: int = 16384
 
-    # Recycling (random 1..max_recycles each batch)
-    max_recycles: int = 4
+    # Recycling (random 0..max_recycles each microstep, AF3 convention).
+    # Total trunk forwards = num_recycles + 1.
+    # max_recycles=3 → up to 4 trunk passes (matches AF3 paper).
+    max_recycles: int = 3
 
     # Diffusion training
     diffusion_batch_size: int = 48
@@ -421,6 +431,7 @@ class TrainingConfig:
     # DataLoader
     num_workers: int = 4
     eval_num_workers: int = 2
+    prefetch_factor: int = 4
     pin_memory: bool = True
     drop_last: bool = True
 
@@ -433,7 +444,10 @@ class TrainingConfig:
     seed: int = 42
     checkpoint_interval: int = 1000
     eval_interval: int = 5000
-    log_interval: int = 50
+    log_interval: int = 50  # in optimizer steps (after grad accumulation)
+    log_microsteps: bool = False  # debug: log every microstep instead of every effective step
+    uniform_recycle: bool = True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
+    batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
     max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
 
     # Multi-stage training (use --override or JSON config to set these per stage)
@@ -496,8 +510,8 @@ class TrainingConfig:
             raise ValueError(f"dtype must be 'bf16', 'fp16', or 'fp32', got '{self.dtype}'")
         if self.accumulate_grad_batches < 1:
             raise ValueError(f"accumulate_grad_batches must be >= 1, got {self.accumulate_grad_batches}")
-        if self.max_recycles < 1:
-            raise ValueError(f"max_recycles must be >= 1, got {self.max_recycles}")
+        if self.max_recycles < 0:
+            raise ValueError(f"max_recycles must be >= 0, got {self.max_recycles}")
 
     @property
     def torch_dtype(self):

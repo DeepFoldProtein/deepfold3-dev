@@ -467,17 +467,33 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
         linear_weight = linear_weight.contiguous()
         scale = scale.contiguous()
         bias = bias.contiguous()
+        orig_shape = X.shape
         c, X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD = ada_layernorm_linear_forward(
             X, linear_weight, scale, bias, supported_configs[0]
         )
-        ctx.save_for_backward(X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD)
+        # Save tensors in their original shape so non-reentrant gradient
+        # checkpointing sees matching metadata between original and recomputed
+        # forward. The flat buffers are contiguous; .view() shares storage and
+        # we re-flatten in backward for free.
+        ctx.save_for_backward(
+            X_flat.view(orig_shape),
+            linear_weight,
+            scale_flat.view(orig_shape),
+            bias_flat.view(orig_shape),
+            Mean,
+            RSTD,
+        )
         ctx.backward_config = supported_configs[1]
         return c
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, dOUT):
-        X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD = ctx.saved_tensors
+        X_orig, linear_weight, scale_orig, bias_orig, Mean, RSTD = ctx.saved_tensors
+        K = X_orig.shape[-1]
+        X_flat = X_orig.reshape(-1, K).contiguous()
+        scale_flat = scale_orig.reshape(-1, K).contiguous()
+        bias_flat = bias_orig.reshape(-1, K).contiguous()
         dOUT = dOUT.contiguous()
         dX, dB, dScale, dBias = ada_layernorm_linear_backward(
             dOUT, X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD, ctx.backward_config

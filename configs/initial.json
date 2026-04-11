@@ -1,7 +1,7 @@
 {
   "training": {
     "lr": 0.0018,
-    "weight_decay": 1e-5,
+    "weight_decay": 1e-8,
     "betas": [0.9, 0.95],
     "eps": 1e-8,
 
@@ -14,16 +14,16 @@
     "cosine_max_steps": 20000,
 
     "grad_clip_norm": 10.0,
-    "accumulate_grad_batches": 1,
+    "accumulate_grad_batches": 32,
     "ema_decay": 0.999,
 
     "max_tokens": 384,
     "max_atoms": 4096,
-    "max_msa_seqs": 16384,
-    "max_recycles": 4,
+    "max_msa_seqs": 512,
+    "max_recycles": 3,
 
     "diffusion_batch_size": 48,
-    "diffusion_chunk_size": 0,
+    "diffusion_chunk_size": 16,
     "mini_rollout_steps": 20,
     "mini_rollout_samples": 1,
 
@@ -47,8 +47,9 @@
     "fused_ce_chunk_n": 32,
 
     "dtype": "bf16",
-    "num_workers": 4,
+    "num_workers": 8,
     "eval_num_workers": 2,
+    "prefetch_factor": 4,
     "pin_memory": true,
     "drop_last": true,
     "find_unused_parameters": false,
@@ -57,10 +58,12 @@
 
     "max_steps": 200000,
     "seed": 42,
-    "checkpoint_interval": 1000,
-    "eval_interval": 5000,
-    "log_interval": 50,
-    "max_checkpoints": 5,
+    "checkpoint_interval": 100,
+    "eval_interval": 500,
+    "log_interval": 1,
+    "log_microsteps": true,
+    "uniform_recycle": true,
+    "max_checkpoints": 100,
 
     "load_strict": true,
     "skip_load_optimizer": false,
@@ -73,7 +76,7 @@
   },
   "model": {
     "num_recycles": 10,
-    "msa_crop_size": 16384,
+    "msa_crop_size": 512,
     "evoformer": {
       "num_layer": 4,
       "msa_channel": 64,
@@ -115,6 +118,18 @@
       "max_template_date": null,
       "prefer_monomer_templates": true
     },
-    "optim": {}
+    "optim": {
+      "use_fused_evo_attention": true,
+      "use_fused_pair_bias": true,
+      "use_fused_swiglu": true,
+      "use_fused_triangle_mul": true,
+      "use_fused_transition_pair": true,
+      "use_fused_ln_transpose": true,
+      "use_tiled_linear": true,
+      "tiled_linear_inference": true,
+      "tiled_opm_chunk": 0,
+      "use_torch_compile": false,
+      "use_gradient_checkpointing": true
+    }
   }
 }

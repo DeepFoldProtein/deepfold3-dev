@@ -384,7 +384,7 @@ def read_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
 
     for path in candidates:
         if path.is_file():
-            logger.info("Found local template %s at %s", pdb_id, path)
+            logger.debug("Found local template %s at %s", pdb_id, path)
             s = str(path)
             if s.endswith(".zst"):
                 dctx = zstd.ZstdDecompressor()

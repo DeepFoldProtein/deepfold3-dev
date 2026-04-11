@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,92 @@ from deepfold3.training.loss import training_loss
 from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _slice_batch_dict(d: dict, b: int, batch_size: int) -> dict:
+    """Slice each tensor value in ``d`` along dim 0 at index ``b``.
+
+    Only tensors whose leading dim equals ``batch_size`` are sliced.
+    Shared weight tensors (e.g. ``pae_weight: [num_bins, c_pair]``),
+    pre-aggregated scalars (``__diffusion_total__``), and other shapes
+    that don't carry the batch dim pass through unchanged. Sub-dicts
+    are recursed into.
+
+    Used by the per-batch loss loop in ``_training_step`` when
+    ``batch_size_per_rank > 1``.
+    """
+    out: dict = {}
+    for k, v in d.items():
+        if isinstance(v, torch.Tensor):
+            if v.dim() >= 1 and v.shape[0] == batch_size:
+                out[k] = v[b]
+            else:
+                out[k] = v
+        elif isinstance(v, dict):
+            out[k] = _slice_batch_dict(v, b, batch_size)
+        else:
+            out[k] = v
+    return out
+
+
+class DistributedAverageMeters:
+    """Group of named metrics with deferred DDP all-reduce.
+
+    Per-step ``update`` is collective-free — values accumulate locally as GPU
+    tensors. ``sync`` packs all metric sums + a shared count into a single
+    f64 tensor and does ONE ``all_reduce`` to compute the global weighted
+    average across ranks. The "all-reduce only at log time" pattern avoids
+    the per-step sync barrier that would otherwise serialize fast and slow
+    ranks at every step.
+
+    Important: ``sync`` MUST be called by every rank in lockstep (it issues a
+    collective). Place the call right after the optimizer step, where DDP's
+    own gradient all-reduce has already synchronized the ranks for free —
+    this makes the meter's all-reduce essentially zero-cost.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._sums: dict[str, torch.Tensor] = {}  # f64 device tensors
+        self._count: int = 0
+
+    def update(self, values: dict[str, torch.Tensor], n: int = 1) -> None:
+        """Accumulate a step's metrics. Tensors are detached and stored on device."""
+        for k, v in values.items():
+            v_f64 = v.detach().to(torch.float64) * n
+            if k in self._sums:
+                self._sums[k] += v_f64
+            else:
+                self._sums[k] = v_f64.clone()
+        self._count += n
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def sync(self) -> dict[str, float]:
+        """All-reduce across ranks and return the global weighted average dict."""
+        if not self._sums:
+            return {}
+        keys = sorted(self._sums.keys())
+        # Pack [sum_k0, sum_k1, ..., sum_kN-1, count] into one f64 tensor.
+        packed = torch.empty(len(keys) + 1, dtype=torch.float64, device=self.device)
+        for i, k in enumerate(keys):
+            packed[i] = self._sums[k]
+        packed[-1] = float(self._count)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        global_count = packed[-1].item()
+        if global_count == 0:
+            return dict.fromkeys(keys, 0.0)
+        # Single GPU→CPU sync at the very end.
+        averaged = (packed[:-1] / global_count).tolist()
+        return dict(zip(keys, averaged, strict=True))
+
+    def reset(self) -> None:
+        for t in self._sums.values():
+            t.zero_()
+        self._count = 0
 
 
 class Trainer:
@@ -78,6 +165,8 @@ class Trainer:
         self.world_size = 1
         self.local_rank = 0
         self.is_main = True
+        self._last_grad_norm: torch.Tensor | None = None
+        self._last_num_recycles: int = 0
 
     # ------------------------------------------------------------------
     # Distributed setup
@@ -122,39 +211,82 @@ class Trainer:
         if self.cfg.train_confidence_only:
             self._freeze_for_confidence_only()
 
-        # Wrap in DDP
+        # Wrap in DDP. ``static_graph=True`` is safe in the unchunked path:
+        #   * Recycles 1..N-1 run inside ``torch.no_grad()`` (model.py:396-409),
+        #     so only the last recycle is in the autograd graph and the graph
+        #     topology is identical iteration-to-iteration regardless of
+        #     ``num_recycles``.
+        #   * Gradient accumulation is pure-scaling (no ``no_sync()``), so
+        #     every backward triggers full DDP sync.
+        # Confidence-loss resolution gating is a tensor multiply (loss.py)
+        # rather than a Python branch, so the set of grad-receiving parameters
+        # is also identical every step.
+        #
+        # Chunked-diffusion path is INCOMPATIBLE with ``static_graph=True``:
+        # it uses ``model.no_sync()`` to defer DDP all_reduce until after the
+        # outer aux backward (otherwise we'd issue an all_reduce per chunk,
+        # swamping NCCL). PyTorch raises if ``no_sync`` is used under
+        # ``static_graph=True`` — auto-disable in that case.
+        chunked_diffusion = self._chunked_diffusion_active()
+        use_static_graph = self.cfg.static_graph and not chunked_diffusion
         if self.world_size > 1:
+            if self.is_main and self.cfg.static_graph and not use_static_graph:
+                logger.info(
+                    "static_graph auto-disabled (diffusion_chunk_size=%d > 0): "
+                    "chunked diffusion uses model.no_sync(), which conflicts with static_graph.",
+                    self.cfg.diffusion_chunk_size,
+                )
             self.ddp_model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
                 find_unused_parameters=self.cfg.find_unused_parameters,
-                static_graph=self.cfg.static_graph,
+                static_graph=use_static_graph,
             )
         else:
             self.ddp_model = self.model
 
-        # Optimizer: separate weight decay for >=2D params (weights) vs <2D (biases, norms)
+        # AdamW with decoupled weight decay. Protenix / nanoGPT convention:
+        # decay 2D+ params (matmul weights, embeddings); skip 1D params
+        # (LayerNorm gamma/beta, biases) — applying L2 to scale/shift terms
+        # collapses them and hurts training stability.
+        #
+        # Additional refinement: many AF3 projections are ``LinearNoBias(1, C)``
+        # or ``LinearNoBias(C, 1)`` — scalar-input or scalar-output linears that
+        # behave as per-channel scale factors. Their weight is technically 2D
+        # (``[C, 1]`` or ``[1, C]``) but semantically equivalent to a 1D param.
+        # We treat any 2D weight where ``min(shape) == 1`` as no-decay.
         decay_params = []
         no_decay_params = []
         for param in self.model.parameters():
             if not param.requires_grad:
                 continue
-            if param.dim() >= 2:
-                decay_params.append(param)
-            else:
+            if param.dim() < 2 or min(param.shape) == 1:
                 no_decay_params.append(param)
+            else:
+                decay_params.append(param)
 
         param_groups = [
             {"params": decay_params, "weight_decay": self.cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
-        self.optimizer = torch.optim.Adam(
+        # Use the fused AdamW kernel on CUDA — single kernel launch per param
+        # group, ~1.3-1.5x faster than the foreach implementation at our scale.
+        use_fused_adam = torch.cuda.is_available()
+        self.optimizer = torch.optim.AdamW(
             param_groups,
             lr=self.cfg.lr,
             betas=self.cfg.betas,
             eps=self.cfg.eps,
+            fused=use_fused_adam,
         )
+        if self.is_main:
+            n_decay = sum(p.numel() for p in decay_params) / 1e6
+            n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
+            logger.info(
+                f"AdamW: fused={use_fused_adam}, weight_decay={self.cfg.weight_decay} "
+                f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
+            )
 
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
@@ -169,7 +301,10 @@ class Trainer:
             n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
             n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6
             logger.info(f"Model parameters: {n_params:.1f}M total, {n_trainable:.1f}M trainable")
-            logger.info(f"DDP: world_size={self.world_size}, static_graph={self.cfg.static_graph}")
+            logger.info(
+                f"DDP: world_size={self.world_size}, static_graph={use_static_graph}, "
+                f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}"
+            )
 
     def _freeze_for_confidence_only(self) -> None:
         """Freeze all parameters except confidence head for stage 3 training."""
@@ -363,13 +498,15 @@ class Trainer:
 
         train_dl = DataLoader(
             train_ds,
-            batch_size=1,
+            batch_size=self.cfg.batch_size_per_rank,
             sampler=train_sampler,
             shuffle=(train_sampler is None),
             collate_fn=collate_fn,
             num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory,
             drop_last=self.cfg.drop_last,
+            persistent_workers=self.cfg.num_workers > 0,
+            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
         )
 
         eval_dl = None
@@ -381,11 +518,13 @@ class Trainer:
             )
             eval_dl = DataLoader(
                 eval_ds,
-                batch_size=1,
+                batch_size=self.cfg.batch_size_per_rank,
                 shuffle=False,
                 collate_fn=collate_fn,
                 num_workers=self.cfg.eval_num_workers,
                 pin_memory=self.cfg.pin_memory,
+                persistent_workers=self.cfg.eval_num_workers > 0,
+                prefetch_factor=self.cfg.prefetch_factor if self.cfg.eval_num_workers > 0 else None,
             )
 
         return train_dl, eval_dl
@@ -429,11 +568,16 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _prepare_features(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Move features to device and squeeze batch dim if batch_size=1."""
+        """Move features to device. Squeeze the leading batch dim only when
+        ``batch_size_per_rank == 1`` so the model uses its (slightly cheaper)
+        unbatched code path. With ``batch_size_per_rank > 1`` we keep the
+        ``[B, ...]`` layout so trunk + diffusion + heads run in batched mode.
+        """
         features = {k: v.to(self.device, non_blocking=True) for k, v in features.items()}
-        for k, v in features.items():
-            if v.dim() > 0 and v.shape[0] == 1:
-                features[k] = v.squeeze(0)
+        if self.cfg.batch_size_per_rank == 1:
+            for k, v in features.items():
+                if v.dim() > 0 and v.shape[0] == 1:
+                    features[k] = v.squeeze(0)
         return features
 
     def _training_step(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -452,21 +596,99 @@ class Trainer:
         cfg = self.cfg
         features = self._prepare_features(features)
 
-        # Random number of recycles per batch
-        num_recycles = random.randint(1, cfg.max_recycles)
+        # Number of recycles per microstep. AF3 convention: total trunk
+        # passes = num_recycles + 1, sampled uniformly from {0..max_recycles}.
+        # max_recycles=3 → up to 4 trunk passes (matches AF3 paper).
+        # Two modes:
+        #   * uniform_recycle=True (default): all DDP ranks pick the SAME
+        #     num_recycles via a fresh ``random.Random`` seeded from
+        #     ``(cfg.seed, global_step)`` — both identical on every rank.
+        #     Avoids the straggler effect where one rank does 3 no_grad
+        #     warmup passes and another does 0, blocking DDP all_reduce
+        #     on the slowest rank (~4× wasted compute at max_recycles=3).
+        #   * uniform_recycle=False: legacy per-rank Python random — each
+        #     rank picks independently from its own seeded RNG. Trains on
+        #     more diverse recycle counts per global batch but pays the
+        #     straggler cost.
+        if cfg.uniform_recycle:
+            num_recycles = random.Random(cfg.seed + self.global_step).randint(0, cfg.max_recycles)
+        else:
+            num_recycles = random.randint(0, cfg.max_recycles)
+        # Stash for ``log_microsteps`` debug logging in the outer train loop.
+        self._last_num_recycles = num_recycles
 
-        pred = self.model.forward_training(
-            features,
-            num_recycles=num_recycles,
-            diffusion_batch_size=cfg.diffusion_batch_size,
-            mini_rollout_steps=cfg.mini_rollout_steps,
-            mini_rollout_samples=cfg.mini_rollout_samples,
-            seed=self.global_step,
-            fused_ce=cfg.use_fused_ce_loss,
+        # Chunked-diffusion path: ``forward_training`` back-props each chunk
+        # internally and runs the trunk flow-back at the end of the chunked
+        # block. Those backwards must run under ``model.no_sync()`` so DDP
+        # doesn't fire an all_reduce per chunk. The aux backward (in
+        # ``_optimizer_step``) runs OUTSIDE no_sync and fires the single
+        # DDP all_reduce per microstep.
+        chunked = self._chunked_diffusion_active()
+        if chunked:
+            sync_ctx = self.ddp_model.no_sync() if self.world_size > 1 else nullcontext()
+            backward_fn = self._scaled_backward
+            loss_cfg_arg = cfg
+            chunk_size_arg = cfg.diffusion_chunk_size
+        else:
+            sync_ctx = nullcontext()
+            backward_fn = None
+            loss_cfg_arg = None
+            chunk_size_arg = 0
+
+        with sync_ctx:
+            pred = self.model.forward_training(
+                features,
+                num_recycles=num_recycles,
+                diffusion_batch_size=cfg.diffusion_batch_size,
+                mini_rollout_steps=cfg.mini_rollout_steps,
+                mini_rollout_samples=cfg.mini_rollout_samples,
+                seed=self.global_step,
+                fused_ce=cfg.use_fused_ce_loss,
+                diffusion_chunk_size=chunk_size_arg,
+                backward_fn=backward_fn,
+                loss_cfg=loss_cfg_arg,
+            )
+
+        # Loss computation. ``training_loss`` and the underlying per-loss
+        # helpers assume unbatched ``[N, ...]`` features. With
+        # ``batch_size_per_rank > 1`` we slice ``pred`` and ``features``
+        # per batch element, call ``training_loss`` per element, and
+        # average. The expensive forward (trunk + diffusion) already ran
+        # batched, so this loop only adds the (cheap) loss-computation
+        # overhead per element.
+        if cfg.batch_size_per_rank > 1:
+            B = cfg.batch_size_per_rank
+            losses_list: list[torch.Tensor] = []
+            loss_dict_acc: dict[str, torch.Tensor] = {}
+            for b in range(B):
+                pred_b = _slice_batch_dict(pred, b, B)
+                features_b = _slice_batch_dict(features, b, B)
+                loss_b, ld_b = training_loss(pred_b, features_b, cfg)
+                losses_list.append(loss_b)
+                for k, v in ld_b.items():
+                    if k in loss_dict_acc:
+                        loss_dict_acc[k] = loss_dict_acc[k] + v
+                    else:
+                        loss_dict_acc[k] = v.clone()
+            total_loss = torch.stack(losses_list).mean()
+            loss_dict = {k: v / B for k, v in loss_dict_acc.items()}
+        else:
+            total_loss, loss_dict = training_loss(pred, features, cfg)
+        return total_loss, loss_dict
+
+    def _chunked_diffusion_active(self) -> bool:
+        cfg = self.cfg
+        return (
+            cfg.diffusion_chunk_size > 0
+            and cfg.diffusion_batch_size % cfg.diffusion_chunk_size == 0
         )
 
-        total_loss, loss_dict = training_loss(pred, features, cfg)
-        return total_loss, loss_dict
+    def _scaled_backward(self, loss: torch.Tensor) -> None:
+        """``scaler.scale(loss / accumulate).backward()`` — used by both the
+        chunked-diffusion per-chunk callback and the outer ``_optimizer_step``.
+        """
+        scaled = loss / self.cfg.accumulate_grad_batches
+        self.scaler.scale(scaled).backward()
 
     # ------------------------------------------------------------------
     # Optimizer step
@@ -478,16 +700,17 @@ class Trainer:
         Args:
             loss: Scalar loss tensor from ``_training_step()``.
         """
-        scaled_loss = loss / self.cfg.accumulate_grad_batches
-        self.scaler.scale(scaled_loss).backward()
+        self._scaled_backward(loss)
 
         self.global_step += 1
 
         if self.global_step % self.cfg.accumulate_grad_batches == 0:
             self.scaler.unscale_(self.optimizer)
 
-            if self.cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip_norm)
+            # Always compute the global pre-clip grad norm for logging,
+            # even when grad_clip_norm <= 0 (use a huge cap as no-op).
+            clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
+            self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -665,22 +888,44 @@ class Trainer:
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
 
+        cfg = self.cfg
         if self.is_main:
-            logger.info(f"Starting training: max_steps={self.cfg.max_steps}")
-            logger.info(f"  confidence_only={self.cfg.train_confidence_only}")
-            logger.info(f"  accumulate_grad_batches={self.cfg.accumulate_grad_batches}")
-            logger.info(f"  lr={self.cfg.lr}, warmup={self.cfg.warmup_steps}")
-            logger.info(f"  scheduler={self.cfg.finetune_scheduler}")
-            logger.info(f"  diffusion_batch_size={self.cfg.diffusion_batch_size}")
-            logger.info(f"  mini_rollout_steps={self.cfg.mini_rollout_steps}")
+            tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
+            effective_batch_size = cfg.batch_size_per_rank * self.world_size * cfg.accumulate_grad_batches
+            tokens_per_opt_step = tokens_per_rank * self.world_size * cfg.accumulate_grad_batches
+            logger.info(f"Starting training: max_steps={cfg.max_steps}")
+            logger.info(f"  confidence_only={cfg.train_confidence_only}")
+            logger.info(f"  lr={cfg.lr}, warmup={cfg.warmup_steps}, scheduler={cfg.finetune_scheduler}")
+            logger.info(
+                f"  crop: max_tokens={cfg.max_tokens}, max_atoms={cfg.max_atoms}, "
+                f"max_msa_seqs={cfg.max_msa_seqs}, max_recycles={cfg.max_recycles}"
+            )
+            logger.info(
+                f"  batch: world_size={self.world_size}, batch_per_rank={cfg.batch_size_per_rank}, "
+                f"accumulate={cfg.accumulate_grad_batches} → "
+                f"effective_batch_size={effective_batch_size} (tokens_per_opt_step={tokens_per_opt_step})"
+            )
+            logger.info(
+                f"  diffusion: batch_size={cfg.diffusion_batch_size}, chunk_size={cfg.diffusion_chunk_size}, "
+                f"mini_rollout_steps={cfg.mini_rollout_steps}, mini_rollout_samples={cfg.mini_rollout_samples}"
+            )
+            logger.info(f"  dtype={cfg.dtype}, grad_clip={cfg.grad_clip_norm}, ema_decay={cfg.ema_decay}")
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
         epoch = 0
-        running_loss: dict[str, float] = {}
-        log_count = 0
+        # DDP-friendly metric accumulator: per-step ``update`` is local-only,
+        # one ``all_reduce`` per log boundary. Placed AFTER backward so DDP
+        # has already synced ranks → the meter's all-reduce is essentially
+        # free (no straggler barrier).
+        meters = DistributedAverageMeters(self.device)
         t0 = time.time()
+        t_last_log = t0  # wall-clock at the previous log emission
+        # Per-microstep wall-clock for ``log_microsteps`` debug logging.
+        # Updated AFTER the optimizer-step so it captures forward+backward+
+        # optimizer time of one microstep.
+        t_last_microstep = t0
 
         while self.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
@@ -698,15 +943,28 @@ class Trainer:
                         enabled=(self.cfg.dtype != "fp32"),
                     ):
                         loss, loss_dict = self._training_step(features)
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.warning(
+                        f"Step {self.effective_step}: OOM, skipping batch: {e}",
+                        exc_info=True,
+                    )
+                    torch.cuda.empty_cache()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.global_step += 1
+                    continue
                 except Exception as e:
-                    logger.warning(f"Step {self.effective_step}: skipping batch ({e})")
+                    logger.warning(
+                        f"Step {self.effective_step}: skipping batch ({e})",
+                        exc_info=True,
+                    )
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
                     continue
 
                 # Distributed NaN check
                 if self._check_nan(loss):
-                    logger.warning(f"Step {self.effective_step}: NaN/Inf loss, skipping")
+                    if self.is_main:
+                        logger.warning(f"Step {self.effective_step}: NaN/Inf loss, skipping")
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
                     del loss, loss_dict
@@ -714,13 +972,34 @@ class Trainer:
 
                 self._optimizer_step(loss)
 
-                # Accumulate logging metrics as detached tensors (no GPU sync here)
-                for k, v in loss_dict.items():
-                    if k in running_loss:
-                        running_loss[k] = running_loss[k] + v.detach()
-                    else:
-                        running_loss[k] = v.detach().clone()
-                log_count += 1
+                # Accumulate logging metrics locally (no collective).
+                meters.update(loss_dict, n=1)
+
+                # Per-microstep timing log (debug). Triggered every microstep
+                # when ``cfg.log_microsteps`` is True. Reports per-microstep
+                # wall-clock and per-example wall-clock so iteration cost can
+                # be measured before reaching an effective optimizer step.
+                if cfg.log_microsteps and self.is_main:
+                    now = time.time()
+                    dt_micro = now - t_last_microstep
+                    t_last_microstep = now
+                    # System-wide throughput: examples processed per second.
+                    # Each microstep processes ``world_size × batch_size_per_rank``
+                    # examples in ``dt_micro`` seconds.
+                    samples_per_microstep = self.world_size * cfg.batch_size_per_rank
+                    samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)
+                    in_step = self.global_step % cfg.accumulate_grad_batches
+                    logger.info(
+                        f"micro: effective={self.effective_step} "
+                        f"global={self.global_step} "
+                        f"in_step={in_step}/{cfg.accumulate_grad_batches} "
+                        f"recycles={self._last_num_recycles} "
+                        f"loss={loss.item():.4f} "
+                        f"dt_micro={dt_micro:.2f}s samples/s={samples_per_sec:.3f}"
+                    )
+                elif cfg.log_microsteps:
+                    # Non-main ranks still need to keep their wall-clock fresh.
+                    t_last_microstep = time.time()
 
                 # Release forward-pass outputs and input features immediately.
                 # Without this, local vars hold references to large GPU tensors
@@ -730,28 +1009,49 @@ class Trainer:
                 del loss, loss_dict, features
 
                 # --- Logging ---
-                if self.is_main and self.effective_step % self.cfg.log_interval == 0 and log_count > 0:
-                    # GPU sync happens here only, at log time
-                    avg = {k: (v / log_count).item() for k, v in running_loss.items()}
-                    elapsed = time.time() - t0
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    parts = [f"step={self.effective_step}"]
-                    parts.append(f"loss={avg.get('total', 0):.4f}")
-                    for k, v in sorted(avg.items()):
-                        if k != "total":
-                            parts.append(f"{k}={v:.4f}")
-                    parts.append(f"lr={lr:.2e}")
-                    parts.append(f"t={elapsed:.0f}s")
-                    logger.info(" | ".join(parts))
+                # All ranks call ``meters.sync()`` (it issues an all_reduce),
+                # but only rank 0 prints / logs to wandb. The all_reduce is
+                # essentially free here because DDP's gradient all-reduce in
+                # the just-completed backward already brought all ranks into
+                # lockstep — no straggler barrier. Gate on optimizer-step
+                # boundaries (``global_step % accumulate == 0``) so the log
+                # always fires AFTER ``clip_grad_norm`` has populated
+                # ``_last_grad_norm`` — otherwise mid-accumulation logs show
+                # ``grad_norm=nan``.
+                on_opt_step_boundary = (self.global_step % cfg.accumulate_grad_batches == 0)
+                if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0 and meters.count > 0:
+                    avg = meters.sync()
+                    meters.reset()
 
-                    if self._wandb is not None:
-                        log_data = {f"train/{k}": v for k, v in avg.items()}
-                        log_data["train/lr"] = lr
-                        log_data["train/epoch"] = epoch
-                        self._wandb.log(log_data, step=self.effective_step)
+                    if self.is_main:
+                        grad_norm = (
+                            self._last_grad_norm.item()
+                            if self._last_grad_norm is not None
+                            else float("nan")
+                        )
+                        now = time.time()
+                        elapsed = now - t0
+                        dt = (now - t_last_log) / max(self.cfg.log_interval, 1)
+                        t_last_log = now
+                        lr = self.optimizer.param_groups[0]["lr"]
+                        parts = [f"step={self.effective_step}"]
+                        parts.append(f"loss={avg.get('total', 0):.4f}")
+                        for k, v in sorted(avg.items()):
+                            if k != "total":
+                                parts.append(f"{k}={v:.4f}")
+                        parts.append(f"grad_norm={grad_norm:.3f}")
+                        parts.append(f"lr={lr:.2e}")
+                        parts.append(f"dt={dt:.1f}s")
+                        parts.append(f"t={elapsed:.0f}s")
+                        logger.info(" | ".join(parts))
 
-                    running_loss.clear()
-                    log_count = 0
+                        if self._wandb is not None:
+                            log_data = {f"train/{k}": v for k, v in avg.items()}
+                            log_data["train/lr"] = lr
+                            log_data["train/epoch"] = epoch
+                            log_data["train/grad_norm"] = grad_norm
+                            log_data["train/step_time_s"] = dt
+                            self._wandb.log(log_data, step=self.effective_step)
 
                 # --- Evaluation ---
                 if eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:

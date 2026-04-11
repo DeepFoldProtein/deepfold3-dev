@@ -679,49 +679,114 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """Denoise each sample independently. Returns [B?, S, N, M, 3].
+        """Denoise S diffusion samples in a SINGLE batched ``denoise`` call.
 
-        Each denoise call is wrapped in ``torch.utils.checkpoint`` so that
-        forward-pass intermediates (24 transformer blocks + atom encoder/decoder)
-        are freed per-sample rather than accumulated across all S samples.
-        This reduces peak memory from O(S) to O(1) w.r.t. transformer activations,
-        at the cost of recomputing each sample's forward pass during backward.
+        Collapses ``[B?, S, N, M, 3]`` into a single ``B*S`` batch dim and
+        invokes ``denoise`` once. The diffusion transformer (24 blocks) then
+        runs with ``B*S`` parallelism in one shot rather than as ``S``
+        sequential calls. Conditioning tensors (``embeddings``, ``ref_*``,
+        ``seq_mask``, ``rel_feat``) are shared across S, so we expand them
+        from ``[B, ...]`` to ``[B*S, ...]`` via ``repeat_interleave`` (the
+        contiguous copy is required because the inner atom encoder loops
+        over the batch dim and slices each element).
+
+        Wrapped in ``torch.utils.checkpoint(use_reentrant=False)`` so that
+        the entire batched forward (encoder + transformer + decoder for all
+        S samples) is recomputed once during backward, freeing intermediates
+        between forward and backward.
         """
-        S = noisy_pos.shape[-4]
-        use_ckpt = torch.is_grad_enabled()
-        results = []
-        for s in range(S):
-            nl_s = noise_level if noise_level.dim() == 0 else noise_level[..., s]
-            if use_ckpt:
-                result = torch_checkpoint(
-                    self.denoise,
-                    noisy_pos[..., s, :, :, :],
-                    nl_s,
-                    embeddings,
-                    ref_pos,
-                    ref_mask,
-                    ref_element,
-                    ref_charge,
-                    ref_atom_name_chars,
-                    seq_mask,
-                    rel_feat,
-                    use_reentrant=False,
-                )
+        # Determine input layout: [S, N, M, 3] (unbatched) or [B, S, N, M, 3]
+        has_batch = noisy_pos.dim() == 5
+        if has_batch:
+            B, S = noisy_pos.shape[0], noisy_pos.shape[1]
+            shape_tail = noisy_pos.shape[2:]  # (N, M, 3)
+        else:
+            B, S = 1, noisy_pos.shape[0]
+            shape_tail = noisy_pos.shape[1:]
+            noisy_pos = noisy_pos.unsqueeze(0)  # [1, S, N, M, 3]
+
+        BS = B * S
+
+        # Collapse position tensor: [B, S, N, M, 3] → [BS, N, M, 3]
+        noisy_pos_bs = noisy_pos.reshape(BS, *shape_tail).contiguous()
+
+        # Noise level: scalar / [S] / [B] / [B, S] → [BS]
+        if noise_level.dim() == 0:
+            nl_bs = noise_level.expand(BS)
+        elif noise_level.dim() == 1:
+            # Either [S] (unbatched) or [B] (batched, scalar per batch)
+            if noise_level.shape[0] == S and not has_batch:
+                # [S] → [BS] via tile across the (single) B dim
+                nl_bs = noise_level.repeat(B)
+            elif noise_level.shape[0] == B and has_batch:
+                # [B] → [BS] via repeat_interleave across S
+                nl_bs = noise_level.repeat_interleave(S)
             else:
-                result = self.denoise(
-                    noisy_pos=noisy_pos[..., s, :, :, :],
-                    noise_level=nl_s,
-                    embeddings=embeddings,
-                    ref_pos=ref_pos,
-                    ref_mask=ref_mask,
-                    ref_element=ref_element,
-                    ref_charge=ref_charge,
-                    ref_atom_name_chars=ref_atom_name_chars,
-                    seq_mask=seq_mask,
-                    rel_feat=rel_feat,
-                )
-            results.append(result)
-        return torch.stack(results, dim=-4)
+                # Best-effort: assume it's the leading dim of denoise's expected shape
+                nl_bs = noise_level.reshape(-1)
+        elif noise_level.dim() == 2:
+            # [B, S] → [BS]
+            nl_bs = noise_level.reshape(BS)
+        else:
+            nl_bs = noise_level.reshape(BS)
+
+        # Helper: expand a [B, ...] (or [...]) tensor to [BS, ...] by
+        # repeating each batch element S times. ``repeat_interleave`` keeps
+        # the per-batch grouping that ``noisy_pos.reshape(BS, ...)`` produces.
+        def _expand_to_bs(t: torch.Tensor) -> torch.Tensor:
+            if not has_batch:
+                # Original tensor has no B dim. Add one (B=1) and tile S times.
+                return t.unsqueeze(0).expand(BS, *t.shape).reshape(BS, *t.shape).contiguous()
+            return t.repeat_interleave(S, dim=0).contiguous()
+
+        ref_pos_bs = _expand_to_bs(ref_pos)
+        ref_mask_bs = _expand_to_bs(ref_mask)
+        ref_element_bs = _expand_to_bs(ref_element)
+        ref_charge_bs = _expand_to_bs(ref_charge)
+        ref_atom_name_chars_bs = _expand_to_bs(ref_atom_name_chars)
+        seq_mask_bs = _expand_to_bs(seq_mask)
+        rel_feat_bs = _expand_to_bs(rel_feat)
+        embeddings_bs = {
+            "single": _expand_to_bs(embeddings["single"]),
+            "pair": _expand_to_bs(embeddings["pair"]),
+            "target_feat": _expand_to_bs(embeddings["target_feat"]),
+        }
+
+        use_ckpt = torch.is_grad_enabled()
+        if use_ckpt:
+            result_bs = torch_checkpoint(
+                self.denoise,
+                noisy_pos_bs,
+                nl_bs,
+                embeddings_bs,
+                ref_pos_bs,
+                ref_mask_bs,
+                ref_element_bs,
+                ref_charge_bs,
+                ref_atom_name_chars_bs,
+                seq_mask_bs,
+                rel_feat_bs,
+                use_reentrant=False,
+            )
+        else:
+            result_bs = self.denoise(
+                noisy_pos=noisy_pos_bs,
+                noise_level=nl_bs,
+                embeddings=embeddings_bs,
+                ref_pos=ref_pos_bs,
+                ref_mask=ref_mask_bs,
+                ref_element=ref_element_bs,
+                ref_charge=ref_charge_bs,
+                ref_atom_name_chars=ref_atom_name_chars_bs,
+                seq_mask=seq_mask_bs,
+                rel_feat=rel_feat_bs,
+            )
+
+        # Reshape back: [BS, N, M, 3] → [B, S, N, M, 3] → caller layout
+        result = result_bs.reshape(B, S, *result_bs.shape[1:])
+        if not has_batch:
+            result = result.squeeze(0)
+        return result
 
     @torch.no_grad()
     def sample(

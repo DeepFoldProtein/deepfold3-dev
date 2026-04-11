@@ -388,25 +388,45 @@ def pde_loss(
 def exp_resolved_loss(
     logits: torch.Tensor,  # [S, N, M * 2]
     atom_mask: torch.Tensor,  # [N, M] bool — ground truth resolved mask
-    fixed_mask: torch.Tensor | None = None,  # [N] float — 1.0 = experimental, 0.0 = generated
+    valid_mask: torch.Tensor,  # [N, M] bool — atom slots that exist (canonical)
+    fixed_mask: torch.Tensor | None = None,  # [N] float — token-level resolved fraction
 ) -> torch.Tensor:
     """Binary cross-entropy for experimentally-resolved prediction.
 
-    When *fixed_mask* is provided (e.g. from PATCHR ATLAS distillation data),
-    atoms on tokens with ``fixed_mask < 1`` have their resolved target scaled
-    down, so model-generated atoms are trained towards "not resolved".
+    Token-level resolved learning. Two cases:
+
+    1. **Regular mmCIF (no ``fixed_mask``)**: target is per-atom ``atom_mask``
+       (the GT resolved bool, 1 = atom resolved in mmCIF, 0 = missing).
+
+    2. **Inpainted data (``fixed_mask`` provided, e.g. PATCHR ATLAS)**: every
+       canonical slot is filled with positions, so per-atom ``atom_mask`` is
+       degenerate (≈ ``valid_mask``). Instead, we use the token-level
+       *experimental fraction* ``fixed_mask`` ∈ [0, 1] as the soft target,
+       broadcast across all atoms in the token's canonical slots. The model
+       learns to flag whole tokens as “experimental” vs “inpainted”.
+
+    ``valid_mask`` is the supervision domain (canonical heavy-atom slots),
+    used as the reduction denominator so padded slots are excluded from the
+    mean entirely.
     """
-    effective_mask = atom_mask.float()
     if fixed_mask is not None:
-        effective_mask = effective_mask * fixed_mask.unsqueeze(-1)  # [N] → [N, M]
+        # Token-level target broadcast to atom level. atom_mask is ignored
+        # because inpainting fills it to ≈ valid_mask, losing the original
+        # missing-residue signal.
+        target = fixed_mask.unsqueeze(-1).expand_as(atom_mask).float()  # [N, M]
+    else:
+        target = atom_mask.float()
+
     M = atom_mask.shape[-1]
-    logits_r = logits.reshape(*logits.shape[:2], M, 2)
-    # Soft target: interpolate between class 0 (not resolved) and class 1 (resolved)
-    p_resolved = effective_mask.unsqueeze(0).expand(logits_r.shape[:-1])  # [S, N, M]
+    logits_r = logits.reshape(*logits.shape[:2], M, 2)  # [S, N, M, 2]
     log_probs = F.log_softmax(logits_r.float(), dim=-1)  # [S, N, M, 2]
-    # Soft cross-entropy: -(p * log_prob_1 + (1-p) * log_prob_0)
-    nll = -(p_resolved * log_probs[..., 1] + (1 - p_resolved) * log_probs[..., 0])
-    return nll.mean()
+
+    p = target.unsqueeze(0).expand(logits_r.shape[:-1])  # [S, N, M]
+    nll = -(p * log_probs[..., 1] + (1 - p) * log_probs[..., 0])  # [S, N, M]
+
+    # Masked mean over valid (canonical) atom slots only.
+    weight = valid_mask.float().unsqueeze(0).expand_as(nll)  # [S, N, M]
+    return (nll * weight).sum() / weight.sum().clamp_min(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +552,88 @@ def _region_to_weight(
 # ---------------------------------------------------------------------------
 
 
+def diffusion_only_loss(
+    pred: dict[str, torch.Tensor],
+    features: dict[str, torch.Tensor],
+    cfg: TrainingConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute just the diffusion-side losses for one (possibly chunked) batch.
+
+    Used by ``DeepFold3.forward_training`` when ``diffusion_chunk_size > 0``:
+    the diffusion loss is computed and back-propped per chunk so the chunk's
+    activation graph can be freed before the next chunk's forward.
+
+    Args:
+        pred: Must contain ``denoised``, ``gt_augmented``, ``noise_levels``.
+        features: Input features (need ``atom_gt_positions``, ``atom_gt_mask``,
+            optionally ``mol_type``, swap pairs, bond features, mask channels).
+        cfg: Training config.
+
+    Returns:
+        ``(total, components)`` where ``total`` is the scalar diffusion loss
+        (already weighted by ``cfg.alpha_diffusion`` and bond weight) and
+        ``components`` is a dict of unweighted scalars for logging.
+    """
+    gt_pos = features["atom_gt_positions"]
+    atom_mask = features["atom_gt_mask"]
+
+    region_label = features.get(f"mask_{MASK_REGION}")
+    region_weights: torch.Tensor | None = None
+    if region_label is not None and cfg.region_loss_weights:
+        region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
+
+    denoised = pred["denoised"]
+    gt_aug = pred["gt_augmented"]
+    noise_levels = pred["noise_levels"]
+
+    components: dict[str, torch.Tensor] = {}
+    total = gt_pos.new_zeros(())
+
+    if cfg.alpha_diffusion > 0:
+        l_mse = diffusion_mse_loss(
+            denoised,
+            gt_aug,
+            atom_mask,
+            noise_levels,
+            mol_type=features.get("mol_type"),
+            nucleotide_loss_weight=cfg.nucleotide_loss_weight,
+            ligand_loss_weight=cfg.ligand_loss_weight,
+            region_weights=region_weights,
+            atom_swap_pairs=features.get("atom_swap_pairs"),
+            ligand_swap_pairs=features.get("ligand_swap_pairs"),
+            asym_id=features.get("asym_id"),
+            entity_id=features.get("entity_id"),
+        )
+        components["diffusion_mse"] = l_mse.detach()
+
+        l_lddt = smooth_lddt_loss(
+            denoised,
+            gt_pos,
+            atom_mask,
+            cutoffs=cfg.lddt_cutoffs,
+            inclusion_radius=cfg.lddt_inclusion_radius,
+            nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
+            min_distance=cfg.lddt_min_distance,
+            mol_type=features.get("mol_type"),
+        )
+        components["smooth_lddt"] = l_lddt.detach()
+
+        total = total + cfg.alpha_diffusion * (l_mse + l_lddt)
+
+        if cfg.alpha_bond > 0 and "bond_atom_indices" in features:
+            l_bond = bond_loss(
+                denoised,
+                features["bond_atom_indices"],
+                features["bond_gt_distances"],
+                features["bond_loss_mask"],
+                noise_levels=noise_levels,
+            )
+            components["bond"] = l_bond.detach()
+            total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
+
+    return total, components
+
+
 def training_loss(
     pred: dict[str, torch.Tensor],
     features: dict[str, torch.Tensor],
@@ -563,7 +665,15 @@ def training_loss(
         region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
 
     # --- Diffusion loss ---
-    if "denoised" in pred and cfg.alpha_diffusion > 0:
+    # When ``forward_training`` ran the chunked-diffusion path, it already
+    # back-propped each chunk's loss internally and stashed the (detached)
+    # weighted total + per-component scalars on ``pred``. Inject them for
+    # logging and add the detached weighted total to ``total`` so the
+    # displayed loss reflects the full training objective (zero grad).
+    if "__diffusion_logged__" in pred:
+        losses.update(pred["__diffusion_logged__"])
+        total = total + pred["__diffusion_total__"]
+    elif "denoised" in pred and cfg.alpha_diffusion > 0:
         denoised = pred["denoised"]  # [S, N, M, 3]
         gt_aug = pred["gt_augmented"]  # [S, N, M, 3]
         noise_levels = pred["noise_levels"]  # [S]
@@ -645,20 +755,25 @@ def training_loss(
             total = total + cfg.alpha_distogram * l_disto
 
     # --- Confidence losses ---
-    # Resolution gating: keep as tensor comparison to avoid GPU sync
+    # Resolution gating uses a tensor multiply (not a Python branch) so the
+    # autograd graph topology is identical across iterations. This is required
+    # for DDP ``static_graph=True`` with ``find_unused_parameters=False``: the
+    # set of parameters reached by autograd must be the same every step, even
+    # for samples whose resolution falls outside the confidence-loss range.
     resolution = features.get("resolution")
-    conf_valid = True
-    if resolution is not None:
-        # Compare on whatever device resolution lives on (may be CPU)
-        conf_valid = bool((resolution >= cfg.min_resolution) & (resolution <= cfg.max_resolution))
+    if resolution is None:
+        conf_valid_mask = torch.ones((), device=gt_pos.device, dtype=gt_pos.dtype)
+    else:
+        res_t = resolution if torch.is_tensor(resolution) else torch.tensor(resolution, device=gt_pos.device)
+        conf_valid_mask = ((res_t >= cfg.min_resolution) & (res_t <= cfg.max_resolution)).to(gt_pos.dtype)
 
-    if conf_valid and cfg.alpha_confidence > 0:
+    if cfg.alpha_confidence > 0:
         mini_pos = pred.get("mini_rollout_pos")  # [1, N, M, 3]
         if mini_pos is not None:
             if "plddt" in pred:
                 l_plddt = plddt_loss(pred["plddt"], mini_pos, gt_pos, atom_mask)
                 losses["plddt"] = l_plddt
-                total = total + cfg.alpha_confidence * l_plddt
+                total = total + cfg.alpha_confidence * conf_valid_mask * l_plddt
 
             if rep_idx is not None:
                 mini_rep = mini_pos[:, arange_n, rep_idx]  # [S, N, 3]
@@ -677,16 +792,27 @@ def training_loss(
                     chunk_n=cfg.fused_ce_chunk_n,
                 )
                 losses["pde"] = l_pde
-                total = total + cfg.alpha_confidence * l_pde
+                total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
             elif "pde" in pred:
                 l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, seq_mask)
                 losses["pde"] = l_pde
-                total = total + cfg.alpha_confidence * l_pde
+                total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
 
             if "exp_resolved" in pred:
-                l_resolved = exp_resolved_loss(pred["exp_resolved"], atom_mask, fixed_mask=fixed_mask)
+                # ``ref_mask`` (=canonical heavy-atom slots) is the supervision
+                # domain — padded slots are excluded from the mean. ``atom_mask``
+                # (=GT resolved mmCIF mask) is the binary target.
+                ref_mask = features.get("ref_mask")
+                if ref_mask is None:
+                    ref_mask = atom_mask  # fall back to GT mask if ref_mask absent
+                l_resolved = exp_resolved_loss(
+                    pred["exp_resolved"],
+                    atom_mask,
+                    valid_mask=ref_mask,
+                    fixed_mask=fixed_mask,
+                )
                 losses["exp_resolved"] = l_resolved
-                total = total + cfg.alpha_confidence * l_resolved
+                total = total + cfg.alpha_confidence * conf_valid_mask * l_resolved
 
             if cfg.alpha_pae > 0:
                 frame_idx = features.get("frame_atom_index")  # [N, 3] int
@@ -727,7 +853,7 @@ def training_loss(
                         l_pae = None
                     if l_pae is not None:
                         losses["pae"] = l_pae
-                        total = total + cfg.alpha_confidence * cfg.alpha_pae * l_pae
+                        total = total + cfg.alpha_confidence * cfg.alpha_pae * conf_valid_mask * l_pae
 
     losses["total"] = total
     return total, losses

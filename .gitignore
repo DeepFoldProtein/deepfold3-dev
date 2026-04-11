@@ -176,5 +176,8 @@ af3.bin
 /output/
 /data/
 
+# Training run outputs (checkpoints, logs, tensorboard, etc.)
+/runs/
+
 # Claude Code
 .claude/

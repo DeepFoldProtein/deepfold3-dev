@@ -121,16 +121,22 @@ class ConfidenceHead(nn.Module):
 
     def forward(
         self,
-        pair: torch.Tensor,  # [N, N, c_pair]
-        single: torch.Tensor,  # [N, c_single]
-        pair_mask: torch.Tensor,  # [N, N]
-        seq_mask: torch.Tensor,  # [N]
-        target_feat: torch.Tensor,  # [N, target_feat_dim]
-        atom_positions: torch.Tensor,  # [num_samples, N, M, 3]
-        rep_atom_index: torch.Tensor | None = None,  # [N] index of representative atom per token
+        pair: torch.Tensor,  # [B?, N, N, c_pair]
+        single: torch.Tensor,  # [B?, N, c_single]
+        pair_mask: torch.Tensor,  # [B?, N, N]
+        seq_mask: torch.Tensor,  # [B?, N]
+        target_feat: torch.Tensor,  # [B?, N, target_feat_dim]
+        atom_positions: torch.Tensor,  # [B?, num_samples, N, M, 3]
+        rep_atom_index: torch.Tensor | None = None,  # [B?, N] index of representative atom per token
         return_pre_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run confidence head per diffusion sample.
+
+        Supports both unbatched and batched inputs. The PairFormer + LN +
+        projection ops inside ``_process_one_sample`` already support
+        ``[B?, N, ...]`` shapes natively, so the only batched-specific work
+        here is gathering ``positions`` from ``atom_positions`` along the
+        sample axis (which is ``dim=0`` unbatched / ``dim=1`` batched).
 
         Args:
             return_pre_logits: If True, return post-LN features instead of
@@ -140,30 +146,50 @@ class ConfidenceHead(nn.Module):
 
         Returns:
             When ``return_pre_logits=False`` (default):
-                plddt_logits:        [num_samples, N, max_atoms * num_plddt_bins]
-                pae_logits:          [num_samples, N, N, num_distogram_bins]
-                pde_logits:          [num_samples, N, N, num_distogram_bins]
-                exp_resolved_logits: [num_samples, N, max_atoms * 2]
+                plddt_logits:        [B?, num_samples, N, max_atoms * num_plddt_bins]
+                pae_logits:          [B?, num_samples, N, N, num_distogram_bins]
+                pde_logits:          [B?, num_samples, N, N, num_distogram_bins]
+                exp_resolved_logits: [B?, num_samples, N, max_atoms * 2]
             When ``return_pre_logits=True``:
-                pae_logits → pae_features [num_samples, N, N, pair_channel]
-                pde_logits → pde_features [num_samples, N, N, pair_channel]
+                pae_logits → pae_features [B?, num_samples, N, N, pair_channel]
+                pde_logits → pde_features [B?, num_samples, N, N, pair_channel]
         """
-        num_samples = atom_positions.shape[0]
+        has_batch = pair.dim() == 4  # [B, N, N, c_pair]
         N = pair.shape[-3]
+        device = pair.device
 
-        # Default: use atom index 1 (Cα for proteins) as representative
+        # Sample-axis position: 0 unbatched, 1 batched (after a leading B).
+        sample_axis = 1 if has_batch else 0
+        num_samples = atom_positions.shape[sample_axis]
+
+        # Default: use atom index 1 (Cα for proteins) as representative.
         if rep_atom_index is None:
-            rep_atom_index = torch.ones(N, dtype=torch.long, device=pair.device)
+            if has_batch:
+                rep_atom_index = torch.ones(pair.shape[0], N, dtype=torch.long, device=device)
+            else:
+                rep_atom_index = torch.ones(N, dtype=torch.long, device=device)
+
+        # Pre-compute the index helpers used to gather rep-atom positions.
+        if has_batch:
+            B = pair.shape[0]
+            b_arange = torch.arange(B, device=device).unsqueeze(-1).expand(B, N)
+            n_arange = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
+        else:
+            n_arange = torch.arange(N, device=device)
 
         plddt_list = []
         pae_list = []
         pde_list = []
         exp_resolved_list = []
 
-        arange_n = torch.arange(N, device=pair.device)
         use_ckpt = torch.is_grad_enabled()
         for s in range(num_samples):
-            positions = atom_positions[s, arange_n, rep_atom_index]  # [N, 3]
+            if has_batch:
+                # atom_positions [B, num_samples, N, M, 3] → positions [B, N, 3]
+                positions = atom_positions[b_arange, s, n_arange, rep_atom_index]
+            else:
+                # atom_positions [num_samples, N, M, 3] → [N, 3]
+                positions = atom_positions[s, n_arange, rep_atom_index]
 
             if use_ckpt:
                 plddt, exp_res, pae, pde = torch_checkpoint(
@@ -193,16 +219,19 @@ class ConfidenceHead(nn.Module):
             pae_list.append(pae)
             pde_list.append(pde)
 
+        # Stack along the sample axis: dim=0 unbatched, dim=1 batched
+        # (so the output preserves the convention ``[B?, num_samples, N, ...]``).
+        stack_dim = 1 if has_batch else 0
         result = {
-            "plddt_logits": torch.stack(plddt_list, dim=0),
-            "exp_resolved_logits": torch.stack(exp_resolved_list, dim=0),
+            "plddt_logits": torch.stack(plddt_list, dim=stack_dim),
+            "exp_resolved_logits": torch.stack(exp_resolved_list, dim=stack_dim),
         }
         if return_pre_logits:
-            result["pae_features"] = torch.stack(pae_list, dim=0)
-            result["pde_features"] = torch.stack(pde_list, dim=0)
+            result["pae_features"] = torch.stack(pae_list, dim=stack_dim)
+            result["pde_features"] = torch.stack(pde_list, dim=stack_dim)
         else:
-            result["pae_logits"] = torch.stack(pae_list, dim=0)
-            result["pde_logits"] = torch.stack(pde_list, dim=0)
+            result["pae_logits"] = torch.stack(pae_list, dim=stack_dim)
+            result["pde_logits"] = torch.stack(pde_list, dim=stack_dim)
         return result
 
     def _process_one_sample(

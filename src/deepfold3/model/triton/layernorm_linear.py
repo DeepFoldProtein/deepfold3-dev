@@ -509,11 +509,16 @@ class LayernormLinearFunction(torch.autograd.Function):
         supported_configs=(DEFAULT_CONFIG, DEFAULT_CONFIG),
     ):
         X = X.contiguous()
+        orig_X_shape = X.shape
         linear_weight = linear_weight.contiguous()
-        c, X, linear_weight, Mean, RSTD = layernorm_linear_forward(
+        c, X_flat, linear_weight, Mean, RSTD = layernorm_linear_forward(
             X, linear_weight, linear_bias, WEIGHT, BIAS, has_layernorm_bias, has_linear_bias, supported_configs[0]
         )
-        ctx.save_for_backward(X, linear_weight, Mean, RSTD, WEIGHT, BIAS)
+        # Save X in its original shape so non-reentrant gradient checkpointing
+        # sees matching metadata between original and recomputed forward.
+        # The flat buffer is contiguous; .view() shares storage and re-flattens
+        # for free in backward.
+        ctx.save_for_backward(X_flat.view(orig_X_shape), linear_weight, Mean, RSTD, WEIGHT, BIAS)
         ctx.backward_config = supported_configs[1]
         ctx.has_layernorm_bias = has_layernorm_bias
         ctx.has_linear_bias = has_linear_bias
@@ -522,11 +527,12 @@ class LayernormLinearFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, dOUT):
-        X, linear_weight, Mean, RSTD, WEIGHT, BIAS = ctx.saved_tensors
+        X_orig, linear_weight, Mean, RSTD, WEIGHT, BIAS = ctx.saved_tensors
+        X_flat = X_orig.reshape(-1, X_orig.shape[-1]).contiguous()
         dOUT = dOUT.contiguous()
         dX, dB, dLinearBias, dWEIGHT, dBIAS = layernorm_linear_backward(
             dOUT,
-            X,
+            X_flat,
             linear_weight,
             Mean,
             RSTD,

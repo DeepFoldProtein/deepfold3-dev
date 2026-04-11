@@ -173,20 +173,21 @@ def _unit_vectors_from_frames(
         each [N, N] or [N, N, 1].
     """
     eps = 1e-8
-    # Displacement vectors: j_pos - i_pos → [N, N, 3]
-    disp = translations.unsqueeze(-2) - translations.unsqueeze(-3)  # [N, N, 3]
+    # Displacement vectors: j_pos - i_pos → [..., N, N, 3]
+    disp = translations.unsqueeze(-2) - translations.unsqueeze(-3)
 
     # Transform to local frame of residue i: frames[i] @ disp[i, j]
-    # frames: [N, 3, 3], disp: [N, N, 3]
+    # frames: [..., N, 3, 3], disp: [..., N, N, 3]
     # For each i: local_vec[i,j] = frames[i] @ disp[i,j]
-    local_vec = torch.einsum("iae,ije->ija", frames, disp)  # [N, N, 3]
+    # Ellipsis carries optional leading batch dims through unchanged.
+    local_vec = torch.einsum("...iae,...ije->...ija", frames, disp)
 
     # Normalize to unit vectors
     norm = local_vec.norm(dim=-1, keepdim=True).clamp(min=eps)
-    unit_vec = local_vec / norm  # [N, N, 3]
+    unit_vec = local_vec / norm  # [..., N, N, 3]
 
     # Mask: both residues need valid backbone frames
-    backbone_mask_2d = frame_mask.unsqueeze(-1) * frame_mask.unsqueeze(-2)  # [N, N]
+    backbone_mask_2d = frame_mask.unsqueeze(-1) * frame_mask.unsqueeze(-2)  # [..., N, N]
 
     # Apply mask
     unit_vec = unit_vec * backbone_mask_2d.unsqueeze(-1)
@@ -319,35 +320,44 @@ class SingleTemplateEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Embed a single template.
 
+        Supports both unbatched (``[N, ...]``) and batched (``[B, N, ...]``)
+        inputs. The downstream PairFormer-style ops (triangle multiply, grid
+        attention, transition) are already batch-aware via the trunk
+        primitives, and ``_unit_vectors_from_frames`` uses ellipsis-style
+        einsum, so the only changes for batch support are:
+          * use ``shape[-3]`` (negative indexing) for ``N``
+          * broadcast ``aatype_1hot`` along an explicit ``unsqueeze`` /
+            ``expand`` that doesn't assume rank-2 inputs
+
         Args:
-            query_pair: [N, N, pair_channel] query pair embedding.
-            template_aatype: [N] template residue types (int64).
-            template_pseudo_beta: [N, 3] pseudo-beta positions.
-            template_pseudo_beta_mask: [N] pseudo-beta mask (1 where template covers token).
-            template_backbone_frame: [N, 3, 3] backbone rotation matrices.
-            template_backbone_mask: [N] backbone frame mask.
-            pair_mask: [N, N] padding mask for attention.
+            query_pair: [B?, N, N, pair_channel] query pair embedding.
+            template_aatype: [B?, N] template residue types (int64).
+            template_pseudo_beta: [B?, N, 3] pseudo-beta positions.
+            template_pseudo_beta_mask: [B?, N] pseudo-beta mask.
+            template_backbone_frame: [B?, N, 3, 3] backbone rotation matrices.
+            template_backbone_mask: [B?, N] backbone frame mask.
+            pair_mask: [B?, N, N] padding mask for attention.
 
         Returns:
-            Template pair embedding [N, N, num_channels].
+            Template pair embedding [B?, N, N, num_channels].
         """
         dtype = query_pair.dtype
-        N = query_pair.shape[0]
+        N = query_pair.shape[-3]
 
-        # Pseudo-beta pairwise distance histogram
+        # Pseudo-beta pairwise distance histogram (already batch-friendly via
+        # ellipsis-style ops in dgram_from_positions).
         dgram = dgram_from_positions_masked(
             template_pseudo_beta,
             template_pseudo_beta_mask,
             min_bin=3.25,
             max_bin=50.75,
             num_bins=self.embed_dgram.in_features,
-        )  # [N, N, dgram_bins]
+        )  # [B?, N, N, dgram_bins]
         # Per-template pair mask: 1 where both tokens are covered by this template.
-        # For multimer templates this allows cross-chain features to flow through.
         pb_mask_2d = template_pseudo_beta_mask.unsqueeze(-1) * template_pseudo_beta_mask.unsqueeze(-2)
         dgram = dgram * pb_mask_2d.unsqueeze(-1)
 
-        # Unit vectors from backbone frames
+        # Unit vectors from backbone frames (ellipsis einsum, batch-friendly)
         unit_x, unit_y, unit_z, bb_mask_2d = _unit_vectors_from_frames(
             template_backbone_frame,
             template_pseudo_beta,  # Use CA positions as translations; backbone frames use CA as origin
@@ -359,21 +369,27 @@ class SingleTemplateEmbedding(nn.Module):
         unit_y = unit_y * bb_mask_2d.unsqueeze(-1)
         unit_z = unit_z * bb_mask_2d.unsqueeze(-1)
 
-        # Amino acid type one-hot
-        aatype_1hot = F.one_hot(template_aatype, self.embed_aatype_row.in_features).to(dtype)  # [N, C]
+        # Amino acid type one-hot. Shape [B?, N, C].
+        aatype_1hot = F.one_hot(template_aatype, self.embed_aatype_row.in_features).to(dtype)
+        # Broadcast to [B?, N, N, C] for row and column views. Use unsqueeze
+        # at negative indices so the leading batch dim (if present) is
+        # preserved automatically.
+        aa_row = aatype_1hot.unsqueeze(-3).expand(*aatype_1hot.shape[:-1], N, aatype_1hot.shape[-1])
+        aa_col = aatype_1hot.unsqueeze(-2).expand(*aatype_1hot.shape[:-1], N, aatype_1hot.shape[-1])
 
         # Sum all 9 projected features
         act = self.embed_dgram(dgram.to(dtype))
         act = act + self.embed_pseudo_beta(pb_mask_2d.unsqueeze(-1).to(dtype))
-        act = act + self.embed_aatype_row(aatype_1hot[None, :, :].expand(N, -1, -1))  # broadcast row
-        act = act + self.embed_aatype_col(aatype_1hot[:, None, :].expand(-1, N, -1))  # broadcast col
+        act = act + self.embed_aatype_row(aa_row)
+        act = act + self.embed_aatype_col(aa_col)
         act = act + self.embed_unit_vec_x(unit_x.to(dtype))
         act = act + self.embed_unit_vec_y(unit_y.to(dtype))
         act = act + self.embed_unit_vec_z(unit_z.to(dtype))
         act = act + self.embed_backbone_mask(bb_mask_2d.unsqueeze(-1).to(dtype))
         act = act + self.embed_query(self.query_norm(query_pair))
 
-        # Template PairFormer stack
+        # Template PairFormer stack (TemplatePairFormerBlock uses the same
+        # batched primitives as the trunk).
         for layer in self.pairformer:
             act = layer(act, pair_mask)
 
@@ -414,34 +430,62 @@ class TemplateEmbedding(nn.Module):
     ) -> torch.Tensor:
         """Embed T templates and produce pair-space embedding.
 
+        Supports both unbatched and batched inputs. The template axis ``T``
+        is always the dim *immediately before* ``N`` in the template feature
+        tensors. The leading dim is optional and used as the batch dim.
+
         Args:
-            query_pair: [N, N, pair_channel] query pair embedding from Evoformer.
-            template_aatype: [T, N] template residue types.
-            template_pseudo_beta: [T, N, 3] pseudo-beta positions.
-            template_pseudo_beta_mask: [T, N] pseudo-beta mask.
-            template_backbone_frame: [T, N, 3, 3] backbone rotation matrices.
-            template_backbone_mask: [T, N] backbone frame mask.
-            pair_mask: [N, N] padding mask for attention.
+            query_pair: [B?, N, N, pair_channel] query pair embedding from Evoformer.
+            template_aatype: [B?, T, N] template residue types.
+            template_pseudo_beta: [B?, T, N, 3] pseudo-beta positions.
+            template_pseudo_beta_mask: [B?, T, N] pseudo-beta mask.
+            template_backbone_frame: [B?, T, N, 3, 3] backbone rotation matrices.
+            template_backbone_mask: [B?, T, N] backbone frame mask.
+            pair_mask: [B?, N, N] padding mask for attention.
             multichain_mask: Unused, kept for backward compatibility.
 
         Returns:
-            Template pair embedding [N, N, pair_channel].
+            Template pair embedding [B?, N, N, pair_channel].
         """
-        T = template_aatype.shape[0]
-        N = query_pair.shape[0]
+        has_batch = query_pair.dim() == 4  # [B, N, N, c_pair]
+        # Template axis position (dim of T): -2 unbatched ([T, N]),
+        # 1 batched ([B, T, N]).
+        t_axis = 1 if has_batch else 0
+        T = template_aatype.shape[t_axis]
         device = query_pair.device
         dtype = query_pair.dtype
 
-        # Sum embeddings across templates
-        summed = torch.zeros(N, N, self.cfg.num_channels, device=device, dtype=dtype)
+        # Initialize summed embedding with the right batch shape.
+        if has_batch:
+            B = query_pair.shape[0]
+            N = query_pair.shape[1]
+            summed = torch.zeros(B, N, N, self.cfg.num_channels, device=device, dtype=dtype)
+        else:
+            N = query_pair.shape[0]
+            summed = torch.zeros(N, N, self.cfg.num_channels, device=device, dtype=dtype)
+
         for t in range(T):
+            if has_batch:
+                # Slice along the T dim (=dim 1) of each batched template feature.
+                aatype_t = template_aatype[:, t]
+                pb_t = template_pseudo_beta[:, t]
+                pbm_t = template_pseudo_beta_mask[:, t]
+                bbf_t = template_backbone_frame[:, t]
+                bbm_t = template_backbone_mask[:, t]
+            else:
+                aatype_t = template_aatype[t]
+                pb_t = template_pseudo_beta[t]
+                pbm_t = template_pseudo_beta_mask[t]
+                bbf_t = template_backbone_frame[t]
+                bbm_t = template_backbone_mask[t]
+
             emb = self.single_template_emb(
                 query_pair=query_pair,
-                template_aatype=template_aatype[t],
-                template_pseudo_beta=template_pseudo_beta[t],
-                template_pseudo_beta_mask=template_pseudo_beta_mask[t],
-                template_backbone_frame=template_backbone_frame[t],
-                template_backbone_mask=template_backbone_mask[t],
+                template_aatype=aatype_t,
+                template_pseudo_beta=pb_t,
+                template_pseudo_beta_mask=pbm_t,
+                template_backbone_frame=bbf_t,
+                template_backbone_mask=bbm_t,
                 pair_mask=pair_mask,
             )
             summed = summed + emb

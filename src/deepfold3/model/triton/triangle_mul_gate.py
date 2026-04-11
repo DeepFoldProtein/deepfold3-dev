@@ -147,67 +147,70 @@ class TriMulPostProcessFunction(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.bfloat16)
     def forward(ctx, combined, K):
-        shape = combined.shape
-        combined = combined.reshape(-1, shape[-1]).contiguous()
-        M = combined.shape[0]
+        orig_shape = combined.shape
+        combined_flat = combined.reshape(-1, orig_shape[-1]).contiguous()
+        M = combined_flat.shape[0]
 
-        a = torch.empty((M, K), dtype=combined.dtype, device=combined.device)
-        b = torch.empty((M, K), dtype=combined.dtype, device=combined.device)
-        out_gate = torch.empty((M, K), dtype=combined.dtype, device=combined.device)
+        a = torch.empty((M, K), dtype=combined_flat.dtype, device=combined_flat.device)
+        b = torch.empty((M, K), dtype=combined_flat.dtype, device=combined_flat.device)
+        out_gate = torch.empty((M, K), dtype=combined_flat.dtype, device=combined_flat.device)
 
         BLOCK_SIZE, num_warps = _calculate_settings(K)
         _trimul_postprocess_fwd[(M,)](
-            combined,
+            combined_flat,
             a,
             b,
             out_gate,
             M,
             K,
-            combined.stride(0),
+            combined_flat.stride(0),
             a.stride(0),
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
 
-        ctx.save_for_backward(combined)
+        # Save the tensor in its original shape so non-reentrant gradient
+        # checkpointing sees matching metadata between original forward and
+        # recomputed forward. The flat buffer is contiguous, so .view() shares
+        # storage and we can re-flatten in backward for free.
+        ctx.save_for_backward(combined_flat.view(orig_shape))
         ctx.K = K
-        ctx.orig_leading = shape[:-1]
 
-        a = a.view(shape[:-1] + (K,))
-        b = b.view(shape[:-1] + (K,))
-        out_gate = out_gate.view(shape[:-1] + (K,))
+        a = a.view(orig_shape[:-1] + (K,))
+        b = b.view(orig_shape[:-1] + (K,))
+        out_gate = out_gate.view(orig_shape[:-1] + (K,))
         return a, b, out_gate
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, da, db, d_out_gate):
-        (combined,) = ctx.saved_tensors
+        (combined_orig,) = ctx.saved_tensors
         K = ctx.K
-        M = combined.shape[0]
+        combined_flat = combined_orig.reshape(-1, 5 * K).contiguous()
+        M = combined_flat.shape[0]
 
         da = da.reshape(M, K).contiguous()
         db = db.reshape(M, K).contiguous()
         d_out_gate = d_out_gate.reshape(M, K).contiguous()
 
-        d_combined = torch.empty_like(combined)
+        d_combined = torch.empty_like(combined_flat)
 
         BLOCK_SIZE, num_warps = _calculate_settings(K)
         _trimul_postprocess_bwd[(M,)](
             da,
             db,
             d_out_gate,
-            combined,
+            combined_flat,
             d_combined,
             M,
             K,
             da.stride(0),
-            combined.stride(0),
+            combined_flat.stride(0),
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
 
-        d_combined = d_combined.view(ctx.orig_leading + (5 * K,))
-        return d_combined, None
+        return d_combined.view(combined_orig.shape), None
 
 
 class FusedTriangleMulGate(nn.Module):
