@@ -63,7 +63,12 @@ class AtomSubsets:
 
 
 def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> AtomSubsets:
-    """Build flat atom subset indices from ref_mask [N, M].
+    """Build flat atom subset indices from ref_mask.
+
+    Accepts ``[N, M]`` (unbatched) or ``[B, N, M]`` (batched). When batched,
+    each sample's index tensors are stacked along a leading dim of size ``B``,
+    so the returned ``AtomSubsets`` has fields like ``ta_to_q_idx`` of shape
+    ``[B, S, Q]`` instead of ``[S, Q]``.
 
     1. Flatten ref_mask → find real atom indices in [N*M]
     2. Pad to next multiple of Q based on the FIXED total slot count [N*M]
@@ -73,6 +78,26 @@ def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> Ato
        identical saved-tensor shapes inside the encoder.
     3. Build query/key gather indices and scatter-back indices
     """
+    if ref_mask.dim() == 3:
+        B = ref_mask.shape[0]
+        per = [build_atom_subsets(ref_mask[b], Q, K) for b in range(B)]
+        first = per[0]
+        return AtomSubsets(
+            num_subsets=first.num_subsets,
+            Q=Q,
+            K=K,
+            N=first.N,
+            M=first.M,
+            ta_to_q_idx=torch.stack([s.ta_to_q_idx for s in per]),
+            ta_to_q_mask=torch.stack([s.ta_to_q_mask for s in per]),
+            q_to_k_idx=torch.stack([s.q_to_k_idx for s in per]),
+            q_to_k_mask=torch.stack([s.q_to_k_mask for s in per]),
+            token_for_query=torch.stack([s.token_for_query for s in per]),
+            token_for_key=torch.stack([s.token_for_key for s in per]),
+            q_to_ta_idx=torch.stack([s.q_to_ta_idx for s in per]),
+            q_to_ta_mask=torch.stack([s.q_to_ta_mask for s in per]),
+        )
+
     device = ref_mask.device
     N, M = ref_mask.shape
 
@@ -155,38 +180,73 @@ def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> Ato
     )
 
 
-def _gather_to_subsets(arr: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Gather from token-atoms [N, M, *F] to subset layout [S, Q_or_K, *F].
+def _batched_take(arr_flat: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Per-batch advanced index ``arr_flat[b, idx[b, ...]]`` followed by mask.
 
-    idx: [S, Q_or_K] indices into flattened [N*M]
-    mask: [S, Q_or_K] bool
+    Args:
+        arr_flat: ``[B, L, *F]`` source flattened along the indexed axis.
+        idx:      ``[B, *D]`` long indices into ``L``.
+        mask:     ``[B, *D]`` bool/float, same leading shape as ``idx``.
+
+    Returns:
+        ``[B, *D, *F]`` with ``mask`` broadcast and applied.
     """
-    flat = arr.reshape(-1, *arr.shape[2:])  # [N*M, *F]
-    out = flat[idx]  # [S, Q_or_K, *F]
-    return out * mask.reshape(*mask.shape, *([1] * (out.ndim - mask.ndim)))
+    B = arr_flat.shape[0]
+    D = idx.shape[1:]
+    b_arange = torch.arange(B, device=arr_flat.device).view(B, *([1] * len(D))).expand(B, *D)
+    out = arr_flat[b_arange, idx]  # [B, *D, *F]
+    m_shape = mask.shape + (1,) * (out.ndim - mask.ndim)
+    return out * mask.view(m_shape).to(out.dtype)
+
+
+def _flat_take(arr_flat: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Unbatched index ``arr_flat[idx]`` followed by mask.
+
+    Args:
+        arr_flat: ``[L, *F]`` source.
+        idx:      ``[*D]`` long indices into ``L``.
+        mask:     ``[*D]`` bool/float, same shape as ``idx``.
+    """
+    out = arr_flat[idx]
+    m_shape = mask.shape + (1,) * (out.ndim - mask.ndim)
+    return out * mask.view(m_shape).to(out.dtype)
+
+
+def _gather_to_subsets(arr: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Gather from token-atoms ``[B?, N, M, *F]`` to subset layout
+    ``[B?, S, Q_or_K, *F]``.
+
+    Unbatched: ``arr [N, M, *F]`` + ``idx [S, Q_or_K]``.
+    Batched:   ``arr [B, N, M, *F]`` + ``idx [B, S, Q_or_K]`` (per-sample subsets).
+    """
+    if idx.dim() == 3:
+        B = idx.shape[0]
+        return _batched_take(arr.reshape(B, -1, *arr.shape[3:]), idx, mask)
+    return _flat_take(arr.reshape(-1, *arr.shape[2:]), idx, mask)
 
 
 def _scatter_from_subsets(arr: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor, N: int, M: int) -> torch.Tensor:
-    """Scatter from subset layout [S, Q, *F] back to token-atoms [N, M, *F].
+    """Scatter from subset layout ``[B?, S, Q, *F]`` back to token-atoms
+    ``[B?, N, M, *F]``.
 
-    idx: [N, M] indices into flattened [S*Q]
-    mask: [N, M] bool
+    Unbatched: ``arr [S, Q, *F]`` + ``idx [N, M]``.
+    Batched:   ``arr [B, S, Q, *F]`` + ``idx [B, N, M]``.
     """
-    flat = arr.reshape(-1, *arr.shape[2:])  # [S*Q, *F]
-    out = flat[idx]  # [N, M, *F]
-    return out * mask.reshape(*mask.shape, *([1] * (out.ndim - mask.ndim)))
+    if idx.dim() == 3:
+        B = idx.shape[0]
+        return _batched_take(arr.reshape(B, -1, *arr.shape[3:]), idx, mask)
+    return _flat_take(arr.reshape(-1, *arr.shape[2:]), idx, mask)
 
 
 def _gather_q_to_k(arr: torch.Tensor, q_to_k_idx: torch.Tensor, q_to_k_mask: torch.Tensor) -> torch.Tensor:
-    """Gather from queries [S, Q, *F] to keys [S, K, *F].
+    """Gather from queries ``[B?, S, Q, *F]`` to keys ``[B?, S, K, *F]``.
 
-    q_to_k_idx: [S, K] indices into flattened [S*Q]
-    q_to_k_mask: [S, K] bool
+    ``q_to_k_idx`` is ``[S, K]`` (unbatched) or ``[B, S, K]`` (batched).
     """
-    S, Q = arr.shape[:2]
-    flat = arr.reshape(S * Q, *arr.shape[2:])  # [S*Q, *F]
-    out = flat[q_to_k_idx]  # [S, K, *F]
-    return out * q_to_k_mask.reshape(*q_to_k_mask.shape, *([1] * (out.ndim - q_to_k_mask.ndim)))
+    if q_to_k_idx.dim() == 3:
+        B = q_to_k_idx.shape[0]
+        return _batched_take(arr.reshape(B, -1, *arr.shape[3:]), q_to_k_idx, q_to_k_mask)
+    return _flat_take(arr.reshape(-1, *arr.shape[2:]), q_to_k_idx, q_to_k_mask)
 
 
 @dataclasses.dataclass
@@ -199,6 +259,63 @@ class AtomCrossAttEncoderOutput:
     keys_single_cond: torch.Tensor  # [S, K, per_atom_channels]
     pair_cond: torch.Tensor  # [S, Q, K, pair_ch]
     subsets: AtomSubsets  # precomputed indices for decoder
+
+
+@dataclasses.dataclass
+class AtomEncoderStatic:
+    """Noise-independent encoder state that can be reused across diffusion samples.
+
+    Computed once per (molecule, trunk_embeddings) pair via
+    ``AtomEncoder.compute_static`` and reused by ``AtomEncoder.forward`` with
+    a ``static=...`` kwarg. Saves the conditioning compute (single embeddings,
+    pair MLP, trunk pair gather) on every sample after the first.
+
+    Always stored at batched ``[B, ...]`` layout — :meth:`compute_static`
+    auto-promotes unbatched inputs to ``B=1``. Use :meth:`expand_for_samples`
+    to materialise the ``[B*S, ...]`` view that aligns with diffusion samples
+    collapsed into a single leading batch dim.
+    """
+
+    subsets: AtomSubsets
+    queries_single: torch.Tensor  # [B, S_sub, Q, c]
+    queries_mask: torch.Tensor  # [B, S_sub, Q]
+    keys_single: torch.Tensor  # [B, S_sub, K, c]
+    keys_mask: torch.Tensor  # [B, S_sub, K]
+    atom_pair: torch.Tensor  # [B, S_sub, Q, K, cp]
+    ref_mask: torch.Tensor  # [B, N, M] — needed for the aggregation denominator
+
+    def expand_for_samples(self, num_samples: int) -> AtomEncoderStatic:
+        """Repeat each field along the leading batch dim by ``num_samples``
+        (``[B, ...]`` → ``[B*num_samples, ...]``)."""
+        if num_samples == 1:
+            return self
+
+        def exp(t: torch.Tensor) -> torch.Tensor:
+            return t.repeat_interleave(num_samples, dim=0).contiguous()
+
+        return AtomEncoderStatic(
+            subsets=AtomSubsets(
+                num_subsets=self.subsets.num_subsets,
+                Q=self.subsets.Q,
+                K=self.subsets.K,
+                N=self.subsets.N,
+                M=self.subsets.M,
+                ta_to_q_idx=exp(self.subsets.ta_to_q_idx),
+                ta_to_q_mask=exp(self.subsets.ta_to_q_mask),
+                q_to_k_idx=exp(self.subsets.q_to_k_idx),
+                q_to_k_mask=exp(self.subsets.q_to_k_mask),
+                token_for_query=exp(self.subsets.token_for_query),
+                token_for_key=exp(self.subsets.token_for_key),
+                q_to_ta_idx=exp(self.subsets.q_to_ta_idx),
+                q_to_ta_mask=exp(self.subsets.q_to_ta_mask),
+            ),
+            queries_single=exp(self.queries_single),
+            queries_mask=exp(self.queries_mask),
+            keys_single=exp(self.keys_single),
+            keys_mask=exp(self.keys_mask),
+            atom_pair=exp(self.atom_pair),
+            ref_mask=exp(self.ref_mask),
+        )
 
 
 class AtomPerAtomConditioning(nn.Module):
@@ -253,20 +370,21 @@ class AtomPerAtomConditioning(nn.Module):
 
     def single_cond(
         self,
-        ref_pos: torch.Tensor,  # [N, M, 3]
-        ref_mask: torch.Tensor,  # [N, M] float
-        ref_element: torch.Tensor,  # [N, M] int64
-        ref_charge: torch.Tensor,  # [N, M] float
-        ref_atom_name_chars: torch.Tensor,  # [N, M, 4] int64
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M] float
+        ref_element: torch.Tensor,  # [B?, N, M] int64
+        ref_charge: torch.Tensor,  # [B?, N, M] float
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
     ) -> torch.Tensor:
-        """Compute per-atom single conditioning [N, M, c]."""
-        N, M, _ = ref_pos.shape
+        """Compute per-atom single conditioning ``[B?, N, M, c]``."""
         act = self.embed_ref_pos(ref_pos)
         act = act + self.embed_ref_mask(ref_mask.unsqueeze(-1))
         elem_1hot = F.one_hot(ref_element, self.num_element_classes).float()
         act = act + self.embed_ref_element(elem_1hot)
         act = act + self.embed_ref_charge(torch.arcsinh(ref_charge).unsqueeze(-1))
-        name_1hot = F.one_hot(ref_atom_name_chars, self.num_atom_name_chars).float().reshape(N, M, -1)
+        name_1hot = F.one_hot(ref_atom_name_chars, self.num_atom_name_chars).float()
+        # Flatten the trailing (atom_name_length, num_atom_name_chars) dims
+        name_1hot = name_1hot.reshape(*name_1hot.shape[:-2], -1)
         act = act + self.embed_ref_atom_name(name_1hot)
         act = act * ref_mask.unsqueeze(-1)
         return act
@@ -293,11 +411,12 @@ class AtomPerAtomConditioning(nn.Module):
         """
         act = self.single_cond(ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars)
 
-        # Intra-token pair (same-token atom pairs)
-        row = self.single_to_pair_row(F.relu(act))  # [N, M, cp]
-        col = self.single_to_pair_col(F.relu(act))  # [N, M, cp]
-        pair_act = row.unsqueeze(2) + col.unsqueeze(1)  # [N, M, M, cp]
-        offsets = ref_pos.unsqueeze(2) - ref_pos.unsqueeze(1)  # [N, M, M, 3]
+        # Intra-token pair (same-token atom pairs); negative-axis ops are
+        # batch-friendly so the same code path works for [N,M,...] and [B,N,M,...].
+        row = self.single_to_pair_row(F.relu(act))  # [..., N, M, cp]
+        col = self.single_to_pair_col(F.relu(act))  # [..., N, M, cp]
+        pair_act = row.unsqueeze(-2) + col.unsqueeze(-3)  # [..., N, M, M, cp]
+        offsets = ref_pos.unsqueeze(-2) - ref_pos.unsqueeze(-3)  # [..., N, M, M, 3]
         sq_dists = (offsets**2).sum(-1, keepdim=True)
         pair_act = pair_act + self.embed_pair_offsets(offsets)
         pair_act = pair_act + self.embed_pair_distances(1.0 / (1.0 + sq_dists))
@@ -416,53 +535,76 @@ class AtomCrossAttTransformer(nn.Module):
 
     def forward(
         self,
-        queries_act: torch.Tensor,  # [S, Q, c]
-        queries_mask: torch.Tensor,  # [S, Q] float
-        queries_single_cond: torch.Tensor,  # [S, Q, c]
-        keys_single_cond: torch.Tensor,  # [S, K, c]
-        keys_mask: torch.Tensor,  # [S, K] float
-        pair_cond: torch.Tensor,  # [S, Q, K, cp]
-        q_to_k_idx: torch.Tensor,  # [S, K] long — indices into [S*Q]
+        queries_act: torch.Tensor,  # [B?, S, Q, c]
+        queries_mask: torch.Tensor,  # [B?, S, Q] float
+        queries_single_cond: torch.Tensor,  # [B?, S, Q, c]
+        keys_single_cond: torch.Tensor,  # [B?, S, K, c]
+        keys_mask: torch.Tensor,  # [B?, S, K] float
+        pair_cond: torch.Tensor,  # [B?, S, Q, K, cp]
+        q_to_k_idx: torch.Tensor,  # [S, K] long — indices into [S*Q] (shared across batch)
         q_to_k_mask: torch.Tensor,  # [S, K] bool
-    ) -> torch.Tensor:  # [S, Q, c]
-        S, Q, C = queries_act.shape
+    ) -> torch.Tensor:  # [B?, S, Q, c]
+        # Detect leading batch dim (queries_act is 3D unbatched, 4D batched).
+        has_batch = queries_act.dim() == 4
+        if has_batch:
+            B, S, Q, C = queries_act.shape
+        else:
+            S, Q, C = queries_act.shape
+            B = 1
         H = self.num_heads
         D = self.head_dim
-        K = keys_mask.shape[1]
+        K = keys_mask.shape[-1]
 
-        # Pre-compute pair logits for all blocks (scale-only LN)
+        # Pre-compute pair logits for all blocks (scale-only LN). Permute the
+        # ``num_blocks * H`` axis to the front so block ``i`` can be sliced
+        # cheaply on the leading dim. ``...`` carries any leading batch dims.
         pair_normed = F.layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
-        pair_logits = self.pair_logits_proj(pair_normed)  # [S, Q, K, nb*H]
-        pair_logits = pair_logits.permute(3, 0, 1, 2)  # [nb*H, S, Q, K]
-        pair_logits = pair_logits.reshape(self.num_blocks, H, S, Q, K)
+        pair_logits = self.pair_logits_proj(pair_normed)  # [..., S, Q, K, nb*H]
+        # Move (nb*H) to the front to slice per block. ``movedim`` is
+        # batch-friendly (handles any leading dims).
+        pair_logits = pair_logits.movedim(-1, 0)  # [nb*H, ..., S, Q, K]
+        pair_logits = pair_logits.reshape(self.num_blocks, H, *pair_logits.shape[1:])  # [nb, H, ..., S, Q, K]
 
         for i, (attn, ffn) in enumerate(zip(self.attn_blocks, self.ffn_blocks, strict=True)):
-            pl = pair_logits[i]  # [H, S, Q, K]
+            pl = pair_logits[i]  # [H, ..., S, Q, K]
 
-            # Re-gather keys from current queries_act (AF3 does this every block)
-            keys_act = _gather_q_to_k(queries_act, q_to_k_idx, q_to_k_mask)  # [S, K, c]
+            # Re-gather keys from current queries_act (AF3 does this every block).
+            keys_act = _gather_q_to_k(queries_act, q_to_k_idx, q_to_k_mask)  # [..., S, K, c]
 
             # --- q-side AdaLN ---
-            xn_q = self.attn_norms[i](queries_act)  # [S, Q, c]  (no params)
+            xn_q = self.attn_norms[i](queries_act)  # [..., S, Q, c]
             cn_q = F.layer_norm(queries_single_cond, [C]) * self.attn_cond_w[i]
             xn_q = torch.sigmoid(self.attn_cond_scale[i](cn_q)) * xn_q + self.attn_cond_bias[i](cn_q)
 
             # --- k-side AdaLN ---
-            xn_k = F.layer_norm(keys_act, [C])  # [S, K, c]  (no params)
+            xn_k = F.layer_norm(keys_act, [C])  # [..., S, K, c]
             cn_k = F.layer_norm(keys_single_cond, [C]) * self.k_cond_w[i]
             xn_k = torch.sigmoid(self.k_cond_scale[i](cn_k)) * xn_k + self.k_cond_bias[i](cn_k)
 
-            # --- Cross-attention ---
-            q = attn["to_q"](xn_q).view(S, Q, H, D).permute(0, 2, 1, 3)  # [S,H,Q,D]
-            k = attn["to_k"](xn_k).view(S, K, H, D).permute(0, 2, 1, 3)  # [S,H,K,D]
-            v = attn["to_v"](xn_k).view(S, K, H, D).permute(0, 2, 1, 3)  # [S,H,K,D]
-
-            logits = torch.matmul(q * (D**-0.5), k.transpose(-2, -1))  # [S,H,Q,K]
-            logits = logits + pl.permute(1, 0, 2, 3)  # [S,H,Q,K]
-            key_mask = keys_mask.unsqueeze(1).unsqueeze(2)  # [S,1,1,K]
-            logits = logits + 1e9 * (key_mask - 1.0)
-            w = F.softmax(logits.float(), dim=-1).to(queries_act.dtype)  # [S,H,Q,K]
-            out = torch.matmul(w, v).permute(0, 2, 1, 3).reshape(S, Q, C)  # [S,Q,C]
+            # --- Cross-attention. Reshape last 3 dims (S, Q, c) to (S, Q, H, D),
+            # then permute the head dim in front of (Q or K). With or without
+            # leading batch dims, the relative positions are the same.
+            if has_batch:
+                q = attn["to_q"](xn_q).view(B, S, Q, H, D).permute(0, 1, 3, 2, 4)  # [B,S,H,Q,D]
+                k = attn["to_k"](xn_k).view(B, S, K, H, D).permute(0, 1, 3, 2, 4)  # [B,S,H,K,D]
+                v = attn["to_v"](xn_k).view(B, S, K, H, D).permute(0, 1, 3, 2, 4)  # [B,S,H,K,D]
+                logits = torch.matmul(q * (D**-0.5), k.transpose(-2, -1))  # [B,S,H,Q,K]
+                # pl has shape [H, B, S, Q, K]; broadcast to logits' [B,S,H,Q,K]
+                logits = logits + pl.permute(1, 2, 0, 3, 4)
+                key_mask = keys_mask.unsqueeze(-2).unsqueeze(-2)  # [B,S,1,1,K]
+                logits = logits + 1e9 * (key_mask - 1.0)
+                w = F.softmax(logits.float(), dim=-1).to(queries_act.dtype)
+                out = torch.matmul(w, v).permute(0, 1, 3, 2, 4).reshape(B, S, Q, C)
+            else:
+                q = attn["to_q"](xn_q).view(S, Q, H, D).permute(0, 2, 1, 3)  # [S,H,Q,D]
+                k = attn["to_k"](xn_k).view(S, K, H, D).permute(0, 2, 1, 3)
+                v = attn["to_v"](xn_k).view(S, K, H, D).permute(0, 2, 1, 3)
+                logits = torch.matmul(q * (D**-0.5), k.transpose(-2, -1))  # [S,H,Q,K]
+                logits = logits + pl.permute(1, 0, 2, 3)
+                key_mask = keys_mask.unsqueeze(1).unsqueeze(2)  # [S,1,1,K]
+                logits = logits + 1e9 * (key_mask - 1.0)
+                w = F.softmax(logits.float(), dim=-1).to(queries_act.dtype)
+                out = torch.matmul(w, v).permute(0, 2, 1, 3).reshape(S, Q, C)
 
             g = torch.sigmoid(attn["to_g"](xn_q))  # gate queries
             out = out * g
@@ -543,47 +685,45 @@ class EvoformerConditioningEncoder(nn.Module):
 
     def forward(
         self,
-        ref_pos: torch.Tensor,  # [N, M, 3]
-        ref_mask: torch.Tensor,  # [N, M] float
-        ref_element: torch.Tensor,  # [N, M] int64
-        ref_charge: torch.Tensor,  # [N, M] float
-        ref_atom_name_chars: torch.Tensor,  # [N, M, 4] int64
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M] float
+        ref_element: torch.Tensor,  # [B?, N, M] int64
+        ref_charge: torch.Tensor,  # [B?, N, M] float
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
     ) -> torch.Tensor:
-        """Returns token_act [N, per_token_channels]."""
-        N, M, _ = ref_pos.shape
+        """Returns token_act ``[B?, N, per_token_channels]``."""
+        N, M = ref_pos.shape[-3], ref_pos.shape[-2]
 
-        # Build flat atom subsets
+        # Build flat atom subsets (batched if ref_mask is 3D)
         subsets = build_atom_subsets(ref_mask.bool(), self.Q, self.K)
 
-        # Single conditioning in token-atoms space [N, M, c]
+        # Single conditioning in token-atoms space [B?, N, M, c]
         atom_single = self.per_atom.single_cond(ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars)
 
-        # Gather to subset layouts
-        queries_single = _gather_to_subsets(atom_single, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, c]
-        queries_mask = subsets.ta_to_q_mask.float()  # [S, Q]
-        keys_single = _gather_q_to_k(queries_single, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [S, K, c]
-        keys_mask = subsets.q_to_k_mask.float()  # [S, K]
+        # Gather to subset layouts (helpers handle batched index tensors)
+        queries_single = _gather_to_subsets(atom_single, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [B?, S, Q, c]
+        queries_mask = subsets.ta_to_q_mask.to(atom_single.dtype)  # [B?, S, Q]
+        keys_single = _gather_q_to_k(queries_single, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [B?, S, K, c]
+        keys_mask = subsets.q_to_k_mask.to(atom_single.dtype)  # [B?, S, K]
 
         # Gather ref_pos to subset layouts
-        queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, 3]
-        keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [S, K, 3]
+        queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [B?, S, Q, 3]
+        keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [B?, S, K, 3]
 
         # offsets_valid: same-token atom pairs (same reference frame)
-        offsets_valid = subsets.token_for_query.unsqueeze(2) == subsets.token_for_key.unsqueeze(1)  # [S, Q, K]
+        offsets_valid = subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)  # [B?, S, Q, K]
 
-        # Build cross-subset pair_cond [S, Q, K, cp]
-        # AF3 only uses _1 variant weights for cross-subset pair
-        # (base per_atom pair from _per_atom_conditioning is discarded)
-        row = self.single_to_pair_row_enc(F.relu(queries_single))  # [S, Q, cp]
-        col = self.single_to_pair_col_enc(F.relu(keys_single))  # [S, K, cp]
-        atom_pair = row.unsqueeze(2) + col.unsqueeze(1)  # [S, Q, K, cp]
+        # Build cross-subset pair_cond [B?, S, Q, K, cp]
+        row = self.single_to_pair_row_enc(F.relu(queries_single))  # [B?, S, Q, cp]
+        col = self.single_to_pair_col_enc(F.relu(keys_single))  # [B?, S, K, cp]
+        atom_pair = row.unsqueeze(-2) + col.unsqueeze(-3)  # [B?, S, Q, K, cp]
 
-        offsets = queries_ref_pos.unsqueeze(2) - keys_ref_pos.unsqueeze(1)  # [S, Q, K, 3]
+        offsets = queries_ref_pos.unsqueeze(-2) - keys_ref_pos.unsqueeze(-3)  # [B?, S, Q, K, 3]
         sq_dists = (offsets**2).sum(-1, keepdim=True)
-        ov = offsets_valid.unsqueeze(-1)  # [S, Q, K, 1]
+        ov = offsets_valid.unsqueeze(-1)  # [B?, S, Q, K, 1]
         atom_pair = atom_pair + self.enc_embed_pair_offsets(offsets) * ov
         atom_pair = atom_pair + self.enc_embed_pair_distances(1.0 / (1.0 + sq_dists)) * ov
-        atom_pair = atom_pair + self.enc_embed_offsets_valid(ov.float())
+        atom_pair = atom_pair + self.enc_embed_offsets_valid(ov.to(atom_pair.dtype))
 
         # Pair MLP applied LAST (after all additive terms, matching AF3)
         atom_pair = self.per_atom.apply_pair_mlp(atom_pair)
@@ -679,82 +819,119 @@ class AtomEncoder(nn.Module):
         # Project atom features → token level
         self.proj_for_aggr = LinearNoBias(c, ct)
 
-    def forward(
+    def compute_static(
         self,
-        ref_pos: torch.Tensor,  # [N, M, 3]
-        ref_mask: torch.Tensor,  # [N, M] float
-        ref_element: torch.Tensor,  # [N, M] int64
-        ref_charge: torch.Tensor,  # [N, M] float
-        ref_atom_name_chars: torch.Tensor,  # [N, M, 4] int64
-        noisy_atom_pos: torch.Tensor | None,  # [N, M, 3] or None
-        trunk_single: torch.Tensor,  # [N, c_single=384]
-        trunk_pair: torch.Tensor,  # [N, N, c_pair=128]
-    ) -> AtomCrossAttEncoderOutput:
-        N, M, _ = ref_pos.shape
+        ref_pos: torch.Tensor,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor,  # [B?, N, M] float
+        ref_element: torch.Tensor,  # [B?, N, M] int64
+        ref_charge: torch.Tensor,  # [B?, N, M] float
+        ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
+        trunk_single: torch.Tensor,  # [B?, N, c_single=384]
+        trunk_pair: torch.Tensor,  # [B?, N, N, c_pair=128]
+    ) -> AtomEncoderStatic:
+        """Compute the noise-independent encoder state.
 
-        # Build flat atom subsets
+        The same static can be reused across many diffusion samples that share
+        the same molecule + trunk embeddings (mini-rollout, training chunked
+        samples, inference 200-step loop). Pass the result to ``forward`` via
+        the ``static`` kwarg, optionally after :meth:`AtomEncoderStatic.expand_for_samples`.
+        """
+        has_batch = ref_pos.dim() == 4
+        N = ref_pos.shape[-3]
+
         subsets = build_atom_subsets(ref_mask.bool(), self.Q, self.K)
 
-        # --- Single conditioning ---
         atom_single = self.per_atom.single_cond(
             ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars
-        )  # [N, M, c]
+        )  # [B?, N, M, c]
 
-        # Broadcast trunk single to all atoms of each token
         ts_norm = F.layer_norm(trunk_single, [trunk_single.shape[-1]]) * self.lnorm_trunk_single_w
-        ts_proj = self.embed_trunk_single(ts_norm)  # [N, c]
-        atom_single = atom_single + ts_proj.unsqueeze(1)
+        ts_proj = self.embed_trunk_single(ts_norm)  # [B?, N, c]
+        atom_single = atom_single + ts_proj.unsqueeze(-2)
 
-        # --- Gather to subset layouts ---
-        queries_single = _gather_to_subsets(atom_single, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, c]
-        queries_mask = subsets.ta_to_q_mask.float()  # [S, Q]
-        keys_single = _gather_q_to_k(queries_single, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [S, K, c]
-        keys_mask = subsets.q_to_k_mask.float()  # [S, K]
+        queries_single = _gather_to_subsets(atom_single, subsets.ta_to_q_idx, subsets.ta_to_q_mask)
+        queries_mask = subsets.ta_to_q_mask.to(atom_single.dtype)
+        keys_single = _gather_q_to_k(queries_single, subsets.q_to_k_idx, subsets.q_to_k_mask)
+        keys_mask = subsets.q_to_k_mask.to(atom_single.dtype)
 
-        # Gather ref_pos to subset layouts
-        queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, 3]
-        keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [S, K, 3]
+        queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)
+        keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)
+        offsets_valid = subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)
 
-        # offsets_valid: same-token atom pairs (same reference frame)
-        offsets_valid = subsets.token_for_query.unsqueeze(2) == subsets.token_for_key.unsqueeze(1)  # [S, Q, K]
-
-        # --- Trunk pair conditioning broadcasted to cross-subset atom pairs ---
+        # --- Trunk pair contribution ---
         tp_norm = F.layer_norm(trunk_pair, [trunk_pair.shape[-1]]) * self.lnorm_trunk_pair_w
-        tp_proj = self.embed_trunk_pair(tp_norm)  # [N, N, cp]
-        # Gather trunk_pair[token_for_query[s,q], token_for_key[s,k], :] for each (s, q, k)
-        pair_idx = subsets.token_for_query.unsqueeze(2) * N + subsets.token_for_key.unsqueeze(1)  # [S, Q, K]
-        trunk_flat = tp_proj.reshape(N * N, -1)  # [N*N, cp]
-        trunk_pair_contrib = trunk_flat[pair_idx]  # [S, Q, K, cp]
-        pair_valid = subsets.ta_to_q_mask.unsqueeze(2) & subsets.q_to_k_mask.unsqueeze(1)  # [S, Q, K]
-        trunk_pair_contrib = trunk_pair_contrib * pair_valid.unsqueeze(-1)
+        tp_proj = self.embed_trunk_pair(tp_norm)  # [B?, N, N, cp]
+        pair_idx = subsets.token_for_query.unsqueeze(-1) * N + subsets.token_for_key.unsqueeze(-2)
+        pair_valid = subsets.ta_to_q_mask.unsqueeze(-1) & subsets.q_to_k_mask.unsqueeze(-2)
+        if has_batch:
+            B = tp_proj.shape[0]
+            trunk_pair_contrib = _batched_take(tp_proj.reshape(B, N * N, -1), pair_idx, pair_valid)
+        else:
+            trunk_pair_contrib = _flat_take(tp_proj.reshape(N * N, -1), pair_idx, pair_valid)
 
-        # --- Build cross-subset pair_cond [S, Q, K, cp] ---
-        # AF3 only uses _1 variant weights for cross-subset pair
-        # (base per_atom pair from _per_atom_conditioning is discarded)
-        row = self.single_to_pair_row_enc(F.relu(queries_single))  # [S, Q, cp]
-        col = self.single_to_pair_col_enc(F.relu(keys_single))  # [S, K, cp]
-        atom_pair = row.unsqueeze(2) + col.unsqueeze(1)  # [S, Q, K, cp]
+        # --- Cross-subset pair_cond ---
+        row = self.single_to_pair_row_enc(F.relu(queries_single))
+        col = self.single_to_pair_col_enc(F.relu(keys_single))
+        atom_pair = row.unsqueeze(-2) + col.unsqueeze(-3)
 
-        offsets = queries_ref_pos.unsqueeze(2) - keys_ref_pos.unsqueeze(1)  # [S, Q, K, 3]
+        offsets = queries_ref_pos.unsqueeze(-2) - keys_ref_pos.unsqueeze(-3)
         sq_dists = (offsets**2).sum(-1, keepdim=True)
-        ov = offsets_valid.unsqueeze(-1)  # [S, Q, K, 1]
+        ov = offsets_valid.unsqueeze(-1)
         atom_pair = atom_pair + self.enc_embed_pair_offsets(offsets) * ov
         atom_pair = atom_pair + self.enc_embed_pair_distances(1.0 / (1.0 + sq_dists)) * ov
-        atom_pair = atom_pair + self.enc_embed_offsets_valid(ov.float())
-        # Add trunk pair contribution
+        atom_pair = atom_pair + self.enc_embed_offsets_valid(ov.to(atom_pair.dtype))
         atom_pair = atom_pair + trunk_pair_contrib
-
-        # Pair MLP applied LAST (after all additive terms, matching AF3)
         atom_pair = self.per_atom.apply_pair_mlp(atom_pair)
 
-        # --- queries_act: start from queries_single, add projected noisy positions ---
+        return AtomEncoderStatic(
+            subsets=subsets,
+            queries_single=queries_single,
+            queries_mask=queries_mask,
+            keys_single=keys_single,
+            keys_mask=keys_mask,
+            atom_pair=atom_pair,
+            ref_mask=ref_mask,
+        )
+
+    def forward(
+        self,
+        ref_pos: torch.Tensor | None = None,  # [B?, N, M, 3]
+        ref_mask: torch.Tensor | None = None,  # [B?, N, M] float
+        ref_element: torch.Tensor | None = None,  # [B?, N, M] int64
+        ref_charge: torch.Tensor | None = None,  # [B?, N, M] float
+        ref_atom_name_chars: torch.Tensor | None = None,  # [B?, N, M, 4] int64
+        noisy_atom_pos: torch.Tensor | None = None,  # [B?, N, M, 3] or None
+        trunk_single: torch.Tensor | None = None,  # [B?, N, c_single=384]
+        trunk_pair: torch.Tensor | None = None,  # [B?, N, N, c_pair=128]
+        static: AtomEncoderStatic | None = None,
+    ) -> AtomCrossAttEncoderOutput:
+        """Run the encoder for a single noise sample.
+
+        When ``static`` is provided, the noise-independent state is reused and
+        ``ref_*`` / ``trunk_*`` arguments are ignored. Otherwise, the static is
+        recomputed inline from those inputs.
+        """
+        if static is None:
+            static = self.compute_static(
+                ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars, trunk_single, trunk_pair
+            )
+
+        subsets = static.subsets
+        queries_single = static.queries_single
+        queries_mask = static.queries_mask
+        keys_single = static.keys_single
+        keys_mask = static.keys_mask
+        atom_pair = static.atom_pair
+        ref_mask_eff = static.ref_mask
+        N, M = subsets.N, subsets.M
+
+        # --- Noise-dependent: project noisy positions and add to queries ---
         if noisy_atom_pos is not None:
-            noisy_q = _gather_to_subsets(noisy_atom_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [S, Q, 3]
+            noisy_q = _gather_to_subsets(noisy_atom_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)
             queries_act = queries_single + self._pos_proj(noisy_q) * queries_mask.unsqueeze(-1)
         else:
             queries_act = queries_single
 
-        # --- Cross-attention transformer ---
         queries_act = self.atom_transformer(
             queries_act=queries_act,
             queries_mask=queries_mask,
@@ -767,12 +944,11 @@ class AtomEncoder(nn.Module):
         )
         queries_act = queries_act * queries_mask.unsqueeze(-1)
 
-        # Project and aggregate to token level
         atom_proj = _scatter_from_subsets(
             self.proj_for_aggr(queries_act), subsets.q_to_ta_idx, subsets.q_to_ta_mask, N, M
-        )  # [N, M, ct]
-        denom = ref_mask.sum(-1, keepdim=True).clamp(min=1e-6)
-        token_act = (F.relu(atom_proj) * ref_mask.unsqueeze(-1)).sum(-2) / denom
+        )
+        denom = ref_mask_eff.sum(-1, keepdim=True).clamp(min=1e-6)
+        token_act = (F.relu(atom_proj) * ref_mask_eff.unsqueeze(-1)).sum(-2) / denom
 
         return AtomCrossAttEncoderOutput(
             token_act=token_act,
@@ -817,16 +993,16 @@ class AtomDecoder(nn.Module):
 
     def forward(
         self,
-        token_act: torch.Tensor,  # [N, ct]
+        token_act: torch.Tensor,  # [B?, N, ct]
         enc: AtomCrossAttEncoderOutput,
-    ) -> torch.Tensor:  # [N, M, 3]
+    ) -> torch.Tensor:  # [B?, N, M, 3]
         N, M = enc.subsets.N, enc.subsets.M
         c = enc.skip_connection.shape[-1]
 
-        # Project token features → per_atom_channels, broadcast to atoms
-        token_proj = self.proj_tokens(token_act)  # [N, c]
-        # Broadcast to token-atoms [N, M, c], then gather to queries [S, Q, c]
-        token_atoms = token_proj.unsqueeze(1).expand(N, M, c)
+        # Project token features → per_atom_channels, broadcast to atoms.
+        # Negative-axis ops handle both unbatched [N, ct] and batched [B, N, ct].
+        token_proj = self.proj_tokens(token_act)  # [B?, N, c]
+        token_atoms = token_proj.unsqueeze(-2).expand(*token_proj.shape[:-1], M, c)
         queries_act = _gather_to_subsets(token_atoms, enc.subsets.ta_to_q_idx, enc.subsets.ta_to_q_mask)
         queries_act = queries_act + enc.skip_connection
         queries_act = queries_act * enc.queries_mask.unsqueeze(-1)

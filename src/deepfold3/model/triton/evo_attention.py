@@ -660,7 +660,7 @@ if HAS_TRITON:
 
         num_steps = (SEQ_LEN + BLOCK_SIZE_Q - 1) // BLOCK_SIZE_Q
         curr_q = 0
-        for blk_idx in range(num_steps):
+        for _blk_idx in range(num_steps):
             offs_q = curr_q + tl.arange(0, BLOCK_SIZE_Q)
 
             if EVEN_Q & EVEN_KV:
@@ -758,7 +758,8 @@ class _EvoformerAttention(torch.autograd.Function):
             waves_per_eu = 3 if DIM <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
-        grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+        def grid(args):
+            return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
 
         M = torch.empty((BATCH_SIZE, N_SEQ, HEAD, SEQ_LEN), device=Q.device, dtype=torch.float32)
 
@@ -836,7 +837,8 @@ class _EvoformerAttention(torch.autograd.Function):
         BLOCK_DIM = max(triton.next_power_of_2(DIM), 16)
         D_diag = torch.empty_like(M)
 
-        preprocess_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+        def preprocess_grid(args):
+            return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_preprocess[preprocess_grid](
             O=O,
             dO=dO,
@@ -849,7 +851,8 @@ class _EvoformerAttention(torch.autograd.Function):
             num_warps=4,
         )
 
-        bwd_dk_dv_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+        def bwd_dk_dv_grid(args):
+            return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_dk_dv[bwd_dk_dv_grid](
             Q=Q,
             K=K,
@@ -881,7 +884,8 @@ class _EvoformerAttention(torch.autograd.Function):
             DIM=ctx.DIM,
         )
 
-        bwd_dq_grid = lambda args: (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+        def bwd_dq_grid(args):
+            return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
         _attn_bwd_dq[bwd_dq_grid](
             Q=Q,
             K=K,

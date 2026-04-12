@@ -36,6 +36,7 @@ def _register_commands() -> None:
     from deepfold3.scripts.prepare_templates import prepare_templates
     from deepfold3.scripts.scan_mmcif import scan_mmcif
     from deepfold3.scripts.train import train
+    from deepfold3.scripts.warmup_triton import main as warmup_triton
 
     cli.add_command(inference)
     cli.add_command(convert)
@@ -54,6 +55,7 @@ def _register_commands() -> None:
     cli.add_command(build_ligand_cache)
     cli.add_command(prepare_templates)
     cli.add_command(train)
+    cli.add_command(warmup_triton)
 
 
 _register_commands()

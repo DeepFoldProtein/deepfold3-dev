@@ -85,6 +85,85 @@ class TestCollation:
         # First sample's padding should be zero
         assert batch["seq_mask"][0, 6:].sum() == 0
 
+    def test_bucket_pad_rounds_to_next_bucket(self):
+        """With bucket_pad=True the N dim is rounded up to the next bucket size."""
+        from deepfold3.model.bucket import next_bucket
+
+        # N=100 → next bucket is 128
+        feats = [_make_features(100, seed=0), _make_features(50, seed=1)]
+        batch = collate_fn(feats, bucket_pad=True)
+        expected_n = next_bucket(100)  # 128
+        assert expected_n == 128
+        assert batch["res_type"].shape == (2, expected_n)
+        assert batch["pair_mask"].shape == (2, expected_n, expected_n)
+        assert batch["ref_pos"].shape == (2, expected_n, 24, 3)
+        assert batch["msa"].shape == (2, 4, expected_n)
+        # All masks must be 0 in the padded slots — both for the smaller
+        # sample (50→128) and the larger (100→128).
+        assert batch["seq_mask"][0, 100:].sum() == 0
+        assert batch["seq_mask"][1, 50:].sum() == 0
+        assert batch["pair_mask"][0, 100:, :].sum() == 0
+        assert batch["pair_mask"][0, :, 100:].sum() == 0
+        assert batch["pair_mask"][1, 50:, :].sum() == 0
+        assert batch["pair_mask"][1, :, 50:].sum() == 0
+        assert batch["msa_mask"][0, :, 100:].sum() == 0
+        assert batch["msa_mask"][1, :, 50:].sum() == 0
+        # ref_mask is dim 0 = N, dim 1 = M (atoms per token)
+        assert batch["ref_mask"][0, 100:, :].sum() == 0
+        assert batch["ref_mask"][1, 50:, :].sum() == 0
+
+    def test_bucket_pad_off_by_default(self):
+        """Without bucket_pad, behaviour is unchanged from the legacy collate."""
+        feats = [_make_features(100, seed=0)]
+        batch_default = collate_fn(feats)
+        batch_no_bucket = collate_fn(feats, bucket_pad=False)
+        assert batch_default["res_type"].shape == (1, 100)
+        assert batch_no_bucket["res_type"].shape == (1, 100)
+
+    def test_bucket_pad_trunk_invariance(self):
+        """The Evoformer trunk produces the same pair/single embeddings on
+        the unpadded slice whether or not the input was bucket-padded.
+
+        This is the deterministic part of the contract: every mask in the
+        trunk must zero out padded slots so the embedding values for the
+        real tokens are identical.  The diffusion head is stochastic so
+        comparing ``atom_positions`` directly is unreliable; the trunk
+        embeddings are not.
+        """
+        cfg = _tiny_config()
+        torch.manual_seed(0)
+        model = DeepFold3(cfg).eval()
+
+        # Single sample, N=10 → bucket-pad rounds to 128 (smallest bucket).
+        feat = _make_features(10, seed=11)
+
+        batch_unpadded = collate_fn([feat], bucket_pad=False)
+        batch_bucket = collate_fn([feat], bucket_pad=True)
+        N = feat["res_type"].shape[0]
+
+        with torch.no_grad():
+            emb_unpadded, *_ = model.run_evoformer(batch_unpadded, num_recycles=0, seed=0)
+            emb_bucket, *_ = model.run_evoformer(batch_bucket, num_recycles=0, seed=0)
+
+        pair_unpadded = emb_unpadded["pair"]
+        pair_bucket = emb_bucket["pair"][..., :N, :N, :]
+        single_unpadded = emb_unpadded["single"]
+        single_bucket = emb_bucket["single"][..., :N, :]
+
+        assert pair_unpadded.shape == pair_bucket.shape
+        assert single_unpadded.shape == single_bucket.shape
+
+        pair_diff = (pair_unpadded - pair_bucket).abs().max().item()
+        single_diff = (single_unpadded - single_bucket).abs().max().item()
+        assert pair_diff < 1e-4, (
+            f"trunk pair embedding diverges after bucket pad: max abs diff {pair_diff:.2e} — "
+            f"a mask is leaking somewhere in the Evoformer"
+        )
+        assert single_diff < 1e-4, (
+            f"trunk single embedding diverges after bucket pad: max abs diff {single_diff:.2e} — "
+            f"a mask is leaking somewhere in the Evoformer"
+        )
+
 
 class TestBatchedEvoformer:
     """Test evoformer trunk with batched inputs."""

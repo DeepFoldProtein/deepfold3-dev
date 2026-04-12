@@ -44,7 +44,7 @@ BUCKET_SIZES = [
 ]
 
 # Features where dim 0 = N
-_DIM0_KEYS = {
+DIM0_KEYS = {
     "res_type",
     "residue_index",
     "token_index",
@@ -67,10 +67,10 @@ _DIM0_KEYS = {
 }
 
 # Features where dims 0 and 1 = N, N
-_DIM01_KEYS = {"pair_mask", "bond_matrix"}
+DIM01_KEYS = {"pair_mask", "bond_matrix"}
 
 # Features where dim 1 = N
-_DIM1_KEYS = {
+DIM1_KEYS = {
     "msa",
     "msa_mask",
     "deletion_matrix",
@@ -120,11 +120,11 @@ def pad_features(
     padded = {}
 
     for key, val in features.items():
-        if key in _DIM0_KEYS:
+        if key in DIM0_KEYS:
             padded[key] = _pad_dim(val, 0, pad_n)
-        elif key in _DIM01_KEYS:
+        elif key in DIM01_KEYS:
             padded[key] = _pad_dim(_pad_dim(val, 0, pad_n), 1, pad_n)
-        elif key in _DIM1_KEYS:
+        elif key in DIM1_KEYS:
             padded[key] = _pad_dim(val, 1, pad_n)
         else:
             warnings.warn(f"bucket.pad_features: unknown key {key!r} — passed through without padding", stacklevel=2)
@@ -155,11 +155,11 @@ def unpad_features(
     """Slice padded features back to original sequence length."""
     result = {}
     for key, val in features.items():
-        if key in _DIM0_KEYS:
+        if key in DIM0_KEYS:
             result[key] = val.narrow(0, 0, original_n)
-        elif key in _DIM01_KEYS:
+        elif key in DIM01_KEYS:
             result[key] = val.narrow(0, 0, original_n).narrow(1, 0, original_n)
-        elif key in _DIM1_KEYS:
+        elif key in DIM1_KEYS:
             result[key] = val.narrow(1, 0, original_n)
         else:
             result[key] = val

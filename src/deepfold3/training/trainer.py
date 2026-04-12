@@ -17,6 +17,7 @@ import os
 import random
 import time
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,10 @@ from deepfold3.model.model import DeepFold3
 from deepfold3.training.ema import EMA
 from deepfold3.training.loss import training_loss
 from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
+
+# Bucket-padded collation keeps Triton kernel input shapes (and the
+# persistent autotune cache keys) deterministic across microsteps.
+_collate_bucket_pad = partial(collate_fn, bucket_pad=True)
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +506,7 @@ class Trainer:
             batch_size=self.cfg.batch_size_per_rank,
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            collate_fn=collate_fn,
+            collate_fn=_collate_bucket_pad,
             num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory,
             drop_last=self.cfg.drop_last,
@@ -520,7 +525,7 @@ class Trainer:
                 eval_ds,
                 batch_size=self.cfg.batch_size_per_rank,
                 shuffle=False,
-                collate_fn=collate_fn,
+                collate_fn=_collate_bucket_pad,
                 num_workers=self.cfg.eval_num_workers,
                 pin_memory=self.cfg.pin_memory,
                 persistent_workers=self.cfg.eval_num_workers > 0,
@@ -876,6 +881,21 @@ class Trainer:
         Args:
             resume_from: Optional checkpoint path to resume from.
         """
+        try:
+            self._run_inner(resume_from)
+        finally:
+            # Per PyTorch reference: every trainer process must call
+            # ``destroy_process_group`` exactly once at the end so NCCL
+            # tears down cleanly. The ``try/finally`` ensures cleanup
+            # fires on uncaught exceptions too.
+            self._cleanup_distributed()
+
+    def _cleanup_distributed(self) -> None:
+        """Tear down the NCCL process group if one was initialized."""
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _run_inner(self, resume_from: str | Path | None) -> None:
         self._init_distributed()
         self._seed_everything()
         self._init_model()
@@ -1075,6 +1095,3 @@ class Trainer:
 
         if self._wandb is not None:
             self._wandb.finish()
-
-        if self.world_size > 1:
-            dist.destroy_process_group()

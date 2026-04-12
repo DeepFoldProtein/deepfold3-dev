@@ -26,7 +26,6 @@ except ImportError:
 
 
 from deepfold3.model.triton import calculate_settings as _calculate_settings
-from deepfold3.model.triton.tuning import DEFAULT_CONFIG
 
 
 def _is_cuda() -> bool:
@@ -34,6 +33,23 @@ def _is_cuda() -> bool:
 
 
 if HAS_TRITON:
+    from deepfold3.model.triton.cache import persistent_autotune
+
+    # Autotune candidate space for the GEMM-style kernels
+    # (_second_forward_kernel, _first_backward_kernel). Pruned from the full
+    # Cartesian product to ~24 viable candidates.
+    _GEMM_CONFIGS = [
+        triton.Config(
+            {"BLOCK_SIZE_M": bm, "BLOCK_SIZE_N": bn, "BLOCK_SIZE_K": bk, "GROUP_SIZE_M": 8},
+            num_warps=nw,
+            num_stages=ns,
+        )
+        for bm in (64, 128)
+        for bn in (32, 64, 128)
+        for bk in (16, 32)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
 
     @triton.jit
     def _first_forward_kernel(
@@ -65,6 +81,7 @@ if HAS_TRITON:
         tl.store(Mean_ptr, mean)
         tl.store(RSTD_ptr, rstd)
 
+    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "N", "K"])
     @triton.jit
     def _second_forward_kernel(
         a_ptr,
@@ -143,6 +160,10 @@ if HAS_TRITON:
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
 
+    # Backward kernel reuses the same M-N-K config space. Cache key uses
+    # the (M, K, N) ordering of this kernel's signature so the autotune cache
+    # is keyed on the actual reduction dimension layout.
+    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "K", "N"])
     @triton.jit
     def _first_backward_kernel(
         dOUT_ptr,
@@ -212,7 +233,7 @@ if HAS_TRITON:
 
         dy = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
 
-        for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+        for _n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
             dOUT = tl.load(dOUT_ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)
 
             db = tl.dot(y_T, dOUT)
@@ -316,9 +337,12 @@ def layernorm_linear_forward(
     bias: torch.Tensor | None,
     has_layernorm_bias: bool = True,
     has_linear_bias: bool = False,
-    forward_config: tuple = DEFAULT_CONFIG,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused LN + Linear forward."""
+    """Fused LN + Linear forward.
+
+    The GEMM kernel block sizes are picked by ``persistent_autotune`` based
+    on (M, N, K) — no manual config required.
+    """
     shape = a.shape
     a = a.view(-1, shape[-1])
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
@@ -344,24 +368,8 @@ def layernorm_linear_forward(
         num_warps=num_warps,
     )
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
-    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_stages, num_warps_gemm, extra = forward_config
-
-    kernel_kwargs = {
-        "BLOCK_SIZE_M": BLOCK_SIZE_M,
-        "BLOCK_SIZE_N": BLOCK_SIZE_N,
-        "BLOCK_SIZE_K": BLOCK_SIZE_K,
-        "GROUP_SIZE_M": GROUP_SIZE_M,
-        "num_stages": num_stages,
-        "num_warps": num_warps_gemm,
-    }
-    if _is_cuda():
-        if extra is not None:
-            kernel_kwargs["maxnreg"] = extra
-    else:
-        if extra is not None:
-            kernel_kwargs["waves_per_eu"] = extra
-
+    def grid(META):
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
     _second_forward_kernel[grid](
         a,
         b,
@@ -385,7 +393,6 @@ def layernorm_linear_forward(
         has_layernorm_bias=has_layernorm_bias,
         has_linear_bias=has_linear_bias,
         DTYPE=_get_dtype_flag(a.dtype),
-        **kernel_kwargs,
     )
     c = c.view(shape[:-1] + (N,))
     return c, a, b, Mean, RSTD
@@ -401,9 +408,11 @@ def layernorm_linear_backward(
     BIAS: torch.Tensor | None,
     has_layernorm_bias: bool = True,
     has_linear_bias: bool = False,
-    backward_config: tuple = DEFAULT_CONFIG,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-    """Fused LN + Linear backward."""
+    """Fused LN + Linear backward.
+
+    The GEMM kernel block sizes are picked by ``persistent_autotune``.
+    """
     dOUT_shape = dOUT.shape
     dOUT = dOUT.view(-1, dOUT_shape[-1]).contiguous()
     M, K = X.shape
@@ -417,23 +426,6 @@ def layernorm_linear_backward(
 
     c1 = torch.zeros((M,), dtype=torch.float32, device=X.device)
     c2 = torch.zeros((M,), dtype=torch.float32, device=X.device)
-
-    BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, GROUP_SIZE_M, num_stages, num_warps, extra = backward_config
-
-    kernel_kwargs = {
-        "BLOCK_SIZE_M": BLOCK_SIZE_M,
-        "BLOCK_SIZE_K": BLOCK_SIZE_K,
-        "BLOCK_SIZE_N": BLOCK_SIZE_N,
-        "GROUP_SIZE_M": GROUP_SIZE_M,
-        "num_stages": num_stages,
-        "num_warps": num_warps,
-    }
-    if _is_cuda():
-        if extra is not None:
-            kernel_kwargs["maxnreg"] = extra
-    else:
-        if extra is not None:
-            kernel_kwargs["waves_per_eu"] = extra
 
     _first_backward_kernel[lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),)](
         dOUT,
@@ -463,7 +455,6 @@ def layernorm_linear_backward(
         c2.stride(0),
         Mean.stride(0),
         has_layernorm_bias=has_layernorm_bias,
-        **kernel_kwargs,
     )
 
     BLOCK_SIZE, num_warps_bwd2 = _calculate_settings(K)
@@ -506,20 +497,18 @@ class LayernormLinearFunction(torch.autograd.Function):
         BIAS,
         has_layernorm_bias=True,
         has_linear_bias=False,
-        supported_configs=(DEFAULT_CONFIG, DEFAULT_CONFIG),
     ):
         X = X.contiguous()
         orig_X_shape = X.shape
         linear_weight = linear_weight.contiguous()
         c, X_flat, linear_weight, Mean, RSTD = layernorm_linear_forward(
-            X, linear_weight, linear_bias, WEIGHT, BIAS, has_layernorm_bias, has_linear_bias, supported_configs[0]
+            X, linear_weight, linear_bias, WEIGHT, BIAS, has_layernorm_bias, has_linear_bias
         )
         # Save X in its original shape so non-reentrant gradient checkpointing
         # sees matching metadata between original and recomputed forward.
         # The flat buffer is contiguous; .view() shares storage and re-flattens
         # for free in backward.
         ctx.save_for_backward(X_flat.view(orig_X_shape), linear_weight, Mean, RSTD, WEIGHT, BIAS)
-        ctx.backward_config = supported_configs[1]
         ctx.has_layernorm_bias = has_layernorm_bias
         ctx.has_linear_bias = has_linear_bias
         return c
@@ -540,9 +529,8 @@ class LayernormLinearFunction(torch.autograd.Function):
             BIAS,
             ctx.has_layernorm_bias,
             ctx.has_linear_bias,
-            ctx.backward_config,
         )
-        return dX, dB, dLinearBias, dWEIGHT, dBIAS, None, None, None
+        return dX, dB, dLinearBias, dWEIGHT, dBIAS, None, None
 
 
 class FusedLayerNormLinear(nn.Module):
@@ -587,17 +575,6 @@ class FusedLayerNormLinear(nn.Module):
                 self.linear_weight.T,
                 self.linear_bias,
             )
-
-        from deepfold3.model.triton.tuning import calculate_config_layernorm_linear
-
-        M = math.prod(X.shape[:-1])
-        supported_configs = calculate_config_layernorm_linear(M, self.out_features, self.in_features, 2)
-        if supported_configs is None:
-            return F.linear(
-                F.layer_norm(X, (self.in_features,), self.weight, self.bias),
-                self.linear_weight.T,
-                self.linear_bias,
-            )
         return LayernormLinearFunction.apply(
             X,
             self.linear_weight,
@@ -606,7 +583,6 @@ class FusedLayerNormLinear(nn.Module):
             self.bias,
             True,
             self.has_linear_bias,
-            supported_configs,
         )
 
     def extra_repr(self):

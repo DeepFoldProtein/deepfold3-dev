@@ -195,14 +195,30 @@ src/deepfold3/model/triton/
 ├── fused_gated_dual_gemm.py  # Dual GEMM + sigmoid gate (TWO_INPUTS, bias, mask, TF32)
 ├── fused_transition.py       # FusedTransitionBlock (compose LN+Linear+SwiGLU+Linear)
 ├── fused_ada_transition.py   # FusedAdaTransitionBlock (AdaLN + SwiGLU + Linear)
-├── layernorm_linear.py       # FusedLayerNormLinear (4 Triton JIT kernels)
-├── ada_layernorm_linear.py   # FusedAdaLayerNormLinear (AdaLN + Linear)
-├── layernorm_transpose.py    # FusedLayerNormTranspose (LN + dim transpose)
-├── triangle_mul_gate.py      # FusedTriangleMulGate (LN + packed 3-GEMM + sigmoid)
-├── swiglu.py                 # FusedSwiGLU (silu(a)*b convention)
-├── tuning.py                 # Pre-tuned block size configs for CUDA/HIP
-└── cache.py                  # Persistent autotuning cache (GPU fingerprint + JSON)
+├── layernorm_linear.py       # FusedLayerNormLinear (4 JIT kernels, GEMMs autotuned)
+├── ada_layernorm_linear.py   # FusedAdaLayerNormLinear (AdaLN + Linear, GEMMs autotuned)
+├── layernorm_transpose.py    # FusedLayerNormTranspose (LN + dim transpose, elementwise)
+├── triangle_mul_gate.py      # FusedTriangleMulGate (LN + packed GEMM + sigmoid, K-only)
+├── swiglu.py                 # FusedSwiGLU (silu(a)*b convention, elementwise)
+├── tuning.py                 # Legacy hand-tuned block configs (kept for fallbacks)
+└── cache.py                  # Persistent autotuning cache + B200_PRETUNED hardcoded table
 ```
+
+**Autotune coverage** — kernels marked "autotuned" use `@persistent_autotune` so block
+sizes are picked by `triton.autotune` per (M, N, K) shape, with results persisted to disk
+and (on B200) seeded from the hardcoded `B200_PRETUNED` table at decorator-import time:
+
+| Kernel | Autotune key | Notes |
+|---|---|---|
+| `_attn_fwd`, `_attn_bwd_dq`, `_attn_bwd_dk_dv` (evo_attention) | `[SEQ_LEN, DIM]` | First-class autotune since the original commit |
+| `_fused_dual_gemm_fwd_kernel`, `_fused_dual_gemm_bwd_pregemm_kernel` | `[M, N, K]` | First-class autotune since the original commit |
+| `_second_forward_kernel`, `_first_backward_kernel` (layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Converted to persistent_autotune; previously used a hand-tuned `tuning.py` table that returned `None` (PyTorch fallback) for buckets ≤224 |
+| `_ada_second_forward_kernel`, `_ada_first_backward_kernel` (ada_layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Same conversion as above |
+
+The remaining elementwise kernels (`swiglu`, `triangle_mul_gate.{fwd,bwd}`,
+`layernorm_transpose`, `fused_pair_bias`) use a single shape-agnostic block-size
+heuristic — `BLOCK_SIZE = next_pow2(K)`, `num_warps` derived from `BLOCK_SIZE` — that's
+already optimal across all bucket sizes. There's no autotune surface for them.
 
 ### TF32 Precision Control
 
@@ -229,11 +245,54 @@ Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (
 - **Fuzzy matching**: When switching GPUs within the same architecture family, cached configs
   transfer if memory/SM count are within 20% tolerance
 - **Atomic writes**: Thread-safe JSON persistence via temp files + `os.replace`
+- **Pre-hook injection**: On first call for a (kernel, shape) pair, the wrapper checks the
+  persistent cache and, if a config is present, injects it directly into Triton's internal
+  `Autotuner.cache` so the benchmark phase is skipped entirely. This is what makes warmup
+  worth running before training.
+- **B200 hardcoded table**: `cache.py:B200_PRETUNED` ships with autotuned configs for every
+  bucket size in `BUCKET_SIZES ≤ 384` × every (M, N, K) shape the model uses. On B200 the
+  table is loaded into `mgr._caches` at decorator-import time, so a fresh-cache machine pays
+  zero autotune cost on first training run.
 
 Environment variables:
 
 - `DEEPFOLD3_TRITON_CACHE_DIR`: Override cache directory
 - `DEEPFOLD3_TRITON_NO_CACHE=1`: Disable caching (re-tune every run)
+
+#### Warming the cache for non-B200 GPUs
+
+The hardcoded `B200_PRETUNED` table in `cache.py` only applies to B200 (compute capability
+10.0). On other GPUs the cache starts empty and the first training run benchmarks every
+shape it encounters — which is wasted compute under DDP because every rank autotunes the
+same shapes redundantly.
+
+Run the warmup script **on a single rank** before launching DDP training:
+
+```bash
+deepfold3 warmup-triton --config configs/initial.json
+```
+
+The script:
+1. Loads channel dimensions from the model config (falls back to defaults).
+2. Iterates over every bucket size in `bucket.BUCKET_SIZES ≤ 384`.
+3. For each bucket, drives `FusedLayerNormLinear`, `FusedAdaLayerNormLinear`,
+   `fused_evo_attention`, and `FusedGatedDualGEMM` at the (M, N, K) shapes the model uses.
+4. The first call for each shape triggers `triton.autotune`; the result is persisted to
+   `~/.cache/deepfold3-triton/{kernel}.{major}.{minor}.json` keyed by GPU fingerprint.
+5. Subsequent processes (training ranks) load the persisted cache via the pre-hook
+   injection and skip the benchmark phase.
+
+Total warmup cost on B200: **~14 minutes** (one-time per GPU model). On other CUDA GPUs
+the cost depends on the candidate config space; the `_GEMM_CONFIGS` list in
+`triton/layernorm_linear.py` is currently 24 configs per shape.
+
+To regenerate the B200 table after changing buckets or channel dims:
+
+```bash
+rm ~/.cache/deepfold3-triton/*.10.0.json
+deepfold3 warmup-triton --config configs/initial.json
+# Then re-run the cache→B200_PRETUNED extractor (one-liner in git history of cache.py).
+```
 
 ### Fused Pair Bias Design (cuEQ pattern)
 

@@ -216,39 +216,24 @@ class DeepFold3(nn.Module):
         # Build raw target_feat [..., N, 63]
         raw_feat = self._build_raw_target_feat(features)
 
-        # Evoformer conditioning: ref atoms → token_act
-        # Atom cross-attention is per-sample (build_atom_subsets depends on ref_mask)
+        # Evoformer conditioning: ref atoms → token_act (natively batched).
         ref_pos = features["ref_pos"]
         ref_mask = features["ref_mask"].float()
         ref_element = features["ref_element"]
         ref_charge = features["ref_charge"].float()
         ref_atom_name_chars = features["ref_atom_name_chars"]
 
-        if has_batch:
-            B = features["res_type"].shape[0]
-            use_ckpt = torch.is_grad_enabled()
-            results = []
-            for b in range(B):
-                if use_ckpt:
-                    r = torch_checkpoint(
-                        self.evo_cond_encoder,
-                        ref_pos[b],
-                        ref_mask[b],
-                        ref_element[b],
-                        ref_charge[b],
-                        ref_atom_name_chars[b],
-                        use_reentrant=False,
-                    )
-                else:
-                    r = self.evo_cond_encoder(
-                        ref_pos=ref_pos[b],
-                        ref_mask=ref_mask[b],
-                        ref_element=ref_element[b],
-                        ref_charge=ref_charge[b],
-                        ref_atom_name_chars=ref_atom_name_chars[b],
-                    )
-                results.append(r)
-            evo_cond_act = torch.stack(results)
+        use_ckpt = torch.is_grad_enabled()
+        if use_ckpt:
+            evo_cond_act = torch_checkpoint(
+                self.evo_cond_encoder,
+                ref_pos,
+                ref_mask,
+                ref_element,
+                ref_charge,
+                ref_atom_name_chars,
+                use_reentrant=False,
+            )
         else:
             evo_cond_act = self.evo_cond_encoder(
                 ref_pos=ref_pos,
@@ -278,6 +263,7 @@ class DeepFold3(nn.Module):
             prev_pair = features["_prev_pair"]
             prev_single = features["_prev_single"]
         elif has_batch:
+            B = features["res_type"].shape[0]
             prev_pair = torch.zeros(B, N, N, c_pair, device=device, dtype=param_dtype)
             prev_single = torch.zeros(B, N, c_single, device=device, dtype=param_dtype)
         else:

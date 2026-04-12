@@ -35,16 +35,17 @@ except ImportError:
 
 
 from deepfold3.model.triton import calculate_settings as _calculate_settings
-from deepfold3.model.triton.tuning import DEFAULT_CONFIG
 
 if HAS_TRITON:
+    from deepfold3.model.triton.cache import persistent_autotune
     from deepfold3.model.triton.layernorm_linear import (
+        _GEMM_CONFIGS,
         _first_forward_kernel,
         _get_dtype_flag,
-        _is_cuda,
         _second_backward_kernel,
     )
 
+    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "N", "K"])
     @triton.jit
     def _ada_second_forward_kernel(
         a_ptr,
@@ -119,6 +120,7 @@ if HAS_TRITON:
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
 
+    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "K", "N"])
     @triton.jit
     def _ada_first_backward_kernel(
         dOUT_ptr,
@@ -256,19 +258,10 @@ def ada_layernorm_linear_forward(
     linear_weight: torch.Tensor,
     scale: torch.Tensor,
     bias: torch.Tensor,
-    forward_config: tuple = DEFAULT_CONFIG,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused AdaLN + Linear forward.
 
-    Args:
-        x: Input tensor [..., K].
-        linear_weight: Weight matrix [K, N].
-        scale: Conditioning scale [..., K] (same leading dims as x).
-        bias: Conditioning bias [..., K].
-        forward_config: Triton block config tuple.
-
-    Returns:
-        (output, x_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD)
+    Block sizes are picked by ``persistent_autotune`` based on (M, N, K).
     """
     shape = x.shape
     K = shape[-1]
@@ -301,23 +294,6 @@ def ada_layernorm_linear_forward(
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
-    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, num_stages, num_warps_gemm, extra = forward_config
-
-    kernel_kwargs = {
-        "BLOCK_SIZE_M": BLOCK_SIZE_M,
-        "BLOCK_SIZE_N": BLOCK_SIZE_N,
-        "BLOCK_SIZE_K": BLOCK_SIZE_K,
-        "GROUP_SIZE_M": GROUP_SIZE_M,
-        "num_stages": num_stages,
-        "num_warps": num_warps_gemm,
-    }
-    if _is_cuda():
-        if extra is not None:
-            kernel_kwargs["maxnreg"] = extra
-    else:
-        if extra is not None:
-            kernel_kwargs["waves_per_eu"] = extra
-
     _ada_second_forward_kernel[grid](
         x,
         linear_weight,
@@ -340,7 +316,6 @@ def ada_layernorm_linear_forward(
         Mean.stride(0),
         RSTD.stride(0),
         DTYPE=_get_dtype_flag(x.dtype),
-        **kernel_kwargs,
     )
 
     c = c.view(shape[:-1] + (N,))
@@ -355,7 +330,6 @@ def ada_layernorm_linear_backward(
     bias: torch.Tensor,
     Mean: torch.Tensor,
     RSTD: torch.Tensor,
-    backward_config: tuple = DEFAULT_CONFIG,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused AdaLN + Linear backward.
 
@@ -375,23 +349,6 @@ def ada_layernorm_linear_backward(
 
     c1 = torch.zeros((M,), dtype=torch.float32, device=X.device)
     c2 = torch.zeros((M,), dtype=torch.float32, device=X.device)
-
-    BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, GROUP_SIZE_M, num_stages, num_warps, extra = backward_config
-
-    kernel_kwargs = {
-        "BLOCK_SIZE_M": BLOCK_SIZE_M,
-        "BLOCK_SIZE_K": BLOCK_SIZE_K,
-        "BLOCK_SIZE_N": BLOCK_SIZE_N,
-        "GROUP_SIZE_M": GROUP_SIZE_M,
-        "num_stages": num_stages,
-        "num_warps": num_warps,
-    }
-    if _is_cuda():
-        if extra is not None:
-            kernel_kwargs["maxnreg"] = extra
-    else:
-        if extra is not None:
-            kernel_kwargs["waves_per_eu"] = extra
 
     _ada_first_backward_kernel[
         lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(K, META["BLOCK_SIZE_K"]),)
@@ -423,7 +380,6 @@ def ada_layernorm_linear_backward(
         c1.stride(0),
         c2.stride(0),
         Mean.stride(0),
-        **kernel_kwargs,
     )
 
     # Pass 2: finish dX using second backward kernel
@@ -461,7 +417,6 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
         linear_weight,
         scale,
         bias,
-        supported_configs=(DEFAULT_CONFIG, DEFAULT_CONFIG),
     ):
         X = X.contiguous()
         linear_weight = linear_weight.contiguous()
@@ -469,7 +424,7 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
         bias = bias.contiguous()
         orig_shape = X.shape
         c, X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD = ada_layernorm_linear_forward(
-            X, linear_weight, scale, bias, supported_configs[0]
+            X, linear_weight, scale, bias
         )
         # Save tensors in their original shape so non-reentrant gradient
         # checkpointing sees matching metadata between original and recomputed
@@ -483,7 +438,6 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
             Mean,
             RSTD,
         )
-        ctx.backward_config = supported_configs[1]
         return c
 
     @staticmethod
@@ -496,9 +450,9 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
         bias_flat = bias_orig.reshape(-1, K).contiguous()
         dOUT = dOUT.contiguous()
         dX, dB, dScale, dBias = ada_layernorm_linear_backward(
-            dOUT, X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD, ctx.backward_config
+            dOUT, X_flat, linear_weight, scale_flat, bias_flat, Mean, RSTD
         )
-        return dX, dB, dScale, dBias, None
+        return dX, dB, dScale, dBias
 
 
 class FusedAdaLayerNormLinear(nn.Module):
@@ -545,16 +499,7 @@ class FusedAdaLayerNormLinear(nn.Module):
             xn = F.layer_norm(x, (self.in_features,))
             xn = scale * xn + bias
             return F.linear(xn, self.linear_weight.T)
-
-        from deepfold3.model.triton.tuning import calculate_config_layernorm_linear
-
-        M = math.prod(x.shape[:-1])
-        supported_configs = calculate_config_layernorm_linear(M, self.out_features, self.in_features, 2)
-        if supported_configs is None:
-            xn = F.layer_norm(x, (self.in_features,))
-            xn = scale * xn + bias
-            return F.linear(xn, self.linear_weight.T)
-        return AdaLayerNormLinearFunction.apply(x, self.linear_weight, scale, bias, supported_configs)
+        return AdaLayerNormLinearFunction.apply(x, self.linear_weight, scale, bias)
 
     def extra_repr(self):
         return f"in_features={self.in_features}, out_features={self.out_features}"

@@ -77,6 +77,9 @@ deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data
 deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.5:uniform:true --dataset pdb2:/data/pdb2:1.0:weighted
 # Multi-GPU training via torchrun
 torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training --output runs/exp1
+# Pre-warm the persistent Triton autotune cache (run once per GPU model on a single rank
+# before launching DDP training; B200 ships with hardcoded configs and skips this step).
+deepfold3 warmup-triton --config configs/initial.json
 ```
 
 ## Ruff Configuration
