@@ -145,13 +145,17 @@ EMA weights are swapped in for evaluation and saved in checkpoints. Fused kernel
 
 ### Recycling
 
-During training, the number of recycles is randomly sampled per batch: `n ∈ [1, max_recycles]`. Only the final recycle propagates gradients; earlier recycles are `.detach()`ed.
+During training, the number of recycles is randomly sampled per microstep: `n ∈ [0, max_recycles]` (AF3 convention — total trunk passes = n + 1). With `uniform_recycle=true` (default), all DDP ranks use the same n per microstep (seeded on `seed + global_step`) to avoid straggler divergence. Only the final trunk pass propagates gradients; earlier passes run under `torch.no_grad()`.
 
 ### DDP Configuration
 
 - Backend: NCCL
-- `static_graph=True` (required for gradient checkpointing compatibility)
-- `find_unused_parameters=False` (default; set True if freezing submodules)
+- `static_graph=True` when unchunked; auto-disabled when `diffusion_chunk_size > 0` (chunked path uses `model.no_sync()` which conflicts with static_graph)
+- `find_unused_parameters=False` (default)
+- `use_reentrant=False` for all gradient checkpoints (required for DDP compatibility)
+- `destroy_process_group()` called at end of training loop with a `dist.barrier()` first
+- `faulthandler` registered on SIGUSR1 for DDP deadlock diagnosis
+- Bucket-padded collation (`bucket_pad=True`) for deterministic kernel shapes across microsteps
 - Launch with `torchrun` for multi-GPU
 
 ### Gradient Management
@@ -413,6 +417,70 @@ Bond loss replaces smooth LDDT as the geometry regularizer. Load stage 1 checkpo
 ```
 
 Freezes all parameters except confidence head. Only confidence losses (pLDDT, PDE, PAE, exp_resolved) are active.
+
+## AF3 Data Pipeline Conformance
+
+Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary material (§2 + §5). See `docs/af3-paper-reference.md` for the full organized reference.
+
+### ✅ Matching
+
+| Paper section | Item | Implementation |
+|---|---|---|
+| §2.5.1 | Weighted PDB sampling (β/α weights, chain+interface) | `data/sample/weighted.py` |
+| §2.5.3 | Protein 40% clustering | wwPDB clusters via `data/prepare/clustering.py` |
+| §2.5.4 | Resolution ≤ 9Å, max 300 chains, min 4 residues | `data/prepare/filters.py` |
+| §2.5.4 | Clashing chains (30%/1.7Å), consecutive Cα > 10Å | `data/prepare/filters.py` |
+| §2.6 | Standard AA/nucleotide = 1 token, ligand = per-atom | `data/tokenize/tokenizer.py` |
+| §2.7 | Cropping weights (0.2/0.4/0.4), interface 15Å | `data/crop/cropper.py` |
+| §2.8 | ref_pos (random rot+trans), ref_element (one-hot 128) | `data/feature/featurizer.py` |
+| §3.7.1 | Diffusion batch 48, MSE mol-type weight (5×/10×) | `model/config.py`, `training/loss.py` |
+| §3.7.1 | EDM weighting, smooth LDDT (15/30Å radii) | `training/loss.py` |
+| §3.7.1 | Bond loss (Eq. 5 — GT distances) | `training/loss.py:bond_loss` |
+| §5.3 | Loss weights (α_diff=4, α_disto=0.03, α_conf=1e-4) | `model/config.py` |
+| §5.4 | Adam β₁=0.9 β₂=0.95 ε=1e-8, LR 1.8e-3, warmup 1000 | `model/config.py` |
+| §5.4 | LR decay 0.95/50k, grad clip 10, batch 256 | `model/config.py`, `training/trainer.py` |
+
+### ⚠️ Divergences
+
+| Paper section | Item | Our approach | Impact |
+|---|---|---|---|
+| §2.5.4 | Clash tie-breaking (3-level: %, atoms, chain_id) | Single-level (% only) | Minor — affects <1% of structures |
+| §2.8 | token_bonds filtered to < 2.4Å during training | No distance filter | May include long-range bonds that AF3 excludes |
+| §3.7.1 | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
+
+### ❌ Missing (known gaps)
+
+| Paper section | Item | Priority | Notes |
+|---|---|---|---|
+| §2.5.3 | 100% clustering for nucleic acids + peptides | Medium | All entities use protein 40% clusters |
+| §2.5.3 | CCD identity clustering for ligands | Medium | Ligands grouped by 40% seq homology instead |
+| §2.5.3 | SCOP modified residue normalization | Low | Modified residues not normalized before clustering |
+| §2.5.4 | >20 chains → select 20 closest to interface | Low | Rare for training data (most <20 chains) |
+| §2.5.4 | CCD atom name validation | Low | Atoms outside CCD atom set not filtered |
+| §2.5.4 | Leaving atom removal | Medium | Affects covalent ligand accuracy |
+| §2.6 | Modified residue per-atom tokenization | Medium | All residues use 1-token (structural simplification) |
+| §3.7.1 | Cross-entity bonds (disulfide, metal, glycan) | High | `bonded_atom_pairs` parsed but ignored (`dataset.py:549`) |
+
+### Stage Configuration Quick Reference
+
+From AF3 Table 6. Use `--config` with stage JSON files or `--override`:
+
+```bash
+# Stage 1: Initial training
+deepfold3 train --data-dir /data --output runs/s1
+
+# Fine-tune 1: crop 640, bond loss on, smooth LDDT off
+deepfold3 train --data-dir /data --output runs/ft1 --params runs/s1/checkpoint_final.pt \
+    --override max_tokens=640 --override alpha_bond=1.0 --override alpha_smooth_lddt=null
+
+# Fine-tune 2: crop 768 (+ TF distillation sets)
+deepfold3 train --data-dir /data --output runs/ft2 --params runs/ft1/checkpoint_final.pt \
+    --override max_tokens=768 --override alpha_bond=1.0
+
+# Fine-tune 3: PAE only
+deepfold3 train --data-dir /data --output runs/ft3 --params runs/ft2/checkpoint_final.pt \
+    --override train_confidence_only=true --override alpha_pae=1.0
+```
 
 ## Source Layout
 

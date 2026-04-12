@@ -437,14 +437,16 @@ def exp_resolved_loss(
 def bond_loss(
     pred_pos: torch.Tensor,  # [S, N, M, 3]
     bond_atom_indices: torch.Tensor,  # [B_bonds, 4] — (token_1, atom_1, token_2, atom_2)
-    ideal_distances: torch.Tensor,  # [B_bonds]
+    gt_distances: torch.Tensor,  # [B_bonds] observed GT distances (AF3 Eq. 5)
     bond_mask: torch.Tensor,  # [B_bonds] bool
     sigma_data: float = 16.0,
     noise_levels: torch.Tensor | None = None,  # [S]
 ) -> torch.Tensor:
-    """MSE loss on bonded atom pair distances vs target distances.
+    """MSE loss on bonded atom pair distances vs ground-truth distances.
 
-    Vectorized over S samples.
+    AF3 Eq. 5: L_bond = mean_{(l,m)∈B} (||x_l - x_m|| - ||x_l^GT - x_m^GT||)²
+
+    Vectorized over S diffusion samples.
     """
     if bond_atom_indices.shape[0] == 0:
         return pred_pos.new_zeros(())
@@ -461,7 +463,7 @@ def bond_loss(
     pos2 = pred_pos[:, t2, a2]
     pred_dist = (pos1 - pos2).norm(dim=-1)  # [S, B_bonds]
 
-    mse_per_sample = ((pred_dist - ideal_distances.unsqueeze(0)) ** 2 * mask.unsqueeze(0)).sum(dim=-1) / n_bonds
+    mse_per_sample = ((pred_dist - gt_distances.unsqueeze(0)) ** 2 * mask.unsqueeze(0)).sum(dim=-1) / n_bonds
 
     if noise_levels is not None:
         w = (noise_levels**2 + sigma_data**2) / (noise_levels * sigma_data) ** 2
@@ -606,19 +608,21 @@ def diffusion_only_loss(
         )
         components["diffusion_mse"] = l_mse.detach()
 
-        l_lddt = smooth_lddt_loss(
-            denoised,
-            gt_pos,
-            atom_mask,
-            cutoffs=cfg.lddt_cutoffs,
-            inclusion_radius=cfg.lddt_inclusion_radius,
-            nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
-            min_distance=cfg.lddt_min_distance,
-            mol_type=features.get("mol_type"),
-        )
-        components["smooth_lddt"] = l_lddt.detach()
-
-        total = total + cfg.alpha_diffusion * (l_mse + l_lddt)
+        if cfg.alpha_smooth_lddt is not None:
+            l_lddt = smooth_lddt_loss(
+                denoised,
+                gt_pos,
+                atom_mask,
+                cutoffs=cfg.lddt_cutoffs,
+                inclusion_radius=cfg.lddt_inclusion_radius,
+                nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
+                min_distance=cfg.lddt_min_distance,
+                mol_type=features.get("mol_type"),
+            )
+            components["smooth_lddt"] = l_lddt.detach()
+            total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
+        else:
+            total = total + cfg.alpha_diffusion * l_mse
 
         if cfg.alpha_bond > 0 and "bond_atom_indices" in features:
             l_bond = bond_loss(
@@ -694,19 +698,21 @@ def training_loss(
         )
         losses["diffusion_mse"] = l_mse
 
-        l_lddt = smooth_lddt_loss(
-            denoised,
-            gt_pos,
-            atom_mask,
-            cutoffs=cfg.lddt_cutoffs,
-            inclusion_radius=cfg.lddt_inclusion_radius,
-            nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
-            min_distance=cfg.lddt_min_distance,
-            mol_type=features.get("mol_type"),
-        )
-        losses["smooth_lddt"] = l_lddt
-
-        total = total + cfg.alpha_diffusion * (l_mse + l_lddt)
+        if cfg.alpha_smooth_lddt is not None:
+            l_lddt = smooth_lddt_loss(
+                denoised,
+                gt_pos,
+                atom_mask,
+                cutoffs=cfg.lddt_cutoffs,
+                inclusion_radius=cfg.lddt_inclusion_radius,
+                nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
+                min_distance=cfg.lddt_min_distance,
+                mol_type=features.get("mol_type"),
+            )
+            losses["smooth_lddt"] = l_lddt
+            total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
+        else:
+            total = total + cfg.alpha_diffusion * l_mse
 
         # Bond violation loss (stage 2 fine-tuning)
         if cfg.alpha_bond > 0 and "bond_atom_indices" in features:

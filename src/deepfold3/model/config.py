@@ -401,6 +401,9 @@ class TrainingConfig:
     alpha_confidence: float = 1e-4
     alpha_pae: float = 0.0
     alpha_bond: float = 0.0
+    # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
+    # smooth LDDT is turned off in fine-tune stage 1).
+    alpha_smooth_lddt: float | None = 1.0
 
     # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
     nucleotide_loss_weight: float = 5.0
