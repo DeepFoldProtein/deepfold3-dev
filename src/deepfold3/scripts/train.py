@@ -18,12 +18,20 @@ Examples:
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import logging
 import os
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Dump Python tracebacks for all threads on SIGUSR1 — invaluable for
+# diagnosing DDP deadlocks where one rank blocks in an NCCL collective.
+faulthandler.enable()
+if hasattr(faulthandler, "register"):
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=True)
 
 import click
 

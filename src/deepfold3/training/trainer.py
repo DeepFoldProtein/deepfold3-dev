@@ -93,7 +93,9 @@ class DistributedAverageMeters:
     def update(self, values: dict[str, torch.Tensor], n: int = 1) -> None:
         """Accumulate a step's metrics. Tensors are detached and stored on device."""
         for k, v in values.items():
-            v_f64 = v.detach().to(torch.float64) * n
+            # Squeeze to scalar — with batch_per_rank > 1 the per-batch
+            # loss loop may produce 0-d or 1-element tensors.
+            v_f64 = v.detach().to(torch.float64).squeeze() * n
             if k in self._sums:
                 self._sums[k] += v_f64
             else:
@@ -881,19 +883,7 @@ class Trainer:
         Args:
             resume_from: Optional checkpoint path to resume from.
         """
-        try:
-            self._run_inner(resume_from)
-        finally:
-            # Per PyTorch reference: every trainer process must call
-            # ``destroy_process_group`` exactly once at the end so NCCL
-            # tears down cleanly. The ``try/finally`` ensures cleanup
-            # fires on uncaught exceptions too.
-            self._cleanup_distributed()
-
-    def _cleanup_distributed(self) -> None:
-        """Tear down the NCCL process group if one was initialized."""
-        if dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
+        self._run_inner(resume_from)
 
     def _run_inner(self, resume_from: str | Path | None) -> None:
         self._init_distributed()
@@ -1095,3 +1085,12 @@ class Trainer:
 
         if self._wandb is not None:
             self._wandb.finish()
+
+        # Per PyTorch reference: every trainer process must call
+        # ``destroy_process_group`` exactly once at the end. The call is a
+        # collective — all ranks must reach it, so it lives AFTER the
+        # training loop (not in a ``try/finally`` which could fire at
+        # different times on different ranks and cause a deadlock).
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()  # ensure all ranks finished before teardown
+            dist.destroy_process_group()
