@@ -55,6 +55,7 @@ DIM0_KEYS = {
     "token_res_name",
     "seq_mask",
     "frames_mask",
+    "frame_atom_index",
     "token_to_rep_atom",
     "ref_pos",
     "ref_mask",
@@ -64,6 +65,11 @@ DIM0_KEYS = {
     "ref_space_uid",
     "profile",
     "deletion_mean",
+    # Training-only ground truth + masks
+    "atom_gt_positions",
+    "atom_gt_mask",
+    "mask_fixed",
+    "mask_region",
 }
 
 # Features where dims 0 and 1 = N, N
@@ -79,6 +85,23 @@ DIM1_KEYS = {
     "template_pseudo_beta_mask",
     "template_backbone_frame",
     "template_backbone_mask",
+}
+
+# Features that should be passed through ``pad_features`` unchanged because
+# they are NOT N-dependent (per-bond, per-symmetry-pair, or scalar metadata).
+# Listed explicitly so the unknown-key warning stays useful for genuinely
+# missing entries.
+PAD_PASSTHROUGH_KEYS = {
+    # Bond loss (size = number of bonds in the sample)
+    "bond_atom_indices",
+    "bond_gt_distances",
+    "bond_loss_mask",
+    # Symmetry permutation tables (size = number of swap pairs)
+    "atom_swap_pairs",
+    "ligand_swap_pairs",
+    # Per-sample scalars / metadata
+    "resolution",
+    "is_distillation",
 }
 
 
@@ -126,6 +149,8 @@ def pad_features(
             padded[key] = _pad_dim(_pad_dim(val, 0, pad_n), 1, pad_n)
         elif key in DIM1_KEYS:
             padded[key] = _pad_dim(val, 1, pad_n)
+        elif key in PAD_PASSTHROUGH_KEYS:
+            padded[key] = val
         else:
             warnings.warn(f"bucket.pad_features: unknown key {key!r} — passed through without padding", stacklevel=2)
             padded[key] = val
