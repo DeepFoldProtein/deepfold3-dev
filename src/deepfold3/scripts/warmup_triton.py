@@ -77,44 +77,56 @@ class WarmupShapes:
     pair_attn_num_head: int
     pair_attn_head_dim: int
 
-    # Transition expansion factors (constant in the AF3 architecture).
+    # Conditioning channels (may differ from trunk channels).
+    c_pair_cond: int  # DiffusionConditioningBlock pair output
+    c_single_cond: int  # DiffusionConditioningBlock single output
+
+    # Transition expansion factors.
     trunk_transition_factor: int = 4  # pair / single / MSA TransitionBlock
+    cond_transition_factor: int = 2  # DiffusionConditioningBlock pair/single trans
     diff_transition_factor: int = 2  # diffusion AdaTransitionBlock FFN
+
+    # Diffusion chunk size — determines the B*S multiplier for the main
+    # diffusion transformer and atom encoder/decoder shapes during training.
+    diffusion_chunk_size: int = 16
 
     @classmethod
     def from_model_config(cls, mcfg: ModelConfig) -> WarmupShapes:
-        # AF3 pair attention key/value dim = c_pair / num_head (=128/4=32).
         pair_num_head = mcfg.evoformer.pair_attention.num_head
         return cls(
             c_pair=mcfg.evoformer.pair_channel,
             c_single=mcfg.evoformer.seq_channel,
             c_msa=mcfg.evoformer.msa_channel,
             c_diff_token=mcfg.diffusion.atom_cross_att.per_token_channels,
-            num_msa=512,  # featurizer cap at training time
+            num_msa=512,
             pair_attn_num_head=pair_num_head,
             pair_attn_head_dim=mcfg.evoformer.pair_channel // pair_num_head,
+            c_pair_cond=mcfg.diffusion.conditioning_pair_channel,
+            c_single_cond=mcfg.diffusion.conditioning_seq_channel,
+            cond_transition_factor=mcfg.diffusion.conditioning_num_intermediate_factor,
             diff_transition_factor=mcfg.diffusion.transformer.num_intermediate_factor,
         )
 
 
-def _load_model_config(config_path: str | None) -> ModelConfig:
-    """Load a ``ModelConfig`` from JSON, mirroring ``deepfold3 train --config``.
+def _load_configs(config_path: str | None) -> tuple[ModelConfig, int]:
+    """Load a ``ModelConfig`` and ``diffusion_chunk_size`` from JSON.
 
-    Returns defaults when ``config_path`` is None or omits a ``model`` block.
+    Returns ``(ModelConfig, chunk_size)`` with defaults when no config is given.
     """
     mcfg = ModelConfig()
+    chunk_size = 16  # TrainingConfig default
     if not config_path:
-        return mcfg
+        return mcfg, chunk_size
     with open(config_path) as f:
         overrides = json.load(f)
     model_overrides = overrides.get("model", {})
-    if not model_overrides:
-        return mcfg
-    # Reuse the same recursive override logic as the train script.
-    from deepfold3.scripts.train import _apply_overrides
+    if model_overrides:
+        from deepfold3.scripts.train import _apply_overrides
 
-    _apply_overrides(mcfg, model_overrides)
-    return mcfg
+        _apply_overrides(mcfg, model_overrides)
+    training_overrides = overrides.get("training", {})
+    chunk_size = training_overrides.get("diffusion_chunk_size", chunk_size)
+    return mcfg, chunk_size
 
 
 def _layernorm_linear_shapes(n_pad: int, batch: int, s: WarmupShapes) -> list[tuple[str, int, int, int]]:
@@ -135,20 +147,42 @@ def _layernorm_linear_shapes(n_pad: int, batch: int, s: WarmupShapes) -> list[tu
     msa_M = batch * s.num_msa * n_pad
     single_M = batch * n_pad
     f = s.trunk_transition_factor
-    return [
+    fc = s.cond_transition_factor
+    shapes = [
+        # Trunk (factor=4)
         ("trimul_gate", pair_M, 5 * s.c_pair, s.c_pair),
         ("pair_transition", pair_M, 2 * f * s.c_pair, s.c_pair),
         ("pair_out_proj", pair_M, s.c_pair, s.c_pair),
         ("single_transition", single_M, 2 * f * s.c_single, s.c_single),
         ("msa_transition", msa_M, 2 * f * s.c_msa, s.c_msa),
+        # Diffusion conditioning (factor=2) — pair_trans0/1, single_trans0/1.
+        # These use the SAME FusedLayerNormLinear kernel at a DIFFERENT output
+        # width (2*fc*c vs 2*f*c). Missing these caused the bp=2/seed=42
+        # deadlock: ranks that hit a new bucket triggered autotune while the
+        # others waited in the next NCCL collective.
+        ("cond_pair_trans", pair_M, 2 * fc * s.c_pair_cond, s.c_pair_cond),
+        ("cond_single_trans", single_M, 2 * fc * s.c_single_cond, s.c_single_cond),
     ]
+    return shapes
 
 
 def _ada_layernorm_linear_shapes(n_pad: int, batch: int, s: WarmupShapes) -> list[tuple[str, int, int, int]]:
-    """Enumerate (label, M, N, K) shapes for the diffusion FFN ``FusedAdaLayerNormLinear``."""
-    return [
-        ("diffusion_ffn", batch * n_pad, 2 * s.diff_transition_factor * s.c_diff_token, s.c_diff_token),
+    """Enumerate (label, M, N, K) shapes for the diffusion FFN ``FusedAdaLayerNormLinear``.
+
+    The diffusion transformer FFN sees M = BS × N where BS is batch × chunk_size
+    during training (or batch × num_samples during inference). We warm the
+    training chunk multiplier so every microstep is a cache hit.
+    """
+    fd = s.diff_transition_factor
+    shapes = [
+        # Per-token diffusion FFN at the standard B*N layout
+        ("diffusion_ffn", batch * n_pad, 2 * fd * s.c_diff_token, s.c_diff_token),
     ]
+    # Also warm the training layout: B * chunk_size * N (collapsed into M).
+    chunk_M = batch * s.diffusion_chunk_size * n_pad
+    if chunk_M != batch * n_pad:  # avoid duplicate when chunk_size=1
+        shapes.append(("diffusion_ffn_chunk", chunk_M, 2 * fd * s.c_diff_token, s.c_diff_token))
+    return shapes
 
 
 def _run_warm(label: str, build_call, device: torch.device) -> None:
@@ -326,15 +360,18 @@ def main(
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA not available — warmup needs a GPU.")
 
-    mcfg = _load_model_config(config_path)
+    mcfg, chunk_size = _load_configs(config_path)
     shapes = WarmupShapes.from_model_config(mcfg)
+    shapes.diffusion_chunk_size = chunk_size
     dev = torch.device(device)
     name = torch.cuda.get_device_name(dev)
     logger.info(f"Warming Triton cache on {name} for buckets: {bucket_list}")
     logger.info(f"Batch sizes: {batch_size_list}")
     logger.info(
         f"Channel dims: c_pair={shapes.c_pair} c_single={shapes.c_single} "
-        f"c_msa={shapes.c_msa} c_diff_token={shapes.c_diff_token} num_msa={shapes.num_msa}"
+        f"c_msa={shapes.c_msa} c_diff_token={shapes.c_diff_token} "
+        f"c_pair_cond={shapes.c_pair_cond} c_single_cond={shapes.c_single_cond} "
+        f"diffusion_chunk_size={shapes.diffusion_chunk_size}"
     )
     if config_path:
         logger.info(f"Loaded shapes from {config_path}")
