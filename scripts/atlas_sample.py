@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import random
 import shutil
-import sys
 from pathlib import Path
 
 import yaml
@@ -65,11 +64,13 @@ def parse_yaml(path: Path) -> dict | None:
             total_residues += len(seq)
         elif "ligand" in entry:
             lig = entry["ligand"]
-            chains.append({
-                "type": "ligand",
-                "id": lig.get("id", "?"),
-                "ccd": lig.get("ccd", "UNK"),
-            })
+            chains.append(
+                {
+                    "type": "ligand",
+                    "id": lig.get("id", "?"),
+                    "ccd": lig.get("ccd", "UNK"),
+                }
+            )
             has_ligand = True
 
     return {
@@ -105,14 +106,17 @@ def sample_diverse(entries: list[dict], n: int, rng: random.Random) -> list[dict
         ("ligand-containing", lambda e: e["has_ligand"]),
         ("nucleic-containing", lambda e: e["has_nucleic"]),
         ("multi-chain (3+)", lambda e: e["num_protein"] >= 3),
-        ("homo-dimer", lambda e: e["num_protein"] == 2 and len(set(
-            c["sequence"] for c in e["chains"] if c["type"] == "protein"
-        )) == 1),
+        (
+            "homo-dimer",
+            lambda e: (
+                e["num_protein"] == 2 and len(set(c["sequence"] for c in e["chains"] if c["type"] == "protein")) == 1
+            ),
+        ),
         ("large (>500 res)", lambda e: e["total_residues"] > 500),
         ("small (<100 res)", lambda e: 0 < e["total_residues"] < 100),
     ]
 
-    for name, pred in categories:
+    for _name, pred in categories:
         if len(selected) >= n:
             break
         candidates = [e for e in remaining if pred(e)]

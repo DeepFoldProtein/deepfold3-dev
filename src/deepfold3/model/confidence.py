@@ -20,14 +20,18 @@ Attribute names match the Haiku → PyTorch converter mapping.
 
 from __future__ import annotations
 
+from functools import partial as _partial
+
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
+
+torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 
 class ConfidenceHead(nn.Module):
@@ -201,7 +205,6 @@ class ConfidenceHead(nn.Module):
                     pair_mask,
                     seq_mask,
                     return_pre_logits,
-                    use_reentrant=False,
                 )
             else:
                 plddt, exp_res, pae, pde = self._process_one_sample(

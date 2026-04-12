@@ -209,6 +209,7 @@ def _warm_layernorm_linear(n_pad: int, batch: int, shapes: WarmupShapes, device:
     from deepfold3.model.triton.layernorm_linear import FusedLayerNormLinear
 
     for label, M, N, K in _layernorm_linear_shapes(n_pad, batch, shapes):
+
         def build(M=M, N=N, K=K):
             module = FusedLayerNormLinear(K, N, has_linear_bias=False).to(device).to(torch.bfloat16)
             return module, (_make_input(M, K, device),)
@@ -221,6 +222,7 @@ def _warm_ada_layernorm_linear(n_pad: int, batch: int, shapes: WarmupShapes, dev
     from deepfold3.model.triton.ada_layernorm_linear import FusedAdaLayerNormLinear
 
     for label, M, N, K in _ada_layernorm_linear_shapes(n_pad, batch, shapes):
+
         def build(M=M, N=N, K=K):
             module = FusedAdaLayerNormLinear(K, N).to(device).to(torch.bfloat16)
             x = _make_input(M, K, device)
@@ -345,9 +347,7 @@ def warmup_buckets(
 )
 @click.option("--skip-gemm", is_flag=True, help="Skip the layernorm_linear / ada_layernorm_linear kernels.")
 @click.option("--device", type=str, default="cuda:0", help="CUDA device to warm on.")
-def main(
-    config_path: str | None, buckets: str | None, batch_sizes: str, skip_gemm: bool, device: str
-) -> None:
+def main(config_path: str | None, buckets: str | None, batch_sizes: str, skip_gemm: bool, device: str) -> None:
     """Pre-populate the persistent Triton autotune cache for our bucket sizes."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     if buckets is None:

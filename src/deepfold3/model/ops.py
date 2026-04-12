@@ -144,7 +144,9 @@ class _TriangleMulBase(nn.Module):
             except ImportError:
                 pass
 
-        _has_triton_fused = self._fused_gate is not None or self._fused_dual_gemm is not None or self._fused_center_proj is not None
+        _has_triton_fused = (
+            self._fused_gate is not None or self._fused_dual_gemm is not None or self._fused_center_proj is not None
+        )
         if optim is not None and optim.use_torch_compile and not _has_triton_fused:
             # Don't combine torch.compile with fused Triton kernels — the compiled
             # graph mishandles nested Triton kernel launches (SymNodeVariable error).

@@ -617,7 +617,7 @@ def main():
         ops = _OPS
 
     all_ok = True
-    for name, (label, func) in ops.items():
+    for _name, (label, func) in ops.items():
         print(f"=== {label} ===")
         all_ok &= func(args.verbose)
 

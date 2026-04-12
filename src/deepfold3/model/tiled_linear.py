@@ -23,10 +23,13 @@ composes correctly with outer non-reentrant checkpointing.
 from __future__ import annotations
 
 import math
+from functools import partial as _partial
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+
+torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 
 def _auto_shards(x: torch.Tensor) -> int:
@@ -42,31 +45,24 @@ def _tiled_forward(x: torch.Tensor, module: nn.Module, num_shards: int) -> torch
     """Tiled forward of ``module(chunk)`` along ``dim=-2``."""
     chunks = x.chunk(num_shards, dim=-2)
     if torch.is_grad_enabled() and x.requires_grad:
-        outputs = [torch_checkpoint(module, chunk, use_reentrant=False) for chunk in chunks]
+        outputs = [torch_checkpoint(module, chunk) for chunk in chunks]
     else:
         outputs = [module(chunk) for chunk in chunks]
     return torch.cat(outputs, dim=-2)
 
 
-def _tiled_ada_forward(
-    x: torch.Tensor, cond: torch.Tensor, module: nn.Module, num_shards: int
-) -> torch.Tensor:
+def _tiled_ada_forward(x: torch.Tensor, cond: torch.Tensor, module: nn.Module, num_shards: int) -> torch.Tensor:
     """Tiled forward of ``module(chunk_x, chunk_cond)`` along ``dim=-2``."""
     chunks_x = x.chunk(num_shards, dim=-2)
     chunks_c = cond.chunk(num_shards, dim=-2)
     if torch.is_grad_enabled() and (x.requires_grad or cond.requires_grad):
-        outputs = [
-            torch_checkpoint(module, xc, cc, use_reentrant=False)
-            for xc, cc in zip(chunks_x, chunks_c, strict=True)
-        ]
+        outputs = [torch_checkpoint(module, xc, cc) for xc, cc in zip(chunks_x, chunks_c, strict=True)]
     else:
         outputs = [module(xc, cc) for xc, cc in zip(chunks_x, chunks_c, strict=True)]
     return torch.cat(outputs, dim=-2)
 
 
-def tiled_opm_contract(
-    a: torch.Tensor, b: torch.Tensor, contract_fn, num_shards: int
-) -> torch.Tensor:
+def tiled_opm_contract(a: torch.Tensor, b: torch.Tensor, contract_fn, num_shards: int) -> torch.Tensor:
     """2D-tiled outer product contraction.
 
     Chunks both ``a`` (dim=2, rows) and ``b`` (dim=2, cols) so the intermediate
@@ -82,7 +78,7 @@ def tiled_opm_contract(
         col_outputs = []
         for b_chunk in chunks_b:
             if use_ckpt:
-                out = torch_checkpoint(contract_fn, a_chunk, b_chunk, use_reentrant=False)
+                out = torch_checkpoint(contract_fn, a_chunk, b_chunk)
             else:
                 out = contract_fn(a_chunk, b_chunk)
             col_outputs.append(out)

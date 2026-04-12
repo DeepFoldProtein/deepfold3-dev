@@ -349,13 +349,9 @@ class TestTiledOPM:
         base(msa.clone().detach().requires_grad_(True), mask).sum().backward()
         tiled(msa.clone().detach().requires_grad_(True), mask).sum().backward()
 
-        for (n1, p1), (n2, p2) in zip(
-            base.named_parameters(), tiled.named_parameters(), strict=True
-        ):
+        for (n1, p1), (_n2, p2) in zip(base.named_parameters(), tiled.named_parameters(), strict=True):
             if p1.grad is not None:
-                torch.testing.assert_close(
-                    p1.grad, p2.grad, atol=1e-3, rtol=1e-3, msg=f"Grad mismatch for {n1}"
-                )
+                torch.testing.assert_close(p1.grad, p2.grad, atol=1e-3, rtol=1e-3, msg=f"Grad mismatch for {n1}")
 
     def test_batched(self):
         """Works with batch dimension."""

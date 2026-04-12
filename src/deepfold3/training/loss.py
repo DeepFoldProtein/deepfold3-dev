@@ -165,12 +165,8 @@ def diffusion_mse_loss(
         permuted_chunks: list[torch.Tensor] = []
         atom_mask_bool = atom_mask.bool()
         for s in range(S):
-            chain_assign = compute_chain_permutation_tokens(
-                pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id
-            )
-            new_gt, _ = apply_chain_permutation_tokens(
-                gt_pos[s], atom_mask_bool, asym_id, chain_assign
-            )
+            chain_assign = compute_chain_permutation_tokens(pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id)
+            new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)
             permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
 

@@ -391,9 +391,7 @@ class Featurizer:
             # Each ligand atom is its own token, so swaps are over (token_a,
             # token_b) pairs at slot M=0. Empty when no cache is loaded or
             # the crop has no symmetric ligands.
-            ligand_swap_pairs = compute_ligand_token_swap_pairs(
-                data.structure, tokens, self.ligand_perm_cache
-            )
+            ligand_swap_pairs = compute_ligand_token_swap_pairs(data.structure, tokens, self.ligand_perm_cache)
             result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
             # Bond features for bond violation loss (Protenix-style: observed GT distances)

@@ -245,7 +245,15 @@ def test_local_command_sequence():
 
             commands.clear()
             _search_monomer(
-                "mmseqs", db_dir, work, use_env=False, use_templates=False, filter=True, threads=4, gpu=False, gpu_server=False
+                "mmseqs",
+                db_dir,
+                work,
+                use_env=False,
+                use_templates=False,
+                filter=True,
+                threads=4,
+                gpu=False,
+                gpu_server=False,
             )
 
             # Verify key commands in order

@@ -169,9 +169,7 @@ def test_contiguous_crop_single_chain():
 
     # Use chain_id=0 so the start position is deterministic with seed=0:
     # Random(0).randint(0, 99) == 49, leaving 51 tokens ahead → 20 fit.
-    selected = cropper._contiguous_crop(
-        data.tokens, max_tokens=20, max_atoms=10_000, chain_id=0, rng=random.Random(0)
-    )
+    selected = cropper._contiguous_crop(data.tokens, max_tokens=20, max_atoms=10_000, chain_id=0, rng=random.Random(0))
 
     assert len(selected) == 20
     # Sorted (monotonically non-decreasing)

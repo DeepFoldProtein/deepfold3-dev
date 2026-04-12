@@ -248,9 +248,7 @@ def _import_msa_files(
             len(fallback_work),
             len(unresolved),
         )
-        ok2, _ = run_materialize(
-            fallback_work, workers, log, label="materialized (fallback)", keep_a3m=keep_a3m
-        )
+        ok2, _ = run_materialize(fallback_work, workers, log, label="materialized (fallback)", keep_a3m=keep_a3m)
         matched += ok2
 
     return matched, total
@@ -446,9 +444,7 @@ def prepare(
 
     # Import pre-existing A3M files if provided
     if msa_dir:
-        matched, total = _import_msa_files(
-            manifest_records, Path(msa_dir), output_path / "msa", workers=workers
-        )
+        matched, total = _import_msa_files(manifest_records, Path(msa_dir), output_path / "msa", workers=workers)
         log.info("MSA import: %d/%d unique sequences matched.", matched, total)
 
     manifest_path = output_path / "manifest.json"
@@ -890,9 +886,7 @@ def import_msa(data_dir: str, msa_dir: str, workers: int, keep_a3m: bool) -> Non
         sys.exit(1)
 
     output_msa_dir = data_path / "msa"
-    matched, total = _import_msa_files(
-        records, Path(msa_dir), output_msa_dir, workers=workers, keep_a3m=keep_a3m
-    )
+    matched, total = _import_msa_files(records, Path(msa_dir), output_msa_dir, workers=workers, keep_a3m=keep_a3m)
 
     log.info("Done: %d/%d unique sequences matched.", matched, total)
 
@@ -994,9 +988,7 @@ def import_paired_msa(data_dir: str, paired_dir: str, workers: int, keep_a3m: bo
             skipped_no_record += 1
             continue
 
-        chain_by_msa_id: dict[str, ChainInfo] = {
-            str(c.msa_id): c for c in record.chains if c.valid
-        }
+        chain_by_msa_id: dict[str, ChainInfo] = {str(c.msa_id): c for c in record.chains if c.valid}
 
         for a3m_file in rec_dir.glob("*.paired.a3m"):
             chain_hash = a3m_file.name.split(".paired.a3m")[0]
@@ -1118,9 +1110,7 @@ def enrich_manifest(data_dir: Path, idx: Path | None, mmcif_cache: Path | None) 
 
     def _ensure_si(record):
         if record.structure_info is None:
-            record.structure_info = StructureInfo(
-                num_chains=len(record.chains), num_interfaces=len(record.interfaces)
-            )
+            record.structure_info = StructureInfo(num_chains=len(record.chains), num_interfaces=len(record.interfaces))
         return record.structure_info
 
     if idx is not None:
@@ -1204,8 +1194,7 @@ def _parse_obsolete_dat(text: str) -> set[str]:
     "--ids-file",
     default=None,
     type=click.Path(exists=True, path_type=Path),
-    help="Optional local copy of obsolete.dat (or a JSON list of IDs). "
-    "If omitted, fetched from wwPDB.",
+    help="Optional local copy of obsolete.dat (or a JSON list of IDs). If omitted, fetched from wwPDB.",
 )
 @click.option(
     "--delete-files",

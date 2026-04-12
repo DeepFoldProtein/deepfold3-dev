@@ -13,16 +13,19 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from functools import partial as _partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncoderStatic
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LinearNoBias
+
+torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 
 @dataclasses.dataclass
@@ -827,7 +830,6 @@ class DiffusionHead(nn.Module):
                 None,  # seq_mask
                 None,  # rel_feat
                 static_bs,
-                use_reentrant=False,
             )
         else:
             result_bs = self.denoise(

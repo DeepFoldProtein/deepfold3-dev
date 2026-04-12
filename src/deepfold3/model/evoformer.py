@@ -31,9 +31,11 @@ Key dimension facts from AF3 weight file:
 
 from __future__ import annotations
 
+from functools import partial as _partial
+
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
 from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
@@ -41,6 +43,8 @@ from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleM
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 from deepfold3.model.template_embedding import TemplateEmbedding
+
+_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 # Full target_feat dimension fed into the Evoformer (raw_feat + evo_cond_token_act)
 _TARGET_FEAT_DIM = 447
@@ -311,18 +315,14 @@ class Evoformer(nn.Module):
         use_ckpt = self._grad_checkpoint and torch.is_grad_enabled()
         for layer in self.msa_stack:
             if use_ckpt:
-                msa_act, pair = torch.utils.checkpoint.checkpoint(
-                    layer, msa_act, pair, msa_mask, pair_mask, use_reentrant=False
-                )
+                msa_act, pair = _checkpoint(layer, msa_act, pair, msa_mask, pair_mask)
             else:
                 msa_act, pair = layer(msa_act, pair, msa_mask, pair_mask)
 
         # PairFormer stack (optionally checkpointed per block during training)
         for layer in self.trunk_pairformer:
             if use_ckpt:
-                pair, single = torch.utils.checkpoint.checkpoint(
-                    layer, pair, single, pair_mask, seq_mask, use_reentrant=False
-                )
+                pair, single = _checkpoint(layer, pair, single, pair_mask, seq_mask)
             else:
                 pair, single = layer(pair, single, pair_mask, seq_mask)
 

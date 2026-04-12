@@ -123,7 +123,9 @@ def bench_swiglu(shapes: list[dict], warmup: int, rep: int) -> list:
         label = shape.get("label", f"M={M}")
         kind = label.split()[0] if " " in label else "pair"
         op_name = f"SwiGLU ({kind})"
-        results.extend(bench_fwd_full(op_name, "pytorch", bench_shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x]))
+        results.extend(
+            bench_fwd_full(op_name, "pytorch", bench_shape, fwd, full, warmup=warmup, rep=rep, grad_to_none=[x])
+        )
 
         if FusedSwiGLU is not None:
             swiglu = FusedSwiGLU()

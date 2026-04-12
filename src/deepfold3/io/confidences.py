@@ -620,9 +620,7 @@ def save_ranking_scores_csv(path: str | Path, summaries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            ["seed", "sample", "ranking_score", "ptm", "iptm", "fraction_disordered", "has_clash"]
-        )
+        writer.writerow(["seed", "sample", "ranking_score", "ptm", "iptm", "fraction_disordered", "has_clash"])
         for row in sorted_rows:
             iptm = row.get("iptm")
             iptm_str = "" if iptm is None or (isinstance(iptm, float) and math.isnan(iptm)) else f"{iptm:.4f}"
@@ -639,9 +637,7 @@ def save_ranking_scores_csv(path: str | Path, summaries: list[dict]) -> None:
             )
 
 
-def save_summary_confidences_json(
-    path: str | Path, summaries: list[dict], job_name: str | None = None
-) -> None:
+def save_summary_confidences_json(path: str | Path, summaries: list[dict], job_name: str | None = None) -> None:
     """Write a top-level ``summary_confidences.json`` aggregating all predictions.
 
     Each entry in ``summaries`` is the value returned by

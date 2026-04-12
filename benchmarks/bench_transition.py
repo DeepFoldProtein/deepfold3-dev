@@ -156,7 +156,9 @@ def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> lis
         atb_c = try_compile(AdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval())
         if atb_c is not None:
             x_c = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_ada_module("AdaTransitionBlock", "compile", bench_shape, atb_c, x_c, cond, do, warmup, rep))
+            results.extend(
+                _bench_ada_module("AdaTransitionBlock", "compile", bench_shape, atb_c, x_c, cond, do, warmup, rep)
+            )
             del atb_c, x_c
 
         # Triton fused
@@ -164,7 +166,9 @@ def bench_ada_transition_block(shapes: list[dict], warmup: int, rep: int) -> lis
             ft = FusedAdaTransitionBlock(C, cond_dim).to(DEVICE, DTYPE).eval()
             ft.load_state_dict(atb.state_dict(), strict=False)
             x2 = x.detach().clone().requires_grad_(True)
-            results.extend(_bench_ada_module("AdaTransitionBlock", "triton", bench_shape, ft, x2, cond, do, warmup, rep))
+            results.extend(
+                _bench_ada_module("AdaTransitionBlock", "triton", bench_shape, ft, x2, cond, do, warmup, rep)
+            )
             del ft, x2
         else:
             print(f"  [skip] Triton FusedAdaTransitionBlock not available ({label})")

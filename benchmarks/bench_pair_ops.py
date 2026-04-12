@@ -277,7 +277,9 @@ def bench_layernorm_transpose(shapes, warmup, rep):
             o.backward(do, retain_graph=True)
 
         results.extend(
-            bench_fwd_full("LNTranspose", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[x])
+            bench_fwd_full(
+                "LNTranspose", "pytorch", shape, fwd_base, full_base, warmup=warmup, rep=rep, grad_to_none=[x]
+            )
         )
 
         # Triton fused
@@ -359,8 +361,14 @@ def bench_grid_col_attention(shapes, warmup, rep):
 
             results.extend(
                 bench_fwd_full(
-                    "GridColAttn", "triton_ln_transpose", shape, fwd_fused, full_fused,
-                    warmup=warmup, rep=rep, grad_to_none=[z2]
+                    "GridColAttn",
+                    "triton_ln_transpose",
+                    shape,
+                    fwd_fused,
+                    full_fused,
+                    warmup=warmup,
+                    rep=rep,
+                    grad_to_none=[z2],
                 )
             )
             del fused, z2
@@ -383,8 +391,7 @@ def bench_grid_col_attention(shapes, warmup, rep):
 
             results.extend(
                 bench_fwd_full(
-                    "GridColAttn", "triton_evo", shape, fwd_evo, full_evo,
-                    warmup=warmup, rep=rep, grad_to_none=[z3]
+                    "GridColAttn", "triton_evo", shape, fwd_evo, full_evo, warmup=warmup, rep=rep, grad_to_none=[z3]
                 )
             )
             del evo, z3
@@ -407,8 +414,7 @@ def bench_grid_col_attention(shapes, warmup, rep):
 
             results.extend(
                 bench_fwd_full(
-                    "GridColAttn", "triton_evo+pb", shape, fwd_pb, full_pb,
-                    warmup=warmup, rep=rep, grad_to_none=[z4]
+                    "GridColAttn", "triton_evo+pb", shape, fwd_pb, full_pb, warmup=warmup, rep=rep, grad_to_none=[z4]
                 )
             )
             del fused_pb, z4

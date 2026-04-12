@@ -685,10 +685,7 @@ class Trainer:
 
     def _chunked_diffusion_active(self) -> bool:
         cfg = self.cfg
-        return (
-            cfg.diffusion_chunk_size > 0
-            and cfg.diffusion_batch_size % cfg.diffusion_chunk_size == 0
-        )
+        return cfg.diffusion_chunk_size > 0 and cfg.diffusion_batch_size % cfg.diffusion_chunk_size == 0
 
     def _scaled_backward(self, loss: torch.Tensor) -> None:
         """``scaler.scale(loss / accumulate).backward()`` — used by both the
@@ -888,6 +885,7 @@ class Trainer:
     def _run_inner(self, resume_from: str | Path | None) -> None:
         self._init_distributed()
         self._seed_everything()
+
         self._init_model()
         self._init_wandb()
 
@@ -1028,17 +1026,13 @@ class Trainer:
                 # always fires AFTER ``clip_grad_norm`` has populated
                 # ``_last_grad_norm`` — otherwise mid-accumulation logs show
                 # ``grad_norm=nan``.
-                on_opt_step_boundary = (self.global_step % cfg.accumulate_grad_batches == 0)
+                on_opt_step_boundary = self.global_step % cfg.accumulate_grad_batches == 0
                 if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0 and meters.count > 0:
                     avg = meters.sync()
                     meters.reset()
 
                     if self.is_main:
-                        grad_norm = (
-                            self._last_grad_norm.item()
-                            if self._last_grad_norm is not None
-                            else float("nan")
-                        )
+                        grad_norm = self._last_grad_norm.item() if self._last_grad_norm is not None else float("nan")
                         now = time.time()
                         elapsed = now - t0
                         dt = (now - t_last_log) / max(self.cfg.log_interval, 1)

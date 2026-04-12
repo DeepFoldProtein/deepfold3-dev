@@ -92,9 +92,7 @@ class Cropper:
             if kind == "chain":
                 selected = self._contiguous_crop(tokens, max_tokens, max_atoms, a, rng)
             elif kind == "interface":
-                selected = self._interface_spatial_crop(
-                    tokens, max_tokens, max_atoms, rng, anchor_chains=(a, b)
-                )
+                selected = self._interface_spatial_crop(tokens, max_tokens, max_atoms, rng, anchor_chains=(a, b))
             else:
                 selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
         else:

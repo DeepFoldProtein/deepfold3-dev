@@ -370,6 +370,7 @@ def layernorm_linear_forward(
 
     def grid(META):
         return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
+
     _second_forward_kernel[grid](
         a,
         b,

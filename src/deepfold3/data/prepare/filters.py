@@ -23,6 +23,7 @@ from deepfold3.data.types import ChainInfo, Record, Structure
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class StructureFilterConfig:
     """Configuration for structure-level and chain-level filters.

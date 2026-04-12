@@ -215,14 +215,27 @@ def prepare_templates(
 
     if monomer:
         _run_monomer(
-            records, m8_dir, data_dir, release_dates,
-            max_templates, max_hits_per_chain, workers, overwrite,
+            records,
+            m8_dir,
+            data_dir,
+            release_dates,
+            max_templates,
+            max_hits_per_chain,
+            workers,
+            overwrite,
         )
     else:
         _run_multimer(
-            records, m8_dir, data_dir, release_dates,
-            max_template_date, query_cutoff_days,
-            max_templates, max_hits_per_chain, workers, overwrite,
+            records,
+            m8_dir,
+            data_dir,
+            release_dates,
+            max_template_date,
+            query_cutoff_days,
+            max_templates,
+            max_hits_per_chain,
+            workers,
+            overwrite,
         )
 
 
@@ -265,8 +278,18 @@ def _run_multimer(
 
     def _args(rid, mids, lens, qdate):
         return (
-            rid, mids, lens, qdate, m8_dir, output_dir, release_dates,
-            max_template_date, query_cutoff_days, max_templates, max_hits_per_chain, overwrite,
+            rid,
+            mids,
+            lens,
+            qdate,
+            m8_dir,
+            output_dir,
+            release_dates,
+            max_template_date,
+            query_cutoff_days,
+            max_templates,
+            max_hits_per_chain,
+            overwrite,
         )
 
     _run_pool(work, _args, _process_multimer, workers)
@@ -309,8 +332,14 @@ def _run_monomer(
 
     def _args(mid, length):
         return (
-            mid, length, m8_dir, output_dir, release_dates,
-            max_templates, max_hits_per_chain, overwrite,
+            mid,
+            length,
+            m8_dir,
+            output_dir,
+            release_dates,
+            max_templates,
+            max_hits_per_chain,
+            overwrite,
         )
 
     _run_pool(work, _args, _process_monomer, workers)

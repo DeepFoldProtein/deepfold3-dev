@@ -27,15 +27,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import click
+
+from deepfold3.scripts import cli
+
 # Dump Python tracebacks for all threads on SIGUSR1 — invaluable for
 # diagnosing DDP deadlocks where one rank blocks in an NCCL collective.
 faulthandler.enable()
 if hasattr(faulthandler, "register"):
     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=True)
 
-import click
 
-from deepfold3.scripts import cli
 
 
 def _apply_overrides(cfg: object, overrides: dict) -> None:

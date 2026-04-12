@@ -36,7 +36,9 @@ from deepfold3.scripts import cli
 
 
 @cli.command("msa-batch")
-@click.option("--data-dir", required=True, type=click.Path(exists=True, path_type=Path), help="Training data directory.")
+@click.option(
+    "--data-dir", required=True, type=click.Path(exists=True, path_type=Path), help="Training data directory."
+)
 @click.option(
     "--db-dir",
     default=None,
@@ -47,8 +49,12 @@ from deepfold3.scripts import cli
 @click.option("--threads", default=8, type=int, show_default=True, help="Threads for MMseqs2 search.")
 @click.option("--gpu/--no-gpu", default=False, help="Use GPU-accelerated search.")
 @click.option("--gpu-server/--no-gpu-server", default=False, help="Use persistent GPU server processes.")
-@click.option("--use-env/--no-env", default=True, show_default=True, help="Search environmental database (ColabFoldDB).")
-@click.option("--filter/--no-filter", "use_filter", default=True, show_default=True, help="Apply MSA filtering (qsc=0.8).")
+@click.option(
+    "--use-env/--no-env", default=True, show_default=True, help="Search environmental database (ColabFoldDB)."
+)
+@click.option(
+    "--filter/--no-filter", "use_filter", default=True, show_default=True, help="Apply MSA filtering (qsc=0.8)."
+)
 @click.option(
     "--batch-size",
     default=0,
@@ -331,7 +337,9 @@ def msa_batch(
 
             log.info(
                 "Paired MSA done: %d searched, %d skipped (cached), %d failed.",
-                paired_done, skipped, paired_failed,
+                paired_done,
+                skipped,
+                paired_failed,
             )
 
         # Save updated manifest with paired_msa_id references

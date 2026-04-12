@@ -384,13 +384,15 @@ def _slide_table(pdf: PdfPages, best: dict):
         modes = ops[op_name]
         mode = "full" if "full" in modes else next(iter(modes))
         for sl, bp, spd, entries in modes[mode]:
-            rows.append([
-                op_name,
-                sl.replace("\n", " / "),
-                _label(bp, op_name),
-                f"{entries[bp]['time_ms']:.2f}",
-                f"{spd:.1f}x" if spd > 1.005 else "—",
-            ])
+            rows.append(
+                [
+                    op_name,
+                    sl.replace("\n", " / "),
+                    _label(bp, op_name),
+                    f"{entries[bp]['time_ms']:.2f}",
+                    f"{spd:.1f}x" if spd > 1.005 else "—",
+                ]
+            )
 
     if not rows:
         return

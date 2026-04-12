@@ -56,9 +56,7 @@ RESIDUE_ATOM_SYMMETRY_GROUPS: Final[dict[str, list[list[tuple[str, str]]]]] = {
 }
 
 
-def build_residue_symmetry_pairs(
-    res_name: str, atom_names: list[str]
-) -> list[tuple[int, int]]:
+def build_residue_symmetry_pairs(res_name: str, atom_names: list[str]) -> list[tuple[int, int]]:
     """Resolve a residue's symmetric atom swap pairs to local atom indices.
 
     Returns a list of ``(i, j)`` index pairs into ``atom_names`` that
@@ -108,10 +106,7 @@ def compute_atom_symmetry_pairs(structure) -> np.ndarray:
         a_num = int(res["atom_num"])
         if a_num <= 0:
             continue
-        atom_names = [
-            atom_names_bytes[a_start + i].decode("ascii", errors="replace").strip()
-            for i in range(a_num)
-        ]
+        atom_names = [atom_names_bytes[a_start + i].decode("ascii", errors="replace").strip() for i in range(a_num)]
         local = build_residue_symmetry_pairs(res_name, atom_names)
         pair_list.extend((a_start + a, a_start + b) for a, b in local)
     if not pair_list:
@@ -119,9 +114,7 @@ def compute_atom_symmetry_pairs(structure) -> np.ndarray:
     return np.asarray(pair_list, dtype=np.int32)
 
 
-def compute_token_atom_symmetry_pairs(
-    structure, tokens: np.ndarray
-) -> np.ndarray:
+def compute_token_atom_symmetry_pairs(structure, tokens: np.ndarray) -> np.ndarray:
     """Token-aware variant: emit ``(token_idx, M_a, M_b)`` swap triples.
 
     The training loss receives atoms in the per-token ``[N, M, 3]`` layout
@@ -156,10 +149,7 @@ def compute_token_atom_symmetry_pairs(
         if res_name is None or res_name not in RESIDUE_ATOM_SYMMETRY_GROUPS:
             continue
         atom_idx = int(tok["atom_idx"])
-        atom_names = [
-            atom_names_bytes[atom_idx + i].decode("ascii", errors="replace").strip()
-            for i in range(atom_num)
-        ]
+        atom_names = [atom_names_bytes[atom_idx + i].decode("ascii", errors="replace").strip() for i in range(atom_num)]
         for a, b in build_residue_symmetry_pairs(res_name, atom_names):
             pair_list.append((token_idx, a, b))
     if not pair_list:

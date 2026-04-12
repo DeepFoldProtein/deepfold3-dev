@@ -249,7 +249,7 @@ class TestFloat32VsFloat64:
         tm32 = TriangleMulOutgoing(c_z=128)
         tm64 = TriangleMulOutgoing(c_z=128).double()
         # Copy weights
-        for (n32, p32), (n64, p64) in zip(tm32.named_parameters(), tm64.named_parameters()):
+        for (_n32, p32), (_n64, p64) in zip(tm32.named_parameters(), tm64.named_parameters(), strict=False):
             p64.data = p32.data.double()
 
         z32 = torch.randn(16, 16, 128)
@@ -274,7 +274,7 @@ class TestFloat32VsFloat64:
         torch.manual_seed(42)
         opm32 = OuterProductMean(c_msa=64, c_z=128, c_hidden=32)
         opm64 = OuterProductMean(c_msa=64, c_z=128, c_hidden=32).double()
-        for (_, p32), (_, p64) in zip(opm32.named_parameters(), opm64.named_parameters()):
+        for (_, p32), (_, p64) in zip(opm32.named_parameters(), opm64.named_parameters(), strict=False):
             p64.data = p32.data.double()
 
         msa32 = torch.randn(8, 16, 64)
@@ -299,7 +299,7 @@ class TestFloat32VsFloat64:
         S, N, c_msa, c_pair = 4, 8, 64, 128
         block32 = EvoformerBlock(c_msa, c_pair)
         block64 = EvoformerBlock(c_msa, c_pair).double()
-        for (_, p32), (_, p64) in zip(block32.named_parameters(), block64.named_parameters()):
+        for (_, p32), (_, p64) in zip(block32.named_parameters(), block64.named_parameters(), strict=False):
             p64.data = p32.data.double()
 
         msa32 = torch.randn(S, N, c_msa) * 0.1
@@ -328,7 +328,7 @@ class TestFloat32VsFloat64:
         N, c_pair, c_single = 8, 128, 384
         block32 = PairFormerBlock(c_pair, c_single)
         block64 = PairFormerBlock(c_pair, c_single).double()
-        for (_, p32), (_, p64) in zip(block32.named_parameters(), block64.named_parameters()):
+        for (_, p32), (_, p64) in zip(block32.named_parameters(), block64.named_parameters(), strict=False):
             p64.data = p32.data.double()
 
         pair32 = torch.randn(N, N, c_pair) * 0.1

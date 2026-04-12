@@ -858,14 +858,10 @@ def _filter_template_hits_by_date(job: JobInput) -> None:
         return
     for chain in job.protein_chains:
         before = len(chain.template_hits)
-        chain.template_hits = [
-            h for h in chain.template_hits if h.release_date is None or h.release_date <= cutoff
-        ]
+        chain.template_hits = [h for h in chain.template_hits if h.release_date is None or h.release_date <= cutoff]
         dropped = before - len(chain.template_hits)
         if dropped:
-            logger.info(
-                "Filtered %d template hit(s) past cutoff %s on chain %s", dropped, cutoff, chain.sequence[:20]
-            )
+            logger.info("Filtered %d template hit(s) past cutoff %s on chain %s", dropped, cutoff, chain.sequence[:20])
 
 
 def _resolve_user_ccd(base_dir: Path, user_ccd: str | None, user_ccd_path: str | None) -> str | None:

@@ -839,6 +839,7 @@ class _EvoformerAttention(torch.autograd.Function):
 
         def preprocess_grid(args):
             return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+
         _attn_bwd_preprocess[preprocess_grid](
             O=O,
             dO=dO,
@@ -853,6 +854,7 @@ class _EvoformerAttention(torch.autograd.Function):
 
         def bwd_dk_dv_grid(args):
             return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+
         _attn_bwd_dk_dv[bwd_dk_dv_grid](
             Q=Q,
             K=K,
@@ -886,6 +888,7 @@ class _EvoformerAttention(torch.autograd.Function):
 
         def bwd_dq_grid(args):
             return (triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * N_SEQ * HEAD, 1)
+
         _attn_bwd_dq[bwd_dq_grid](
             Q=Q,
             K=K,

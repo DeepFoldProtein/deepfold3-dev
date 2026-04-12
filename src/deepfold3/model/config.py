@@ -449,7 +449,9 @@ class TrainingConfig:
     eval_interval: int = 5000
     log_interval: int = 50  # in optimizer steps (after grad accumulation)
     log_microsteps: bool = False  # debug: log every microstep instead of every effective step
-    uniform_recycle: bool = True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
+    uniform_recycle: bool = (
+        True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
+    )
     batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
     max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
 

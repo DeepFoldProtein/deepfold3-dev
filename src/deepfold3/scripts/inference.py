@@ -189,11 +189,7 @@ def inference(
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     # Fused kernel parameters are derived from base weights via _sync_to_fused — not real misses
-    real_missing = [
-        k
-        for k in missing
-        if not any(p in k for p in OptimConfig.FUSED_STATE_DICT_MARKERS)
-    ]
+    real_missing = [k for k in missing if not any(p in k for p in OptimConfig.FUSED_STATE_DICT_MARKERS)]
     if real_missing:
         click.echo(f"  [WARN] missing keys   : {len(real_missing)}")
     if unexpected:
@@ -311,8 +307,7 @@ def inference(
 
     for current_seed in seed_list:
         click.echo(
-            f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, "
-            f"samples={num_samples}) …"
+            f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
         )
         t0 = time.perf_counter()
         with torch.inference_mode():
@@ -366,17 +361,11 @@ def inference(
                     f"{stem}_confidences.json" if num_samples == 1 else f"{stem}_sample{s}_confidences.json"
                 )
 
-            summary = save_confidences_json(
-                conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed)
-            )
+            summary = save_confidences_json(conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed))
             summary = {**summary, "seed": int(current_seed), "sample": int(s)}
             summaries.append(summary)
 
-            iptm_str = (
-                f", ipTM={summary['iptm']:.3f}"
-                if summary.get("iptm") is not None
-                else ""
-            )
+            iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
             clash_str = ", CLASH" if summary["has_clash"] else ""
             click.echo(
                 f"  seed {current_seed} sample {s}: "
@@ -404,8 +393,7 @@ def inference(
             click.echo("[inference] ranking:")
             for rank, row in enumerate(ranked, 1):
                 click.echo(
-                    f"  #{rank}  seed-{row['seed']}_sample-{row['sample']}  "
-                    f"ranking_score={row['ranking_score']:.4f}"
+                    f"  #{rank}  seed-{row['seed']}_sample-{row['sample']}  ranking_score={row['ranking_score']:.4f}"
                 )
 
 

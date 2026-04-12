@@ -78,8 +78,7 @@ def _compute_one(ccd_code: str) -> tuple[str, list[list[int]]]:
     "--ccd",
     default=None,
     type=click.Path(exists=True, path_type=Path),
-    help="Optional bulk components.cif (or .cif.gz) — strongly recommended to "
-    "avoid per-compound HTTP fetches.",
+    help="Optional bulk components.cif (or .cif.gz) — strongly recommended to avoid per-compound HTTP fetches.",
 )
 @click.option(
     "--workers",

@@ -11,11 +11,12 @@ msa_feat: [S, N, 34]  (one_hot(32) + has_deletion + deletion_value)
 from __future__ import annotations
 
 import dataclasses
+from functools import partial as _partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.atom_cross_attn import EvoformerConditioningEncoder
 from deepfold3.model.confidence import ConfidenceHead
@@ -24,6 +25,12 @@ from deepfold3.model.diffusion import DiffusionHead
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.primitives import LinearNoBias
+
+# Disable the determinism metadata check that compares saved vs recomputed
+# tensor shapes.  View reshapes inside checkpointed functions (e.g.
+# [1,384,384,128] → [147456,128]) trigger a spurious mismatch warning
+# that floods the log.  The values are correct; only the view shape differs.
+torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 # Raw target_feat dimensions (before evoformer conditioning)
 # aatype_1hot(31) + profile(31) + deletion_mean(1) = 63
@@ -232,7 +239,6 @@ class DeepFold3(nn.Module):
                 ref_element,
                 ref_charge,
                 ref_atom_name_chars,
-                use_reentrant=False,
             )
         else:
             evo_cond_act = self.evo_cond_encoder(

@@ -84,15 +84,13 @@ def _scan_one(args: tuple[str, str]) -> tuple[str, dict | None]:
     "--data-dir",
     default=None,
     type=click.Path(exists=True, path_type=Path),
-    help="Training data directory; PDB IDs are taken from its manifest.json. "
-    "Mutually exclusive with --ids-file.",
+    help="Training data directory; PDB IDs are taken from its manifest.json. Mutually exclusive with --ids-file.",
 )
 @click.option(
     "--ids-file",
     default=None,
     type=click.Path(exists=True, path_type=Path),
-    help="Text file with one PDB ID per line. "
-    "Mutually exclusive with --data-dir.",
+    help="Text file with one PDB ID per line. Mutually exclusive with --data-dir.",
 )
 @click.option(
     "--workers",

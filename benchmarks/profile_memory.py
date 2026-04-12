@@ -219,9 +219,7 @@ def main():
         profiler.attach(model.diffusion_head, target_depth=args.depth, prefix_filter=args.prefix)
         ref_kwargs = DeepFold3._ref_kwargs(feats)
         with torch.inference_mode():
-            model.diffusion_head.sample(
-                embeddings=embeddings, seq_mask=seq_mask, rel_feat=rel_feat, **ref_kwargs
-            )
+            model.diffusion_head.sample(embeddings=embeddings, seq_mask=seq_mask, rel_feat=rel_feat, **ref_kwargs)
 
     elif args.phase == "confidence":
         with torch.inference_mode():
