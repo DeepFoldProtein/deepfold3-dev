@@ -247,7 +247,7 @@ class Featurizer:
 
         # frames_mask starts as the polymer mask and is tightened below if
         # any of the three frame atoms is missing from the residue.
-        # Also drives frame-aligned PAE (AF3 §3.6.2, §3.7.5).
+        # Also drives frame-aligned PAE (AF3 §4.3.2).
         mol_types = tokens["mol_type"]
         frames_mask_np = (
             (mol_types == const.MOL_PROTEIN) | (mol_types == const.MOL_RNA) | (mol_types == const.MOL_DNA)

@@ -347,7 +347,9 @@ def process_mmcif(
                 for atom_name in ccd_leaving_atoms.get(p1_comp, ()):
                     _leaving_atoms.add((p1_chain, p1_seq_int, atom_name))
         if _leaving_atoms:
-            logger.debug("%s: excluding %d leaving atoms from %d covalent bonds", pdb_id, len(_leaving_atoms), len(_conn_table))
+            logger.debug(
+                "%s: excluding %d leaving atoms from %d covalent bonds", pdb_id, len(_leaving_atoms), len(_conn_table)
+            )
 
     # Parse model into arrays
     all_atoms: list[tuple] = []

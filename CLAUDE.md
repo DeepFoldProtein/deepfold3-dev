@@ -224,7 +224,7 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 5. Distogram head (cross-entropy on distance bins)
 ```
 
-### Loss Weights (AF3 §3.7)
+### Loss Weights (AF3 §5.3)
 
 | Loss | Weight | Notes |
 |------|--------|-------|

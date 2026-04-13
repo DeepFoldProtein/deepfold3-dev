@@ -38,8 +38,6 @@ if hasattr(faulthandler, "register"):
     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=True)
 
 
-
-
 def _apply_overrides(cfg: object, overrides: dict) -> None:
     """Recursively apply dict overrides to a nested dataclass config.
 
@@ -295,7 +293,10 @@ def train(
                 records.append(r)
         log.info(
             "Date-based split (cutoff=%s, max=%s): %d train, %d eval",
-            cutoff, max_eval or "none", len(records), len(eval_records),
+            cutoff,
+            max_eval or "none",
+            len(records),
+            len(eval_records),
         )
     else:
         # Mode 3: random split
@@ -305,7 +306,13 @@ def train(
         n_eval = max(1, int(len(all_records) * train_cfg.eval_fraction))
         records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
         eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
-        log.info("Random split (seed=%d, frac=%.2f): %d train, %d eval", split_seed, train_cfg.eval_fraction, len(records), len(eval_records))
+        log.info(
+            "Random split (seed=%d, frac=%.2f): %d train, %d eval",
+            split_seed,
+            train_cfg.eval_fraction,
+            len(records),
+            len(eval_records),
+        )
 
     # Load distillation records if configured (legacy)
     distillation_records = []

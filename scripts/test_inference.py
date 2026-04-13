@@ -124,15 +124,12 @@ def run_inference(
     ccd_cache: str | None = None,
     device: str = "cuda",
 ):
-    from deepfold3.data import const
-    from deepfold3.data.crop.cropper import Cropper
     from deepfold3.data.feature.featurizer import Featurizer
     from deepfold3.data.msa.paths import unpaired_msa_path
     from deepfold3.data.paths import structure_path
     from deepfold3.data.prepare.manifest import load_manifest
     from deepfold3.data.tokenize.tokenizer import Tokenizer
-    from deepfold3.data.types import Input, MSA, Structure
-    from deepfold3.io.mmcif import save_mmcif
+    from deepfold3.data.types import MSA, Input, Structure
     from deepfold3.io.structure_builder import prediction_to_structure
     from deepfold3.io.structure_mmcif import save_structure_mmcif
     from deepfold3.model.config import ModelConfig
@@ -142,7 +139,7 @@ def run_inference(
 
     # Load CCD cache if provided
     if ccd_cache:
-        from deepfold3.data.ccd import load_ccd_cache, set_ccd_components_path
+        from deepfold3.data.ccd import load_ccd_cache
         from deepfold3.data.feature.ref_atoms import set_ref_pos_cache
 
         _, ref_pos, _ = load_ccd_cache(ccd_cache)
@@ -159,6 +156,7 @@ def run_inference(
     model = DeepFold3(model_cfg)
     if params_path.suffix == ".safetensors":
         from safetensors.torch import load_file
+
         state = load_file(str(params_path), device=device)
     else:
         ckpt = torch.load(str(params_path), map_location=device, weights_only=False)
@@ -223,14 +221,16 @@ def run_inference(
 
         output = _dc.replace(
             output,
-            **{f.name: getattr(output, f.name).squeeze(0) for f in _dc.fields(output) if isinstance(getattr(output, f.name), torch.Tensor)},
+            **{
+                f.name: getattr(output, f.name).squeeze(0)
+                for f in _dc.fields(output)
+                if isinstance(getattr(output, f.name), torch.Tensor)
+            },
         )
 
         # Save mmCIF per sample and compute metrics
         for s in range(num_samples):
-            pred_structure = prediction_to_structure(
-                output, features, sample_idx=s, name=f"{pdb_id}_s{s}"
-            )
+            pred_structure = prediction_to_structure(output, features, sample_idx=s, name=f"{pdb_id}_s{s}")
 
             cif_path = output_dir / f"{pdb_id}_s{s}.cif"
             save_structure_mmcif(cif_path, pred_structure, entry_id=pdb_id)
@@ -241,6 +241,7 @@ def run_inference(
             # pLDDT: convert logits → [0, 100] via compute_plddt
             if hasattr(output, "plddt") and output.plddt is not None:
                 from deepfold3.io.confidences import compute_plddt
+
                 plddt_per_atom, _ = compute_plddt(output.plddt.cpu().float(), features["ref_mask"].float())
                 atom_mask = features["ref_mask"].bool()
                 mean_plddt = plddt_per_atom[s][atom_mask].mean().item()

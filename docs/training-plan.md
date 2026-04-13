@@ -42,7 +42,7 @@ src/deepfold3/data/prepare/clustering.py
 
 ### 1.2 Cluster-weighted sampling
 
-**What**: Replace uniform `DistributedSampler` with cluster-balanced weighted sampling (AF3 §2.5.6).
+**What**: Replace uniform `DistributedSampler` with cluster-balanced weighted sampling (AF3 §2.5.1).
 
 **Design** (Boltz-style `Sampler` abstraction):
 

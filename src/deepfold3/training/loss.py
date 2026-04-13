@@ -336,7 +336,7 @@ def pae_loss(
 ) -> torch.Tensor:
     """Frame-aligned predicted aligned error (PAE) cross-entropy loss.
 
-    AF3 §3.6.2 / §3.7.5. For every ordered pair ``(i, j)``, projects token
+    AF3 §4.3.2. For every ordered pair ``(i, j)``, projects token
     ``j``'s representative atom into token ``i``'s local rigid frame for
     both prediction and ground truth, takes the L2 distance, bucketises into
     ``num_bins`` bins over ``[0, max_error_bin]`` (last bin is catch-all),

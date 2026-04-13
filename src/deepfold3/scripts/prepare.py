@@ -259,7 +259,9 @@ def _import_msa_files(
         if still_missing:
             log.warning(
                 "%d unique msa_ids have no A3M in source dir (content-hash resolved %d/%d):",
-                len(still_missing), len(unresolved) - len(still_missing), len(unresolved),
+                len(still_missing),
+                len(unresolved) - len(still_missing),
+                len(unresolved),
             )
             for mid in still_missing:
                 log.warning("  missing: %s", mid)
@@ -398,7 +400,9 @@ def prepare(
         from deepfold3.data.ccd import load_ccd_cache
 
         ccd_atom_names, _, ccd_leaving_atoms = load_ccd_cache(ccd_cache)
-        log.info("Loaded CCD cache: %d atom name entries, %d with leaving atoms", len(ccd_atom_names), len(ccd_leaving_atoms))
+        log.info(
+            "Loaded CCD cache: %d atom name entries, %d with leaving atoms", len(ccd_atom_names), len(ccd_leaving_atoms)
+        )
 
     from deepfold3.data.prepare.filters import StructureFilterConfig
 
@@ -440,7 +444,9 @@ def prepare(
 
     if workers <= 1:
         for i, pdb_id in enumerate(ids):
-            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names, ccd_leaving_atoms)
+            result = _process_one(
+                pdb_id, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names, ccd_leaving_atoms
+            )
             if isinstance(result, dict):
                 records.append(result)
                 log.info(
@@ -457,7 +463,16 @@ def prepare(
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names, ccd_leaving_atoms): pid
+                executor.submit(
+                    _process_one,
+                    pid,
+                    mmcif_path,
+                    output_path,
+                    use_assembly,
+                    filter_cfg,
+                    ccd_atom_names,
+                    ccd_leaving_atoms,
+                ): pid
                 for pid in ids
             }
             for i, future in enumerate(as_completed(futures)):

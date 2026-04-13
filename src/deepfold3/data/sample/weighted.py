@@ -1,6 +1,6 @@
 """Cluster-balanced weighted sampler for training data.
 
-Implements AlphaFold 3 §2.5.6 cluster-balanced sampling. Following AF3 /
+Implements AlphaFold 3 §2.5.1 cluster-balanced sampling. Following AF3 /
 Protenix / OpenFold-3, the sampling table is **flattened** so each
 ``(record, anchor)`` candidate is its own row:
 
@@ -84,7 +84,7 @@ def build_sampling_rows(
     Returns ``(rows, weights)`` where ``weights`` is a normalised
     probability distribution of length ``len(rows)``. Records with no
     valid chains contribute no rows. Cluster sizes are computed across
-    all valid chains in the dataset (matching AF3 §2.5.6).
+    all valid chains in the dataset (matching AF3 §2.5.1).
     """
     cluster_sizes = _compute_cluster_sizes(records)
     rows: list[SamplingRow] = []
@@ -230,6 +230,50 @@ class WeightedClusterSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.epoch_size // self.num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+
+class WeightedEvalSampler(Sampler[int]):
+    """Cluster-weighted fixed-size eval sampler.
+
+    Each ``set_epoch`` / ``__iter__`` draws ``n_samples`` record indices
+    **without replacement** using per-record cluster weights from
+    :func:`compute_cluster_weights`. This avoids evaluating the entire
+    (potentially huge) eval set while still covering sequence families
+    proportionally.
+
+    Yielded indices are plain record indices (no ``sampling_rows``
+    indirection) since eval doesn't need per-anchor crop control.
+
+    Compatible with DDP — each rank takes ``indices[rank::num_replicas]``.
+    """
+
+    def __init__(
+        self,
+        records: list[Record],
+        n_samples: int = 50,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+    ):
+        self.n_records = len(records)
+        self.n_samples = min(n_samples, self.n_records)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        self.weights = compute_cluster_weights(records)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        indices = rng.choice(self.n_records, size=self.n_samples, replace=False, p=self.weights)
+        shard = indices[self.rank :: self.num_replicas]
+        yield from shard.tolist()
+
+    def __len__(self) -> int:
+        return self.n_samples // self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch

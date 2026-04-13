@@ -540,9 +540,11 @@ class Trainer:
                 data_dir=eval_data_dir,
                 **ds_kwargs,
             )
+            eval_sampler = self._build_eval_sampler(eval_ds)
             eval_dl = DataLoader(
                 eval_ds,
                 batch_size=self.cfg.batch_size_per_rank,
+                sampler=eval_sampler,
                 shuffle=False,
                 collate_fn=_collate_bucket_pad,
                 num_workers=self.cfg.eval_num_workers,
@@ -560,7 +562,7 @@ class Trainer:
         ``rows`` table to ``train_ds.sampling_rows`` so the dataset's
         ``__getitem__`` can resolve each sampled index back to a record
         and the chain/interface anchor that earned the draw — closing
-        the loop the AF3 §2.5.6 sampler depends on.
+        the loop the AF3 §2.5.1 sampler depends on.
         """
         has_real_clusters = any(isinstance(c.cluster_id, int) for r in self.records for c in r.chains)
 
@@ -586,6 +588,33 @@ class Trainer:
             )
 
         return None
+
+    def _build_eval_sampler(self, eval_ds: TrainingDataset):
+        """Build eval sampler — subsample with cluster-weighted probabilities.
+
+        When ``eval_samples > 0``, uses :class:`WeightedEvalSampler` to
+        draw a fixed-size subset each eval pass using per-record cluster
+        weights (so large families aren't over-represented). Each pass
+        gets a different subset via ``set_epoch(effective_step)``.
+
+        When ``eval_samples == 0`` (use all), falls back to a plain
+        ``DistributedSampler`` (DDP) or ``None`` (single GPU).
+        """
+        n_eval = self.cfg.eval_samples
+        if n_eval <= 0 or n_eval >= len(self.eval_records):
+            if self.world_size > 1:
+                return DistributedSampler(eval_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False)
+            return None
+
+        from deepfold3.data.sample.weighted import WeightedEvalSampler
+
+        return WeightedEvalSampler(
+            records=self.eval_records,
+            n_samples=n_eval,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            seed=self.cfg.seed,
+        )
 
     # ------------------------------------------------------------------
     # Training step
@@ -1020,8 +1049,10 @@ class Trainer:
                 # Accumulate logging metrics locally (no collective).
                 # Inject token count so it rides the same all-reduce as losses.
                 seq_mask = features.get("seq_mask")
-                n_tokens = seq_mask.sum() if seq_mask is not None else torch.tensor(
-                    cfg.max_tokens * cfg.batch_size_per_rank, device=self.device
+                n_tokens = (
+                    seq_mask.sum()
+                    if seq_mask is not None
+                    else torch.tensor(cfg.max_tokens * cfg.batch_size_per_rank, device=self.device)
                 )
                 loss_dict["_tokens"] = n_tokens
                 meters.update(loss_dict, n=1)
@@ -1131,6 +1162,8 @@ class Trainer:
 
                 # --- Evaluation ---
                 if eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
+                    if hasattr(eval_dl.sampler, "set_epoch"):
+                        eval_dl.sampler.set_epoch(self.effective_step)
                     eval_metrics = self._evaluate(eval_dl)
                     if self.is_main:
                         logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")

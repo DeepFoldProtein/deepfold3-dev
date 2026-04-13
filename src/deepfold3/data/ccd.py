@@ -533,7 +533,10 @@ def build_atom_name_cache(
 
         log.info(
             "Generated ref_pos for %d/%d CCD entries (%d conformer failed, %d skipped no atoms)",
-            generated, n_total, len(failed_codes), len(skipped_no_atoms),
+            generated,
+            n_total,
+            len(failed_codes),
+            len(skipped_no_atoms),
         )
         if failed_codes:
             for code in failed_codes[:50]:
