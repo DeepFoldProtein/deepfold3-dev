@@ -352,10 +352,11 @@ def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
 
 
 def build_atom_name_cache(components_path: str | Path, output_path: str | Path) -> int:
-    """Build a JSON cache mapping CCD code → list of valid heavy-atom names.
+    """Build a JSON cache mapping CCD code → atom info.
 
-    Reads the full ``components.cif`` (or ``.cif.gz``) and extracts atom
-    names for each component, excluding hydrogens.
+    Reads the full ``components.cif`` (or ``.cif.gz``) and extracts per-component:
+    - ``atoms``: list of valid heavy-atom names
+    - ``leaving``: list of heavy-atom names with ``pdbx_leaving_atom_flag = Y``
 
     Args:
         components_path: Path to ``components.cif`` or ``components.cif.gz``.
@@ -370,19 +371,33 @@ def build_atom_name_cache(components_path: str | Path, output_path: str | Path) 
 
     log.info("Reading %s (this may take a minute)...", components_path)
     doc = gemmi.cif.read(str(components_path))
-    cache: dict[str, list[str]] = {}
+    cache: dict[str, dict] = {}
 
     for block in doc:
         code = block.name
-        table = block.find(["_chem_comp_atom.atom_id", "_chem_comp_atom.type_symbol"])
+        table = block.find(
+            [
+                "_chem_comp_atom.atom_id",
+                "_chem_comp_atom.type_symbol",
+                "_chem_comp_atom.pdbx_leaving_atom_flag",
+            ]
+        )
         names: list[str] = []
+        leaving: list[str] = []
         for row in table:
             elem = row[1].strip().strip('"')
             if elem.upper() == "H":
                 continue
-            names.append(row[0].strip().strip('"'))
+            name = row[0].strip().strip('"')
+            names.append(name)
+            flag = row[2].strip().strip('"').upper() if len(row) > 2 else ""
+            if flag == "Y":
+                leaving.append(name)
         if names:
-            cache[code] = names
+            entry: dict = {"atoms": names}
+            if leaving:
+                entry["leaving"] = leaving
+            cache[code] = entry
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,7 +409,7 @@ def build_atom_name_cache(components_path: str | Path, output_path: str | Path) 
 
 
 def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
-    """Load a pre-built CCD atom name cache.
+    """Load a pre-built CCD atom name cache (atom names only).
 
     Returns:
         Mapping from CCD code to set of valid heavy-atom names.
@@ -403,4 +418,28 @@ def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
 
     with open(path) as f:
         raw = json.load(f)
-    return {k: set(v) for k, v in raw.items()}
+    result: dict[str, set[str]] = {}
+    for k, v in raw.items():
+        if isinstance(v, list):
+            result[k] = set(v)  # backward compat: old format is list of names
+        else:
+            result[k] = set(v["atoms"])
+    return result
+
+
+def load_leaving_atom_cache(path: str | Path) -> dict[str, set[str]]:
+    """Load leaving atom names from the CCD cache.
+
+    Returns:
+        Mapping from CCD code to set of leaving heavy-atom names.
+        Only entries with leaving atoms are included.
+    """
+    import json
+
+    with open(path) as f:
+        raw = json.load(f)
+    result: dict[str, set[str]] = {}
+    for k, v in raw.items():
+        if isinstance(v, dict) and "leaving" in v:
+            result[k] = set(v["leaving"])
+    return result

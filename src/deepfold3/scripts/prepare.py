@@ -36,6 +36,7 @@ def _process_one(
     use_assembly: bool,
     filter_cfg: StructureFilterConfig | None = None,
     ccd_atom_names: dict[str, set[str]] | None = None,
+    ccd_leaving_atoms: dict[str, set[str]] | None = None,
 ) -> dict | str:
     """Process a single PDB entry. Returns record dict or skip reason string."""
     from deepfold3.data.parse.templates import find_pdb_mmcif_path
@@ -48,7 +49,9 @@ def _process_one(
         return "file not found"
 
     try:
-        structure, record = process_mmcif(cif_path, use_assembly=use_assembly, ccd_atom_names=ccd_atom_names)
+        structure, record = process_mmcif(
+            cif_path, use_assembly=use_assembly, ccd_atom_names=ccd_atom_names, ccd_leaving_atoms=ccd_leaving_atoms
+        )
     except Exception as e:
         return f"parse error: {e}"
 
@@ -379,13 +382,15 @@ def prepare(
 
         set_ccd_components_path(ccd)
 
-    # Load CCD atom name cache for validation
+    # Load CCD caches for atom name validation and leaving atom removal
     ccd_atom_names = None
+    ccd_leaving_atoms = None
     if ccd_cache:
-        from deepfold3.data.ccd import load_atom_name_cache
+        from deepfold3.data.ccd import load_atom_name_cache, load_leaving_atom_cache
 
         ccd_atom_names = load_atom_name_cache(ccd_cache)
-        log.info("Loaded CCD atom name cache: %d entries", len(ccd_atom_names))
+        ccd_leaving_atoms = load_leaving_atom_cache(ccd_cache)
+        log.info("Loaded CCD cache: %d atom name entries, %d with leaving atoms", len(ccd_atom_names), len(ccd_leaving_atoms))
 
     from deepfold3.data.prepare.filters import StructureFilterConfig
 
@@ -427,7 +432,7 @@ def prepare(
 
     if workers <= 1:
         for i, pdb_id in enumerate(ids):
-            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names)
+            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names, ccd_leaving_atoms)
             if isinstance(result, dict):
                 records.append(result)
                 log.info(
@@ -444,7 +449,7 @@ def prepare(
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names): pid
+                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names, ccd_leaving_atoms): pid
                 for pid in ids
             }
             for i, future in enumerate(as_completed(futures)):

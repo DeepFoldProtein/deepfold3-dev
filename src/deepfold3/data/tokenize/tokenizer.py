@@ -50,50 +50,72 @@ class Tokenizer:
             res_end = res_start + int(chain["res_num"])
 
             if mol_type in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA):
-                # One token per residue
                 for ri in range(res_start, res_end):
                     res = structure.residues[ri]
                     res_type = int(res["res_type"])
                     res_id = int(res["res_id"])
                     atom_idx = int(res["atom_idx"])
                     atom_num = int(res["atom_num"])
+                    is_standard = bool(res["is_standard"])
 
-                    # Center coordinates: use first atom or CA/C1' if present
-                    cx, cy, cz = _get_center_coords(
-                        structure.atoms,
-                        atom_idx,
-                        atom_num,
-                        res["name"].decode("ascii", errors="replace").strip(),
-                        mol_type,
-                    )
-
-                    tokens_list.append(
-                        (
-                            token_idx,  # token_idx
-                            res_id,  # residue_index (PDB number)
-                            res_type,  # res_type
-                            mol_type,  # mol_type
-                            asym_id,  # asym_id
-                            entity_id,  # entity_id
-                            sym_id,  # sym_id
-                            atom_idx,  # atom_idx
-                            atom_num,  # atom_num
-                            cx,
-                            cy,
-                            cz,  # center coords
+                    if is_standard:
+                        # Standard residue: one token per residue
+                        cx, cy, cz = _get_center_coords(
+                            structure.atoms,
+                            atom_idx,
+                            atom_num,
+                            res["name"].decode("ascii", errors="replace").strip(),
+                            mol_type,
                         )
-                    )
 
-                    # Register each atom in this residue for cross-entity bond lookup
-                    for ai in range(atom_num):
-                        atom_to_token[atom_idx + ai] = (token_idx, ai)
+                        tokens_list.append(
+                            (
+                                token_idx,
+                                res_id,
+                                res_type,
+                                mol_type,
+                                asym_id,
+                                entity_id,
+                                sym_id,
+                                atom_idx,
+                                atom_num,
+                                cx,
+                                cy,
+                                cz,
+                            )
+                        )
 
-                    # NOTE: backbone bonds are NOT included in the bond matrix.
-                    # AF3 restricts the bond matrix to polymer-ligand and
-                    # ligand-ligand covalent bonds only.  Backbone connectivity
-                    # is already captured by the sequence/relative-position encoding.
+                        for ai in range(atom_num):
+                            atom_to_token[atom_idx + ai] = (token_idx, ai)
 
-                    token_idx += 1
+                        token_idx += 1
+                    else:
+                        # AF3 §2.6: modified (non-standard) residue — one token per atom
+                        for ai in range(atom_num):
+                            global_ai = atom_idx + ai
+                            atom = structure.atoms[global_ai]
+                            cx = float(atom["x"])
+                            cy = float(atom["y"])
+                            cz = float(atom["z"])
+
+                            tokens_list.append(
+                                (
+                                    token_idx,
+                                    res_id,
+                                    20,  # res_type = UNK for per-atom tokens
+                                    mol_type,
+                                    asym_id,
+                                    entity_id,
+                                    sym_id,
+                                    global_ai,
+                                    1,  # atom_num = 1
+                                    cx,
+                                    cy,
+                                    cz,
+                                )
+                            )
+                            atom_to_token[global_ai] = (token_idx, 0)
+                            token_idx += 1
 
             elif mol_type == const.MOL_NONPOLYMER:
                 # One token per heavy atom

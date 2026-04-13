@@ -221,8 +221,12 @@ def _hash_sequence(seq: str) -> str:
 
 
 def _chain_sequence(residues: list[tuple[str, int, bool]]) -> str:
-    """Build canonical sequence string from residue list for entity/MSA dedup."""
-    return "|".join(res_name for res_name, _, _ in residues)
+    """Build canonical sequence string from residue list for entity/MSA dedup.
+
+    Modified residues are normalized to their parent standard residue
+    (AF3 §2.5.3) so that e.g. MSE chains cluster with MET chains.
+    """
+    return "|".join(const._NONSTANDARD_TO_STANDARD.get(res_name.strip(), res_name) for res_name, _, _ in residues)
 
 
 def _compute_interfaces(
@@ -258,6 +262,7 @@ def process_mmcif(
     use_assembly: bool = True,
     assembly_id: str = "1",
     ccd_atom_names: dict[str, set[str]] | None = None,
+    ccd_leaving_atoms: dict[str, set[str]] | None = None,
 ) -> tuple[Structure, Record]:
     """Process a PDB mmCIF file into a DeepFold3 Structure and Record.
 
@@ -268,6 +273,9 @@ def process_mmcif(
         ccd_atom_names: Optional CCD atom name cache for validation. If provided,
             atoms whose names are not in the CCD dictionary for their residue type
             are excluded (AF3 §2.5.4).
+        ccd_leaving_atoms: Optional CCD leaving atom cache. If provided, leaving
+            atoms are removed from residues involved in covalent bonds that have
+            ``pdbx_leaving_atom_flag`` set (AF3 §2.5.4).
 
     Returns:
         Tuple of (Structure, Record).
@@ -301,6 +309,44 @@ def process_mmcif(
     for entity in st.entities:
         for sc in entity.subchains:
             subchain_to_entity[sc] = entity.name
+
+    # AF3 §2.5.4: collect leaving atoms to exclude from covalent bond partners
+    _leaving_atoms: set[tuple[str, int, str]] = set()  # (chain_name, res_id, atom_name)
+    if ccd_leaving_atoms:
+        _conn_table = doc[0].find(
+            "_struct_conn.",
+            [
+                "conn_type_id",
+                "pdbx_leaving_atom_flag",
+                "ptnr1_label_asym_id",
+                "ptnr1_label_comp_id",
+                "ptnr1_label_seq_id",
+                "ptnr2_label_asym_id",
+                "ptnr2_label_comp_id",
+                "ptnr2_label_seq_id",
+            ],
+        )
+        for row in _conn_table:
+            flag = row[1].strip().strip('"').lower()
+            if flag not in ("one", "both"):
+                continue
+            # Partner 1
+            p1_chain, p1_comp, p1_seq = row[2].strip(), row[3].strip(), row[4].strip()
+            p2_chain, p2_comp, p2_seq = row[5].strip(), row[6].strip(), row[7].strip()
+            try:
+                p1_seq_int = int(p1_seq) if p1_seq != "." else 0
+                p2_seq_int = int(p2_seq) if p2_seq != "." else 0
+            except ValueError:
+                continue
+            # "one" = partner 2 has leaving atoms; "both" = both partners
+            if flag == "both" or flag == "one":
+                for atom_name in ccd_leaving_atoms.get(p2_comp, ()):
+                    _leaving_atoms.add((p2_chain, p2_seq_int, atom_name))
+            if flag == "both":
+                for atom_name in ccd_leaving_atoms.get(p1_comp, ()):
+                    _leaving_atoms.add((p1_chain, p1_seq_int, atom_name))
+        if _leaving_atoms:
+            logger.debug("%s: excluding %d leaving atoms from %d covalent bonds", pdb_id, len(_leaving_atoms), len(_conn_table))
 
     # Parse model into arrays
     all_atoms: list[tuple] = []
@@ -376,6 +422,10 @@ def process_mmcif(
 
                     # AF3 §2.5.4: filter atoms not in CCD dictionary
                     if _ccd_valid is not None and atom.name.strip() not in _ccd_valid:
+                        continue
+
+                    # AF3 §2.5.4: remove leaving atoms from covalent bond partners
+                    if _leaving_atoms and (orig_label, res_id, atom.name.strip()) in _leaving_atoms:
                         continue
 
                     pos = atom.pos

@@ -62,7 +62,6 @@ class StructureFilterConfig:
     max_ca_dist: float = 10.0
     clash_freq: float = 0.3
     clash_dist: float = 1.7
-    max_polymer_chains: int = 20  # AF3 §2.5.4: keep 20 closest to interface center
 
 
 def _get_chain_residues(structure: Structure, chain_info: ChainInfo) -> np.ndarray:
@@ -344,12 +343,10 @@ def filter_structure(
             reasons[ci.chain_name] = "chain clashing"
             ci.valid = False
 
-    # AF3 §2.5.4: if >20 polymer chains, keep 20 that maximise interfaces
-    too_far = select_interface_chains(record, cfg.max_polymer_chains)
-    for ci in record.chains:
-        if ci.chain_id in too_far:
-            reasons[ci.chain_name] = f"polymer chain not in top {cfg.max_polymer_chains} closest to interface"
-            ci.valid = False
+    # NOTE: chain selection (>20 polymer chains → keep 20 maximising interfaces)
+    # is NOT applied here.  It belongs at training time (sampler/dataset) because
+    # the limit varies by stage (initial=20, fine-tune=larger).
+    # Use select_interface_chains() from this module at load time.
 
     # Mark interfaces invalid if either chain is invalid
     valid_chain_ids = {ci.chain_id for ci in record.chains if ci.valid}
