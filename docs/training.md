@@ -189,7 +189,7 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py`: rea
 
 **Train/eval split**: records are shuffled with a fixed seed (42) then split 95/5 (at least 1 eval record). The seeded shuffle ensures reproducible splits regardless of manifest ordering.
 
-**Sampling**: If records have integer cluster IDs (from wwPDB `clusters-by-entity-40.txt`), `WeightedClusterSampler` applies AF3-style cluster-balanced weights: `w = β[type] × Σ(α[mol] × count) / cluster_size` with α(protein)=3, α(nucleic)=3, α(ligand)=1, β(chain)=0.5, β(interface)=1.0. Synthetic epoch size of 10,000 samples. Falls back to uniform `DistributedSampler` if no cluster data.
+**Sampling**: If records have cluster IDs (from wwPDB `clusters-by-entity-40.txt`), `WeightedClusterSampler` applies AF3 §2.5.1 cluster-balanced weights with per-chain and per-interface rows: `w = β[type] × Σ(α[mol] × count) / N_clust` with α(protein)=3, α(nucleic)=3, α(ligand)=1, β(chain)=0.5, β(interface)=1.0. For chains, `N_clust` is the chain cluster size. For interfaces, `N_clust` is the **interface cluster** size per AF3 §2.5.3 — interfaces share a cluster iff their constituent chain pairs map to the same pair of chain clusters. Synthetic epoch size of 10,000 samples. Falls back to uniform `DistributedSampler` if no cluster data.
 
 **Cropping**: Three strategies with weighted random selection — contiguous (20%), spatial KD-tree (40%), interface-seeded (40%). Interface cropping seeds from tokens within 15 Å of another chain, then expands spatially.
 
@@ -499,7 +499,6 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 | Paper section | Item | Our approach | Impact |
 |---|---|---|---|
 | §3.7.1 | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
-| §2.5.1 | Chain/interface-level sampling | Sampler aggregates per-record, not per-(chain\|interface) | Affects sampling distribution; see §2.5.1 weight formula |
 
 ### ❌ Missing (known gaps)
 

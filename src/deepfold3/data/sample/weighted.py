@@ -1,14 +1,20 @@
 """Cluster-balanced weighted sampler for training data.
 
-Implements AlphaFold 3 §2.5.1 cluster-balanced sampling. Following AF3 /
-Protenix / OpenFold-3, the sampling table is **flattened** so each
-``(record, anchor)`` candidate is its own row:
+Implements AlphaFold 3 §2.5.1 cluster-balanced sampling. The sampling
+table is **flattened** so each ``(record, anchor)`` candidate is its own row:
 
 * one row per **valid chain** of every record
-  ``w_chain     = beta_chain / cluster_size * alpha(mol_type)``
+  ``w_chain     = beta_chain / N_clust * alpha(mol_type)``
 * one row per **valid interface** of every record
-  ``w_interface = beta_interface / sqrt(cluster_size_1 * cluster_size_2)
-                  * (alpha(c1.mol_type) + alpha(c2.mol_type))``
+  ``w_interface = beta_interface / N_clust * (alpha(c1.mol_type) + alpha(c2.mol_type))``
+
+For chains, ``N_clust`` is the number of valid chains sharing the same
+chain cluster ID.
+
+For interfaces, ``N_clust`` is the number of valid interfaces sharing
+the same **interface cluster ID**, defined per AF3 §2.5.3 as the
+(unordered) pair of constituent chain cluster IDs:
+``C_interface = frozenset({C_chain_1, C_chain_2})``.
 
 Sampling a row tells the dataloader BOTH which record to load AND which
 chain/interface should anchor the crop. This is critical: a 20-chain
@@ -55,19 +61,44 @@ def _mol_type_alpha(mol_type: int, alpha_prot: float, alpha_nucl: float, alpha_l
     return 1.0
 
 
-def _find_chain(rec: Record, chain_id: int):
-    for c in rec.chains:
-        if c.chain_id == chain_id:
-            return c
-    return None
-
-
-def _compute_cluster_sizes(records: list[Record]) -> dict:
+def _compute_chain_cluster_sizes(records: list[Record]) -> dict:
+    """Count valid chains per chain cluster ID."""
     counter: Counter = Counter()
     for rec in records:
         for chain in rec.chains:
             if chain.valid:
                 counter[chain.cluster_id] += 1
+    return dict(counter)
+
+
+def _interface_cluster_id(c1_cluster, c2_cluster):
+    """Build an interface cluster ID from two chain cluster IDs (AF3 §2.5.3).
+
+    Interface clustering is a join on chain cluster pairs: interfaces share
+    a cluster iff their constituent chain pairs map to the same pair of chain
+    clusters (unordered).
+    """
+    return frozenset((c1_cluster, c2_cluster))
+
+
+def _compute_interface_cluster_sizes(records: list[Record]) -> dict:
+    """Count valid interfaces per interface cluster ID.
+
+    The interface cluster ID is the unordered pair of constituent chain
+    cluster IDs, per AF3 §2.5.3.
+    """
+    counter: Counter = Counter()
+    for rec in records:
+        chain_map = {c.chain_id: c for c in rec.chains}
+        for iface in rec.interfaces:
+            if not iface.valid:
+                continue
+            c1 = chain_map.get(iface.chain_1)
+            c2 = chain_map.get(iface.chain_2)
+            if c1 is None or c2 is None or not c1.valid or not c2.valid:
+                continue
+            icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
+            counter[icid] += 1
     return dict(counter)
 
 
@@ -83,18 +114,24 @@ def build_sampling_rows(
 
     Returns ``(rows, weights)`` where ``weights`` is a normalised
     probability distribution of length ``len(rows)``. Records with no
-    valid chains contribute no rows. Cluster sizes are computed across
-    all valid chains in the dataset (matching AF3 §2.5.1).
+    valid chains contribute no rows.
+
+    Chain cluster sizes are counted across all valid chains. Interface
+    cluster sizes are counted across all valid interfaces, using the
+    AF3 §2.5.3 interface cluster ID = unordered pair of chain cluster IDs.
     """
-    cluster_sizes = _compute_cluster_sizes(records)
+    chain_cluster_sizes = _compute_chain_cluster_sizes(records)
+    iface_cluster_sizes = _compute_interface_cluster_sizes(records)
     rows: list[SamplingRow] = []
     weight_list: list[float] = []
 
     for record_idx, rec in enumerate(records):
+        chain_map = {c.chain_id: c for c in rec.chains}
+
         for chain in rec.chains:
             if not chain.valid:
                 continue
-            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
+            cs = max(chain_cluster_sizes.get(chain.cluster_id, 1), 1)
             alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
             w = beta_chain * alpha / cs
             if w > 0:
@@ -104,16 +141,16 @@ def build_sampling_rows(
         for iface in rec.interfaces:
             if not iface.valid:
                 continue
-            c1 = _find_chain(rec, iface.chain_1)
-            c2 = _find_chain(rec, iface.chain_2)
+            c1 = chain_map.get(iface.chain_1)
+            c2 = chain_map.get(iface.chain_2)
             if c1 is None or c2 is None or not c1.valid or not c2.valid:
                 continue
-            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
-            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
             alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
                 c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
             )
-            cs = max((cs1 * cs2) ** 0.5, 1.0)
+            # AF3 §2.5.3: N_clust = size of interface cluster (pair of chain clusters)
+            icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
+            cs = max(iface_cluster_sizes.get(icid, 1), 1)
             w = beta_interface * alpha_sum / cs
             if w > 0:
                 rows.append(SamplingRow(record_idx, "interface", c1.chain_id, c2.chain_id))
@@ -145,30 +182,31 @@ def compute_cluster_weights(
     callers that don't need the per-anchor flat layout. New code should
     use :func:`build_sampling_rows` instead.
     """
-    cluster_sizes = _compute_cluster_sizes(records)
+    chain_cluster_sizes = _compute_chain_cluster_sizes(records)
+    iface_cluster_sizes = _compute_interface_cluster_sizes(records)
     weights = np.zeros(len(records), dtype=np.float64)
 
     for i, rec in enumerate(records):
         w = 0.0
+        chain_map = {c.chain_id: c for c in rec.chains}
         for chain in rec.chains:
             if not chain.valid:
                 continue
-            cs = max(cluster_sizes.get(chain.cluster_id, 1), 1)
+            cs = max(chain_cluster_sizes.get(chain.cluster_id, 1), 1)
             alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
             w += beta_chain * alpha / cs
         for iface in rec.interfaces:
             if not iface.valid:
                 continue
-            c1 = _find_chain(rec, iface.chain_1)
-            c2 = _find_chain(rec, iface.chain_2)
-            if c1 is None or c2 is None:
+            c1 = chain_map.get(iface.chain_1)
+            c2 = chain_map.get(iface.chain_2)
+            if c1 is None or c2 is None or not c1.valid or not c2.valid:
                 continue
-            cs1 = max(cluster_sizes.get(c1.cluster_id, 1), 1)
-            cs2 = max(cluster_sizes.get(c2.cluster_id, 1), 1)
             alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
                 c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
             )
-            cs = max((cs1 * cs2) ** 0.5, 1)
+            icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
+            cs = max(iface_cluster_sizes.get(icid, 1), 1)
             w += beta_interface * alpha_sum / cs
         weights[i] = w
     total = weights.sum()
