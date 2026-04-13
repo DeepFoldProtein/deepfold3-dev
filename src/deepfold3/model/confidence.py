@@ -85,21 +85,22 @@ class ConfidenceHead(nn.Module):
         )
 
         # Output heads: LayerNorm before logit projections (matching AF3)
+        # AF3: all logit projections use final_init (zeros)
         max_atoms = cfg.max_atoms_per_token
 
         self.plddt_logits_ln = LayerNorm(c_single)
-        self.plddt_logits = LinearNoBias(c_single, max_atoms * cfg.num_plddt_bins)
+        self.plddt_logits = LinearNoBias(c_single, max_atoms * cfg.num_plddt_bins, initializer="zeros")
 
         self.pae_logits_ln = LayerNorm(c_pair)
-        self.pae_logits = LinearNoBias(c_pair, cfg.num_distogram_bins)
+        self.pae_logits = LinearNoBias(c_pair, cfg.num_distogram_bins, initializer="zeros")
 
         # PDE head: symmetrised half-logits on pair track
         self.pde_logits_ln = LayerNorm(c_pair)
-        self.pde_half_logits = LinearNoBias(c_pair, cfg.num_distogram_bins)
+        self.pde_half_logits = LinearNoBias(c_pair, cfg.num_distogram_bins, initializer="zeros")
 
         # Experimentally resolved head: per-atom 2-class on single track
         self.exp_resolved_ln = LayerNorm(c_single)
-        self.exp_resolved_logits = LinearNoBias(c_single, max_atoms * 2)
+        self.exp_resolved_logits = LinearNoBias(c_single, max_atoms * 2, initializer="zeros")
 
     def _embed_features(
         self,

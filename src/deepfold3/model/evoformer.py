@@ -201,10 +201,11 @@ class Evoformer(nn.Module):
         self.bond_embedding = LinearNoBias(1, c_pair)
 
         # Previous embedding projections (recycling)
+        # AF3: prev_embedding and prev_single_embedding use final_init (zeros)
         self.prev_embedding_layer_norm = LayerNorm(c_pair)
-        self.prev_embedding = LinearNoBias(c_pair, c_pair)
+        self.prev_embedding = LinearNoBias(c_pair, c_pair, initializer="zeros")
         self.prev_single_embedding_layer_norm = LayerNorm(c_single)
-        self.prev_single_embedding = LinearNoBias(c_single, c_single)
+        self.prev_single_embedding = LinearNoBias(c_single, c_single, initializer="zeros")
 
         # Position activations for relative encoding
         # rel_feat_dim = rel_pos(66) + rel_token(66) + entity_same(1) + rel_chain(6) = 139

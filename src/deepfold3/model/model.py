@@ -67,7 +67,8 @@ class DistogramHead(nn.Module):
         self.num_bins = cfg.num_bins
         self.first_break = cfg.first_break
         self.last_break = cfg.last_break
-        self.half_logits = LinearNoBias(pair_channels, self.num_bins)
+        # AF3: half_logits uses final_init (zeros)
+        self.half_logits = LinearNoBias(pair_channels, self.num_bins, initializer="zeros")
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
         """Symmetrised logits [..., N, N, num_bins]."""

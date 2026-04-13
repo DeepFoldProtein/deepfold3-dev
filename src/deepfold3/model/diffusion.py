@@ -23,7 +23,7 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncoderStatic
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LinearNoBias
+from deepfold3.model.primitives import LinearNoBias, af3_linear_init_
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -202,25 +202,36 @@ class DiffusionTransformerBlock(nn.Module):
         # Conditioning inputs are c_single_cond-dimensional, outputs are c-dimensional
         self.attn_norm = nn.LayerNorm(c, elementwise_affine=False)
         self.attn_cond_norm_w = nn.Parameter(torch.ones(c_single_cond))
+        # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
         self.attn_cond_scale = nn.Linear(c_single_cond, c)
-        self.attn_cond_bias = LinearNoBias(c_single_cond, c)
+        af3_linear_init_(self.attn_cond_scale.weight, "zeros")
+        nn.init.zeros_(self.attn_cond_scale.bias)
+        self.attn_cond_bias = LinearNoBias(c_single_cond, c, initializer="zeros")
         self.to_q = nn.Linear(c, key_dim)  # q_projection has bias
+        af3_linear_init_(self.to_q.weight, "linear")
+        nn.init.zeros_(self.to_q.bias)
         self.to_k = LinearNoBias(c, key_dim)
         self.to_v = LinearNoBias(c, value_dim)
-        self.to_g = LinearNoBias(c, value_dim)  # gating_query no bias
-        self.out_proj = LinearNoBias(value_dim, c)  # transition2 no bias
+        # AF3: gating_query uses initializer='zeros' (no bias)
+        self.to_g = LinearNoBias(c, value_dim, initializer="zeros")
+        # AF3: transition2 uses default init (with single_cond), adaptive_zero_cond gates it
+        self.out_proj = LinearNoBias(value_dim, c)
         self.zero_cond = nn.Linear(c_single_cond, c)
 
         # FFN with AdaLN-zero
         self.ffn_norm = nn.LayerNorm(c, elementwise_affine=False)
         self.ffn_cond_norm_w = nn.Parameter(torch.ones(c_single_cond))
+        # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
         self.ffn_cond_scale = nn.Linear(c_single_cond, c)
-        self.ffn_cond_bias = LinearNoBias(c_single_cond, c)
-        self.ffn_linear1 = LinearNoBias(c, num_int * 2)
+        af3_linear_init_(self.ffn_cond_scale.weight, "zeros")
+        nn.init.zeros_(self.ffn_cond_scale.bias)
+        self.ffn_cond_bias = LinearNoBias(c_single_cond, c, initializer="zeros")
+        # AF3: ffw_transition1 uses initializer='relu'
+        self.ffn_linear1 = LinearNoBias(c, num_int * 2, initializer="relu")
         self.ffn_linear2 = LinearNoBias(num_int, c)  # ffw_transition2 no bias
         self.ffn_zero_cond = nn.Linear(c_single_cond, c)
 
-        # Initialize
+        # Initialize zero_cond gates
         nn.init.zeros_(self.zero_cond.weight)
         nn.init.constant_(self.zero_cond.bias, -2.0)
         nn.init.zeros_(self.ffn_zero_cond.weight)
@@ -597,8 +608,9 @@ class DiffusionHead(nn.Module):
         )
 
         # Project trunk single to diffusion act (scale-only LN + no-bias projection)
+        # AF3: single_cond_embedding_projection uses final_init (zeros)
         self.single_cond_emb_norm_w = nn.Parameter(torch.ones(cfg.conditioning_seq_channel))
-        self.single_cond_embedding_projection = LinearNoBias(cfg.conditioning_seq_channel, c_diff)
+        self.single_cond_embedding_projection = LinearNoBias(cfg.conditioning_seq_channel, c_diff, initializer="zeros")
 
         # Main diffusion transformer
         self.transformer = DiffusionTransformer(

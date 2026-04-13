@@ -55,9 +55,10 @@ class FusedTransitionBlock(nn.Module):
             self._swiglu = None
 
         # These are always created for weight compatibility
+        # AF3: transition1='relu', transition2=final_init ('zeros')
         self.norm = nn.LayerNorm(channels)
-        self.linear1 = LinearNoBias(channels, num_intermediate * 2)
-        self.linear2 = LinearNoBias(num_intermediate, channels)
+        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")
+        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")
 
         if HAS_TRITON:
             self._sync_to_fused()

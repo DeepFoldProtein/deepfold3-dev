@@ -277,16 +277,16 @@ class SingleTemplateEmbedding(nn.Module):
         c = cfg.num_channels
         pc = cfg.pair_channel
 
-        # 9 input feature projections
-        self.embed_dgram = LinearNoBias(cfg.dgram_num_bins, c)  # 0: distance histogram
-        self.embed_pseudo_beta = LinearNoBias(1, c)  # 1: pseudo-beta mask
-        self.embed_aatype_row = LinearNoBias(cfg.aatype_num_classes, c)  # 2: aatype (row)
-        self.embed_aatype_col = LinearNoBias(cfg.aatype_num_classes, c)  # 3: aatype (col)
-        self.embed_unit_vec_x = LinearNoBias(1, c)  # 4: backbone unit vec x
-        self.embed_unit_vec_y = LinearNoBias(1, c)  # 5: backbone unit vec y
-        self.embed_unit_vec_z = LinearNoBias(1, c)  # 6: backbone unit vec z
-        self.embed_backbone_mask = LinearNoBias(1, c)  # 7: backbone mask
-        self.embed_query = LinearNoBias(pc, c)  # 8: query embedding
+        # 9 input feature projections (AF3: template_pair_embedding_* uses initializer='relu')
+        self.embed_dgram = LinearNoBias(cfg.dgram_num_bins, c, initializer="relu")
+        self.embed_pseudo_beta = LinearNoBias(1, c, initializer="relu")
+        self.embed_aatype_row = LinearNoBias(cfg.aatype_num_classes, c, initializer="relu")
+        self.embed_aatype_col = LinearNoBias(cfg.aatype_num_classes, c, initializer="relu")
+        self.embed_unit_vec_x = LinearNoBias(1, c, initializer="relu")
+        self.embed_unit_vec_y = LinearNoBias(1, c, initializer="relu")
+        self.embed_unit_vec_z = LinearNoBias(1, c, initializer="relu")
+        self.embed_backbone_mask = LinearNoBias(1, c, initializer="relu")
+        self.embed_query = LinearNoBias(pc, c, initializer="relu")
 
         # LayerNorm on query embedding before projection
         self.query_norm = LayerNorm(pc)
@@ -415,7 +415,8 @@ class TemplateEmbedding(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.single_template_emb = SingleTemplateEmbedding(cfg, optim=optim)
-        self.output_proj = LinearNoBias(cfg.num_channels, cfg.pair_channel)
+        # AF3: output_linear uses initializer='relu'
+        self.output_proj = LinearNoBias(cfg.num_channels, cfg.pair_channel, initializer="relu")
 
     def forward(
         self,

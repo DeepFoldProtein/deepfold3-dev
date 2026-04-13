@@ -67,6 +67,11 @@ class TestTriangleMulOutgoing:
 
         torch.manual_seed(42)
         tm = TriangleMulOutgoing(c_z=32)
+        # AF3-style init zeros output projections → output is zero at init.
+        # Randomize weights so the mask actually affects output.
+        for p in tm.parameters():
+            if p.dim() >= 2:
+                torch.nn.init.kaiming_uniform_(p)
         tm.eval()
         z = torch.randn(4, 4, 32)
         mask_full = torch.ones(4, 4)

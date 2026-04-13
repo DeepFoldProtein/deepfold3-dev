@@ -37,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfold3.model.config import OptimConfig
-from deepfold3.model.primitives import LayerNorm, LinearNoBias
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_
 
 
 def _load_evo_attn():
@@ -70,8 +70,9 @@ class GridSelfAttention(nn.Module):
         self.to_q = LinearNoBias(c, num_heads * self.head_dim)
         self.to_k = LinearNoBias(c, num_heads * self.head_dim)
         self.to_v = LinearNoBias(c, num_heads * self.head_dim)
-        self.to_g = LinearNoBias(c, num_heads * self.head_dim)
-        self.out_proj = LinearNoBias(num_heads * self.head_dim, c)
+        # AF3: gating_query uses initializer='zeros' (no bias)
+        self.to_g = LinearNoBias(c, num_heads * self.head_dim, initializer="zeros")
+        self.out_proj = LinearNoBias(num_heads * self.head_dim, c, initializer="zeros")
 
         self._evo_attn = None
         self._ln_transpose = None
@@ -303,8 +304,9 @@ class MSAAttention(nn.Module):
         self.pair_norm = LayerNorm(c_pair)
         self.pair_logits = LinearNoBias(c_pair, num_heads)
         self.to_v = LinearNoBias(c_msa, num_heads * self.head_dim)
-        self.to_g = LinearNoBias(c_msa, num_heads * self.head_dim)
-        self.out_proj = LinearNoBias(num_heads * self.head_dim, c_msa)
+        # AF3: gating_query uses initializer='zeros' (no bias)
+        self.to_g = LinearNoBias(c_msa, num_heads * self.head_dim, initializer="zeros")
+        self.out_proj = LinearNoBias(num_heads * self.head_dim, c_msa, initializer="zeros")
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
 
@@ -382,10 +384,14 @@ class SingleAttention(nn.Module):
         self.norm = LayerNorm(c)
 
         self.to_q = nn.Linear(c, key_dim)
+        af3_linear_init_(self.to_q.weight, "linear")
+        nn.init.zeros_(self.to_q.bias)
         self.to_k = LinearNoBias(c, key_dim)
         self.to_v = LinearNoBias(c, value_dim)
-        self.to_g = LinearNoBias(c, value_dim)
-        self.out_proj = LinearNoBias(value_dim, c)
+        # AF3: gating_query uses initializer='zeros' (no bias)
+        self.to_g = LinearNoBias(c, value_dim, initializer="zeros")
+        # AF3: adaptive_zero_init with single_cond=None → plain linear output (final_init)
+        self.out_proj = LinearNoBias(value_dim, c, initializer="zeros")
 
         # Triton EvoAttention is NOT beneficial for SingleAttention (N_seq=1 makes kernel
         # overhead dominate — benchmarks show 0.87-1.03x, i.e. slower). Use torch.compile instead.

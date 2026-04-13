@@ -6,16 +6,47 @@ expected mapping so that load_state_dict() works without manual renaming.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Constant from scipy.stats.truncnorm.std(a=-2, b=2, loc=0., scale=1.)
+# Used to adjust stddev for truncation at ±2 sigma.
+TRUNCATED_NORMAL_STDDEV_FACTOR = 0.87962566103423978
+
+
+def af3_linear_init_(weight: torch.Tensor, initializer: str = "linear") -> None:
+    """Initialize a weight tensor using AF3's variance-scaled truncated normal.
+
+    Args:
+        weight: Parameter tensor of shape ``[out_features, in_features]``.
+        initializer: One of ``'linear'``, ``'relu'``, or ``'zeros'``.
+    """
+    if initializer == "zeros":
+        nn.init.zeros_(weight)
+        return
+    fan_in = weight.shape[1] if weight.dim() >= 2 else weight.shape[0]
+    scale = 1.0 / fan_in
+    if initializer == "relu":
+        scale *= 2.0
+    stddev = math.sqrt(scale) / TRUNCATED_NORMAL_STDDEV_FACTOR
+    nn.init.trunc_normal_(weight, mean=0.0, std=stddev, a=-2.0, b=2.0)
+
 
 class LinearNoBias(nn.Linear):
-    """nn.Linear with bias=False, matching AF3's `hm.Linear(use_bias=False)`."""
+    """nn.Linear with bias=False, matching AF3's `hm.Linear(use_bias=False)`.
 
-    def __init__(self, in_features: int, out_features: int):
+    Supports AF3-compatible initialization via the ``initializer`` parameter:
+        ``'linear'``  — truncated normal, stddev = sqrt(1/fan_in) / 0.8796 (default)
+        ``'relu'``    — truncated normal, stddev = sqrt(2/fan_in) / 0.8796
+        ``'zeros'``   — all zeros
+    """
+
+    def __init__(self, in_features: int, out_features: int, initializer: str = "linear"):
         super().__init__(in_features, out_features, bias=False)
+        af3_linear_init_(self.weight, initializer)
 
 
 class LayerNorm(nn.LayerNorm):
@@ -51,7 +82,10 @@ class AdaLayerNorm(nn.Module):
         # weight-only LN (create_offset=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, dim)
-        self.cond_bias = LinearNoBias(cond_dim, dim)
+        self.cond_bias = LinearNoBias(cond_dim, dim, initializer="zeros")
+        # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
+        af3_linear_init_(self.cond_scale.weight, "zeros")
+        nn.init.zeros_(self.cond_scale.bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         x = self.norm(x)
@@ -83,8 +117,8 @@ class TransitionBlock(nn.Module):
         num_intermediate = channels * num_intermediate_factor
         self.norm = LayerNorm(channels)
         # AF3 uses SwiGLU: transition1 projects to 2 × intermediate
-        self.linear1 = LinearNoBias(channels, num_intermediate * 2)
-        self.linear2 = LinearNoBias(num_intermediate, channels)
+        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")
+        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")
         self._act = SwiGLU()
         if optim is not None and optim.use_fused_swiglu:
             try:
@@ -120,10 +154,13 @@ class AdaTransitionBlock(nn.Module):
         self.norm = nn.LayerNorm(channels, elementwise_affine=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, channels)
-        self.cond_bias = LinearNoBias(cond_dim, channels)
+        self.cond_bias = LinearNoBias(cond_dim, channels, initializer="zeros")
+        # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
+        af3_linear_init_(self.cond_scale.weight, "zeros")
+        nn.init.zeros_(self.cond_scale.bias)
         # FFW
-        self.linear1 = LinearNoBias(channels, num_intermediate * 2)
-        self.linear2 = LinearNoBias(num_intermediate, channels)
+        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")
+        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")
         # AdaLN-zero gate (init bias -2 ≈ sigmoid(-2) ~ 0.1)
         self.zero_cond = nn.Linear(cond_dim, channels)
         nn.init.zeros_(self.zero_cond.weight)

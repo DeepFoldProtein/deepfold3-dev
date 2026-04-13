@@ -87,6 +87,11 @@ class TestGridSelfAttention:
         from deepfold3.model.attention import GridSelfAttention
 
         attn = GridSelfAttention(c=32, num_heads=4, transpose=False)
+        # AF3-style init zeros out_proj/to_g → output is zero at init.
+        # Randomize weights so the mask actually affects output.
+        for p in attn.parameters():
+            if p.dim() >= 2:
+                torch.nn.init.kaiming_uniform_(p)
         attn.eval()
         z = torch.randn(4, 4, 32)
 

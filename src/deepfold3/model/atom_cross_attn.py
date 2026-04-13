@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold3.model.primitives import LinearNoBias
+from deepfold3.model.primitives import LinearNoBias, af3_linear_init_
 
 
 @dataclasses.dataclass
@@ -364,9 +364,10 @@ class AtomPerAtomConditioning(nn.Module):
         self.embed_pair_offsets = LinearNoBias(3, cp)
         self.embed_pair_distances = LinearNoBias(1, cp)
         # small MLP on pair (accessible from encoder for cross-token pairs)
-        self.pair_mlp1 = LinearNoBias(cp, cp)
-        self.pair_mlp2 = LinearNoBias(cp, cp)
-        self.pair_mlp3 = LinearNoBias(cp, cp)
+        # AF3: pair_mlp_1/2 use initializer='relu', pair_mlp_3 uses final_init (zeros)
+        self.pair_mlp1 = LinearNoBias(cp, cp, initializer="relu")
+        self.pair_mlp2 = LinearNoBias(cp, cp, initializer="relu")
+        self.pair_mlp3 = LinearNoBias(cp, cp, initializer="zeros")
 
     def single_cond(
         self,
@@ -485,14 +486,18 @@ class AtomCrossAttTransformer(nn.Module):
         self.attn_blocks = nn.ModuleList()
         self.ffn_blocks = nn.ModuleList()
         for _ in range(num_blocks):
+            to_q = nn.Linear(c, c)  # q_projection has bias
+            af3_linear_init_(to_q.weight, "linear")
+            nn.init.zeros_(to_q.bias)
             self.attn_blocks.append(
                 nn.ModuleDict(
                     {
-                        "to_q": nn.Linear(c, c),  # q_projection has bias
+                        "to_q": to_q,
                         "to_k": LinearNoBias(c, c),
                         "to_v": LinearNoBias(c, c),
-                        "to_g": LinearNoBias(c, c),  # gating_query no bias
-                        "out_proj": LinearNoBias(c, c),  # transition2 no bias
+                        # AF3: gating_query uses initializer='zeros' (no bias)
+                        "to_g": LinearNoBias(c, c, initializer="zeros"),
+                        "out_proj": LinearNoBias(c, c),  # transition2 (default — gate handles zero init)
                         "zero_cond": nn.Linear(c, c),  # adaptive_zero_cond has bias
                     }
                 )
@@ -500,8 +505,9 @@ class AtomCrossAttTransformer(nn.Module):
             self.ffn_blocks.append(
                 nn.ModuleDict(
                     {
-                        "linear1": LinearNoBias(c, num_int * 2),
-                        "linear2": LinearNoBias(num_int, c),
+                        # AF3: ffw_transition1 uses initializer='relu'
+                        "linear1": LinearNoBias(c, num_int * 2, initializer="relu"),
+                        "linear2": LinearNoBias(num_int, c),  # transition2 (default — gate handles zero init)
                         "zero_cond": nn.Linear(c, c),
                     }
                 )
@@ -519,19 +525,38 @@ class AtomCrossAttTransformer(nn.Module):
         self.ffn_norms = nn.ModuleList([nn.LayerNorm(c, elementwise_affine=False) for _ in range(num_blocks)])
 
         # q-side AdaLN conditioning
+        # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
         self.attn_cond_w = nn.ParameterList([nn.Parameter(torch.ones(c)) for _ in range(num_blocks)])
-        self.attn_cond_scale = nn.ModuleList([nn.Linear(c, c) for _ in range(num_blocks)])
-        self.attn_cond_bias = nn.ModuleList([LinearNoBias(c, c) for _ in range(num_blocks)])
+        self.attn_cond_scale = nn.ModuleList()
+        self.attn_cond_bias = nn.ModuleList()
+        for _ in range(num_blocks):
+            s = nn.Linear(c, c)
+            af3_linear_init_(s.weight, "zeros")
+            nn.init.zeros_(s.bias)
+            self.attn_cond_scale.append(s)
+            self.attn_cond_bias.append(LinearNoBias(c, c, initializer="zeros"))
 
         # k-side AdaLN conditioning (keys/values conditioned separately from queries)
         self.k_cond_w = nn.ParameterList([nn.Parameter(torch.ones(c)) for _ in range(num_blocks)])
-        self.k_cond_scale = nn.ModuleList([nn.Linear(c, c) for _ in range(num_blocks)])
-        self.k_cond_bias = nn.ModuleList([LinearNoBias(c, c) for _ in range(num_blocks)])
+        self.k_cond_scale = nn.ModuleList()
+        self.k_cond_bias = nn.ModuleList()
+        for _ in range(num_blocks):
+            s = nn.Linear(c, c)
+            af3_linear_init_(s.weight, "zeros")
+            nn.init.zeros_(s.bias)
+            self.k_cond_scale.append(s)
+            self.k_cond_bias.append(LinearNoBias(c, c, initializer="zeros"))
 
         # FFN AdaLN conditioning (on queries only)
         self.ffn_cond_w = nn.ParameterList([nn.Parameter(torch.ones(c)) for _ in range(num_blocks)])
-        self.ffn_cond_scale = nn.ModuleList([nn.Linear(c, c) for _ in range(num_blocks)])
-        self.ffn_cond_bias = nn.ModuleList([LinearNoBias(c, c) for _ in range(num_blocks)])
+        self.ffn_cond_scale = nn.ModuleList()
+        self.ffn_cond_bias = nn.ModuleList()
+        for _ in range(num_blocks):
+            s = nn.Linear(c, c)
+            af3_linear_init_(s.weight, "zeros")
+            nn.init.zeros_(s.bias)
+            self.ffn_cond_scale.append(s)
+            self.ffn_cond_bias.append(LinearNoBias(c, c, initializer="zeros"))
 
     def forward(
         self,
@@ -796,12 +821,14 @@ class AtomEncoder(nn.Module):
         self.per_atom = AtomPerAtomConditioning(c, cp, num_element_classes, num_atom_name_chars, atom_name_length)
 
         # Trunk single conditioning
+        # AF3: embed_trunk_single_cond uses final_init (zeros)
         self.lnorm_trunk_single_w = nn.Parameter(torch.ones(384))
-        self.embed_trunk_single = LinearNoBias(384, c)
+        self.embed_trunk_single = LinearNoBias(384, c, initializer="zeros")
 
         # Trunk pair conditioning
+        # AF3: embed_trunk_pair_cond uses final_init (zeros)
         self.lnorm_trunk_pair_w = nn.Parameter(torch.ones(128))
-        self.embed_trunk_pair = LinearNoBias(128, cp)
+        self.embed_trunk_pair = LinearNoBias(128, cp, initializer="zeros")
 
         # Encoder-specific additional pair conditioning (_1 variants)
         self.single_to_pair_row_enc = LinearNoBias(c, cp)
@@ -989,7 +1016,8 @@ class AtomDecoder(nn.Module):
         self.proj_tokens = LinearNoBias(ct, c)
         self.atom_transformer = AtomCrossAttTransformer(c, cp, num_blocks=atom_transformer_num_blocks)
         self.atom_norm_w = nn.Parameter(torch.ones(c))
-        self.pos_update = LinearNoBias(c, 3)
+        # AF3: atom_features_to_position_update uses final_init (zeros)
+        self.pos_update = LinearNoBias(c, 3, initializer="zeros")
 
     def forward(
         self,

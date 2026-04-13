@@ -62,12 +62,17 @@ class FusedAdaTransitionBlock(nn.Module):
             self._swiglu = None
 
         # Standard modules for weight compatibility and fallback
+        # AF3: single_cond_scale/bias use initializer='zeros', linear1='relu', linear2='zeros'
         self.norm = nn.LayerNorm(channels, elementwise_affine=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, channels)
-        self.cond_bias = LinearNoBias(cond_dim, channels)
-        self.linear1 = LinearNoBias(channels, num_intermediate * 2)
-        self.linear2 = LinearNoBias(num_intermediate, channels)
+        from deepfold3.model.primitives import af3_linear_init_
+
+        af3_linear_init_(self.cond_scale.weight, "zeros")
+        nn.init.zeros_(self.cond_scale.bias)
+        self.cond_bias = LinearNoBias(cond_dim, channels, initializer="zeros")
+        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")
+        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")
         self.zero_cond = nn.Linear(cond_dim, channels)
         nn.init.zeros_(self.zero_cond.weight)
         nn.init.constant_(self.zero_cond.bias, -2.0)

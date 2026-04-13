@@ -39,6 +39,11 @@ class TestEvoformerBlock:
         torch.manual_seed(42)
         S, N, c_msa, c_pair = 4, 8, 64, 128
         block = EvoformerBlock(c_msa, c_pair)
+        # AF3-style init zeros output projections → residual delta is zero at init.
+        # Randomize weights so the residual path contributes non-zero output.
+        for p in block.parameters():
+            if p.dim() >= 2:
+                torch.nn.init.kaiming_uniform_(p)
         block.eval()
         msa = torch.randn(S, N, c_msa)
         pair = torch.randn(N, N, c_pair)

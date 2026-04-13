@@ -107,10 +107,13 @@ class _TriangleMulBase(nn.Module):
         super().__init__()
         self.norm_left = LayerNorm(c_z)
         self.proj = LinearNoBias(c_z, c_z * 2)
-        self.gate = LinearNoBias(c_z, c_z * 2)
+        # AF3: gate uses final_init (zeros)
+        self.gate = LinearNoBias(c_z, c_z * 2, initializer="zeros")
         self.norm_center = LayerNorm(c_z)
-        self.out_proj = LinearNoBias(c_z, c_z)
-        self.out_gate = LinearNoBias(c_z, c_z)
+        # AF3: output_projection uses final_init (zeros)
+        self.out_proj = LinearNoBias(c_z, c_z, initializer="zeros")
+        # AF3: gating_linear uses final_init (zeros)
+        self.out_gate = LinearNoBias(c_z, c_z, initializer="zeros")
 
         self._fused_gate = None
         self._fused_dual_gemm = None
@@ -287,9 +290,9 @@ class OuterProductMean(nn.Module):
         self.norm = LayerNorm(c_msa)
         self.proj_a = LinearNoBias(c_msa, c_hidden)
         self.proj_b = LinearNoBias(c_msa, c_hidden)
+        # AF3: output_w uses Constant(0.0) when final_init='zeros'
         self.out_w = nn.Parameter(torch.zeros(c_hidden, c_hidden, c_z))
         self.out_b = nn.Parameter(torch.zeros(c_z))
-        nn.init.kaiming_uniform_(self.out_w, nonlinearity="linear")
         self._chunk_size: int = 0  # 0 = disabled, >0 = tiled OPM
 
     def _outer_product_contract(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
