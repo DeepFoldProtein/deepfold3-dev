@@ -174,9 +174,10 @@ def filter_clashing_chains(
     atom_count: dict[int, int] = {cid: len(chain_coords[cid]) for cid in remaining}
     invalid: set[int] = set()
 
+    # Build KDTrees once — trees don't change when a chain is removed
+    trees: dict[int, KDTree] = {cid: KDTree(chain_coords[cid]) for cid in remaining}
+
     while True:
-        # Build KDTrees for remaining chains
-        trees = {cid: KDTree(chain_coords[cid]) for cid in remaining}
         chain_ids = sorted(remaining)
 
         # Compute per-chain clash counts against all other remaining chains
@@ -206,6 +207,7 @@ def filter_clashing_chains(
 
         invalid.add(worst_cid)
         remaining.discard(worst_cid)
+        del trees[worst_cid]
 
     return invalid
 

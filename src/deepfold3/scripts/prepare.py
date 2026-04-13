@@ -386,10 +386,9 @@ def prepare(
     ccd_atom_names = None
     ccd_leaving_atoms = None
     if ccd_cache:
-        from deepfold3.data.ccd import load_atom_name_cache, load_leaving_atom_cache
+        from deepfold3.data.ccd import load_ccd_cache
 
-        ccd_atom_names = load_atom_name_cache(ccd_cache)
-        ccd_leaving_atoms = load_leaving_atom_cache(ccd_cache)
+        ccd_atom_names, _, ccd_leaving_atoms = load_ccd_cache(ccd_cache)
         log.info("Loaded CCD cache: %d atom name entries, %d with leaving atoms", len(ccd_atom_names), len(ccd_leaving_atoms))
 
     from deepfold3.data.prepare.filters import StructureFilterConfig

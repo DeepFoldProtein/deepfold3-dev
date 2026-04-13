@@ -311,7 +311,7 @@ def process_mmcif(
             subchain_to_entity[sc] = entity.name
 
     # AF3 §2.5.4: collect leaving atoms to exclude from covalent bond partners
-    _leaving_atoms: set[tuple[str, int, str]] = set()  # (chain_name, res_id, atom_name)
+    _leaving_atoms: set[tuple[str, int, str]] = set()  # (label_asym_id, res_id, atom_name)
     if ccd_leaving_atoms:
         _conn_table = doc[0].find(
             "_struct_conn.",

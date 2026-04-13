@@ -263,10 +263,53 @@ def _parse_ccd_cif(ccd_code: str) -> CcdMolecule:
     )
 
 
+def _embed_conformer(smiles: str, seed: int = 42):
+    """Shared RDKit ETKDGv3 + MMFF conformer generation.
+
+    Returns (heavy_atom_mol, conformer) or (None, None) on failure.
+    Requires RDKit — caller must handle ImportError.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, None
+
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) != 0:
+            return None, None
+
+    AllChem.MMFFOptimizeMolecule(mol)
+    mol = Chem.RemoveHs(mol)
+    return mol, mol.GetConformer()
+
+
+def _extract_heavy_atoms(mol, conf) -> tuple[list[str], list[list[float]], list[str], list[float]]:
+    """Extract atom names, positions, elements, charges from an RDKit mol+conformer."""
+    atom_names: list[str] = []
+    positions_list: list[list[float]] = []
+    elements: list[str] = []
+    charges: list[float] = []
+    elem_counts: dict[str, int] = {}
+    for atom in mol.GetAtoms():
+        sym = atom.GetSymbol()
+        elem_counts[sym] = elem_counts.get(sym, 0) + 1
+        atom_names.append(f"{sym}{elem_counts[sym]}")
+        pos = conf.GetAtomPosition(atom.GetIdx())
+        positions_list.append([pos.x, pos.y, pos.z])
+        elements.append(sym)
+        charges.append(float(atom.GetFormalCharge()))
+    return atom_names, positions_list, elements, charges
+
+
 def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
     """Builds a molecule from a SMILES string using RDKit.
 
-    Adds hydrogens, generates a 3D conformer via ETKDG, optimizes
+    Adds hydrogens, generates a 3D conformer via ETKDGv3, optimizes
     with MMFF, then strips all hydrogens to keep only heavy atoms.
 
     Args:
@@ -282,56 +325,22 @@ def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
     """
     try:
         from rdkit import Chem
-        from rdkit.Chem import AllChem
     except ImportError as e:
         raise ImportError("RDKit is required for SMILES input: pip install rdkit") from e
 
-    mol = Chem.MolFromSmiles(smiles)
+    mol, conf = _embed_conformer(smiles)
     if mol is None:
-        raise ValueError(f"RDKit failed to parse SMILES: {smiles!r}")
+        raise ValueError(f"Failed to generate 3D conformer for SMILES: {smiles!r}")
 
-    mol = Chem.AddHs(mol)
+    atom_names, positions_list, elements, charges = _extract_heavy_atoms(mol, conf)
 
-    # Generate 3D conformer
-    params = AllChem.ETKDGv3()
-    params.randomSeed = 42
-    status = AllChem.EmbedMolecule(mol, params)
-    if status != 0:
-        # Retry without distance geometry constraints
-        status = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-        if status != 0:
-            raise ValueError(f"Failed to generate 3D conformer for SMILES: {smiles!r}")
-
-    AllChem.MMFFOptimizeMolecule(mol)
-
-    # Remove non-heavy atoms
-    mol = Chem.RemoveHs(mol)
-
-    conf = mol.GetConformer()
-    atom_names: list[str] = []
-    positions_list: list[list[float]] = []
-    elements: list[str] = []
-    charges: list[float] = []
-
-    # Generate unique atom names
-    elem_counts: dict[str, int] = {}
-    for atom in mol.GetAtoms():
-        sym = atom.GetSymbol()
-        elem_counts[sym] = elem_counts.get(sym, 0) + 1
-        name = f"{sym}{elem_counts[sym]}"
-        atom_names.append(name)
-        pos = conf.GetAtomPosition(atom.GetIdx())
-        positions_list.append([pos.x, pos.y, pos.z])
-        elements.append(sym)
-        charges.append(float(atom.GetFormalCharge()))
-
-    bonds: list[tuple[int, int, int]] = []
     _RDKIT_BOND_ORDER = {
         Chem.rdchem.BondType.SINGLE: 1,
         Chem.rdchem.BondType.DOUBLE: 2,
         Chem.rdchem.BondType.TRIPLE: 3,
         Chem.rdchem.BondType.AROMATIC: 2,
     }
+    bonds: list[tuple[int, int, int]] = []
     for bond in mol.GetBonds():
         order = _RDKIT_BOND_ORDER.get(bond.GetBondType(), 1)
         bonds.append((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), order))
@@ -360,7 +369,6 @@ def ccd_smiles_from_block(block) -> str | None:
             smiles = row[1].strip().strip('"')
             if smiles and smiles != "?":
                 return smiles
-    # Fallback to plain SMILES
     for row in table:
         dtype = row[0].strip().strip('"')
         if dtype == "SMILES":
@@ -377,42 +385,13 @@ def etkdg_conformer(smiles: str, seed: int = 42) -> CcdMolecule | None:
     conformer, or None if generation fails.
     """
     try:
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
+        mol, conf = _embed_conformer(smiles, seed)
     except ImportError:
         return None
-
-    mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
 
-    mol = Chem.AddHs(mol)
-    params = AllChem.ETKDGv3()
-    params.randomSeed = seed
-    if AllChem.EmbedMolecule(mol, params) != 0:
-        # Retry without custom seed
-        if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) != 0:
-            return None
-
-    AllChem.MMFFOptimizeMolecule(mol)
-    mol = Chem.RemoveHs(mol)
-
-    conf = mol.GetConformer()
-    atom_names: list[str] = []
-    positions_list: list[list[float]] = []
-    elements: list[str] = []
-    charges: list[float] = []
-
-    elem_counts: dict[str, int] = {}
-    for atom in mol.GetAtoms():
-        sym = atom.GetSymbol()
-        elem_counts[sym] = elem_counts.get(sym, 0) + 1
-        atom_names.append(f"{sym}{elem_counts[sym]}")
-        pos = conf.GetAtomPosition(atom.GetIdx())
-        positions_list.append([pos.x, pos.y, pos.z])
-        elements.append(sym)
-        charges.append(float(atom.GetFormalCharge()))
-
+    atom_names, positions_list, elements, charges = _extract_heavy_atoms(mol, conf)
     if not atom_names:
         return None
 
@@ -542,56 +521,46 @@ def build_atom_name_cache(
     return len(cache)
 
 
-def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
-    """Load a pre-built CCD atom name cache (atom names only).
+def load_ccd_cache(
+    path: str | Path,
+) -> tuple[dict[str, set[str]], dict[str, np.ndarray], dict[str, set[str]]]:
+    """Load all CCD cache data in a single JSON parse.
 
     Returns:
-        Mapping from CCD code to set of valid heavy-atom names.
+        (atom_names, ref_pos, leaving_atoms) — three dicts keyed by CCD code.
     """
     import json
 
     with open(path) as f:
         raw = json.load(f)
-    result: dict[str, set[str]] = {}
+
+    atom_names: dict[str, set[str]] = {}
+    ref_pos: dict[str, np.ndarray] = {}
+    leaving: dict[str, set[str]] = {}
+
     for k, v in raw.items():
         if isinstance(v, list):
-            result[k] = set(v)  # backward compat: old format is list of names
+            atom_names[k] = set(v)  # backward compat: old format is list of names
         else:
-            result[k] = set(v["atoms"])
-    return result
+            atom_names[k] = set(v["atoms"])
+            if "ref_pos" in v:
+                ref_pos[k] = np.array(v["ref_pos"], dtype=np.float32)
+            if "leaving" in v:
+                leaving[k] = set(v["leaving"])
+
+    return atom_names, ref_pos, leaving
+
+
+def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
+    """Load atom names only. Prefer :func:`load_ccd_cache` to avoid re-parsing."""
+    return load_ccd_cache(path)[0]
 
 
 def load_ref_pos_cache(path: str | Path) -> dict[str, np.ndarray]:
-    """Load ETKDGv3-generated reference positions from the CCD cache.
-
-    Returns:
-        Mapping from CCD code to float32 positions array [n_atoms, 3].
-        Only entries with ref_pos are included.
-    """
-    import json
-
-    with open(path) as f:
-        raw = json.load(f)
-    result: dict[str, np.ndarray] = {}
-    for k, v in raw.items():
-        if isinstance(v, dict) and "ref_pos" in v:
-            result[k] = np.array(v["ref_pos"], dtype=np.float32)
-    return result
+    """Load ref_pos only. Prefer :func:`load_ccd_cache` to avoid re-parsing."""
+    return load_ccd_cache(path)[1]
 
 
 def load_leaving_atom_cache(path: str | Path) -> dict[str, set[str]]:
-    """Load leaving atom names from the CCD cache.
-
-    Returns:
-        Mapping from CCD code to set of leaving heavy-atom names.
-        Only entries with leaving atoms are included.
-    """
-    import json
-
-    with open(path) as f:
-        raw = json.load(f)
-    result: dict[str, set[str]] = {}
-    for k, v in raw.items():
-        if isinstance(v, dict) and "leaving" in v:
-            result[k] = set(v["leaving"])
-    return result
+    """Load leaving atoms only. Prefer :func:`load_ccd_cache` to avoid re-parsing."""
+    return load_ccd_cache(path)[2]

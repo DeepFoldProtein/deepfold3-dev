@@ -90,14 +90,6 @@ TOKEN_BOND_DTYPE = np.dtype(
     ]
 )
 
-# Legacy 2-field dtype for backward-compatible loading of old NPZ files.
-_TOKEN_BOND_DTYPE_V1 = np.dtype(
-    [
-        ("token_1", np.int32),
-        ("token_2", np.int32),
-    ]
-)
-
 
 @dataclass
 class Structure:
