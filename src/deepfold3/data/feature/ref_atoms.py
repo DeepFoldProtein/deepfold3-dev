@@ -18,6 +18,18 @@ from deepfold3.data.ccd import fetch_ccd_block
 log = logging.getLogger(__name__)
 
 _CCD_CACHE: dict[str, _CCDEntry | None] = {}
+# Optional ETKDGv3-generated ref_pos cache (AF3 §2.8). Set via set_ref_pos_cache().
+_REF_POS_CACHE: dict[str, np.ndarray] | None = None
+
+
+def set_ref_pos_cache(cache: dict[str, np.ndarray]) -> None:
+    """Set ETKDGv3-generated reference positions for CCD codes.
+
+    When set, ref_pos are taken from this cache instead of CCD ideal
+    coordinates.  Generate with ``deepfold3 build-ccd-cache --ref-pos``.
+    """
+    global _REF_POS_CACHE
+    _REF_POS_CACHE = cache
 
 
 @dataclass
@@ -162,6 +174,12 @@ def get_ref_atoms(
             ccd_positions = entry.positions
             ccd_elements = entry.elements
             ccd_charges = entry.charges
+
+            # AF3 §2.8: prefer ETKDGv3-generated ref_pos when available
+            if _REF_POS_CACHE is not None and res_name in _REF_POS_CACHE:
+                etkdg_pos = _REF_POS_CACHE[res_name]
+                if len(etkdg_pos) == len(atom_names):
+                    ccd_positions = etkdg_pos
 
             # Filter OXT for polymer residues
             if is_polymer and "OXT" in atom_names:

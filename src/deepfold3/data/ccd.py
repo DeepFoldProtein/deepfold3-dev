@@ -347,20 +347,119 @@ def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
 
 
 # ---------------------------------------------------------------------------
+# ETKDGv3 conformer generation from CCD SMILES (AF3 §2.8 ref_pos)
+# ---------------------------------------------------------------------------
+
+
+def ccd_smiles_from_block(block) -> str | None:
+    """Extract canonical SMILES from a CCD gemmi block."""
+    table = block.find(["_pdbx_chem_comp_descriptor.type", "_pdbx_chem_comp_descriptor.descriptor"])
+    for row in table:
+        dtype = row[0].strip().strip('"')
+        if dtype == "SMILES_CANONICAL":
+            smiles = row[1].strip().strip('"')
+            if smiles and smiles != "?":
+                return smiles
+    # Fallback to plain SMILES
+    for row in table:
+        dtype = row[0].strip().strip('"')
+        if dtype == "SMILES":
+            smiles = row[1].strip().strip('"')
+            if smiles and smiles != "?":
+                return smiles
+    return None
+
+
+def etkdg_conformer(smiles: str, seed: int = 42) -> CcdMolecule | None:
+    """Generate a 3D conformer from SMILES via RDKit ETKDGv3 (AF3 §2.8).
+
+    Returns CcdMolecule with heavy-atom positions from force-field-optimised
+    conformer, or None if generation fails.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+    except ImportError:
+        return None
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        # Retry without custom seed
+        if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) != 0:
+            return None
+
+    AllChem.MMFFOptimizeMolecule(mol)
+    mol = Chem.RemoveHs(mol)
+
+    conf = mol.GetConformer()
+    atom_names: list[str] = []
+    positions_list: list[list[float]] = []
+    elements: list[str] = []
+    charges: list[float] = []
+
+    elem_counts: dict[str, int] = {}
+    for atom in mol.GetAtoms():
+        sym = atom.GetSymbol()
+        elem_counts[sym] = elem_counts.get(sym, 0) + 1
+        atom_names.append(f"{sym}{elem_counts[sym]}")
+        pos = conf.GetAtomPosition(atom.GetIdx())
+        positions_list.append([pos.x, pos.y, pos.z])
+        elements.append(sym)
+        charges.append(float(atom.GetFormalCharge()))
+
+    if not atom_names:
+        return None
+
+    return CcdMolecule(
+        atom_names=atom_names,
+        positions=np.array(positions_list, dtype=np.float32),
+        elements=elements,
+        charges=charges,
+        bonds=[],
+        res_name="LIG",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CCD atom name cache for validation during structure processing
 # ---------------------------------------------------------------------------
 
 
-def build_atom_name_cache(components_path: str | Path, output_path: str | Path) -> int:
+def _generate_ref_pos_for_code(args: tuple[str, str]) -> tuple[str, list[list[float]]] | None:
+    """Worker: generate ETKDGv3 ref_pos for a single CCD code from its SMILES."""
+    code, smiles = args
+    mol = etkdg_conformer(smiles)
+    if mol is None:
+        return None
+    return code, mol.positions.tolist()
+
+
+def build_atom_name_cache(
+    components_path: str | Path,
+    output_path: str | Path,
+    *,
+    ref_pos: bool = False,
+    workers: int = 1,
+) -> int:
     """Build a JSON cache mapping CCD code → atom info.
 
     Reads the full ``components.cif`` (or ``.cif.gz``) and extracts per-component:
     - ``atoms``: list of valid heavy-atom names
     - ``leaving``: list of heavy-atom names with ``pdbx_leaving_atom_flag = Y``
+    - ``ref_pos`` (optional): ETKDGv3-generated 3D coordinates ``[[x,y,z], ...]``
+      for each heavy atom (AF3 §2.8). Requires RDKit.
 
     Args:
         components_path: Path to ``components.cif`` or ``components.cif.gz``.
         output_path: Where to write the JSON cache.
+        ref_pos: If True, generate ETKDGv3 conformers via RDKit for ref_pos.
+        workers: Number of parallel workers for ref_pos generation.
 
     Returns:
         Number of CCD entries written.
@@ -372,6 +471,7 @@ def build_atom_name_cache(components_path: str | Path, output_path: str | Path) 
     log.info("Reading %s (this may take a minute)...", components_path)
     doc = gemmi.cif.read(str(components_path))
     cache: dict[str, dict] = {}
+    smiles_map: dict[str, str] = {}  # code → SMILES (for ref_pos generation)
 
     for block in doc:
         code = block.name
@@ -399,12 +499,46 @@ def build_atom_name_cache(components_path: str | Path, output_path: str | Path) 
                 entry["leaving"] = leaving
             cache[code] = entry
 
+        # Collect SMILES for ref_pos generation
+        if ref_pos:
+            smiles = ccd_smiles_from_block(block)
+            if smiles:
+                smiles_map[code] = smiles
+
+    # Generate ETKDGv3 ref_pos from SMILES
+    if ref_pos and smiles_map:
+        log.info("Generating ETKDGv3 ref_pos for %d CCD entries (workers=%d)...", len(smiles_map), workers)
+        generated = 0
+
+        if workers <= 1:
+            for code, smiles in smiles_map.items():
+                result = _generate_ref_pos_for_code((code, smiles))
+                if result is not None and code in cache:
+                    cache[code]["ref_pos"] = result[1]
+                    generated += 1
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            items = list(smiles_map.items())
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_generate_ref_pos_for_code, item): item[0] for item in items}
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                    except Exception:
+                        continue
+                    if result is not None and result[0] in cache:
+                        cache[result[0]]["ref_pos"] = result[1]
+                        generated += 1
+
+        log.info("Generated ref_pos for %d/%d CCD entries", generated, len(smiles_map))
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
         json.dump(cache, f, separators=(",", ":"))
 
-    log.info("Wrote CCD atom name cache: %d entries → %s", len(cache), output_path)
+    log.info("Wrote CCD cache: %d entries → %s", len(cache), output_path)
     return len(cache)
 
 
@@ -424,6 +558,24 @@ def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
             result[k] = set(v)  # backward compat: old format is list of names
         else:
             result[k] = set(v["atoms"])
+    return result
+
+
+def load_ref_pos_cache(path: str | Path) -> dict[str, np.ndarray]:
+    """Load ETKDGv3-generated reference positions from the CCD cache.
+
+    Returns:
+        Mapping from CCD code to float32 positions array [n_atoms, 3].
+        Only entries with ref_pos are included.
+    """
+    import json
+
+    with open(path) as f:
+        raw = json.load(f)
+    result: dict[str, np.ndarray] = {}
+    for k, v in raw.items():
+        if isinstance(v, dict) and "ref_pos" in v:
+            result[k] = np.array(v["ref_pos"], dtype=np.float32)
     return result
 
 

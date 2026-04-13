@@ -520,14 +520,20 @@ def fetch_ccd(output: str) -> None:
     "--output",
     required=True,
     type=click.Path(),
-    help="Output path for the JSON cache (e.g. ccd_atoms.json).",
+    help="Output path for the JSON cache (e.g. ccd_cache.json).",
 )
-def build_ccd_cache(components_cif: str, output: str) -> None:
-    """Build a CCD atom name cache for structure validation.
+@click.option(
+    "--ref-pos",
+    is_flag=True,
+    help="Generate ETKDGv3 ref_pos via RDKit from CCD SMILES (AF3 §2.8). Requires RDKit.",
+)
+@click.option("--workers", default=1, type=int, help="Parallel workers for ref_pos generation.")
+def build_ccd_cache(components_cif: str, output: str, ref_pos: bool, workers: int) -> None:
+    """Build a CCD cache for structure validation and ref_pos.
 
-    Reads the full components.cif and writes a JSON mapping CCD code →
-    list of valid heavy-atom names.  Used with ``deepfold3 prepare
-    --ccd-cache`` to filter atoms not present in the CCD dictionary.
+    Reads the full components.cif and writes a JSON cache with atom names,
+    leaving atoms, and optionally ETKDGv3-generated reference positions.
+    Used with ``deepfold3 prepare --ccd-cache``.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -536,7 +542,7 @@ def build_ccd_cache(components_cif: str, output: str) -> None:
     )
     from deepfold3.data.ccd import build_atom_name_cache
 
-    n = build_atom_name_cache(components_cif, output)
+    n = build_atom_name_cache(components_cif, output, ref_pos=ref_pos, workers=workers)
     click.echo(f"Wrote {n} CCD entries to {output}")
 
 
