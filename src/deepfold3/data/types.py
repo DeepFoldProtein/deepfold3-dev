@@ -85,6 +85,16 @@ TOKEN_BOND_DTYPE = np.dtype(
     [
         ("token_1", np.int32),
         ("token_2", np.int32),
+        ("atom_1", np.int16),  # atom index within token_1
+        ("atom_2", np.int16),  # atom index within token_2
+    ]
+)
+
+# Legacy 2-field dtype for backward-compatible loading of old NPZ files.
+_TOKEN_BOND_DTYPE_V1 = np.dtype(
+    [
+        ("token_1", np.int32),
+        ("token_2", np.int32),
     ]
 )
 
@@ -319,6 +329,7 @@ class ChainInfo:
     paired_msa_id: str | int | None = None  # separate file for paired (cross-chain) MSA
     valid: bool = True
     auth_chain_name: str | None = None  # original chain name from input CIF (before assembly renaming)
+    res_name: str | None = None  # CCD code for nonpolymer chains (first residue name)
 
 
 @dataclass
@@ -363,6 +374,7 @@ class Record:
                 "paired_msa_id": c.paired_msa_id,
                 "valid": c.valid,
                 **({"auth_chain_name": c.auth_chain_name} if c.auth_chain_name is not None else {}),
+                **({"res_name": c.res_name} if c.res_name is not None else {}),
             }
             for c in self.chains
         ]

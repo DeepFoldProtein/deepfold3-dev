@@ -145,6 +145,12 @@ def filter_clashing_chains(
 ) -> set[int]:
     """Find chains with >freq_threshold fraction of atoms clashing.
 
+    Uses AF3 §2.5.4 iterative 3-level tie-breaking: at each step remove
+    the single worst chain by (1) clash fraction, (2) number of clashing
+    atoms, (3) chain_id (highest removed first).  Clash counts are
+    recomputed after each removal since removing one chain can reduce
+    clashes for its neighbours.
+
     Returns set of chain_ids (asym_id) that should be marked invalid.
     """
     try:
@@ -164,24 +170,42 @@ def filter_clashing_chains(
         coords = np.column_stack([atoms["x"], atoms["y"], atoms["z"]]).astype(np.float64)
         chain_coords[ci.chain_id] = coords
 
-    # Pre-build all KDTrees once
-    chain_ids = sorted(chain_coords.keys())
-    trees: dict[int, KDTree] = {cid: KDTree(chain_coords[cid]) for cid in chain_ids}
+    remaining = set(chain_coords.keys())
+    atom_count: dict[int, int] = {cid: len(chain_coords[cid]) for cid in remaining}
+    invalid: set[int] = set()
 
-    clash_count: dict[int, int] = {cid: 0 for cid in chain_ids}
-    atom_count: dict[int, int] = {cid: len(chain_coords[cid]) for cid in chain_ids}
+    while True:
+        # Build KDTrees for remaining chains
+        trees = {cid: KDTree(chain_coords[cid]) for cid in remaining}
+        chain_ids = sorted(remaining)
 
-    for i, c1 in enumerate(chain_ids):
-        for c2 in chain_ids[i + 1 :]:
-            n_clash = trees[c1].count_neighbors(trees[c2], dist_threshold)
-            if n_clash > 0:
-                clash_count[c1] += n_clash
-                clash_count[c2] += n_clash
+        # Compute per-chain clash counts against all other remaining chains
+        clash_count: dict[int, int] = {cid: 0 for cid in chain_ids}
+        for i, c1 in enumerate(chain_ids):
+            for c2 in chain_ids[i + 1 :]:
+                n_clash = trees[c1].count_neighbors(trees[c2], dist_threshold)
+                if n_clash > 0:
+                    clash_count[c1] += n_clash
+                    clash_count[c2] += n_clash
 
-    invalid = set()
-    for cid in chain_ids:
-        if atom_count[cid] > 0 and clash_count[cid] / atom_count[cid] > freq_threshold:
-            invalid.add(cid)
+        # Find the single worst chain above threshold
+        worst_cid = None
+        worst_key = (-1.0, -1, -1)  # (clash_frac, clash_count, chain_id)
+        for cid in chain_ids:
+            if atom_count[cid] == 0:
+                continue
+            frac = clash_count[cid] / atom_count[cid]
+            if frac > freq_threshold:
+                key = (frac, clash_count[cid], cid)
+                if key > worst_key:
+                    worst_key = key
+                    worst_cid = cid
+
+        if worst_cid is None:
+            break  # no chain exceeds threshold
+
+        invalid.add(worst_cid)
+        remaining.discard(worst_cid)
 
     return invalid
 

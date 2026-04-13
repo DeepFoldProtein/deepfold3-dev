@@ -428,14 +428,19 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 |---|---|---|
 | §2.5.1 | Weighted PDB sampling (β/α weights, chain+interface) | `data/sample/weighted.py` |
 | §2.5.3 | Protein 40% clustering | wwPDB clusters via `data/prepare/clustering.py` |
+| §2.5.3 | 100% clustering for nucleic acids + peptides | Hash-based cluster_id = 100% identity; `scripts/prepare.py:_apply_clusters` |
+| §2.5.3 | CCD identity clustering for ligands | `ChainInfo.res_name` + `_apply_clusters` maps `ccd_{res_name}` |
 | §2.5.4 | Resolution ≤ 9Å, max 300 chains, min 4 residues | `data/prepare/filters.py` |
-| §2.5.4 | Clashing chains (30%/1.7Å), consecutive Cα > 10Å | `data/prepare/filters.py` |
+| §2.5.4 | Clashing chains (30%/1.7Å, iterative 3-level tie-break) | `data/prepare/filters.py:filter_clashing_chains` |
+| §2.5.4 | Consecutive Cα > 10Å | `data/prepare/filters.py` |
 | §2.6 | Standard AA/nucleotide = 1 token, ligand = per-atom | `data/tokenize/tokenizer.py` |
 | §2.7 | Cropping weights (0.2/0.4/0.4), interface 15Å | `data/crop/cropper.py` |
 | §2.8 | ref_pos (random rot+trans), ref_element (one-hot 128) | `data/feature/featurizer.py` |
+| §2.8 | token_bonds filtered to < 2.4Å during training | `data/feature/featurizer.py:_build_bond_features` |
 | §3.7.1 | Diffusion batch 48, MSE mol-type weight (5×/10×) | `model/config.py`, `training/loss.py` |
 | §3.7.1 | EDM weighting, smooth LDDT (15/30Å radii) | `training/loss.py` |
 | §3.7.1 | Bond loss (Eq. 5 — GT distances) | `training/loss.py:bond_loss` |
+| §3.7.1 | Cross-entity bonds (disulfide, metal, covalent) | `data/prepare/structure.py` extracts from `_struct_conn`; `tokenizer.py` propagates with atom indices |
 | §5.3 | Loss weights (α_diff=4, α_disto=0.03, α_conf=1e-4) | `model/config.py` |
 | §5.4 | Adam β₁=0.9 β₂=0.95 ε=1e-8, LR 1.8e-3, warmup 1000 | `model/config.py` |
 | §5.4 | LR decay 0.95/50k, grad clip 10, batch 256 | `model/config.py`, `training/trainer.py` |
@@ -444,22 +449,17 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 
 | Paper section | Item | Our approach | Impact |
 |---|---|---|---|
-| §2.5.4 | Clash tie-breaking (3-level: %, atoms, chain_id) | Single-level (% only) | Minor — affects <1% of structures |
-| §2.8 | token_bonds filtered to < 2.4Å during training | No distance filter | May include long-range bonds that AF3 excludes |
 | §3.7.1 | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
 
 ### ❌ Missing (known gaps)
 
 | Paper section | Item | Priority | Notes |
 |---|---|---|---|
-| §2.5.3 | 100% clustering for nucleic acids + peptides | Medium | All entities use protein 40% clusters |
-| §2.5.3 | CCD identity clustering for ligands | Medium | Ligands grouped by 40% seq homology instead |
 | §2.5.3 | SCOP modified residue normalization | Low | Modified residues not normalized before clustering |
 | §2.5.4 | >20 chains → select 20 closest to interface | Low | Rare for training data (most <20 chains) |
 | §2.5.4 | CCD atom name validation | Low | Atoms outside CCD atom set not filtered |
-| §2.5.4 | Leaving atom removal | Medium | Affects covalent ligand accuracy |
+| §2.5.4 | Leaving atom removal | Low | Mostly H atoms (already skipped) + water (separate entity) |
 | §2.6 | Modified residue per-atom tokenization | Medium | All residues use 1-token (structural simplification) |
-| §3.7.1 | Cross-entity bonds (disulfide, metal, glycan) | High | `bonded_atom_pairs` parsed but ignored (`dataset.py:549`) |
 
 ### Stage Configuration Quick Reference
 

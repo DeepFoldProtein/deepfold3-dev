@@ -257,17 +257,32 @@ def _import_msa_files(
 def _apply_clusters(records: list, cluster_file: Path) -> int:
     """Apply cluster IDs from a cluster file to manifest records.
 
+    Mol-type aware clustering (AF3 §2.5.3):
+    - Protein: PDB 40% sequence identity clusters
+    - DNA/RNA: keep hash-based cluster_id (= 100% sequence identity)
+    - Nonpolymer (ligand): CCD code identity (same CCD code = same cluster)
+
     Returns the number of chains that were matched to a cluster.
     """
+    from deepfold3.data import const
     from deepfold3.data.prepare.clustering import load_pdb_clusters, sequence_to_cluster_key
 
     pdb_clusters = load_pdb_clusters(cluster_file)
     matched = 0
     for record in records:
         for chain in record.chains:
-            key = sequence_to_cluster_key(record.id, chain.chain_name)
-            if key in pdb_clusters:
-                chain.cluster_id = pdb_clusters[key]
+            if chain.mol_type == const.MOL_PROTEIN:
+                key = sequence_to_cluster_key(record.id, chain.chain_name)
+                if key in pdb_clusters:
+                    chain.cluster_id = pdb_clusters[key]
+                    matched += 1
+            elif chain.mol_type in (const.MOL_DNA, const.MOL_RNA):
+                # 100% identity: hash-based cluster_id is already correct
+                matched += 1
+            elif chain.mol_type == const.MOL_NONPOLYMER:
+                # CCD code identity clustering
+                if chain.res_name:
+                    chain.cluster_id = f"ccd_{chain.res_name}"
                 matched += 1
     return matched
 

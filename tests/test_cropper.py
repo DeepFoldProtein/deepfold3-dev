@@ -145,7 +145,7 @@ def make_tokenized(
 
     bonds = np.empty(0, dtype=TOKEN_BOND_DTYPE)
     if with_bonds and n >= 4:
-        bond_list = [(0, 1), (1, 2), (2, 3), (0, n - 1)]
+        bond_list = [(0, 1, 0, 0), (1, 2, 0, 0), (2, 3, 0, 0), (0, n - 1, 0, 0)]
         bonds = np.array(bond_list, dtype=TOKEN_BOND_DTYPE)
 
     return Tokenized(

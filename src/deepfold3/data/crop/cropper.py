@@ -331,7 +331,7 @@ class Cropper:
         for bond in data.bonds:
             t1, t2 = int(bond["token_1"]), int(bond["token_2"])
             if t1 in valid_old_idxs and t2 in valid_old_idxs:
-                new_bonds_list.append((old_to_new[t1], old_to_new[t2]))
+                new_bonds_list.append((old_to_new[t1], old_to_new[t2], int(bond["atom_1"]), int(bond["atom_2"])))
 
         new_bonds = (
             np.array(new_bonds_list, dtype=TOKEN_BOND_DTYPE) if new_bonds_list else np.empty(0, dtype=TOKEN_BOND_DTYPE)

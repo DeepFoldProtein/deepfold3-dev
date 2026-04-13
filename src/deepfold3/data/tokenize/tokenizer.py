@@ -37,6 +37,8 @@ class Tokenizer:
         token_bonds_list: list[tuple] = []
 
         token_idx = 0
+        # Global atom index → (token_idx, local_atom_within_token)
+        atom_to_token: dict[int, tuple[int, int]] = {}
 
         for chain in structure.chains:
             mol_type = int(chain["mol_type"])
@@ -82,6 +84,10 @@ class Tokenizer:
                         )
                     )
 
+                    # Register each atom in this residue for cross-entity bond lookup
+                    for ai in range(atom_num):
+                        atom_to_token[atom_idx + ai] = (token_idx, ai)
+
                     # NOTE: backbone bonds are NOT included in the bond matrix.
                     # AF3 restricts the bond matrix to polymer-ligand and
                     # ligand-ligand covalent bonds only.  Backbone connectivity
@@ -91,7 +97,6 @@ class Tokenizer:
 
             elif mol_type == const.MOL_NONPOLYMER:
                 # One token per heavy atom
-                first_token_in_ligand = token_idx
                 ligand_atom_start = int(chain["atom_idx"])
 
                 for ri in range(res_start, res_end):
@@ -123,21 +128,26 @@ class Tokenizer:
                                 cz,
                             )
                         )
+                        atom_to_token[global_ai] = (token_idx, 0)
                         token_idx += 1
 
-                # Ligand intra-bonds: for each bond where both atoms are in this ligand
-                # atom global idx → token idx
-                atom_to_token = {
-                    int(chain["atom_idx"]) + i: first_token_in_ligand + i for i in range(int(chain["atom_num"]))
-                }
-                for bond in structure.bonds:
-                    a1 = int(bond["atom_1"])
-                    a2 = int(bond["atom_2"])
-                    if a1 in atom_to_token and a2 in atom_to_token:
-                        t1 = atom_to_token[a1]
-                        t2 = atom_to_token[a2]
-                        if t1 != t2:
-                            token_bonds_list.append((t1, t2))
+        # Build token bonds from structure bonds (cross-entity + ligand intra-bonds)
+        seen_bonds: set[tuple[int, int]] = set()
+        for bond in structure.bonds:
+            a1, a2 = int(bond["atom_1"]), int(bond["atom_2"])
+            loc1 = atom_to_token.get(a1)
+            loc2 = atom_to_token.get(a2)
+            if loc1 is None or loc2 is None:
+                continue
+            t1, la1 = loc1
+            t2, la2 = loc2
+            if t1 == t2:
+                continue  # skip intra-token bonds
+            bond_key = (min(t1, t2), max(t1, t2))
+            if bond_key in seen_bonds:
+                continue  # deduplicate
+            seen_bonds.add(bond_key)
+            token_bonds_list.append((t1, t2, la1, la2))
 
         tokens_arr = np.array(tokens_list, dtype=TOKEN_DTYPE) if tokens_list else np.empty(0, dtype=TOKEN_DTYPE)
         bonds_arr = (

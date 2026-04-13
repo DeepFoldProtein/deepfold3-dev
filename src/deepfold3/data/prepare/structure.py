@@ -313,6 +313,10 @@ def process_mmcif(
 
     chain_infos: list[ChainInfo] = []
     chain_atom_coords: dict[int, np.ndarray] = {}  # asym_id → coords for interface detection
+    # Atom lookup for cross-entity bond extraction: (chain_label, res_id, atom_name) → global atom index
+    # Uses parent chain.name as key because gemmi connections reference label_asym_id
+    # which corresponds to the parent chain (not the subchain) after assembly expansion.
+    atom_lookup: dict[tuple[str, int, str], int] = {}
 
     for chain in model:
         # Get subchains as ResidueSpan objects (works for both raw and assembly models)
@@ -382,6 +386,8 @@ def process_mmcif(
                         )
                     )
                     chain_coords.append([float(pos.x), float(pos.y), float(pos.z)])
+                    global_idx = atom_offset + len(chain_atom_data) - 1
+                    atom_lookup[(chain.name, res_id, atom.name.strip())] = global_idx
                     res_atom_count += 1
 
                 chain_res_data.append((res_name, res_id, is_standard))
@@ -446,6 +452,9 @@ def process_mmcif(
 
             # Build ChainInfo
             seq_hash = _hash_sequence(seq_key)
+            # For nonpolymer (ligand) chains, store the CCD code for clustering
+            ligand_res_name = chain_res_data[0][0].strip() if mol_type == const.MOL_NONPOLYMER else None
+
             chain_infos.append(
                 ChainInfo(
                     chain_id=asym_id,
@@ -456,6 +465,7 @@ def process_mmcif(
                     num_residues=chain_res_count,
                     entity_id=entity_id,
                     auth_chain_name=orig_label,
+                    res_name=ligand_res_name,
                 )
             )
 
@@ -467,7 +477,18 @@ def process_mmcif(
     atoms_arr = np.array(all_atoms, dtype=ATOM_DTYPE) if all_atoms else np.empty(0, dtype=ATOM_DTYPE)
     residues_arr = np.array(all_residues, dtype=RESIDUE_DTYPE) if all_residues else np.empty(0, dtype=RESIDUE_DTYPE)
     chains_arr = np.array(all_chains, dtype=CHAIN_DTYPE) if all_chains else np.empty(0, dtype=CHAIN_DTYPE)
-    bonds_arr = np.empty(0, dtype=BOND_DTYPE)
+    # Extract cross-entity bonds from mmCIF _struct_conn (disulfide, covalent, metal)
+    conn_bonds: list[tuple[int, int, int]] = []
+    _BOND_TYPES = {gemmi.ConnectionType.Covale, gemmi.ConnectionType.Disulf, gemmi.ConnectionType.MetalC}
+    for conn in st.connections:
+        if conn.type not in _BOND_TYPES:
+            continue
+        p1, p2 = conn.partner1, conn.partner2
+        idx1 = atom_lookup.get((p1.chain_name, p1.res_id.seqid.num, p1.atom_name))
+        idx2 = atom_lookup.get((p2.chain_name, p2.res_id.seqid.num, p2.atom_name))
+        if idx1 is not None and idx2 is not None:
+            conn_bonds.append((idx1, idx2, 1))  # bond order 1 (single)
+    bonds_arr = np.array(conn_bonds, dtype=BOND_DTYPE) if conn_bonds else np.empty(0, dtype=BOND_DTYPE)
 
     structure = Structure(
         atoms=atoms_arr,

@@ -772,12 +772,12 @@ class Featurizer:
                 if o3_idx is not None and p_idx is not None:
                     bonds.append((i, o3_idx, i + 1, p_idx))
 
-        # --- 3. Ligand-ligand bonds from tokenizer ---
+        # --- 3. Token bonds (cross-entity + ligand intra-bonds) ---
         for bond in token_bonds:
             t1, t2 = int(bond["token_1"]), int(bond["token_2"])
-            if 0 <= t1 < N and 0 <= t2 < N:
-                # Ligand tokens have 1 atom each → atom index 0
-                bonds.append((t1, 0, t2, 0))
+            a1, a2 = int(bond["atom_1"]), int(bond["atom_2"])
+            if 0 <= t1 < N and 0 <= t2 < N and a1 < M and a2 < M:
+                bonds.append((t1, a1, t2, a2))
 
         if not bonds:
             return {
@@ -794,6 +794,9 @@ class Featurizer:
         pos2 = atom_gt_positions[t2, a2]  # [B, 3]
         gt_dist = np.linalg.norm(pos1 - pos2, axis=-1)  # [B]
         mask = atom_gt_mask[t1, a1] & atom_gt_mask[t2, a2]  # [B]
+
+        # AF3 §2.8: exclude token bonds with GT distance >= 2.4 A
+        mask = mask & (gt_dist < 2.4)
 
         return {
             "bond_atom_indices": torch.from_numpy(indices),
