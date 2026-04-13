@@ -218,7 +218,8 @@ class TestExpResolvedLoss:
     def test_scalar_output(self):
         logits = _randn(S, N, M * 2, grad=True)
         atom_mask, _ = _masks()
-        loss = exp_resolved_loss(logits, atom_mask)
+        valid_mask = torch.ones(N, M, dtype=torch.bool)
+        loss = exp_resolved_loss(logits, atom_mask, valid_mask)
         assert loss.shape == ()
         assert loss.isfinite()
         loss.backward()
@@ -227,12 +228,13 @@ class TestExpResolvedLoss:
     def test_correct_with_perfect_prediction(self):
         """When logits perfectly predict the mask, loss should be low."""
         atom_mask = torch.ones(N, M, dtype=torch.bool)
+        valid_mask = torch.ones(N, M, dtype=torch.bool)
         # Class 1 (resolved) with high logit
         logits = torch.zeros(S, N, M * 2)
         logits_r = logits.reshape(S, N, M, 2)
         logits_r[..., 1] = 10.0  # high confidence for "resolved"
         logits_r[..., 0] = -10.0
-        loss = exp_resolved_loss(logits_r.reshape(S, N, M * 2), atom_mask)
+        loss = exp_resolved_loss(logits_r.reshape(S, N, M * 2), atom_mask, valid_mask)
         assert loss.item() < 0.01
 
 
