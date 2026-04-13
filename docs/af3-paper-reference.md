@@ -2,7 +2,7 @@
 
 Organized reference from the AlphaFold 3 supplementary material (Abramson et al., Nature 2024). Section numbers refer to the supplementary information.
 
-> **Source**: `resources/41586_2024_7487_MOESM1_ESM.pdf`
+> **Source**: `resources/41586_2024_7487_MOESM1_ESM.txt`
 >
 > **Caution**: The paper contains known typos (e.g. the diffusion loss EDM weighting formula). Cross-reference with reference implementations (Protenix, OpenFold 3) before trusting any equation.
 

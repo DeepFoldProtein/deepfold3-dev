@@ -1,0 +1,28 @@
+{
+  "training": {
+    "max_tokens": 640,
+    "max_atoms": 4096,
+    "diffusion_batch_size": 32,
+    "diffusion_chunk_size": 16,
+
+    "alpha_diffusion": 4.0,
+    "alpha_distogram": 0.03,
+    "alpha_confidence": 1e-4,
+    "alpha_pae": 0.0,
+    "alpha_bond": 1.0,
+    "alpha_smooth_lddt": null,
+
+    "finetune_scheduler": "cosine",
+    "cosine_max_steps": 20000,
+
+    "load_strict": true,
+    "skip_load_optimizer": true,
+    "skip_load_scheduler": true,
+    "skip_load_step": true
+  },
+  "model": {
+    "data": {
+      "max_chains": 20
+    }
+  }
+}

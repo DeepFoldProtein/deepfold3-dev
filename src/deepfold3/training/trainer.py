@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import random
+import re
+import signal
 import time
 from contextlib import nullcontext
 from functools import partial
@@ -24,7 +27,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -106,10 +109,15 @@ class DistributedAverageMeters:
     def count(self) -> int:
         return self._count
 
-    def sync(self) -> dict[str, float]:
-        """All-reduce across ranks and return the global weighted average dict."""
+    def sync(self) -> tuple[dict[str, float], dict[str, float]]:
+        """All-reduce across ranks and return ``(averages, sums)``.
+
+        Both dicts share the same keys. ``averages`` divides by global count
+        (for losses). ``sums`` gives the raw global totals (for counters like
+        token counts that should not be averaged).
+        """
         if not self._sums:
-            return {}
+            return {}, {}
         keys = sorted(self._sums.keys())
         # Pack [sum_k0, sum_k1, ..., sum_kN-1, count] into one f64 tensor.
         packed = torch.empty(len(keys) + 1, dtype=torch.float64, device=self.device)
@@ -120,10 +128,12 @@ class DistributedAverageMeters:
             dist.all_reduce(packed, op=dist.ReduceOp.SUM)
         global_count = packed[-1].item()
         if global_count == 0:
-            return dict.fromkeys(keys, 0.0)
+            return dict.fromkeys(keys, 0.0), dict.fromkeys(keys, 0.0)
         # Single GPU→CPU sync at the very end.
-        averaged = (packed[:-1] / global_count).tolist()
-        return dict(zip(keys, averaged, strict=True))
+        raw = packed[:-1].tolist()
+        sums = dict(zip(keys, raw, strict=True))
+        averaged = {k: v / global_count for k, v in sums.items()}
+        return averaged, sums
 
     def reset(self) -> None:
         for t in self._sums.values():
@@ -173,6 +183,7 @@ class Trainer:
         self.local_rank = 0
         self.is_main = True
         self._last_grad_norm: torch.Tensor | None = None
+        self._best_eval_loss: float = float("inf")
         self._last_num_recycles: int = 0
 
     # ------------------------------------------------------------------
@@ -302,7 +313,7 @@ class Trainer:
             self.ema = EMA(self.model, decay=self.cfg.ema_decay)
 
         # Mixed precision scaler (only for fp16; bf16 doesn't need scaling)
-        self.scaler = GradScaler(enabled=(self.cfg.dtype == "fp16"))
+        self.scaler = GradScaler("cuda", enabled=(self.cfg.dtype == "fp16"))
 
         if self.is_main:
             n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
@@ -377,6 +388,10 @@ class Trainer:
                 name=run_name,
                 config=dataclasses.asdict(self.cfg),
             )
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("eval/*", step_metric="train/step")
+            wandb.define_metric("system/*", step_metric="train/step")
             logger.info(f"WandB initialized: project={self.cfg.wandb_project}, run={run_name}")
         except ImportError:
             logger.warning("wandb not installed, skipping experiment tracking")
@@ -411,6 +426,7 @@ class Trainer:
             spatial_crop_weight=self.model_cfg.data.spatial_crop_weight,
             interface_crop_weight=self.model_cfg.data.interface_crop_weight,
             interface_distance=self.model_cfg.data.interface_distance,
+            max_chains=self.model_cfg.data.max_chains,
         )
 
         # Primary (PDB) dataset
@@ -518,9 +534,10 @@ class Trainer:
 
         eval_dl = None
         if self.eval_records:
+            eval_data_dir = Path(self.cfg.eval_data_dir) if self.cfg.eval_data_dir else Path(self.cfg.data_dir)
             eval_ds = TrainingDataset(
                 records=self.eval_records,
-                data_dir=Path(self.cfg.data_dir),
+                data_dir=eval_data_dir,
                 **ds_kwargs,
             )
             eval_dl = DataLoader(
@@ -816,6 +833,7 @@ class Trainer:
             "scheduler": self.scheduler.state_dict(),
             "global_step": self.global_step,
             "effective_step": self.effective_step,
+            "best_eval_loss": self._best_eval_loss,
             "model_cfg": self.model_cfg,
             "train_cfg": self.cfg,
         }
@@ -833,11 +851,23 @@ class Trainer:
         pattern = "checkpoint_*.pt"
         ckpts = sorted(output_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
         # Exclude checkpoint_final.pt from rotation
-        ckpts = [c for c in ckpts if "final" not in c.stem]
+        ckpts = [c for c in ckpts if "final" not in c.stem and "best" not in c.stem]
         while len(ckpts) > self.cfg.max_checkpoints:
             old = ckpts.pop(0)
             old.unlink()
             logger.info(f"Removed old checkpoint: {old}")
+
+    @staticmethod
+    def _find_latest_checkpoint(output_dir: Path) -> Path | None:
+        """Find the checkpoint with the highest step number in *output_dir*."""
+        best_step, best_path = -1, None
+        for p in output_dir.glob("checkpoint_*.pt"):
+            m = re.search(r"checkpoint_(\d+)\.pt$", p.name)
+            if m:
+                step = int(m.group(1))
+                if step > best_step:
+                    best_step, best_path = step, p
+        return best_path
 
     def _load_checkpoint(self, path: Path) -> None:
         """Resume training from a checkpoint.
@@ -866,6 +896,7 @@ class Trainer:
         if not self.cfg.skip_load_step:
             self.global_step = ckpt.get("global_step", 0)
             self.effective_step = ckpt.get("effective_step", 0)
+        self._best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
 
         if self.is_main:
             logger.info(f"Resumed from {path} at step {self.effective_step}")
@@ -893,8 +924,13 @@ class Trainer:
         output_dir = Path(self.cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Auto-resume: find latest checkpoint in output_dir if none specified
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
+        elif self.cfg.auto_resume:
+            latest = self._find_latest_checkpoint(output_dir)
+            if latest is not None:
+                self._load_checkpoint(latest)
 
         cfg = self.cfg
         if self.is_main:
@@ -923,17 +959,18 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         epoch = 0
-        # DDP-friendly metric accumulator: per-step ``update`` is local-only,
-        # one ``all_reduce`` per log boundary. Placed AFTER backward so DDP
-        # has already synced ranks → the meter's all-reduce is essentially
-        # free (no straggler barrier).
         meters = DistributedAverageMeters(self.device)
-        t0 = time.time()
-        t_last_log = t0  # wall-clock at the previous log emission
-        # Per-microstep wall-clock for ``log_microsteps`` debug logging.
-        # Updated AFTER the optimizer-step so it captures forward+backward+
-        # optimizer time of one microstep.
+        t0 = time.monotonic()
+        t_last_log = t0
         t_last_microstep = t0
+        t_last_ckpt = t0
+        # _best_eval_loss is initialized in __init__ and may be overwritten
+        # by _load_checkpoint; no need for getattr guard here.
+
+        # SIGUSR2 → request immediate checkpoint (preemption safety)
+        self._checkpoint_requested = False
+        if platform.system() != "Windows":
+            signal.signal(signal.SIGUSR2, lambda *_: setattr(self, "_checkpoint_requested", True))
 
         while self.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
@@ -981,6 +1018,12 @@ class Trainer:
                 self._optimizer_step(loss)
 
                 # Accumulate logging metrics locally (no collective).
+                # Inject token count so it rides the same all-reduce as losses.
+                seq_mask = features.get("seq_mask")
+                n_tokens = seq_mask.sum() if seq_mask is not None else torch.tensor(
+                    cfg.max_tokens * cfg.batch_size_per_rank, device=self.device
+                )
+                loss_dict["_tokens"] = n_tokens
                 meters.update(loss_dict, n=1)
 
                 # Per-microstep timing log (debug). Triggered every microstep
@@ -988,7 +1031,7 @@ class Trainer:
                 # wall-clock and per-example wall-clock so iteration cost can
                 # be measured before reaching an effective optimizer step.
                 if cfg.log_microsteps and self.is_main:
-                    now = time.time()
+                    now = time.monotonic()
                     dt_micro = now - t_last_microstep
                     t_last_microstep = now
                     # System-wide throughput: examples processed per second.
@@ -1006,8 +1049,7 @@ class Trainer:
                         f"dt_micro={dt_micro:.2f}s samples/s={samples_per_sec:.3f}"
                     )
                 elif cfg.log_microsteps:
-                    # Non-main ranks still need to keep their wall-clock fresh.
-                    t_last_microstep = time.time()
+                    t_last_microstep = time.monotonic()
 
                 # Release forward-pass outputs and input features immediately.
                 # Without this, local vars hold references to large GPU tensors
@@ -1028,16 +1070,31 @@ class Trainer:
                 # ``grad_norm=nan``.
                 on_opt_step_boundary = self.global_step % cfg.accumulate_grad_batches == 0
                 if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0 and meters.count > 0:
-                    avg = meters.sync()
+                    avg, sums = meters.sync()
                     meters.reset()
 
                     if self.is_main:
                         grad_norm = self._last_grad_norm.item() if self._last_grad_norm is not None else float("nan")
-                        now = time.time()
+                        now = time.monotonic()
                         elapsed = now - t0
-                        dt = (now - t_last_log) / max(self.cfg.log_interval, 1)
+                        wall_since_log = now - t_last_log
+                        dt = wall_since_log / max(self.cfg.log_interval, 1)
                         t_last_log = now
                         lr = self.optimizer.param_groups[0]["lr"]
+
+                        # Throughput (global token sum from all ranks via all-reduce)
+                        tok_per_sec = sums.pop("_tokens", 0) / max(wall_since_log, 1e-9)
+                        avg.pop("_tokens", None)
+
+                        # GPU memory
+                        peak_mem_gb = torch.cuda.max_memory_allocated() / (1 << 30) if torch.cuda.is_available() else 0
+
+                        # ETA
+                        remaining = cfg.max_steps - self.effective_step
+                        eta_sec = remaining * dt
+                        eta_h, eta_rem = divmod(int(eta_sec), 3600)
+                        eta_str = f"{eta_h}:{eta_rem // 60:02d}" if eta_h > 0 else f"{int(eta_sec // 60)}m"
+
                         parts = [f"step={self.effective_step}"]
                         parts.append(f"loss={avg.get('total', 0):.4f}")
                         for k, v in sorted(avg.items()):
@@ -1045,16 +1102,31 @@ class Trainer:
                                 parts.append(f"{k}={v:.4f}")
                         parts.append(f"grad_norm={grad_norm:.3f}")
                         parts.append(f"lr={lr:.2e}")
+                        if tok_per_sec >= 1000:
+                            parts.append(f"tok/s={tok_per_sec / 1000:.1f}k")
+                        else:
+                            parts.append(f"tok/s={tok_per_sec:.0f}")
+                        parts.append(f"mem={peak_mem_gb:.1f}G")
+                        parts.append(f"eta={eta_str}")
                         parts.append(f"dt={dt:.1f}s")
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
 
                         if self._wandb is not None:
                             log_data = {f"train/{k}": v for k, v in avg.items()}
+                            log_data["train/step"] = self.effective_step
                             log_data["train/lr"] = lr
                             log_data["train/epoch"] = epoch
                             log_data["train/grad_norm"] = grad_norm
                             log_data["train/step_time_s"] = dt
+                            log_data["train/tokens_per_sec"] = tok_per_sec
+                            log_data["system/gpu_memory_allocated_gb"] = (
+                                torch.cuda.memory_allocated() / (1 << 30) if torch.cuda.is_available() else 0
+                            )
+                            log_data["system/gpu_memory_reserved_gb"] = (
+                                torch.cuda.memory_reserved() / (1 << 30) if torch.cuda.is_available() else 0
+                            )
+                            log_data["system/gpu_peak_memory_gb"] = peak_mem_gb
                             self._wandb.log(log_data, step=self.effective_step)
 
                 # --- Evaluation ---
@@ -1064,11 +1136,31 @@ class Trainer:
                         logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
                         if self._wandb is not None:
                             self._wandb.log(eval_metrics, step=self.effective_step)
+                        # Best-model tracking
+                        eval_total = eval_metrics.get("eval/total", float("inf"))
+                        if eval_total < self._best_eval_loss:
+                            self._best_eval_loss = eval_total
+                            self._save_checkpoint(output_dir / "checkpoint_best.pt")
+                            logger.info(f"New best eval loss: {eval_total:.4f}")
 
                 # --- Checkpoint ---
-                if self.is_main and self.effective_step % self.cfg.checkpoint_interval == 0:
-                    ckpt_path = output_dir / f"checkpoint_{self.effective_step}.pt"
-                    self._save_checkpoint(ckpt_path)
+                need_ckpt = False
+                if self.is_main:
+                    if self.effective_step % self.cfg.checkpoint_interval == 0:
+                        need_ckpt = True
+                    elif (
+                        cfg.checkpoint_every_hours > 0
+                        and (time.monotonic() - t_last_ckpt) / 3600 >= cfg.checkpoint_every_hours
+                    ):
+                        need_ckpt = True
+                    elif self._checkpoint_requested:
+                        self._checkpoint_requested = False
+                        need_ckpt = True
+                        logger.info("Signal-triggered checkpoint requested")
+
+                if need_ckpt:
+                    self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
+                    t_last_ckpt = time.monotonic()
 
             epoch += 1
 

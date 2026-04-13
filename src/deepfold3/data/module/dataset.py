@@ -72,6 +72,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         spatial_crop_weight: float = 0.4,
         interface_crop_weight: float = 0.4,
         interface_distance: float = 15.0,
+        max_chains: int = 0,
         sampling_rows: list | None = None,
     ):
         self.records = records
@@ -84,6 +85,17 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.data_dir = Path(data_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
+        self.max_chains = max_chains
+        # Pre-compute chain selection for records exceeding max_chains
+        # (deterministic per record, no need to recompute each __getitem__).
+        self._dropped_chains_cache: dict[str, set[int]] = {}
+        if max_chains > 0:
+            from deepfold3.data.prepare.filters import select_interface_chains
+
+            for r in records:
+                dropped = select_interface_chains(r, max_polymer_chains=max_chains)
+                if dropped:
+                    self._dropped_chains_cache[r.id] = dropped
         self.is_distillation = is_distillation
         self.tokenizer = Tokenizer()
         self.cropper = Cropper(
@@ -143,11 +155,26 @@ class TrainingDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Structure file not found: {struct_path}")
         structure = Structure.load(struct_path)
 
+        # Training-time chain selection (AF3 §2.5.4 / Table 6).
+        # Pre-computed at init time; look up from cache.
+        dropped_chain_ids: set[int] = self._dropped_chains_cache.get(record.id, set())
+        if dropped_chain_ids:
+            mask = ~np.isin(structure.chains["asym_id"], list(dropped_chain_ids))
+            structure = Structure(
+                atoms=structure.atoms,
+                residues=structure.residues,
+                chains=structure.chains[mask],
+                bonds=structure.bonds,
+                name=structure.name,
+            )
+
         # Load per-chain MSAs (unpaired + optional paired)
         msa_dir = self.data_dir / "msa"
         unpaired_msa: dict[int, MSA] = {}
         paired_msa: dict[int, MSA] = {}
         for chain_info in record.chains:
+            if chain_info.chain_id in dropped_chain_ids:
+                continue
             # Unpaired MSA
             msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
             if msa_path.exists():
@@ -166,7 +193,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
         if self.mmcif_dir:
             if self.prefer_monomer_templates and self._has_monomer_templates:
-                template_feats_per_chain = self._load_monomer_templates(record)
+                template_feats_per_chain = self._load_monomer_templates(record, dropped_chain_ids)
             elif self._has_templates:
                 tpl_index = template_path(self.data_dir / "templates", record.id)
                 if tpl_index.exists():
@@ -196,7 +223,9 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         return feats
 
-    def _load_monomer_templates(self, record: Record) -> dict[int, list[TemplateFeatures]] | None:
+    def _load_monomer_templates(
+        self, record: Record, skip_chain_ids: set[int] | None = None
+    ) -> dict[int, list[TemplateFeatures]] | None:
         """Load per-chain monomer template features (AlphaFold 3 §2.4).
 
         For each protein chain in the record:
@@ -243,6 +272,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         result: dict[int, list[TemplateFeatures]] = {}
         for chain_info in record.chains:
             if not chain_info.valid or chain_info.mol_type != const.MOL_PROTEIN:
+                continue
+            if skip_chain_ids and chain_info.chain_id in skip_chain_ids:
                 continue
             tpl_path = monomer_template_path(templates_root, str(chain_info.msa_id))
             if not tpl_path.exists():

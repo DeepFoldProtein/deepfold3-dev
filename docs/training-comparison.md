@@ -220,9 +220,10 @@ Config-driven via YAML dataset specifications:
 
 Config-override-driven stages (no hardcoded presets — use `--config` JSON or `--override key=value`):
 
-1. **Stage 1 — Initial**: Default config. `alpha_diffusion=4.0`, `alpha_pae=0.0`, `alpha_bond=0.0`. AF3 LR schedule.
-2. **Stage 2 — Finetune (structure)**: `alpha_bond>0`. Optional cosine annealing (`finetune_scheduler=cosine`). Load stage 1 checkpoint with `--params`.
-3. **Stage 3 — Finetune (confidence)**: `train_confidence_only=True` (freezes trunk). `alpha_pae=1.0`. `alpha_diffusion=0`, `alpha_distogram=0`.
+1. **Stage 1 — Initial**: crop 384, diffusion batch 48. `alpha_diffusion=4.0`, `alpha_pae=0.0`, `alpha_bond=0.0`. AF3 LR schedule.
+2. **Fine-tune 1 — Structure (640)**: crop 640, diffusion batch 32. `alpha_bond=1.0`, `alpha_smooth_lddt=null`. Load Stage 1 with `--params`.
+3. **Fine-tune 2 — Structure (768)**: crop 768, diffusion batch 32. `alpha_bond=1.0`, smooth LDDT back on. TF distillation sets on. Load Fine-tune 1 with `--params`.
+4. **Fine-tune 3 — Confidence**: `train_confidence_only=True` (freezes trunk). `alpha_pae=1.0`. `alpha_diffusion=0`, `alpha_distogram=0`. Max chains 50. Load Fine-tune 2 with `--params`.
 
 ## 8. Checkpointing
 

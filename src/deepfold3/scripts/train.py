@@ -101,6 +101,17 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     ),
 )
 @click.option(
+    "--eval-data-dir",
+    default=None,
+    type=click.Path(exists=True),
+    help="Separate evaluation data directory (overrides date-based or random split).",
+)
+@click.option(
+    "--eval-cutoff-date",
+    default=None,
+    help="ISO date (YYYY-MM-DD): records released after this go to eval set (AF3-style).",
+)
+@click.option(
     "--mmcif-dir",
     default=None,
     type=click.Path(exists=True),
@@ -124,6 +135,8 @@ def train(
     include_list: str | None,
     exclude_list: str | None,
     extra_datasets: tuple[str, ...],
+    eval_data_dir: str | None,
+    eval_cutoff_date: str | None,
     mmcif_dir: str | None,
 ) -> None:
     """Train DeepFold3 model."""
@@ -209,6 +222,10 @@ def train(
         train_cfg.wandb_enabled = True
     if mmcif_dir is not None:
         train_cfg.mmcif_dir = mmcif_dir
+    if eval_data_dir is not None:
+        train_cfg.eval_data_dir = eval_data_dir
+    if eval_cutoff_date is not None:
+        train_cfg.eval_cutoff_date = eval_cutoff_date
 
     # Apply --override key=value pairs (supports int, float, bool, str)
     for kv in override:
@@ -250,16 +267,45 @@ def train(
             all_records = [r for r in all_records if r.id not in denied]
             log.info("Exclude list: %d → %d records", before, len(all_records))
 
-    # Shuffle with fixed seed for reproducible train/eval split
+    # Train / eval split — three modes by priority:
+    #   1. --eval-data-dir: separate dataset directory for eval
+    #   2. eval_cutoff_date: records released AFTER cutoff → eval set (AF3-style)
+    #   3. fallback: random split with fixed seed
     import random
 
-    rng = random.Random(42)
-    rng.shuffle(all_records)
+    eval_records: list = []
 
-    # Split: last 5% for eval (at least 1 if available)
-    n_eval = max(1, len(all_records) // 20)
-    records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
-    eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
+    if train_cfg.eval_data_dir:
+        # Mode 1: dedicated eval dataset
+        eval_records = discover_records(Path(train_cfg.eval_data_dir))
+        records = all_records
+        log.info("Eval from separate dir: %d eval records from %s", len(eval_records), train_cfg.eval_data_dir)
+    elif train_cfg.eval_cutoff_date:
+        # Mode 2: date-based split (AF3 §5.8)
+        cutoff = train_cfg.eval_cutoff_date
+        max_eval = train_cfg.eval_max_date
+        records, eval_records = [], []
+        for r in all_records:
+            released = r.structure_info.released if r.structure_info else None
+            if released and released > cutoff:
+                if not max_eval or released <= max_eval:
+                    eval_records.append(r)
+                # Records after max_eval are excluded entirely
+            else:
+                records.append(r)
+        log.info(
+            "Date-based split (cutoff=%s, max=%s): %d train, %d eval",
+            cutoff, max_eval or "none", len(records), len(eval_records),
+        )
+    else:
+        # Mode 3: random split
+        split_seed = train_cfg.seed
+        rng = random.Random(split_seed)
+        rng.shuffle(all_records)
+        n_eval = max(1, int(len(all_records) * train_cfg.eval_fraction))
+        records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
+        eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
+        log.info("Random split (seed=%d, frac=%.2f): %d train, %d eval", split_seed, train_cfg.eval_fraction, len(records), len(eval_records))
 
     # Load distillation records if configured (legacy)
     distillation_records = []

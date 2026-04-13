@@ -24,6 +24,7 @@ from pathlib import Path
 
 import click
 
+from deepfold3.data import const
 from deepfold3.data.msa.paths import paired_msa_path, paired_msa_root, unpaired_msa_path, unpaired_msa_root
 from deepfold3.data.parse.a3m import convert_a3m_file_to_npz
 from deepfold3.data.prepare.materialize import MaterializeTask, precreate_shards, run_materialize
@@ -69,6 +70,11 @@ from deepfold3.scripts import cli
     help="Generate paired (cross-chain) MSAs for multimer complexes.",
 )
 @click.option("--verbose", is_flag=True, default=False, help="Stream MMseqs2 stderr to terminal.")
+@click.option(
+    "--use-templates/--no-templates",
+    default=False,
+    help="Also search PDB for template hits and write per-sequence m8 files.",
+)
 def msa_batch(
     data_dir: Path,
     db_dir: Path | None,
@@ -82,6 +88,7 @@ def msa_batch(
     convert_only: bool,
     use_pairing: bool,
     verbose: bool,
+    use_templates: bool,
 ) -> None:
     """Generate MSAs for all unique sequences in training data.
 
@@ -193,7 +200,7 @@ def msa_batch(
                 mmseqs=mmseqs,
                 db_dir=str(db_dir),
                 use_env=use_env,
-                use_templates=False,
+                use_templates=use_templates,
                 filter=use_filter,
                 threads=threads,
                 gpu=gpu,
@@ -203,14 +210,22 @@ def msa_batch(
 
             # Write A3M files; shards already pre-created
             written = 0
+            m8_written = 0
             for msa_id, msa_result in results.items():
                 a3m_text = msa_result.unpaired.get(0, "")
                 if a3m_text:
                     a3m_path = unpaired_msa_path(msa_dir, msa_id).with_suffix(".a3m")
                     a3m_path.write_text(a3m_text)
                     written += 1
+                # Write m8 template hits alongside A3M
+                if use_templates and msa_result.m8_text:
+                    m8_path = unpaired_msa_path(msa_dir, msa_id).with_suffix(".m8")
+                    m8_path.write_text(msa_result.m8_text)
+                    m8_written += 1
 
             log.info("Batch %d: wrote %d/%d A3M files.", batch_idx + 1, written, len(keys))
+            if use_templates:
+                log.info("Batch %d: wrote %d/%d m8 template hit files.", batch_idx + 1, m8_written, len(keys))
 
         # Move searched sequences to need_convert
         need_convert.extend(need_search)
@@ -251,7 +266,7 @@ def msa_batch(
         skipped = 0
 
         for record in records:
-            protein_chains = [c for c in record.chains if c.valid and c.mol_type == 0]
+            protein_chains = [c for c in record.chains if c.valid and c.mol_type == const.MOL_PROTEIN]
             if len(protein_chains) <= 1:
                 continue
 

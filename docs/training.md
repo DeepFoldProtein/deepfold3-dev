@@ -37,7 +37,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 {
   "training": {
     "lr": 0.0018,
-    "weight_decay": 0.0,
+    "weight_decay": 1e-8,
     "betas": [0.9, 0.95],
     "warmup_steps": 1000,
     "start_decay_after": 50000,
@@ -48,7 +48,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
     "ema_decay": 0.999,
     "max_tokens": 384,
     "max_atoms": 4096,
-    "max_recycles": 4,
+    "max_recycles": 3,
     "diffusion_batch_size": 48,
     "diffusion_chunk_size": 0,
     "mini_rollout_steps": 20,
@@ -71,7 +71,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
   },
   "model": {
     "num_recycles": 10,
-    "msa_crop_size": 1024
+    "msa_crop_size": 512
   }
 }
 ```
@@ -81,7 +81,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 ### Forward Pass (per batch)
 
 ```
-1. Evoformer trunk (random 1–4 recycles, gradient on last only)
+1. Evoformer trunk (random 0–3 recycles = 1–4 trunk passes, gradient on last only)
      → single [N, 384] + pair [N, N, 128]
 
 2. Diffusion training step (gradient flows)
@@ -193,7 +193,41 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py`: rea
 
 **Cropping**: Three strategies with weighted random selection — contiguous (20%), spatial KD-tree (40%), interface-seeded (40%). Interface cropping seeds from tokens within 15 Å of another chain, then expands spatially.
 
-**Preprocessing**: use `deepfold3 prepare` to generate the data directory from a PDB mmCIF mirror. See `docs/data-pipeline.md` § Data Preprocessing for details.
+**Preprocessing**: End-to-end recipe from a PDB mmCIF mirror to training-ready data:
+
+```bash
+# 1. Process structures: mmCIF → Structure NPZ + manifest
+#    Filters: resolution ≤ 9 Å, max 300 chains, min 4 residues per chain
+deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training \
+    --max-resolution 9.0 --workers 16
+
+# 2. Enrich manifest with release dates (needed for template date cutoff)
+deepfold3 scan-mmcif --mmcif-dir /scratch/pdb/mmCIF --data-dir /data/training \
+    --output mmcif_meta.json --workers 32
+deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx \
+    --mmcif-cache mmcif_meta.json
+
+# 3. Apply sequence clustering (40% identity, wwPDB pre-computed)
+wget -q https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-40.txt
+deepfold3 apply-clusters --manifest /data/training/manifest.json \
+    --cluster-file clusters-by-entity-40.txt --output /data/training/manifest.json
+
+# 4. Generate unpaired MSAs (local MMseqs2, GPU-accelerated)
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
+
+# 5. Generate paired MSAs for multimer complexes
+deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ \
+    --gpu --use-pairing
+
+# 6. Discover monomer templates (per-chain m8 hits)
+deepfold3 prepare-templates --data-dir /data/training \
+    --m8-dir /data/msa/pdb/merged/m8 --max-templates 20 --workers 16
+
+# 7. Drop obsolete PDB entries (optional, if using a stale mirror)
+deepfold3 drop-obsolete --data-dir /data/training
+```
+
+See `docs/data-pipeline.md` for details on each step.
 
 ### Multi-Dataset Training
 
@@ -396,27 +430,37 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 Stages are controlled by config overrides — no hardcoded presets. Use `--config` with stage JSON files or `--override key=value`.
 
+AF3 trains in 4 stages (Table 6 of supplementary). Each loads weights from the previous stage.
+
 ### Stage 1: Initial Training
 
 ```json
-{"alpha_diffusion": 4.0, "alpha_pae": 0.0, "alpha_bond": 0.0}
+{"alpha_diffusion": 4.0, "alpha_pae": 0.0, "alpha_bond": 0.0, "diffusion_batch_size": 48, "max_tokens": 384}
 ```
 
-### Stage 2: Fine-tune Structure
+### Fine-tune 1: Structure (crop 640)
 
 ```json
-{"alpha_diffusion": 4.0, "alpha_pae": 0.0, "alpha_bond": 1.0, "finetune_scheduler": "cosine"}
+{"alpha_bond": 1.0, "alpha_smooth_lddt": null, "diffusion_batch_size": 32, "max_tokens": 640}
 ```
 
-Bond loss replaces smooth LDDT as the geometry regularizer. Load stage 1 checkpoint with `--params`.
+Bond loss on, smooth LDDT off. Disorder PDB distillation weight reduced to 0.01; masked diffusion for non-protein disabled. Load Stage 1 checkpoint with `--params`.
 
-### Stage 3: Fine-tune Confidence
+### Fine-tune 2: Structure (crop 768)
 
 ```json
-{"train_confidence_only": true, "alpha_diffusion": 0.0, "alpha_distogram": 0.0, "alpha_pae": 1.0}
+{"alpha_bond": 1.0, "diffusion_batch_size": 32, "max_tokens": 768}
 ```
 
-Freezes all parameters except confidence head. Only confidence losses (pLDDT, PDE, PAE, exp_resolved) are active.
+Smooth LDDT back on (default). Transcription factor distillation sets enabled. Disorder PDB weight back to 0.02. Load Fine-tune 1 checkpoint with `--params`.
+
+### Fine-tune 3: Confidence
+
+```json
+{"train_confidence_only": true, "alpha_diffusion": 0.0, "alpha_distogram": 0.0, "alpha_pae": 1.0, "diffusion_batch_size": 32, "max_tokens": 768}
+```
+
+Freezes all parameters except confidence head. Only confidence losses (pLDDT, PDE, PAE, exp_resolved) are active. Max chains increased to 50. Load Fine-tune 2 checkpoint with `--params`.
 
 ## AF3 Data Pipeline Conformance
 
@@ -455,30 +499,33 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 | Paper section | Item | Our approach | Impact |
 |---|---|---|---|
 | §3.7.1 | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
+| §2.5.1 | Chain/interface-level sampling | Sampler aggregates per-record, not per-(chain\|interface) | Affects sampling distribution; see §2.5.1 weight formula |
 
 ### ❌ Missing (known gaps)
 
-None — all AF3 data pipeline items are implemented or have configurable support.
+| Paper section | Item | Notes |
+|---|---|---|
+| §5.2, Table 6 | Masked diffusion loss for non-protein in disorder PDB distillation | Not applicable — diffusion without masking is intended |
 
 ### Stage Configuration Quick Reference
 
 From AF3 Table 6. Use `--config` with stage JSON files or `--override`:
 
 ```bash
-# Stage 1: Initial training
-deepfold3 train --data-dir /data --output runs/s1
+# Stage 1: Initial training (crop 384, diffusion batch 48, max_chains 20)
+deepfold3 train --data-dir /data --output runs/s1 --config configs/initial.json
 
-# Fine-tune 1: crop 640, bond loss on, smooth LDDT off
+# Fine-tune 1: crop 640, bond loss on, smooth LDDT off, diffusion batch 32
 deepfold3 train --data-dir /data --output runs/ft1 --params runs/s1/checkpoint_final.pt \
-    --override max_tokens=640 --override alpha_bond=1.0 --override alpha_smooth_lddt=null
+    --config configs/finetune1_structure_640.json
 
-# Fine-tune 2: crop 768 (+ TF distillation sets)
+# Fine-tune 2: crop 768, smooth LDDT back on, TF distillation sets on
 deepfold3 train --data-dir /data --output runs/ft2 --params runs/ft1/checkpoint_final.pt \
-    --override max_tokens=768 --override alpha_bond=1.0
+    --config configs/finetune2_structure_768.json
 
-# Fine-tune 3: PAE only
+# Fine-tune 3: PAE only, max chains 50
 deepfold3 train --data-dir /data --output runs/ft3 --params runs/ft2/checkpoint_final.pt \
-    --override train_confidence_only=true --override alpha_pae=1.0
+    --config configs/finetune3_confidence.json
 ```
 
 ## Source Layout

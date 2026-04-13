@@ -255,6 +255,15 @@ def _import_msa_files(
         ok2, _ = run_materialize(fallback_work, workers, log, label="materialized (fallback)", keep_a3m=keep_a3m)
         matched += ok2
 
+        still_missing = [mid for mid in unresolved if mid not in a3m_index]
+        if still_missing:
+            log.warning(
+                "%d unique msa_ids have no A3M in source dir (content-hash resolved %d/%d):",
+                len(still_missing), len(unresolved) - len(still_missing), len(unresolved),
+            )
+            for mid in still_missing:
+                log.warning("  missing: %s", mid)
+
     return matched, total
 
 

@@ -454,6 +454,8 @@ class TrainingConfig:
     )
     batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
     max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
+    checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)
+    auto_resume: bool = True  # auto-detect latest checkpoint in output_dir
 
     # Multi-stage training (use --override or JSON config to set these per stage)
     train_confidence_only: bool = False  # freeze trunk, only train confidence head
@@ -474,6 +476,12 @@ class TrainingConfig:
     # ``output_dir`` and append a YYYYMMDD-HHMMSS timestamp so re-runs are
     # never accidentally collapsed under one wandb run.
     wandb_run_name: str | None = None
+
+    # Evaluation
+    eval_data_dir: str = ""  # separate eval dataset dir (overrides date-based split)
+    eval_cutoff_date: str = ""  # ISO date: records released AFTER this → eval set (e.g. "2021-09-30")
+    eval_max_date: str = ""  # ISO date: records released AFTER this are excluded from eval
+    eval_fraction: float = 0.05  # fallback random split fraction when no cutoff/dir provided
 
     # Paths (set at runtime)
     output_dir: str = "output"
@@ -556,6 +564,12 @@ class DataConfig:
     # Prefer per-sequence monomer templates over per-record multimer
     # templates when both directories are present.
     prefer_monomer_templates: bool = True
+    # Maximum polymer chains to keep per sample at training time
+    # (AF3 §2.5.4 / Table 6: 20 for initial + fine-tune 1/2, 50 for
+    # fine-tune 3).  When a structure exceeds this limit, the same
+    # greedy interface-maximising selection from prepare-time is applied
+    # at sampling time.  Set 0 to disable.
+    max_chains: int = 20
 
 
 @dataclass

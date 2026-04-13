@@ -410,12 +410,12 @@ def etkdg_conformer(smiles: str, seed: int = 42) -> CcdMolecule | None:
 # ---------------------------------------------------------------------------
 
 
-def _generate_ref_pos_for_code(args: tuple[str, str]) -> tuple[str, list[list[float]]] | None:
+def _generate_ref_pos_for_code(args: tuple[str, str]) -> tuple[str, list[list[float]] | None]:
     """Worker: generate ETKDGv3 ref_pos for a single CCD code from its SMILES."""
     code, smiles = args
     mol = etkdg_conformer(smiles)
     if mol is None:
-        return None
+        return code, None
     return code, mol.positions.tolist()
 
 
@@ -489,28 +489,57 @@ def build_atom_name_cache(
         log.info("Generating ETKDGv3 ref_pos for %d CCD entries (workers=%d)...", len(smiles_map), workers)
         generated = 0
 
+        failed_codes: list[str] = []
+        n_total = len(smiles_map)
+
+        skipped_no_atoms: list[str] = []
+
+        def _apply_result(code: str, positions: list[list[float]] | None) -> None:
+            nonlocal generated
+            if positions is None:
+                failed_codes.append(code)
+            elif code not in cache:
+                skipped_no_atoms.append(code)
+            else:
+                cache[code]["ref_pos"] = positions
+                generated += 1
+
         if workers <= 1:
-            for code, smiles in smiles_map.items():
+            for i, (code, smiles) in enumerate(smiles_map.items()):
                 result = _generate_ref_pos_for_code((code, smiles))
-                if result is not None and code in cache:
-                    cache[code]["ref_pos"] = result[1]
-                    generated += 1
+                _apply_result(code, result[1])
+                if (i + 1) % 5000 == 0:
+                    log.info("  ref_pos: %d/%d done (%d ok, %d failed)", i + 1, n_total, generated, len(failed_codes))
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
 
             items = list(smiles_map.items())
+            done = 0
             with ProcessPoolExecutor(max_workers=workers) as executor:
                 futures = {executor.submit(_generate_ref_pos_for_code, item): item[0] for item in items}
                 for future in as_completed(futures):
+                    done += 1
+                    code = futures[future]
                     try:
                         result = future.result()
                     except Exception:
+                        failed_codes.append(code)
                         continue
-                    if result is not None and result[0] in cache:
-                        cache[result[0]]["ref_pos"] = result[1]
-                        generated += 1
+                    _apply_result(result[0], result[1])
+                    if done % 5000 == 0:
+                        log.info(
+                            "  ref_pos: %d/%d done (%d ok, %d failed)", done, n_total, generated, len(failed_codes)
+                        )
 
-        log.info("Generated ref_pos for %d/%d CCD entries", generated, len(smiles_map))
+        log.info(
+            "Generated ref_pos for %d/%d CCD entries (%d conformer failed, %d skipped no atoms)",
+            generated, n_total, len(failed_codes), len(skipped_no_atoms),
+        )
+        if failed_codes:
+            for code in failed_codes[:50]:
+                log.warning("  ref_pos conformer failed: %s (SMILES: %.60s)", code, smiles_map.get(code, "?"))
+            if len(failed_codes) > 50:
+                log.warning("  ... and %d more", len(failed_codes) - 50)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

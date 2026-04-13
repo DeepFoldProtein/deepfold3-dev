@@ -28,6 +28,7 @@
     "mini_rollout_samples": 1,
 
     "alpha_diffusion": 4.0,
+    "alpha_smooth_lddt": 1.0,
     "alpha_distogram": 0.03,
     "alpha_confidence": 1e-4,
     "alpha_pae": 0.0,
@@ -56,22 +57,22 @@
     "static_graph": true,
     "train_confidence_only": false,
 
-    "max_steps": 200000,
+    "max_steps": 100000,
     "seed": 42,
     "checkpoint_interval": 100,
     "eval_interval": 500,
     "log_interval": 1,
-    "log_microsteps": true,
+    "log_microsteps": false,
     "uniform_recycle": true,
-    "max_checkpoints": 100,
+    "max_checkpoints": 500,
 
     "load_strict": true,
     "skip_load_optimizer": false,
     "skip_load_scheduler": false,
     "skip_load_step": false,
 
-    "wandb_enabled": false,
-    "wandb_project": "deepfold3",
+    "wandb_enabled": true,
+    "wandb_project": "deepfold3-stage0",
     "wandb_run_name": null
   },
   "model": {

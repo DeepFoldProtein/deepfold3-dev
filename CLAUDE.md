@@ -70,7 +70,7 @@ deepfold3 drop-obsolete --data-dir /data/training --delete-files
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors --mmcif-dir /data/pdb/mmcif
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
-deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
+deepfold3 train     --data-dir /data/training --output runs/exp1 --config configs/finetune1_structure_640.json --params runs/exp1/checkpoint_final.pt
 deepfold3 train     --data-dir /data/training --output runs/exp1 --override alpha_pae=1.0 --override train_confidence_only=true
 deepfold3 train     --data-dir /data/training --output runs/exp1 --wandb deepfold3
 deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.25:uniform:true
@@ -261,11 +261,11 @@ deepfold3 train --data-dir /data/training --output runs/exp1
 
 # Stage 2: Fine-tune structure (bond loss on, cosine LR)
 deepfold3 train --data-dir /data/training --output runs/exp2 \
-    --config configs/stage2_finetune_structure.json --params runs/exp1/checkpoint_final.pt
+    --config configs/finetune1_structure_640.json --params runs/exp1/checkpoint_final.pt
 
 # Stage 3: Fine-tune confidence (freeze trunk, enable PAE)
 deepfold3 train --data-dir /data/training --output runs/exp3 \
-    --config configs/stage3_finetune_confidence.json --params runs/exp2/checkpoint_final.pt
+    --config configs/finetune3_confidence.json --params runs/exp2/checkpoint_final.pt
 ```
 
 ### Training Data Format
@@ -328,7 +328,7 @@ Training-time template support uses pre-computed per-chain m8 files (MMseqs2 hit
 3. **Seqres realignment**: `template_realign.py` handles the mismatch between PDB SEQRES (used by search tools) and the actual mmCIF structure (which may have missing/different residues). Applied automatically in both the HHR inference path (`extract_template_features_from_hhr`) and the training CIGAR path (`extract_from_seqres_alignment`).
 4. **Template augmentation**: each sample randomly uses 0..max_templates from available hits (uniform). Per-chain dropout randomly drops chain alignments from multimer templates (50% per chain, always keeping ≥1), so the model sees full, partial, or no cross-chain template context.
 5. **Per-template pair mask**: Template embedding uses per-template coverage mask (`pb_mask[i] × pb_mask[j]`) instead of the query's `multichain_mask`. This allows multimer templates to provide cross-chain structural information (interface distances, relative orientations). Monomer templates naturally mask to intra-chain only since they cover a single chain.
-6. **Not yet implemented**: Date cutoff filtering to avoid data leakage.
+6. **Date cutoff filtering**: Implemented in `dataset.py:_load_monomer_templates` — applies `min(max_template_date, record.released - cutoff_days)` per record (AF3 §2.4: template release ≥ 60 days before example release; distillation max 2018-04-30).
 
 The inference template pipeline (`data/parse/templates.py`) supports per-chain HHR templates and whole-complex JSON templates.
 

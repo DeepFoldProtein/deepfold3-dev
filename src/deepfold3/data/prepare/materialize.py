@@ -51,6 +51,7 @@ def _materialize_one(args: tuple[MaterializeTask, bool]) -> tuple[str, bool]:
     """
     task, keep_a3m = args
     dest_npz = Path(task.dest_npz)
+    dest_npz.parent.mkdir(parents=True, exist_ok=True)
     src = Path(task.src)
     if not convert_a3m_file_to_npz(src, dest_npz):
         return task.msa_id, False
