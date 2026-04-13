@@ -310,27 +310,28 @@ def process_mmcif(
         for sc in entity.subchains:
             subchain_to_entity[sc] = entity.name
 
-    # AF3 §2.5.4: collect leaving atoms to exclude from covalent bond partners
-    _leaving_atoms: set[tuple[str, int, str]] = set()  # (label_asym_id, res_id, atom_name)
+    # AF3 §2.5.4: collect leaving atoms to exclude from covalent bond partners.
+    # Uses auth_asym_id + auth_seq_id because gemmi exposes residues via
+    # chain.name (= auth_asym_id) and res.seqid.num (= auth_seq_id).
+    _leaving_atoms: set[tuple[str, int, str]] = set()  # (auth_asym_id, auth_seq_id, atom_name)
     if ccd_leaving_atoms:
         _conn_table = doc[0].find(
             "_struct_conn.",
             [
                 "conn_type_id",
                 "pdbx_leaving_atom_flag",
-                "ptnr1_label_asym_id",
+                "ptnr1_auth_asym_id",
                 "ptnr1_label_comp_id",
-                "ptnr1_label_seq_id",
-                "ptnr2_label_asym_id",
+                "ptnr1_auth_seq_id",
+                "ptnr2_auth_asym_id",
                 "ptnr2_label_comp_id",
-                "ptnr2_label_seq_id",
+                "ptnr2_auth_seq_id",
             ],
         )
         for row in _conn_table:
             flag = row[1].strip().strip('"').lower()
             if flag not in ("one", "both"):
                 continue
-            # Partner 1
             p1_chain, p1_comp, p1_seq = row[2].strip(), row[3].strip(), row[4].strip()
             p2_chain, p2_comp, p2_seq = row[5].strip(), row[6].strip(), row[7].strip()
             try:
@@ -425,7 +426,8 @@ def process_mmcif(
                         continue
 
                     # AF3 §2.5.4: remove leaving atoms from covalent bond partners
-                    if _leaving_atoms and (orig_label, res_id, atom.name.strip()) in _leaving_atoms:
+                    # Key uses (chain.name, res_id) = (auth_asym_id, auth_seq_id)
+                    if _leaving_atoms and (chain.name, res_id, atom.name.strip()) in _leaving_atoms:
                         continue
 
                     pos = atom.pos
