@@ -62,6 +62,7 @@ class StructureFilterConfig:
     max_ca_dist: float = 10.0
     clash_freq: float = 0.3
     clash_dist: float = 1.7
+    max_polymer_chains: int = 20  # AF3 §2.5.4: keep 20 closest to interface center
 
 
 def _get_chain_residues(structure: Structure, chain_info: ChainInfo) -> np.ndarray:
@@ -210,6 +211,49 @@ def filter_clashing_chains(
     return invalid
 
 
+def select_interface_chains(
+    record: Record,
+    max_polymer_chains: int = 20,
+) -> set[int]:
+    """If >max_polymer_chains polymer chains, greedily keep those maximising interfaces.
+
+    AF3 §2.5.4: when a structure has more than 20 polymer chains, select
+    the 20 that maximise the number of cross-chain interfaces.  Uses a
+    greedy algorithm: repeatedly pick the chain that adds the most new
+    interfaces with already-selected chains.
+
+    Returns set of chain_ids (asym_ids) to mark invalid (the ones NOT kept).
+    """
+    polymer_chains = [ci for ci in record.chains if ci.valid and ci.mol_type != const.MOL_NONPOLYMER]
+    if len(polymer_chains) <= max_polymer_chains:
+        return set()
+
+    polymer_ids = {ci.chain_id for ci in polymer_chains}
+
+    # Build adjacency from interfaces: chain_id → set of neighbouring chain_ids
+    neighbours: dict[int, set[int]] = {cid: set() for cid in polymer_ids}
+    for iface in record.interfaces:
+        if not iface.valid:
+            continue
+        c1, c2 = iface.chain_1, iface.chain_2
+        if c1 in polymer_ids and c2 in polymer_ids:
+            neighbours[c1].add(c2)
+            neighbours[c2].add(c1)
+
+    # Greedy selection: start with the chain having most interfaces, then
+    # iteratively pick the chain that adds the most new interfaces to the
+    # selected set.
+    selected: set[int] = set()
+    remaining = set(polymer_ids)
+
+    for _ in range(min(max_polymer_chains, len(polymer_ids))):
+        best_cid = max(remaining, key=lambda c: len(neighbours[c] & selected) if selected else len(neighbours[c]))
+        selected.add(best_cid)
+        remaining.discard(best_cid)
+
+    return polymer_ids - selected
+
+
 def filter_structure_metadata(
     record: Record,
     cfg: StructureFilterConfig | None = None,
@@ -298,6 +342,13 @@ def filter_structure(
     for ci in record.chains:
         if ci.chain_id in clashing:
             reasons[ci.chain_name] = "chain clashing"
+            ci.valid = False
+
+    # AF3 §2.5.4: if >20 polymer chains, keep 20 that maximise interfaces
+    too_far = select_interface_chains(record, cfg.max_polymer_chains)
+    for ci in record.chains:
+        if ci.chain_id in too_far:
+            reasons[ci.chain_name] = f"polymer chain not in top {cfg.max_polymer_chains} closest to interface"
             ci.valid = False
 
     # Mark interfaces invalid if either chain is invalid

@@ -257,6 +257,7 @@ def process_mmcif(
     path: Path,
     use_assembly: bool = True,
     assembly_id: str = "1",
+    ccd_atom_names: dict[str, set[str]] | None = None,
 ) -> tuple[Structure, Record]:
     """Process a PDB mmCIF file into a DeepFold3 Structure and Record.
 
@@ -264,6 +265,9 @@ def process_mmcif(
         path: Path to .cif, .cif.gz, or .cif.zst file.
         use_assembly: If True, expand biological assembly (default: assembly 1).
         assembly_id: Which assembly to expand (default "1").
+        ccd_atom_names: Optional CCD atom name cache for validation. If provided,
+            atoms whose names are not in the CCD dictionary for their residue type
+            are excluded (AF3 §2.5.4).
 
     Returns:
         Tuple of (Structure, Record).
@@ -363,8 +367,15 @@ def process_mmcif(
                 res_atom_start = atom_offset + len(chain_atom_data)
                 res_atom_count = 0
 
+                # CCD valid atom names for this residue (if cache provided)
+                _ccd_valid = ccd_atom_names.get(res_name.strip()) if ccd_atom_names is not None else None
+
                 for atom in res:
                     if atom.element in (_ELEMENT_H, _ELEMENT_D):
+                        continue
+
+                    # AF3 §2.5.4: filter atoms not in CCD dictionary
+                    if _ccd_valid is not None and atom.name.strip() not in _ccd_valid:
                         continue
 
                     pos = atom.pos

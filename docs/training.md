@@ -441,6 +441,8 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 | §3.7.1 | EDM weighting, smooth LDDT (15/30Å radii) | `training/loss.py` |
 | §3.7.1 | Bond loss (Eq. 5 — GT distances) | `training/loss.py:bond_loss` |
 | §3.7.1 | Cross-entity bonds (disulfide, metal, covalent) | `data/prepare/structure.py` extracts from `_struct_conn`; `tokenizer.py` propagates with atom indices |
+| §2.5.4 | >20 polymer chains → greedy select 20 maximising interfaces | `data/prepare/filters.py:select_interface_chains` |
+| §2.5.4 | CCD atom name validation | `data/ccd.py:build_atom_name_cache` + `process_mmcif(ccd_atom_names=...)` |
 | §5.3 | Loss weights (α_diff=4, α_disto=0.03, α_conf=1e-4) | `model/config.py` |
 | §5.4 | Adam β₁=0.9 β₂=0.95 ε=1e-8, LR 1.8e-3, warmup 1000 | `model/config.py` |
 | §5.4 | LR decay 0.95/50k, grad clip 10, batch 256 | `model/config.py`, `training/trainer.py` |
@@ -456,8 +458,6 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 | Paper section | Item | Priority | Notes |
 |---|---|---|---|
 | §2.5.3 | SCOP modified residue normalization | Low | Modified residues not normalized before clustering |
-| §2.5.4 | >20 chains → select 20 closest to interface | Low | Rare for training data (most <20 chains) |
-| §2.5.4 | CCD atom name validation | Low | Atoms outside CCD atom set not filtered |
 | §2.5.4 | Leaving atom removal | Low | Mostly H atoms (already skipped) + water (separate entity) |
 | §2.6 | Modified residue per-atom tokenization | Medium | All residues use 1-token (structural simplification) |
 

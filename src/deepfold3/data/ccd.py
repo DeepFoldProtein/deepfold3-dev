@@ -344,3 +344,63 @@ def smiles_to_molecule(smiles: str, res_name: str = "LIG") -> CcdMolecule:
         bonds=bonds,
         res_name=res_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# CCD atom name cache for validation during structure processing
+# ---------------------------------------------------------------------------
+
+
+def build_atom_name_cache(components_path: str | Path, output_path: str | Path) -> int:
+    """Build a JSON cache mapping CCD code → list of valid heavy-atom names.
+
+    Reads the full ``components.cif`` (or ``.cif.gz``) and extracts atom
+    names for each component, excluding hydrogens.
+
+    Args:
+        components_path: Path to ``components.cif`` or ``components.cif.gz``.
+        output_path: Where to write the JSON cache.
+
+    Returns:
+        Number of CCD entries written.
+    """
+    import json
+
+    import gemmi
+
+    log.info("Reading %s (this may take a minute)...", components_path)
+    doc = gemmi.cif.read(str(components_path))
+    cache: dict[str, list[str]] = {}
+
+    for block in doc:
+        code = block.name
+        table = block.find(["_chem_comp_atom.atom_id", "_chem_comp_atom.type_symbol"])
+        names: list[str] = []
+        for row in table:
+            elem = row[1].strip().strip('"')
+            if elem.upper() == "H":
+                continue
+            names.append(row[0].strip().strip('"'))
+        if names:
+            cache[code] = names
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(cache, f, separators=(",", ":"))
+
+    log.info("Wrote CCD atom name cache: %d entries → %s", len(cache), output_path)
+    return len(cache)
+
+
+def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
+    """Load a pre-built CCD atom name cache.
+
+    Returns:
+        Mapping from CCD code to set of valid heavy-atom names.
+    """
+    import json
+
+    with open(path) as f:
+        raw = json.load(f)
+    return {k: set(v) for k, v in raw.items()}

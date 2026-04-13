@@ -35,6 +35,7 @@ def _process_one(
     output_dir: Path,
     use_assembly: bool,
     filter_cfg: StructureFilterConfig | None = None,
+    ccd_atom_names: dict[str, set[str]] | None = None,
 ) -> dict | str:
     """Process a single PDB entry. Returns record dict or skip reason string."""
     from deepfold3.data.parse.templates import find_pdb_mmcif_path
@@ -47,7 +48,7 @@ def _process_one(
         return "file not found"
 
     try:
-        structure, record = process_mmcif(cif_path, use_assembly=use_assembly)
+        structure, record = process_mmcif(cif_path, use_assembly=use_assembly, ccd_atom_names=ccd_atom_names)
     except Exception as e:
         return f"parse error: {e}"
 
@@ -331,6 +332,12 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
     "Maps chains to integer cluster IDs for cluster-balanced sampling.",
 )
 @click.option(
+    "--ccd-cache",
+    default=None,
+    type=click.Path(exists=True),
+    help="CCD atom name cache (from build-ccd-cache). Filters atoms not in CCD dictionary.",
+)
+@click.option(
     "--msa-dir",
     default=None,
     type=click.Path(exists=True),
@@ -354,6 +361,7 @@ def prepare(
     no_assembly: bool,
     ccd: str | None,
     cluster_file: str | None,
+    ccd_cache: str | None,
     msa_dir: str | None,
     workers: int,
 ) -> None:
@@ -370,6 +378,14 @@ def prepare(
         from deepfold3.data.ccd import set_ccd_components_path
 
         set_ccd_components_path(ccd)
+
+    # Load CCD atom name cache for validation
+    ccd_atom_names = None
+    if ccd_cache:
+        from deepfold3.data.ccd import load_atom_name_cache
+
+        ccd_atom_names = load_atom_name_cache(ccd_cache)
+        log.info("Loaded CCD atom name cache: %d entries", len(ccd_atom_names))
 
     from deepfold3.data.prepare.filters import StructureFilterConfig
 
@@ -411,7 +427,7 @@ def prepare(
 
     if workers <= 1:
         for i, pdb_id in enumerate(ids):
-            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg)
+            result = _process_one(pdb_id, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names)
             if isinstance(result, dict):
                 records.append(result)
                 log.info(
@@ -428,7 +444,7 @@ def prepare(
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg): pid
+                executor.submit(_process_one, pid, mmcif_path, output_path, use_assembly, filter_cfg, ccd_atom_names): pid
                 for pid in ids
             }
             for i, future in enumerate(as_completed(futures)):
@@ -486,6 +502,37 @@ def fetch_ccd(output: str) -> None:
 
     path = fetch_components_cif(output)
     click.echo(f"CCD components saved to: {path}")
+
+
+@cli.command("build-ccd-cache")
+@click.option(
+    "--components-cif",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to components.cif or components.cif.gz.",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(),
+    help="Output path for the JSON cache (e.g. ccd_atoms.json).",
+)
+def build_ccd_cache(components_cif: str, output: str) -> None:
+    """Build a CCD atom name cache for structure validation.
+
+    Reads the full components.cif and writes a JSON mapping CCD code →
+    list of valid heavy-atom names.  Used with ``deepfold3 prepare
+    --ccd-cache`` to filter atoms not present in the CCD dictionary.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    from deepfold3.data.ccd import build_atom_name_cache
+
+    n = build_atom_name_cache(components_cif, output)
+    click.echo(f"Wrote {n} CCD entries to {output}")
 
 
 @cli.command()
