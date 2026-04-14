@@ -271,12 +271,20 @@ def msa_batch(
                 continue
 
             # Check if already done (all chains have paired NPZ)
-            paired_ids = [f"{record.id}_paired_{i}" for i in range(len(protein_chains))]
-            if all(paired_msa_path(msa_dir, pid).exists() for pid in paired_ids):
-                for i, chain in enumerate(protein_chains):
-                    chain.paired_msa_id = paired_ids[i]
-                skipped += 1
-                continue
+            # Use existing paired_msa_id from manifest if set (e.g. from import-paired-msa),
+            # otherwise construct index-based IDs for new searches.
+            existing_ids = [c.paired_msa_id for c in protein_chains if c.paired_msa_id]
+            if len(existing_ids) == len(protein_chains):
+                if all(paired_msa_path(msa_dir, pid).exists() for pid in existing_ids):
+                    skipped += 1
+                    continue
+            else:
+                fallback_ids = [f"{record.id}_paired_{i}" for i in range(len(protein_chains))]
+                if all(paired_msa_path(msa_dir, pid).exists() for pid in fallback_ids):
+                    for i, chain in enumerate(protein_chains):
+                        chain.paired_msa_id = fallback_ids[i]
+                    skipped += 1
+                    continue
 
             chain_msa_ids = [str(c.msa_id) for c in protein_chains]
             if not all(mid in all_sequences for mid in chain_msa_ids):
