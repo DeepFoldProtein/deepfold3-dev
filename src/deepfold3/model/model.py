@@ -461,13 +461,9 @@ class DeepFold3(nn.Module):
             num_chunks = diffusion_batch_size // diffusion_chunk_size
             logged: dict[str, torch.Tensor] = {}
             weighted_total: torch.Tensor = pair_real.new_zeros(())
-            # ``diffusion_only_loss`` (and the per-loss helpers it calls) assume
-            # unbatched ``[N, ...]`` features. With ``B > 1`` we slice the
-            # chunk's per-sample tensors and average per batch element. Trunk
-            # + diffusion forward stayed batched — only the loss computation
-            # pays the per-element cost.
-            B_pair = pair_real.shape[0] if pair_real.dim() == 4 else 1
-            slice_loss_per_batch = B_pair > 1
+            # ``diffusion_only_loss`` assumes unbatched ``[N, ...]`` features.
+            # Always slice per batch element (batch dim is always kept).
+            B_pair = pair_real.shape[0]  # [B, N, N, C]
 
             for _ in range(num_chunks):
                 gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
@@ -479,34 +475,25 @@ class DeepFold3(nn.Module):
                     num_samples=diffusion_chunk_size,
                     **ref_kwargs,
                 )
-                chunk_pred = {
-                    "denoised": denoised_c,
-                    "gt_augmented": gt_aug_c,
-                    "noise_levels": noise_levels_c,
-                }
-                if slice_loss_per_batch:
-                    # chunk_pred shapes:
-                    #   denoised, gt_augmented: [B, S_chunk, N, M, 3]
-                    #   noise_levels: [B, S_chunk]
-                    # features shapes: [B, ...] (batched dataloader output)
-                    chunk_loss = pair_real.new_zeros(())
-                    chunk_components: dict[str, torch.Tensor] = {}
-                    for b in range(B_pair):
-                        chunk_pred_b = {
-                            "denoised": denoised_c[b],
-                            "gt_augmented": gt_aug_c[b],
-                            "noise_levels": noise_levels_c[b],
-                        }
-                        features_b = {
-                            k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
-                            for k, v in features.items()
-                        }
-                        loss_b, comp_b = diffusion_only_loss(chunk_pred_b, features_b, loss_cfg)
-                        chunk_loss = chunk_loss + loss_b / B_pair
-                        for k, v in comp_b.items():
-                            chunk_components[k] = chunk_components.get(k, v.new_zeros(())) + v / B_pair
-                else:
-                    chunk_loss, chunk_components = diffusion_only_loss(chunk_pred, features, loss_cfg)
+                # chunk_pred shapes:
+                #   denoised, gt_augmented: [B, S_chunk, N, M, 3]
+                #   noise_levels: [B, S_chunk]
+                chunk_loss = pair_real.new_zeros(())
+                chunk_components: dict[str, torch.Tensor] = {}
+                for b in range(B_pair):
+                    chunk_pred_b = {
+                        "denoised": denoised_c[b],
+                        "gt_augmented": gt_aug_c[b],
+                        "noise_levels": noise_levels_c[b],
+                    }
+                    features_b = {
+                        k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
+                        for k, v in features.items()
+                    }
+                    loss_b, comp_b = diffusion_only_loss(chunk_pred_b, features_b, loss_cfg)
+                    chunk_loss = chunk_loss + loss_b / B_pair
+                    for k, v in comp_b.items():
+                        chunk_components[k] = chunk_components.get(k, v.new_zeros(())) + v / B_pair
                 # Each chunk contributes 1/num_chunks of the full diffusion
                 # loss; the accumulated grads on emb_det / diffusion params
                 # equal the unchunked equivalent.

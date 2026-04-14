@@ -621,17 +621,13 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _prepare_features(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Move features to device. Squeeze the leading batch dim only when
-        ``batch_size_per_rank == 1`` so the model uses its (slightly cheaper)
-        unbatched code path. With ``batch_size_per_rank > 1`` we keep the
-        ``[B, ...]`` layout so trunk + diffusion + heads run in batched mode.
+        """Move features to device.
+
+        Always keeps the leading ``[B, ...]`` batch dimension so every
+        module consistently takes the batched code path (even when
+        ``batch_size_per_rank == 1``).
         """
-        features = {k: v.to(self.device, non_blocking=True) for k, v in features.items()}
-        if self.cfg.batch_size_per_rank == 1:
-            for k, v in features.items():
-                if v.dim() > 0 and v.shape[0] == 1:
-                    features[k] = v.squeeze(0)
-        return features
+        return {k: v.to(self.device, non_blocking=True) for k, v in features.items()}
 
     def _training_step(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Run one forward pass and compute all losses.
@@ -702,31 +698,24 @@ class Trainer:
                 loss_cfg=loss_cfg_arg,
             )
 
-        # Loss computation. ``training_loss`` and the underlying per-loss
-        # helpers assume unbatched ``[N, ...]`` features. With
-        # ``batch_size_per_rank > 1`` we slice ``pred`` and ``features``
-        # per batch element, call ``training_loss`` per element, and
-        # average. The expensive forward (trunk + diffusion) already ran
-        # batched, so this loop only adds the (cheap) loss-computation
-        # overhead per element.
-        if cfg.batch_size_per_rank > 1:
-            B = cfg.batch_size_per_rank
-            losses_list: list[torch.Tensor] = []
-            loss_dict_acc: dict[str, torch.Tensor] = {}
-            for b in range(B):
-                pred_b = _slice_batch_dict(pred, b, B)
-                features_b = _slice_batch_dict(features, b, B)
-                loss_b, ld_b = training_loss(pred_b, features_b, cfg)
-                losses_list.append(loss_b)
-                for k, v in ld_b.items():
-                    if k in loss_dict_acc:
-                        loss_dict_acc[k] = loss_dict_acc[k] + v
-                    else:
-                        loss_dict_acc[k] = v.clone()
-            total_loss = torch.stack(losses_list).mean()
-            loss_dict = {k: v / B for k, v in loss_dict_acc.items()}
-        else:
-            total_loss, loss_dict = training_loss(pred, features, cfg)
+        # Loss computation. ``training_loss`` assumes unbatched ``[N, ...]``
+        # features. Slice per batch element and average (even for B=1,
+        # since we always keep the batch dim).
+        B = cfg.batch_size_per_rank
+        losses_list: list[torch.Tensor] = []
+        loss_dict_acc: dict[str, torch.Tensor] = {}
+        for b in range(B):
+            pred_b = _slice_batch_dict(pred, b, B)
+            features_b = _slice_batch_dict(features, b, B)
+            loss_b, ld_b = training_loss(pred_b, features_b, cfg)
+            losses_list.append(loss_b)
+            for k, v in ld_b.items():
+                if k in loss_dict_acc:
+                    loss_dict_acc[k] = loss_dict_acc[k] + v
+                else:
+                    loss_dict_acc[k] = v.clone()
+        total_loss = torch.stack(losses_list).mean()
+        loss_dict = {k: v / B for k, v in loss_dict_acc.items()}
         return total_loss, loss_dict
 
     def _chunked_diffusion_active(self) -> bool:
@@ -831,7 +820,10 @@ class Trainer:
                         mini_rollout_samples=1,
                         seed=0,
                     )
-                    _, loss_dict = training_loss(pred, features, self.cfg)
+                    # Slice batch dim (always kept) before loss
+                    pred_0 = _slice_batch_dict(pred, 0, self.cfg.batch_size_per_rank)
+                    features_0 = _slice_batch_dict(features, 0, self.cfg.batch_size_per_rank)
+                    _, loss_dict = training_loss(pred_0, features_0, self.cfg)
 
                 for k, v in loss_dict.items():
                     metrics.setdefault(f"eval/{k}", []).append(v.item())

@@ -35,6 +35,10 @@ class Tokenizer:
         structure = inp.structure
         tokens_list: list[tuple] = []
         token_bonds_list: list[tuple] = []
+        # Per-token MSA column index within the chain.  Standard polymer
+        # residues increment sequentially; expanded non-standard residues
+        # share the same column.  Ligand tokens get -1.
+        msa_col_list: list[int] = []
 
         token_idx = 0
         # Global atom index → (token_idx, local_atom_within_token)
@@ -50,6 +54,7 @@ class Tokenizer:
             res_end = res_start + int(chain["res_num"])
 
             if mol_type in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA):
+                chain_msa_col = 0  # per-chain MSA column counter
                 for ri in range(res_start, res_end):
                     res = structure.residues[ri]
                     res_type = int(res["res_type"])
@@ -84,13 +89,16 @@ class Tokenizer:
                                 cz,
                             )
                         )
+                        msa_col_list.append(chain_msa_col)
 
                         for ai in range(atom_num):
                             atom_to_token[atom_idx + ai] = (token_idx, ai)
 
                         token_idx += 1
+                        chain_msa_col += 1
                     else:
-                        # AF3 §2.6: modified (non-standard) residue — one token per atom
+                        # AF3 §2.6: modified (non-standard) residue — one token per atom.
+                        # All expanded atoms share the same MSA column.
                         for ai in range(atom_num):
                             global_ai = atom_idx + ai
                             atom = structure.atoms[global_ai]
@@ -114,8 +122,10 @@ class Tokenizer:
                                     cz,
                                 )
                             )
+                            msa_col_list.append(chain_msa_col)
                             atom_to_token[global_ai] = (token_idx, 0)
                             token_idx += 1
+                        chain_msa_col += 1
 
             elif mol_type == const.MOL_NONPOLYMER:
                 # One token per heavy atom
@@ -150,6 +160,7 @@ class Tokenizer:
                                 cz,
                             )
                         )
+                        msa_col_list.append(-1)  # ligands have no MSA column
                         atom_to_token[global_ai] = (token_idx, 0)
                         token_idx += 1
 
@@ -178,6 +189,8 @@ class Tokenizer:
             else np.empty(0, dtype=TOKEN_BOND_DTYPE)
         )
 
+        msa_col_arr = np.array(msa_col_list, dtype=np.int32) if msa_col_list else np.empty(0, dtype=np.int32)
+
         return Tokenized(
             tokens=tokens_arr,
             bonds=bonds_arr,
@@ -185,6 +198,7 @@ class Tokenizer:
             paired_msa=inp.paired_msa,
             unpaired_msa=inp.unpaired_msa,
             token_mask=inp.token_mask,
+            msa_col_idx=msa_col_arr,
         )
 
 

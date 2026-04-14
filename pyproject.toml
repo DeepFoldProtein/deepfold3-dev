@@ -10,12 +10,13 @@ dependencies = [
     "numpy>=2.4.2",
     "pdbeccdutils>=1.0.0",
     "rdkit>=2025.9.4",
-    "torch>=2.10.0",
+    "torch>=2.11.0",
     "tqdm>=4.67.3",
     "safetensors>=0.5.2",
     "zstandard>=0.25.0",
     "matplotlib>=3.10.8",
     "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
 ]
 
 [project.scripts]

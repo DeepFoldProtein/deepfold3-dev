@@ -257,12 +257,30 @@ def _compute_interfaces(
     return interfaces
 
 
+def _estimate_assembly_chains(st: gemmi.Structure, assembly_id: str = "1") -> int | None:
+    """Estimate chain count after assembly expansion without building it.
+
+    Returns None if no assemblies are defined (falls back to asymmetric unit).
+    """
+    if not st.assemblies:
+        return None
+    assembly = None
+    for a in st.assemblies:
+        if a.name == assembly_id:
+            assembly = a
+            break
+    if assembly is None:
+        assembly = st.assemblies[0]
+    return sum(len(g.operators) * len(g.subchains) for g in assembly.generators)
+
+
 def process_mmcif(
     path: Path,
     use_assembly: bool = True,
     assembly_id: str = "1",
     ccd_atom_names: dict[str, set[str]] | None = None,
     ccd_leaving_atoms: dict[str, set[str]] | None = None,
+    max_chains: int = 0,
 ) -> tuple[Structure, Record]:
     """Process a PDB mmCIF file into a DeepFold3 Structure and Record.
 
@@ -276,9 +294,14 @@ def process_mmcif(
         ccd_leaving_atoms: Optional CCD leaving atom cache. If provided, leaving
             atoms are removed from residues involved in covalent bonds that have
             ``pdbx_leaving_atom_flag`` set (AF3 §2.5.4).
+        max_chains: Skip assembly expansion if estimated chain count exceeds this.
+            0 means no limit.
 
     Returns:
         Tuple of (Structure, Record).
+
+    Raises:
+        ValueError: If estimated assembly chain count exceeds *max_chains*.
     """
     # Some CIF files (e.g. PATCHR Atlas ModelCIF) have duplicate _chem_comp
     # loops; _read_cif_lenient strips them as a fallback.
@@ -290,6 +313,12 @@ def process_mmcif(
     pdb_id = st.name.lower() if st.name and st.name.lower() != "model" else file_stem
 
     metadata = _extract_metadata(doc[0])
+
+    # Pre-filter: estimate assembly chain count before expensive expansion
+    if use_assembly and max_chains > 0:
+        est = _estimate_assembly_chains(st, assembly_id)
+        if est is not None and est > max_chains:
+            raise ValueError(f"{est} chains > max {max_chains}")
 
     # Build entity → mol_type mapping
     entity_mol_type: dict[str, int] = {}

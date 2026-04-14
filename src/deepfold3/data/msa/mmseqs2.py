@@ -1719,44 +1719,15 @@ def search_monomer_batch(
         # Run monomer search
         _search_monomer(mmseqs, db_dir, work_dir, use_env, use_templates, filter, threads, gpu, gpu_server)
 
-        # Unpack results via mmseqs unpackdb (uses lookup for naming)
-        a3m_dir = work_dir / "a3m_out"
-        a3m_dir.mkdir(exist_ok=True)
-
-        uniref_a3m = work_dir / "uniref.a3m"
-        if uniref_a3m.exists():
-            shutil.copy2(str(work_dir / "qdb.lookup"), f"{uniref_a3m}.lookup")
-            _run_mmseqs(
-                mmseqs,
-                ["unpackdb", uniref_a3m, a3m_dir / "uniref", "--unpack-suffix", ".a3m", "--unpack-name-mode", "1"],
-            )
-
-        env_a3m = work_dir / "env.a3m"
-        if use_env and env_a3m.exists():
-            shutil.copy2(str(work_dir / "qdb.lookup"), f"{env_a3m}.lookup")
-            _run_mmseqs(
-                mmseqs,
-                ["unpackdb", env_a3m, a3m_dir / "env", "--unpack-suffix", ".a3m", "--unpack-name-mode", "1"],
-            )
-
-        pdb_m8 = work_dir / "pdb.m8"
-        if use_templates and pdb_m8.exists():
-            shutil.copy2(str(work_dir / "qdb.lookup"), f"{pdb_m8}.lookup")
-            _run_mmseqs(
-                mmseqs,
-                ["unpackdb", pdb_m8, a3m_dir / "m8", "--unpack-suffix", ".m8", "--unpack-name-mode", "1"],
-            )
-
-        # Assemble MsaResult per sequence
+        # _search_monomer unpacks final.a3m (merged uniref+env) as {idx}.a3m
+        # and template hits as {idx}.m8 in work_dir, using --unpack-name-mode 0
+        # (numeric index).  Read them directly by index order.
         results: dict[str, MsaResult] = {}
-        for seq_id in seq_ids:
-            uniref_path = a3m_dir / "uniref" / f"{seq_id}.a3m"
-            env_path = a3m_dir / "env" / f"{seq_id}.a3m"
-            m8_path = a3m_dir / "m8" / f"{seq_id}.m8"
+        for idx, seq_id in enumerate(seq_ids):
+            a3m_path = work_dir / f"{idx}.a3m"
+            m8_path = work_dir / f"{idx}.m8"
 
-            uniref_text = uniref_path.read_text() if uniref_path.exists() else ""
-            env_text = env_path.read_text() if use_env and env_path.exists() else ""
-            unpaired_text = uniref_text + env_text if env_text else uniref_text
+            unpaired_text = a3m_path.read_text() if a3m_path.exists() else ""
             m8_text = m8_path.read_text() if use_templates and m8_path.exists() else ""
 
             results[seq_id] = MsaResult(unpaired={0: unpaired_text}, m8_text=m8_text)

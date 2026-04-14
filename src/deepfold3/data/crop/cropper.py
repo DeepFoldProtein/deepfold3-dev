@@ -364,24 +364,41 @@ class Cropper:
             chains=data.structure.chains,
         )
 
-        # Crop paired and unpaired MSA to match selected tokens (by asym_id).
-        # For each chain, find which positions within the original chain were
-        # selected, then index the corresponding MSA columns.
-        # Build per-chain column index mapping: for each asym_id, the indices
-        # within the original chain ordering that were selected.
-        chain_col_indices: dict[int, np.ndarray] = {}
-        for asym_id in set(int(t["asym_id"]) for t in new_tokens):
-            orig_chain_mask = data.tokens["asym_id"] == asym_id
-            orig_chain_positions = np.where(orig_chain_mask)[0]
-            keep = np.isin(orig_chain_positions, selected)
-            chain_col_indices[asym_id] = np.where(keep)[0].astype(np.int64)
+        # Crop paired and unpaired MSA to match selected tokens.
+        # Use msa_col_idx (AF3 standard_token_idxs) when available — it
+        # correctly maps expanded non-standard residue tokens to their
+        # shared MSA column.  Fall back to positional indexing for legacy
+        # Tokenized objects without the field.
+        chain_msa_cols: dict[int, np.ndarray] = {}
+        if data.msa_col_idx is not None:
+            # Gather per-chain MSA column indices for the selected tokens.
+            sel_msa_cols = data.msa_col_idx[selected]
+            sel_asym_ids = new_tokens["asym_id"]
+            for asym_id in set(int(a) for a in sel_asym_ids):
+                mask = sel_asym_ids == asym_id
+                cols = sel_msa_cols[mask]
+                # Drop ligand tokens (msa_col_idx == -1)
+                cols = cols[cols >= 0]
+                if len(cols) > 0:
+                    # Deduplicate (expanded tokens share a column) while
+                    # preserving order via a stable unique.
+                    _, idx = np.unique(cols, return_index=True)
+                    chain_msa_cols[asym_id] = cols[np.sort(idx)]
+        else:
+            # Legacy fallback: assume 1 token = 1 MSA column (breaks for
+            # chains with expanded non-standard residues).
+            for asym_id in set(int(t["asym_id"]) for t in new_tokens):
+                orig_chain_mask = data.tokens["asym_id"] == asym_id
+                orig_chain_positions = np.where(orig_chain_mask)[0]
+                keep = np.isin(orig_chain_positions, selected)
+                chain_msa_cols[asym_id] = np.where(keep)[0].astype(np.int64)
 
         def _crop_msa_dict(msa_dict: dict[int, MSAType]) -> dict[int, MSAType]:
             cropped: dict[int, MSAType] = {}
             for asym_id, msa in msa_dict.items():
-                if asym_id not in chain_col_indices:
+                if asym_id not in chain_msa_cols:
                     continue
-                cols = chain_col_indices[asym_id]
+                cols = chain_msa_cols[asym_id]
                 if len(cols) == 0:
                     continue
                 cropped[asym_id] = MSAType(
@@ -391,6 +408,9 @@ class Cropper:
                 )
             return cropped
 
+        # Crop msa_col_idx to the selected tokens.
+        new_msa_col_idx = data.msa_col_idx[selected] if data.msa_col_idx is not None else None
+
         return Tokenized(
             tokens=new_tokens,
             bonds=new_bonds,
@@ -398,4 +418,5 @@ class Cropper:
             paired_msa=_crop_msa_dict(data.paired_msa),
             unpaired_msa=_crop_msa_dict(data.unpaired_msa),
             token_mask=data.token_mask.select(selected) if data.token_mask is not None else None,
+            msa_col_idx=new_msa_col_idx,
         )

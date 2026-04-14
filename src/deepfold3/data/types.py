@@ -301,6 +301,12 @@ class Tokenized:
     paired_msa: dict[int, MSA]  # keyed by asym_id
     unpaired_msa: dict[int, MSA]  # keyed by asym_id
     token_mask: TokenMask | None = None
+    # Per-token MSA column index within the chain.  Standard polymer
+    # residues map 1:1 (0, 1, 2, …).  Expanded non-standard residues
+    # share the same column index (the position the residue occupies in
+    # the canonical sequence).  Ligand tokens get -1 (no MSA column).
+    # Shape: int32 [N_tokens].  AF3 calls this ``standard_token_idxs``.
+    msa_col_idx: np.ndarray | None = None
 
     def with_mask(self, token_mask: TokenMask) -> Tokenized:
         """Return a copy with the given token mask attached."""

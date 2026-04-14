@@ -58,6 +58,11 @@ def template_path(templates_dir: Path, pdb_id: str) -> Path:
     return Path(templates_dir) / shard(pdb_id) / f"{pdb_id}.json"
 
 
+def record_path(records_dir: Path, pdb_id: str) -> Path:
+    """Path to a record JSON under the sharded layout."""
+    return Path(records_dir) / shard(pdb_id) / f"{pdb_id}.json"
+
+
 def monomer_template_path(monomer_templates_dir: Path, msa_id: str) -> Path:
     """Path to a monomer-template index JSON under the sharded layout (per sequence).
 

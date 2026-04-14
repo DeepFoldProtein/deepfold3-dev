@@ -40,7 +40,7 @@ def _process_one(
 ) -> dict | str:
     """Process a single PDB entry. Returns record dict or skip reason string."""
     from deepfold3.data.parse.templates import find_pdb_mmcif_path
-    from deepfold3.data.paths import structure_path
+    from deepfold3.data.paths import record_path, structure_path
     from deepfold3.data.prepare.filters import filter_structure, filter_structure_metadata
     from deepfold3.data.prepare.structure import process_mmcif
 
@@ -48,10 +48,18 @@ def _process_one(
     if cif_path is None:
         return "file not found"
 
+    max_chains = filter_cfg.max_chains if filter_cfg is not None else 0
+
     try:
         structure, record = process_mmcif(
-            cif_path, use_assembly=use_assembly, ccd_atom_names=ccd_atom_names, ccd_leaving_atoms=ccd_leaving_atoms
+            cif_path,
+            use_assembly=use_assembly,
+            ccd_atom_names=ccd_atom_names,
+            ccd_leaving_atoms=ccd_leaving_atoms,
+            max_chains=max_chains,
         )
+    except ValueError as e:
+        return f"skipped ({e})"
     except Exception as e:
         return f"parse error: {e}"
 
@@ -78,7 +86,9 @@ def _process_one(
 
     # Save individual record JSON
     record_dict = record.to_dict()
-    with open(output_dir / "records" / f"{record.id}.json", "w") as f:
+    rec_path = record_path(output_dir / "records", record.id)
+    rec_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(rec_path, "w") as f:
         json.dump(record_dict, f, indent=2)
 
     return record_dict
@@ -420,7 +430,7 @@ def prepare(
     mmcif_path = Path(mmcif_dir)
     output_path = Path(output)
     (output_path / "structures").mkdir(parents=True, exist_ok=True)
-    (output_path / "records").mkdir(parents=True, exist_ok=True)
+    (output_path / "records").mkdir(parents=True, exist_ok=True)  # parent dir; shards created per-record
     use_assembly = not no_assembly
 
     # Determine PDB IDs to process
@@ -1316,7 +1326,7 @@ def drop_obsolete(data_dir: Path, ids_file: Path | None, delete_files: bool) -> 
         deepfold3 drop-obsolete --data-dir /data/training
         deepfold3 drop-obsolete --data-dir /data/training --delete-files
     """
-    from deepfold3.data.paths import mask_path, structure_path, template_path
+    from deepfold3.data.paths import mask_path, record_path, structure_path, template_path
     from deepfold3.data.prepare.manifest import load_manifest, save_manifest
     from deepfold3.scripts._common import require_manifest, setup_cli_logging
 
@@ -1376,7 +1386,7 @@ def drop_obsolete(data_dir: Path, ids_file: Path | None, delete_files: bool) -> 
                 structure_path(data_dir / "structures", r.id),
                 mask_path(data_dir / "masks", r.id),
                 template_path(data_dir / "templates", r.id),
-                data_dir / "records" / f"{r.id}.json",
+                record_path(data_dir / "records", r.id),
             ):
                 try:
                     p.unlink()

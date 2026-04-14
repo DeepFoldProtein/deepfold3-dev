@@ -445,11 +445,38 @@ class Featurizer:
         Cross-chain gap positions have msa_mask=True (AF3 treats gaps as
         valid aligned positions).
         """
-        # Build chain position maps
+        # Build chain position maps: asym_id → global token indices.
         chain_pos_map: dict[int, np.ndarray] = {}
         for asym_id in set(tokens["asym_id"]):
-            chain_mask = tokens["asym_id"] == asym_id
-            chain_pos_map[int(asym_id)] = np.where(chain_mask)[0]
+            chain_pos_map[int(asym_id)] = np.where(tokens["asym_id"] == asym_id)[0]
+
+        # Pre-compute per-chain scatter indices: (token_positions, msa_columns).
+        # When msa_col_idx is available, expanded non-standard residues map
+        # multiple tokens to the same MSA column.  Otherwise fall back to
+        # positional 1:1 mapping (legacy).
+        _chain_scatter: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for aid, pos in chain_pos_map.items():
+            if data.msa_col_idx is not None:
+                cols = data.msa_col_idx[pos]
+                valid = cols >= 0  # ligand tokens have -1
+                _chain_scatter[aid] = (pos[valid], cols[valid])
+            else:
+                _chain_scatter[aid] = (pos, np.arange(len(pos)))
+
+        def _scatter_msa(dst: np.ndarray, aid: int, msa_data: np.ndarray) -> None:
+            """Scatter MSA data into token positions for one chain.
+
+            Handles both 1-D (single row) and 2-D (multiple rows) ``msa_data``.
+            Columns beyond the MSA width are silently skipped.
+            """
+            tok_pos, msa_cols = _chain_scatter[aid]
+            keep = msa_cols < msa_data.shape[-1]
+            if not keep.all():
+                tok_pos, msa_cols = tok_pos[keep], msa_cols[keep]
+            if msa_data.ndim == 1:
+                dst[tok_pos] = msa_data[msa_cols]
+            else:
+                dst[:, tok_pos] = msa_data[:, msa_cols]
 
         combined_seqs: list[np.ndarray] = []
         combined_masks: list[np.ndarray] = []
@@ -475,11 +502,9 @@ class Featurizer:
                     for aid, msa in paired_chains:
                         if row_i >= msa.sequences.shape[0]:
                             continue
-                        chain_pos = chain_pos_map[aid]
-                        L = min(msa.sequences.shape[1], len(chain_pos))
-                        row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]
-                        row_mask[chain_pos[:L]] = msa.mask[row_i, :L]
-                        row_del[chain_pos[:L]] = msa.deletion_matrix[row_i, :L]
+                        _scatter_msa(row_seq, aid, msa.sequences[row_i])
+                        _scatter_msa(row_mask, aid, msa.mask[row_i])
+                        _scatter_msa(row_del, aid, msa.deletion_matrix[row_i])
                     combined_seqs.append(row_seq[None])
                     combined_masks.append(row_mask[None])
                     combined_dels.append(row_del[None])
@@ -539,11 +564,9 @@ class Featurizer:
                         if row_i >= msa.sequences.shape[0]:
                             continue
                         for asym_id in group_chains:
-                            chain_pos = chain_pos_map[asym_id]
-                            L = min(msa.sequences.shape[1], len(chain_pos))
-                            row_seq[chain_pos[:L]] = msa.sequences[row_i, :L]
-                            row_mask[chain_pos[:L]] = msa.mask[row_i, :L]
-                            row_del[chain_pos[:L]] = msa.deletion_matrix[row_i, :L]
+                            _scatter_msa(row_seq, asym_id, msa.sequences[row_i])
+                            _scatter_msa(row_mask, asym_id, msa.mask[row_i])
+                            _scatter_msa(row_del, asym_id, msa.deletion_matrix[row_i])
                     combined_seqs.append(row_seq[None])
                     combined_masks.append(row_mask[None])
                     combined_dels.append(row_del[None])
@@ -563,10 +586,9 @@ class Featurizer:
                 chain_pos = chain_pos_map.get(int(asym_id))
                 if chain_pos is None or len(chain_pos) == 0 or msa.sequences.shape[0] == 0:
                     continue
-                L = min(msa.sequences.shape[1], len(chain_pos))
-                query_seq[chain_pos[:L]] = msa.sequences[0, :L]
-                query_mask[chain_pos[:L]] = msa.mask[0, :L]
-                query_del[chain_pos[:L]] = msa.deletion_matrix[0, :L]
+                _scatter_msa(query_seq, int(asym_id), msa.sequences[0])
+                _scatter_msa(query_mask, int(asym_id), msa.mask[0])
+                _scatter_msa(query_del, int(asym_id), msa.deletion_matrix[0])
             combined_seqs.append(query_seq[None])
             combined_masks.append(query_mask[None])
             combined_dels.append(query_del[None])
@@ -606,10 +628,9 @@ class Featurizer:
                 if chain_pos is None or len(chain_pos) == 0:
                     continue
                 S_chain = seqs.shape[0]
-                L = min(seqs.shape[1], len(chain_pos))
-                dense_seqs[:S_chain, chain_pos[:L]] = seqs[:, :L]
-                dense_masks[:S_chain, chain_pos[:L]] = masks[:, :L]
-                dense_dels[:S_chain, chain_pos[:L]] = dels[:, :L]
+                _scatter_msa(dense_seqs[:S_chain], asym_id, seqs)
+                _scatter_msa(dense_masks[:S_chain], asym_id, masks)
+                _scatter_msa(dense_dels[:S_chain], asym_id, dels)
             combined_seqs.append(dense_seqs)
             combined_masks.append(dense_masks)
             combined_dels.append(dense_dels)
