@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import random
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -178,13 +179,19 @@ class TrainingDataset(torch.utils.data.Dataset):
             # Unpaired MSA
             msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
             if msa_path.exists():
-                unpaired_msa[chain_info.chain_id] = MSA.load(msa_path)
+                try:
+                    unpaired_msa[chain_info.chain_id] = MSA.load(msa_path)
+                except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
+                    logger.warning("Corrupt MSA %s: %s — skipping", msa_path, e)
 
             # Paired MSA (cross-chain co-evolutionary signal)
             if chain_info.paired_msa_id is not None:
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():
-                    paired_msa[chain_info.chain_id] = MSA.load(paired_path)
+                    try:
+                        paired_msa[chain_info.chain_id] = MSA.load(paired_path)
+                    except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
+                        logger.warning("Corrupt paired MSA %s: %s — skipping", paired_path, e)
 
         inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
 

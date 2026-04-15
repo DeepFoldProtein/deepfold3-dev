@@ -12,6 +12,7 @@ Example::
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import platform
@@ -27,6 +28,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import yaml
 from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -1070,6 +1072,13 @@ class Trainer:
         output_dir = Path(self.cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save resolved config (all CLI/YAML overrides applied) for reproducibility.
+        if self.is_main:
+            config_out = output_dir / "config.yaml"
+            with open(config_out, "w") as f:
+                yaml.dump(dataclasses.asdict(self.cfg), f, default_flow_style=False, sort_keys=False)
+            logger.info(f"Resolved config saved to {config_out}")
+
         # Auto-resume: find latest checkpoint in output_dir if none specified
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
@@ -1114,9 +1123,16 @@ class Trainer:
         # by _load_checkpoint; no need for getattr guard here.
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
+        # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
         self._checkpoint_requested = False
+        self._shutdown_requested = False
         if platform.system() != "Windows":
             signal.signal(signal.SIGUSR2, lambda *_: setattr(self, "_checkpoint_requested", True))
+
+            signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_shutdown_requested", True))
+            signal.signal(signal.SIGINT, lambda *_: setattr(self, "_shutdown_requested", True))
+
+        shutdown_flag = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         while self.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
@@ -1305,16 +1321,38 @@ class Trainer:
                         need_ckpt = True
                         logger.info("Signal-triggered checkpoint requested")
 
+                # Sync shutdown flag across ranks at optimizer boundaries so
+                # all ranks exit together.  Uses all_reduce(MAX) so any rank's
+                # signal (SIGINT goes to all, SIGTERM may go to rank 0 only)
+                # propagates to everyone.
+                if on_opt_step_boundary and self.world_size > 1:
+                    shutdown_flag.fill_(int(self._shutdown_requested))
+                    dist.all_reduce(shutdown_flag, op=dist.ReduceOp.MAX)
+                    self._shutdown_requested = bool(shutdown_flag.item())
+
+                if self._shutdown_requested and self.is_main:
+                    need_ckpt = True
+                    logger.info("Shutdown requested — saving checkpoint before exit")
+
                 if need_ckpt:
                     self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
                     t_last_ckpt = time.monotonic()
 
+                if self._shutdown_requested:
+                    break
+
+            if self._shutdown_requested:
+                break
             epoch += 1
 
         # Final checkpoint
         if self.is_main:
-            self._save_checkpoint(output_dir / "checkpoint_final.pt")
-            logger.info(f"Training complete at step {self.effective_step}")
+            if not self._shutdown_requested:
+                self._save_checkpoint(output_dir / "checkpoint_final.pt")
+            logger.info(
+                f"Training {'interrupted' if self._shutdown_requested else 'complete'} "
+                f"at step {self.effective_step}"
+            )
 
         if self._wandb is not None:
             self._wandb.finish()
