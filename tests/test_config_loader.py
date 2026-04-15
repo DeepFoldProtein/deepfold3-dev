@@ -231,13 +231,12 @@ class TestLoadConfig:
         result = load_config(tmp_path / "cfg.yaml")
         assert "extra_datasets" not in result.get("training", {})
 
-    def test_existing_json_configs(self):
-        """Verify existing JSON configs load without error."""
+    def test_existing_yaml_configs(self):
+        """Verify existing YAML configs load without error."""
         configs_dir = Path(__file__).parent.parent / "configs"
-        for json_file in configs_dir.glob("*.json"):
-            result = load_config(json_file)
+        for yaml_file in configs_dir.glob("*.yaml"):
+            result = load_config(yaml_file)
             assert isinstance(result, dict)
-            # Should have training and/or model keys
             assert "training" in result or "model" in result
 
 

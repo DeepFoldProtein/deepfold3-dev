@@ -479,6 +479,8 @@ def parse_mmcif_structure(mmcif_text: str, label: str = "template"):
 def select_template_chain(st, chain_id: str | None = None, label: str = "template"):
     """Select a polymer chain from a parsed gemmi Structure.
 
+    Searches by ``auth_asym_id`` (``chain.name`` in gemmi).
+
     Returns:
         gemmi Chain, or ``None`` if not found.
     """
@@ -494,6 +496,24 @@ def select_template_chain(st, chain_id: str | None = None, label: str = "templat
         if entity is not None and entity.entity_type == gemmi.EntityType.Polymer:
             return ch
     return model[0]
+
+
+def select_template_chain_by_label(st, label_asym_id: str, label: str = "template"):
+    """Select a polymer chain by ``label_asym_id`` (subchain ID).
+
+    OF3 template hits use label (not auth) chain IDs. In gemmi, each Chain
+    contains subchains whose ``subchain_id()`` corresponds to ``label_asym_id``.
+
+    Returns:
+        gemmi Chain containing the matching subchain, or ``None`` if not found.
+    """
+    model = st[0]
+    for ch in model:
+        for sub in ch.subchains():
+            if sub.subchain_id() == label_asym_id:
+                return ch
+    logger.warning("Label chain %s not found in template %s", label_asym_id, label)
+    return None
 
 
 def _parse_mmcif_chain(
@@ -534,7 +554,7 @@ def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
     if entity is None or not entity.full_sequence:
         return None, struct_seq
 
-    seqres = "".join(_one_letter(gemmi.find_tabulated_residue(item.mon)) for item in entity.full_sequence)
+    seqres = "".join(_one_letter(gemmi.find_tabulated_residue(str(item))) for item in entity.full_sequence)
     return seqres, struct_seq
 
 

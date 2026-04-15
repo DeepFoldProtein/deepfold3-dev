@@ -13,7 +13,7 @@ training:
   cosine_max_steps: 20000
 
   grad_clip_norm: 10.0
-  accumulate_grad_batches: 32
+  accumulate_grad_batches: 16
   ema_decay: 0.999
 
   max_tokens: 384
@@ -21,6 +21,7 @@ training:
   max_msa_seqs: 512
   max_recycles: 3
 
+  batch_size_per_rank: 2
   diffusion_batch_size: 48
   diffusion_chunk_size: 16
   mini_rollout_steps: 20
@@ -56,7 +57,7 @@ training:
   static_graph: true
   train_confidence_only: false
 
-  max_steps: 100000
+  max_steps: 100_000
   seed: 42
   checkpoint_interval: 100
   eval_interval: 500
@@ -73,6 +74,28 @@ training:
   wandb_enabled: true
   wandb_project: deepfold3-stage0
   wandb_run_name: null
+
+datasets:
+  - name: patchr
+    data_dir: /data/distillation/patchr_training
+    weight: 0.5
+    strategy: weighted
+    is_distillation: false
+    format: df3
+
+  - name: long_monomers
+    data_dir: /data/distillation/long_monomers/preprocessed
+    weight: 0.45
+    strategy: uniform
+    is_distillation: true
+    format: of3
+
+  - name: short_monomers
+    data_dir: /data/distillation/short_monomers/preprocessed
+    weight: 0.05
+    strategy: uniform
+    is_distillation: true
+    format: of3
 
 model:
   num_recycles: 10
@@ -109,7 +132,7 @@ model:
     interface_crop_weight: 0.4
     interface_distance: 15.0
     template_cutoff_days: 60
-    max_template_date: null
+    max_template_date: "2021-09-30"
     prefer_monomer_templates: true
   optim:
     use_fused_evo_attention: true
