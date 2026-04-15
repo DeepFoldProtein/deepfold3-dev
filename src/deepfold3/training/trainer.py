@@ -234,25 +234,33 @@ class Trainer:
         #     so only the last recycle is in the autograd graph and the graph
         #     topology is identical iteration-to-iteration regardless of
         #     ``num_recycles``.
-        #   * Gradient accumulation is pure-scaling (no ``no_sync()``), so
-        #     every backward triggers full DDP sync.
+        #   * Gradient accumulation uses ``no_sync()`` on non-final
+        #     microsteps (see ``_optimizer_step``), so only the final
+        #     backward per optimizer step triggers DDP sync.
         # Confidence-loss resolution gating is a tensor multiply (loss.py)
         # rather than a Python branch, so the set of grad-receiving parameters
         # is also identical every step.
         #
-        # Chunked-diffusion path is INCOMPATIBLE with ``static_graph=True``:
-        # it uses ``model.no_sync()`` to defer DDP all_reduce until after the
-        # outer aux backward (otherwise we'd issue an all_reduce per chunk,
-        # swamping NCCL). PyTorch raises if ``no_sync`` is used under
-        # ``static_graph=True`` — auto-disable in that case.
+        # ``static_graph=True`` is INCOMPATIBLE with ``model.no_sync()``:
+        # PyTorch raises if the two are combined.  ``no_sync`` is used in
+        # two places: (a) chunked-diffusion to defer DDP all_reduce until
+        # after the outer aux backward, and (b) gradient-accumulation
+        # microsteps in ``_optimizer_step`` to defer sync until the final
+        # microstep.  Auto-disable ``static_graph`` when either is active.
         chunked_diffusion = self._chunked_diffusion_active()
-        use_static_graph = self.cfg.static_graph and not chunked_diffusion
+        needs_no_sync = chunked_diffusion or self.cfg.accumulate_grad_batches > 1
+        use_static_graph = self.cfg.static_graph and not needs_no_sync
         if self.world_size > 1:
             if self.is_main and self.cfg.static_graph and not use_static_graph:
+                reasons = []
+                if chunked_diffusion:
+                    reasons.append(f"diffusion_chunk_size={self.cfg.diffusion_chunk_size}")
+                if self.cfg.accumulate_grad_batches > 1:
+                    reasons.append(f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}")
                 logger.info(
-                    "static_graph auto-disabled (diffusion_chunk_size=%d > 0): "
-                    "chunked diffusion uses model.no_sync(), which conflicts with static_graph.",
-                    self.cfg.diffusion_chunk_size,
+                    "static_graph auto-disabled (%s): "
+                    "model.no_sync() is required, which conflicts with static_graph.",
+                    ", ".join(reasons),
                 )
             self.ddp_model = DDP(
                 self.model,
@@ -831,17 +839,31 @@ class Trainer:
     # Optimizer step
     # ------------------------------------------------------------------
 
-    def _optimizer_step(self, loss: torch.Tensor) -> None:
+    def _optimizer_step(self, loss: torch.Tensor) -> bool:
         """Backward pass, gradient clipping, and optimizer step.
+
+        When ``accumulate_grad_batches > 1``, non-final microsteps run
+        under ``ddp_model.no_sync()`` so DDP defers the gradient
+        all-reduce until the final microstep — otherwise every backward
+        fires a redundant all-reduce per microstep.
 
         Args:
             loss: Scalar loss tensor from ``_training_step()``.
+
+        Returns:
+            True if an optimizer step was taken (sync boundary).
         """
-        self._scaled_backward(loss)
+        next_step = self.global_step + 1
+        is_sync_step = next_step % self.cfg.accumulate_grad_batches == 0
 
-        self.global_step += 1
+        # Suppress DDP gradient all-reduce on non-final accumulation steps.
+        sync_ctx = self.ddp_model.no_sync() if (not is_sync_step and self.world_size > 1) else nullcontext()
+        with sync_ctx:
+            self._scaled_backward(loss)
 
-        if self.global_step % self.cfg.accumulate_grad_batches == 0:
+        self.global_step = next_step
+
+        if is_sync_step:
             self.scaler.unscale_(self.optimizer)
 
             # Always compute the global pre-clip grad norm for logging,
@@ -858,6 +880,8 @@ class Trainer:
 
             if self.ema is not None:
                 self.ema.update(self.model)
+
+        return is_sync_step
 
     # ------------------------------------------------------------------
     # NaN detection
@@ -1134,7 +1158,7 @@ class Trainer:
                     del loss, loss_dict
                     continue
 
-                self._optimizer_step(loss)
+                on_opt_step_boundary = self._optimizer_step(loss)
 
                 # Accumulate logging metrics locally (no collective).
                 # Inject token count so it rides the same all-reduce as losses.
@@ -1180,16 +1204,9 @@ class Trainer:
                 del loss, loss_dict, features
 
                 # --- Logging ---
-                # All ranks call ``meters.sync()`` (it issues an all_reduce),
-                # but only rank 0 prints / logs to wandb. The all_reduce is
-                # essentially free here because DDP's gradient all-reduce in
-                # the just-completed backward already brought all ranks into
-                # lockstep — no straggler barrier. Gate on optimizer-step
-                # boundaries (``global_step % accumulate == 0``) so the log
-                # always fires AFTER ``clip_grad_norm`` has populated
-                # ``_last_grad_norm`` — otherwise mid-accumulation logs show
-                # ``grad_norm=nan``.
-                on_opt_step_boundary = self.global_step % cfg.accumulate_grad_batches == 0
+                # Gate on ``on_opt_step_boundary`` (returned by
+                # ``_optimizer_step``) so the log always fires AFTER
+                # ``clip_grad_norm`` has populated ``_last_grad_norm``.
                 if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0 and meters.count > 0:
                     avg, sums = meters.sync()
                     meters.reset()
@@ -1251,7 +1268,11 @@ class Trainer:
                             self._wandb.log(log_data, step=self.effective_step)
 
                 # --- Evaluation ---
-                if eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
+                # Gate on ``on_opt_step_boundary`` so eval fires exactly once
+                # per effective step — without the gate, ``effective_step``
+                # stays constant across ``accumulate_grad_batches`` microsteps
+                # and the check would trigger on every one of them.
+                if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
                     if hasattr(eval_dl.sampler, "set_epoch"):
                         eval_dl.sampler.set_epoch(self.effective_step)
                     eval_metrics = self._evaluate(eval_dl)
@@ -1268,7 +1289,7 @@ class Trainer:
 
                 # --- Checkpoint ---
                 need_ckpt = False
-                if self.is_main:
+                if on_opt_step_boundary and self.is_main:
                     if self.effective_step % self.cfg.checkpoint_interval == 0:
                         need_ckpt = True
                     elif (

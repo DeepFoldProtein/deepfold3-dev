@@ -410,9 +410,7 @@ class OF3Dataset(torch.utils.data.Dataset):
 
         return feats
 
-    def _load_templates(
-        self, tpl_npz: Path, live_record: Record
-    ) -> dict[int, list[TemplateFeatures]] | None:
+    def _load_templates(self, tpl_npz: Path, live_record: Record) -> dict[int, list[TemplateFeatures]] | None:
         """Load and extract template features from an OF3 template.npz.
 
         Follows AF3 §2.4: randomly sample k = min(Uniform[0, n], max_templates)

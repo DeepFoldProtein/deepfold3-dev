@@ -151,9 +151,28 @@ class TestResolveConfig:
 
 class TestNormalizeDatasets:
     def test_full_entry(self):
-        raw = [{"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5, "strategy": "uniform", "is_distillation": True, "format": "of3"}]
+        raw = [
+            {
+                "name": "afdb",
+                "data_dir": "/data/afdb",
+                "weight": 0.5,
+                "strategy": "uniform",
+                "is_distillation": True,
+                "format": "of3",
+            }
+        ]
         result = normalize_datasets(raw)
-        assert result == [{"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5, "strategy": "uniform", "is_distillation": True, "format": "of3"}]
+        assert result == [
+            {
+                "name": "afdb",
+                "data_dir": "/data/afdb",
+                "weight": 0.5,
+                "strategy": "uniform",
+                "is_distillation": True,
+                "format": "of3",
+                "cutoff_date": "",
+            }
+        ]
 
     def test_defaults(self):
         raw = [{"name": "pdb2", "data_dir": "/data/pdb2"}]
@@ -162,6 +181,7 @@ class TestNormalizeDatasets:
         assert result[0]["strategy"] == "uniform"
         assert result[0]["is_distillation"] is False
         assert result[0]["format"] == "df3"
+        assert result[0]["cutoff_date"] == ""
 
     def test_missing_name(self):
         with pytest.raises(ValueError, match="name"):
@@ -194,7 +214,15 @@ class TestLoadConfig:
         result = load_config(tmp_path / "cfg.yaml")
         assert "datasets" not in result
         assert result["training"]["extra_datasets"] == [
-            {"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5, "strategy": "uniform", "is_distillation": False, "format": "df3"}
+            {
+                "name": "afdb",
+                "data_dir": "/data/afdb",
+                "weight": 0.5,
+                "strategy": "uniform",
+                "is_distillation": False,
+                "format": "df3",
+                "cutoff_date": "",
+            }
         ]
 
     def test_datasets_inherited_from_base(self, tmp_path: Path):
@@ -247,7 +275,14 @@ class TestLoadConfig:
 
 class TestDatasetConfig:
     def test_from_dict(self):
-        d = {"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5, "strategy": "uniform", "is_distillation": True, "format": "of3"}
+        d = {
+            "name": "afdb",
+            "data_dir": "/data/afdb",
+            "weight": 0.5,
+            "strategy": "uniform",
+            "is_distillation": True,
+            "format": "of3",
+        }
         cfg = DatasetConfig(**d)
         assert cfg.name == "afdb"
         assert cfg.data_dir == "/data/afdb"
