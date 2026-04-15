@@ -76,6 +76,7 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
 @click.option("--seed", default=None, type=int, help="Override random seed.")
 @click.option("--dtype", default=None, type=click.Choice(["bf16", "fp32", "fp16"]), help="Override precision.")
 @click.option("--wandb", "wandb_project", default=None, help="WandB project name (enables tracking).")
+@click.option("--wandb-entity", default=None, help="WandB team/org entity (default: personal workspace).")
 @click.option("--override", multiple=True, help="Override config: key=value (e.g. --override alpha_pae=1.0).")
 @click.option(
     "--ccd",
@@ -131,6 +132,7 @@ def train(
     seed: int | None,
     dtype: str | None,
     wandb_project: str | None,
+    wandb_entity: str | None,
     override: tuple[str, ...],
     ccd: str | None,
     include_list: str | None,
@@ -225,6 +227,8 @@ def train(
     if wandb_project is not None:
         train_cfg.wandb_project = wandb_project
         train_cfg.wandb_enabled = True
+    if wandb_entity is not None:
+        train_cfg.wandb_entity = wandb_entity
     if mmcif_dir is not None:
         train_cfg.mmcif_dir = mmcif_dir
     if eval_cutoff_date is not None:

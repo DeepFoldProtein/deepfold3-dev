@@ -466,6 +466,8 @@ class TrainingConfig:
     # DDP
     find_unused_parameters: bool = False
     static_graph: bool = True
+    bucket_cap_mb: int = 25
+    gradient_as_bucket_view: bool = True
 
     # Run control
     max_steps: int = 200000
@@ -497,6 +499,7 @@ class TrainingConfig:
     # Experiment tracking
     wandb_enabled: bool = False  # explicit on/off; takes precedence over wandb_project
     wandb_project: str = ""
+    wandb_entity: str = ""  # WandB team/org entity; empty → personal workspace
     # Optional explicit run name. ``None`` (or empty string) → derive from
     # ``output_dir`` and append a YYYYMMDD-HHMMSS timestamp so re-runs are
     # never accidentally collapsed under one wandb run.

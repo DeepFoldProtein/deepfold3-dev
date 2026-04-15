@@ -267,6 +267,8 @@ class Trainer:
                 device_ids=[self.local_rank],
                 find_unused_parameters=self.cfg.find_unused_parameters,
                 static_graph=use_static_graph,
+                bucket_cap_mb=self.cfg.bucket_cap_mb,
+                gradient_as_bucket_view=self.cfg.gradient_as_bucket_view,
             )
         else:
             self.ddp_model = self.model
@@ -391,6 +393,7 @@ class Trainer:
             self._wandb = wandb
             wandb.init(
                 project=self.cfg.wandb_project,
+                entity=self.cfg.wandb_entity or None,
                 name=run_name,
                 config=dataclasses.asdict(self.cfg),
             )

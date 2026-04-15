@@ -55,6 +55,8 @@ training:
   drop_last: true
   find_unused_parameters: false
   static_graph: true
+  bucket_cap_mb: 25
+  gradient_as_bucket_view: true
   train_confidence_only: false
 
   max_steps: 100_000
