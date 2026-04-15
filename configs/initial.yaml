@@ -63,7 +63,7 @@ training:
   seed: 42
   checkpoint_interval: 100
   checkpoint_every_hours: 1.0
-  eval_samples: 512
+  eval_samples: 128
   eval_interval: 500
   log_interval: 1
   log_microsteps: false

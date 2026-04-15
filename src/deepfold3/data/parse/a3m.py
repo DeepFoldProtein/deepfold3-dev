@@ -143,6 +143,9 @@ def convert_a3m_file_to_npz(
     try:
         a3m_text = Path(a3m_path).read_text()
         msa = parse_a3m(a3m_text, mol_type=mol_type)
+        if msa.is_empty:
+            logger.warning("convert_a3m_file_to_npz: empty MSA (shape %s) for %s", msa.sequences.shape, a3m_path)
+            return False
         msa.save(Path(npz_path))
         return True
     except Exception:

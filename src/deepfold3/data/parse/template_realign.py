@@ -68,7 +68,7 @@ def realign_hit_to_structure(
             f"The structure sequence ({len(structure_sequence)}) "
             f"must not be longer than the PDB seqres sequence ({full_length}):\n"
             f"Structure sequence : {structure_sequence}\n"
-            f"PDB seqres hit    : {hit_sequence}"
+            f"PDB seqres hit     : {hit_sequence}"
         )
 
     if len(hit_sequence) != hit_end_index - hit_start_index:

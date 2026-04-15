@@ -929,12 +929,13 @@ class Trainer:
 
         self.model.eval()
         metrics: dict[str, list[float]] = {}
+        n_batches = len(eval_dl)
 
-        for features in eval_dl:
+        for batch_idx, features in enumerate(eval_dl):
             features = self._prepare_features(features)
 
             try:
-                with torch.autocast(
+                with torch.no_grad(), torch.autocast(
                     device_type="cuda",
                     dtype=self.cfg.torch_dtype,
                     enabled=(self.cfg.dtype != "fp32"),
@@ -954,8 +955,11 @@ class Trainer:
 
                 for k, v in loss_dict.items():
                     metrics.setdefault(f"eval/{k}", []).append(v.item())
+
+                if self.is_main and self.cfg.log_microsteps:
+                    logger.info("eval: %d/%d loss=%.2f", batch_idx + 1, n_batches, loss_dict["total"])
             except Exception as e:
-                logger.warning(f"Eval error: {e}")
+                logger.warning("Eval error at batch %d: %s", batch_idx, e)
                 continue
 
         self.model.train()
@@ -1286,27 +1290,7 @@ class Trainer:
                             log_data["system/gpu_peak_memory_gb"] = peak_mem_gb
                             self._wandb.log(log_data, step=self.effective_step)
 
-                # --- Evaluation ---
-                # Gate on ``on_opt_step_boundary`` so eval fires exactly once
-                # per effective step — without the gate, ``effective_step``
-                # stays constant across ``accumulate_grad_batches`` microsteps
-                # and the check would trigger on every one of them.
-                if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
-                    if hasattr(eval_dl.sampler, "set_epoch"):
-                        eval_dl.sampler.set_epoch(self.effective_step)
-                    eval_metrics = self._evaluate(eval_dl)
-                    if self.is_main:
-                        logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
-                        if self._wandb is not None:
-                            self._wandb.log(eval_metrics, step=self.effective_step)
-                        # Best-model tracking
-                        eval_total = eval_metrics.get("eval/total", float("inf"))
-                        if eval_total < self._best_eval_loss:
-                            self._best_eval_loss = eval_total
-                            self._save_checkpoint(output_dir / "checkpoint_best.pt")
-                            logger.info(f"New best eval loss: {eval_total:.4f}")
-
-                # --- Checkpoint ---
+                # --- Checkpoint (before eval so weights are saved even if eval crashes) ---
                 need_ckpt = False
                 if on_opt_step_boundary and self.is_main:
                     if self.effective_step % self.cfg.checkpoint_interval == 0:
@@ -1337,6 +1321,26 @@ class Trainer:
                 if need_ckpt:
                     self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
                     t_last_ckpt = time.monotonic()
+
+                # --- Evaluation ---
+                # Gate on ``on_opt_step_boundary`` so eval fires exactly once
+                # per effective step — without the gate, ``effective_step``
+                # stays constant across ``accumulate_grad_batches`` microsteps
+                # and the check would trigger on every one of them.
+                if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
+                    if hasattr(eval_dl.sampler, "set_epoch"):
+                        eval_dl.sampler.set_epoch(self.effective_step)
+                    eval_metrics = self._evaluate(eval_dl)
+                    if self.is_main:
+                        logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
+                        if self._wandb is not None:
+                            self._wandb.log(eval_metrics, step=self.effective_step)
+                        # Best-model tracking
+                        eval_total = eval_metrics.get("eval/total", float("inf"))
+                        if eval_total < self._best_eval_loss:
+                            self._best_eval_loss = eval_total
+                            self._save_checkpoint(output_dir / "checkpoint_best.pt")
+                            logger.info(f"New best eval loss: {eval_total:.4f}")
 
                 if self._shutdown_requested:
                     break

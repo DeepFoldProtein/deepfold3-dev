@@ -251,6 +251,10 @@ class MSA:
     mask: np.ndarray  # bool [S, N]
     deletion_matrix: np.ndarray  # int8 [S, N]
 
+    @property
+    def is_empty(self) -> bool:
+        return self.sequences.shape[0] == 0 or self.sequences.shape[1] == 0
+
     def save(self, path: Path) -> None:
         np.savez_compressed(
             str(path),

@@ -180,7 +180,11 @@ class TrainingDataset(torch.utils.data.Dataset):
             msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
             if msa_path.exists():
                 try:
-                    unpaired_msa[chain_info.chain_id] = MSA.load(msa_path)
+                    msa_obj = MSA.load(msa_path)
+                    if msa_obj.is_empty:
+                        logger.warning("Empty MSA %s (shape %s) — skipping", msa_path, msa_obj.sequences.shape)
+                    else:
+                        unpaired_msa[chain_info.chain_id] = msa_obj
                 except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
                     logger.warning("Corrupt MSA %s: %s — skipping", msa_path, e)
 
@@ -189,7 +193,11 @@ class TrainingDataset(torch.utils.data.Dataset):
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():
                     try:
-                        paired_msa[chain_info.chain_id] = MSA.load(paired_path)
+                        msa_obj = MSA.load(paired_path)
+                        if msa_obj.is_empty:
+                            logger.warning("Empty paired MSA %s (shape %s) — skipping", paired_path, msa_obj.sequences.shape)
+                        else:
+                            paired_msa[chain_info.chain_id] = msa_obj
                     except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
                         logger.warning("Corrupt paired MSA %s: %s — skipping", paired_path, e)
 

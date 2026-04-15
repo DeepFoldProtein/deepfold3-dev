@@ -311,7 +311,7 @@ class WeightedEvalSampler(Sampler[int]):
         yield from shard.tolist()
 
     def __len__(self) -> int:
-        return self.n_samples // self.num_replicas
+        return -(-self.n_samples // self.num_replicas)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
