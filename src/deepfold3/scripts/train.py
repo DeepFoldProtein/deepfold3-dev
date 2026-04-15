@@ -1,18 +1,22 @@
 """``deepfold3 train`` -- training entry point.
 
 Examples:
-    Single-GPU::
+    Single-GPU (data_dir from config)::
+
+        deepfold3 train --config configs/initial.yaml --output output/run1
+
+    Single-GPU (explicit data-dir overrides config)::
 
         deepfold3 train --data-dir /data/training --output output/run1
 
     Multi-GPU (DDP via torchrun)::
 
         torchrun --nproc_per_node=4 -m deepfold3.scripts.train \\
-            --data-dir /data/training --output output/run1
+            --config configs/initial.yaml --output output/run1
 
     Resume::
 
-        deepfold3 train --data-dir /data/training --output output/run1 \\
+        deepfold3 train --output output/run1 \\
             --resume output/run1/checkpoint_1000.pt
 """
 
@@ -56,11 +60,15 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
 
 
 @cli.command()
-@click.option("--data-dir", required=True, type=click.Path(exists=True), help="Training data directory.")
+@click.option(
+    "--data-dir", default=None, type=click.Path(exists=True), help="Primary training data directory (overrides config)."
+)
 @click.option("--output", required=True, type=click.Path(), help="Output directory for checkpoints and logs.")
 @click.option("--params", default="", help="Pretrained weights (.safetensors or .pt).")
 @click.option("--resume", default=None, type=click.Path(exists=True), help="Resume from checkpoint.")
-@click.option("--config", "config_path", default=None, type=click.Path(exists=True), help="Training config (JSON or YAML).")
+@click.option(
+    "--config", "config_path", default=None, type=click.Path(exists=True), help="Training config (JSON or YAML)."
+)
 @click.option("--lr", default=None, type=float, help="Override learning rate.")
 @click.option("--max-steps", default=None, type=int, help="Override max training steps.")
 @click.option("--max-tokens", default=None, type=int, help="Override max tokens per crop.")
@@ -100,12 +108,6 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     ),
 )
 @click.option(
-    "--eval-data-dir",
-    default=None,
-    type=click.Path(exists=True),
-    help="Separate evaluation data directory (overrides date-based or random split).",
-)
-@click.option(
     "--eval-cutoff-date",
     default=None,
     help="ISO date (YYYY-MM-DD): records released after this go to eval set (AF3-style).",
@@ -117,7 +119,7 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     help="PDB mmCIF mirror directory. Enables template loading during training.",
 )
 def train(
-    data_dir: str,
+    data_dir: str | None,
     output: str,
     params: str,
     resume: str | None,
@@ -134,7 +136,6 @@ def train(
     include_list: str | None,
     exclude_list: str | None,
     extra_datasets: tuple[str, ...],
-    eval_data_dir: str | None,
     eval_cutoff_date: str | None,
     mmcif_dir: str | None,
 ) -> None:
@@ -195,16 +196,18 @@ def train(
         # Apply training config overrides
         for key, val in overrides.get("training", {}).items():
             if key == "extra_datasets":
-                # Convert dicts to DatasetConfig objects
                 train_cfg.extra_datasets = [DatasetConfig(**d) for d in val]
+            elif key == "eval_datasets":
+                train_cfg.eval_datasets = [DatasetConfig(**d) for d in val]
             elif hasattr(train_cfg, key):
                 setattr(train_cfg, key, val)
 
         # Apply model config overrides (recursively for nested dataclasses)
         _apply_overrides(model_cfg, overrides.get("model", {}))
 
-    # Apply CLI overrides
-    train_cfg.data_dir = data_dir
+    # Apply CLI overrides — data_dir from CLI takes precedence over config
+    if data_dir is not None:
+        train_cfg.data_dir = data_dir
     train_cfg.output_dir = output
     train_cfg.params_path = params
     if lr is not None:
@@ -224,8 +227,6 @@ def train(
         train_cfg.wandb_enabled = True
     if mmcif_dir is not None:
         train_cfg.mmcif_dir = mmcif_dir
-    if eval_data_dir is not None:
-        train_cfg.eval_data_dir = eval_data_dir
     if eval_cutoff_date is not None:
         train_cfg.eval_cutoff_date = eval_cutoff_date
 
@@ -249,10 +250,15 @@ def train(
     # Load records from manifest or by scanning data_dir
     from deepfold3.data.prepare.manifest import discover_records
 
-    all_records = discover_records(Path(data_dir))
     log = logging.getLogger(__name__)
-    if not all_records:
-        log.warning("No records found in %s", data_dir)
+    effective_data_dir = train_cfg.data_dir
+    all_records = []
+    if effective_data_dir:
+        all_records = discover_records(Path(effective_data_dir))
+        if not all_records:
+            log.warning("No records found in %s", effective_data_dir)
+    else:
+        log.info("No primary data_dir specified; training will use extra_datasets only")
 
     # Filter by include/exclude lists
     if include_list or exclude_list:
@@ -269,21 +275,14 @@ def train(
             all_records = [r for r in all_records if r.id not in denied]
             log.info("Exclude list: %d → %d records", before, len(all_records))
 
-    # Train / eval split — three modes by priority:
-    #   1. --eval-data-dir: separate dataset directory for eval
-    #   2. eval_cutoff_date: records released AFTER cutoff → eval set (AF3-style)
-    #   3. fallback: random split with fixed seed
-    import random
-
+    # Train / eval split — two modes by priority:
+    #   1. eval_cutoff_date: records released AFTER cutoff → eval set (AF3-style)
+    #   2. eval_datasets from config (separate dataset dirs)
+    # If neither is configured, no eval is performed on the primary dataset.
     eval_records: list = []
 
-    if train_cfg.eval_data_dir:
-        # Mode 1: dedicated eval dataset
-        eval_records = discover_records(Path(train_cfg.eval_data_dir))
-        records = all_records
-        log.info("Eval from separate dir: %d eval records from %s", len(eval_records), train_cfg.eval_data_dir)
-    elif train_cfg.eval_cutoff_date:
-        # Mode 2: date-based split (AF3 §5.8)
+    if train_cfg.eval_cutoff_date:
+        # Mode 1: date-based split on primary records (AF3 §5.8)
         cutoff = train_cfg.eval_cutoff_date
         max_eval = train_cfg.eval_max_date
         records, eval_records = [], []
@@ -303,20 +302,7 @@ def train(
             len(eval_records),
         )
     else:
-        # Mode 3: random split
-        split_seed = train_cfg.seed
-        rng = random.Random(split_seed)
-        rng.shuffle(all_records)
-        n_eval = max(1, int(len(all_records) * train_cfg.eval_fraction))
-        records = all_records[:-n_eval] if len(all_records) > n_eval else all_records
-        eval_records = all_records[-n_eval:] if len(all_records) > n_eval else []
-        log.info(
-            "Random split (seed=%d, frac=%.2f): %d train, %d eval",
-            split_seed,
-            train_cfg.eval_fraction,
-            len(records),
-            len(eval_records),
-        )
+        records = all_records
 
     # Load distillation records if configured (legacy)
     distillation_records = []

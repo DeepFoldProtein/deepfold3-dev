@@ -179,5 +179,8 @@ af3.bin
 # Training run outputs (checkpoints, logs, tensorboard, etc.)
 /runs/
 
+# Weights & Biases
+wandb/
+
 # Claude Code
 .claude/

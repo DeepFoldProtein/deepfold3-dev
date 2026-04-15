@@ -115,6 +115,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "strategy": strategy,
                 "is_distillation": bool(entry.get("is_distillation", False)),
                 "format": fmt,
+                "cutoff_date": str(entry.get("cutoff_date", "")),
             }
         )
     return result
@@ -127,7 +128,8 @@ def load_config(config_path: str | Path) -> dict:
 
     1. Resolves ``base:`` inheritance chains via :func:`resolve_config`.
     2. Moves a top-level ``datasets:`` key into ``training.extra_datasets``.
-    3. Returns a clean dict ready for application to ``TrainingConfig`` /
+    3. Moves a top-level ``eval_datasets:`` key into ``training.eval_datasets``.
+    4. Returns a clean dict ready for application to ``TrainingConfig`` /
        ``ModelConfig`` via ``_apply_overrides``.
     """
     data = resolve_config(config_path)
@@ -139,5 +141,11 @@ def load_config(config_path: str | Path) -> dict:
         # Config-defined datasets: set (not append) — base-inherited datasets
         # are already merged by deep_merge, so the final list is authoritative.
         training["extra_datasets"] = normalised
+
+    eval_datasets_raw = data.pop("eval_datasets", None)
+    if eval_datasets_raw is not None:
+        normalised = normalize_datasets(eval_datasets_raw)
+        training = data.setdefault("training", {})
+        training["eval_datasets"] = normalised
 
     return data

@@ -314,7 +314,7 @@ class OptimConfig:
 
 @dataclass
 class DatasetConfig:
-    """Configuration for a training dataset source.
+    """Configuration for a training or evaluation dataset source.
 
     Attributes:
         name: Identifier for logging.
@@ -323,6 +323,9 @@ class DatasetConfig:
         strategy: ``"weighted"`` (cluster-balanced) or ``"uniform"``.
         is_distillation: If True, disables confidence/distogram losses.
         format: ``"df3"`` (default) or ``"of3"`` (OpenFold 3 preprocessed).
+        cutoff_date: ISO date filter. For training datasets: records released
+            AFTER this date are excluded. For eval datasets: only records
+            released AFTER this date are included.
     """
 
     name: str = ""
@@ -331,6 +334,7 @@ class DatasetConfig:
     strategy: str = "uniform"
     is_distillation: bool = False
     format: str = "df3"
+    cutoff_date: str = ""
 
 
 @dataclass
@@ -499,11 +503,10 @@ class TrainingConfig:
     wandb_run_name: str | None = None
 
     # Evaluation
-    eval_data_dir: str = ""  # separate eval dataset dir (overrides date-based split)
     eval_cutoff_date: str = ""  # ISO date: records released AFTER this → eval set (e.g. "2021-09-30")
     eval_max_date: str = ""  # ISO date: records released AFTER this are excluded from eval
-    eval_fraction: float = 0.05  # fallback random split fraction when no cutoff/dir provided
     eval_samples: int = 50  # max records per eval pass (0 = use all; cluster-weighted when clusters available)
+    eval_datasets: list[DatasetConfig] = field(default_factory=list)  # YAML eval_datasets section
 
     # Paths (set at runtime)
     output_dir: str = "output"

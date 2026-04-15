@@ -82,6 +82,7 @@ datasets:
     strategy: weighted
     is_distillation: false
     format: df3
+    cutoff_date: "2021-09-30"
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
@@ -96,6 +97,12 @@ datasets:
     strategy: uniform
     is_distillation: true
     format: of3
+
+eval_datasets:
+  - name: patchr_eval
+    data_dir: /data/distillation/patchr_training
+    format: df3
+    cutoff_date: "2021-09-30"
 
 model:
   num_recycles: 10

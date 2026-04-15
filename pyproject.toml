@@ -17,6 +17,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
+    "wandb>=0.26.0",
 ]
 
 [project.scripts]

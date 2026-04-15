@@ -10,54 +10,48 @@ Usage::
 import click
 
 
-@click.group()
+class _LazyGroup(click.Group):
+    """Click group that defers command registration until first use.
+
+    This avoids importing all subcommand modules at package import time,
+    which would cause ``RuntimeWarning: found in sys.modules`` when
+    running a subcommand via ``python -m deepfold3.scripts.train``
+    (e.g. under torchrun).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._commands_loaded = False
+
+    def _ensure_loaded(self) -> None:
+        if self._commands_loaded:
+            return
+        self._commands_loaded = True
+
+        # Each module uses @cli.command() which registers on import.
+        import deepfold3.scripts.build_ligand_cache  # noqa: F401
+        import deepfold3.scripts.build_masks  # noqa: F401
+        import deepfold3.scripts.convert_weights  # noqa: F401
+        import deepfold3.scripts.inference  # noqa: F401
+        import deepfold3.scripts.msa_batch  # noqa: F401
+        import deepfold3.scripts.msa_search  # noqa: F401
+        import deepfold3.scripts.plot_confidences  # noqa: F401
+        import deepfold3.scripts.prepare  # noqa: F401
+        import deepfold3.scripts.prepare_templates  # noqa: F401
+        import deepfold3.scripts.scan_mmcif  # noqa: F401
+        import deepfold3.scripts.train  # noqa: F401
+        import deepfold3.scripts.warmup_triton  # noqa: F401
+
+    def list_commands(self, ctx):
+        self._ensure_loaded()
+        return super().list_commands(ctx)
+
+    def get_command(self, ctx, cmd_name):
+        self._ensure_loaded()
+        return super().get_command(ctx, cmd_name)
+
+
+@click.group(cls=_LazyGroup)
 @click.version_option(package_name="deepfold3")
 def cli() -> None:
     """DeepFold3: biomolecular complex structure prediction."""
-
-
-def _register_commands() -> None:
-    from deepfold3.scripts.build_ligand_cache import build_ligand_cache
-    from deepfold3.scripts.build_masks import build_masks
-    from deepfold3.scripts.convert_weights import convert
-    from deepfold3.scripts.inference import inference
-    from deepfold3.scripts.msa_batch import msa_batch
-    from deepfold3.scripts.msa_search import msa_search
-    from deepfold3.scripts.plot_confidences import plot
-    from deepfold3.scripts.prepare import (
-        drop_obsolete,
-        enrich_manifest,
-        export_complexes,
-        fetch_ccd,
-        import_msa,
-        import_of3,
-        import_paired_msa,
-        prepare,
-    )
-    from deepfold3.scripts.prepare_templates import prepare_templates
-    from deepfold3.scripts.scan_mmcif import scan_mmcif
-    from deepfold3.scripts.train import train
-    from deepfold3.scripts.warmup_triton import main as warmup_triton
-
-    cli.add_command(inference)
-    cli.add_command(convert)
-    cli.add_command(plot)
-    cli.add_command(msa_search)
-    cli.add_command(msa_batch)
-    cli.add_command(prepare)
-    cli.add_command(fetch_ccd)
-    cli.add_command(import_msa)
-    cli.add_command(import_of3)
-    cli.add_command(import_paired_msa)
-    cli.add_command(export_complexes)
-    cli.add_command(enrich_manifest)
-    cli.add_command(drop_obsolete)
-    cli.add_command(scan_mmcif)
-    cli.add_command(build_ligand_cache)
-    cli.add_command(build_masks)
-    cli.add_command(prepare_templates)
-    cli.add_command(train)
-    cli.add_command(warmup_triton)
-
-
-_register_commands()

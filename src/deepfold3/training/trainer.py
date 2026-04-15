@@ -372,15 +372,13 @@ class Trainer:
             return
         try:
             import dataclasses
-            import datetime
 
             import wandb
 
             if self.cfg.wandb_run_name:
                 run_name = self.cfg.wandb_run_name
             else:
-                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                run_name = f"{Path(self.cfg.output_dir).name}_{timestamp}"
+                run_name = Path(self.cfg.output_dir).name
 
             self._wandb = wandb
             wandb.init(
@@ -429,13 +427,96 @@ class Trainer:
             max_chains=self.model_cfg.data.max_chains,
         )
 
-        # Primary (PDB) dataset
-        pdb_ds = TrainingDataset(
-            records=self.records,
-            data_dir=Path(self.cfg.data_dir),
-            is_distillation=False,
-            **ds_kwargs,
-        )
+        # Keys accepted by OF3Dataset (subset of ds_kwargs)
+        _OF3_KWARGS = {
+            "max_tokens",
+            "max_atoms",
+            "max_msa_seqs",
+            "max_neighborhood",
+            "contiguous_crop_weight",
+            "spatial_crop_weight",
+            "interface_crop_weight",
+            "interface_distance",
+            "mmcif_dir",
+            "max_templates",
+        }
+        of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in _OF3_KWARGS}
+
+        # Cache discovered records by (data_dir, format) to avoid re-scanning
+        _record_cache: dict[tuple[str, str], list] = {}
+
+        def _discover(data_dir: str, fmt: str) -> list:
+            key = (data_dir, fmt)
+            if key not in _record_cache:
+                if fmt == "of3":
+                    from deepfold3.data.module.of3_dataset import discover_of3_records
+
+                    _record_cache[key] = discover_of3_records(Path(data_dir))
+                else:
+                    from deepfold3.data.prepare.manifest import discover_records
+
+                    _record_cache[key] = discover_records(Path(data_dir))
+            # Return a copy so cutoff filtering doesn't mutate the cache
+            return list(_record_cache[key])
+
+        def _apply_cutoff(records, cutoff: str, *, keep_after: bool):
+            """Filter records by release date cutoff."""
+            if not cutoff:
+                return records
+            filtered = []
+            for r in records:
+                released = r.structure_info.released if r.structure_info else None
+                if released is None:
+                    if not keep_after:
+                        filtered.append(r)
+                elif keep_after:
+                    if released > cutoff:
+                        filtered.append(r)
+                else:
+                    if released <= cutoff:
+                        filtered.append(r)
+            return filtered
+
+        def _load_dataset_from_spec(spec, *, keep_after: bool, preloaded_records=None):
+            """Load a dataset from a DatasetConfig spec.
+
+            Returns (dataset, records) or (None, []) if no records found.
+            """
+            if preloaded_records is not None:
+                records = preloaded_records
+            else:
+                records = _discover(spec.data_dir, spec.format)
+            if spec.cutoff_date:
+                records = _apply_cutoff(records, spec.cutoff_date, keep_after=keep_after)
+            if not records:
+                return None, []
+            if spec.format == "of3":
+                from deepfold3.data.module.of3_dataset import OF3Dataset
+
+                ds = OF3Dataset(
+                    records=records,
+                    of3_dir=Path(spec.data_dir),
+                    is_distillation=spec.is_distillation,
+                    **of3_kwargs,
+                )
+            else:
+                ds = TrainingDataset(
+                    records=records,
+                    data_dir=Path(spec.data_dir),
+                    is_distillation=spec.is_distillation,
+                    **ds_kwargs,
+                )
+            return ds, records
+
+        # Primary (PDB) dataset — may be empty when only extra_datasets are used
+        pdb_ds = None
+        if self.records and self.cfg.data_dir:
+            pdb_ds = TrainingDataset(
+                records=self.records,
+                data_dir=Path(self.cfg.data_dir),
+                is_distillation=False,
+                **ds_kwargs,
+            )
 
         # Collect extra datasets from config
         extra_specs = list(self.cfg.extra_datasets)
@@ -461,75 +542,29 @@ class Trainer:
         if extra_specs:
             from torch.utils.data import ConcatDataset
 
-            from deepfold3.data.prepare.manifest import discover_records
             from deepfold3.data.sample.multi import MultiDatasetSampler
 
-            datasets = [pdb_ds]
-            sampler_configs = [
-                {
-                    "records": self.records,
-                    "dataset_len": len(pdb_ds),
-                    "weight": 1.0,
-                    "strategy": "weighted",
-                },
-            ]
+            datasets = []
+            sampler_configs = []
+
+            # Only include primary dataset if it has records
+            if pdb_ds is not None and len(pdb_ds) > 0:
+                datasets.append(pdb_ds)
+                sampler_configs.append(
+                    {
+                        "records": self.records,
+                        "dataset_len": len(pdb_ds),
+                        "weight": 1.0,
+                        "strategy": "weighted",
+                    },
+                )
 
             for spec in extra_specs:
-                if spec.format == "of3":
-                    # On-the-fly OpenFold 3 dataset — no bulk conversion needed
-                    from deepfold3.data.module.of3_dataset import OF3Dataset, discover_of3_records
-
-                    records = discover_of3_records(Path(spec.data_dir))
-                    if not records:
-                        logger.warning(
-                            "Extra dataset %r: no OF3 records in %s, skipping.",
-                            spec.name,
-                            spec.data_dir,
-                        )
-                        continue
-
-                    of3_kwargs = {
-                        k: v
-                        for k, v in ds_kwargs.items()
-                        if k
-                        in (
-                            "max_tokens",
-                            "max_atoms",
-                            "max_msa_seqs",
-                            "max_neighborhood",
-                            "contiguous_crop_weight",
-                            "spatial_crop_weight",
-                            "interface_crop_weight",
-                            "interface_distance",
-                            "mmcif_dir",
-                            "max_templates",
-                        )
-                    }
-                    ds = OF3Dataset(
-                        records=records,
-                        of3_dir=Path(spec.data_dir),
-                        is_distillation=spec.is_distillation,
-                        **of3_kwargs,
-                    )
-                else:
-                    # Standard DF3 dataset
-                    records = self.distillation_records if spec.name == "_distillation" else None
-                    if records is None:
-                        records = discover_records(Path(spec.data_dir))
-                    if not records:
-                        logger.warning(
-                            "Extra dataset %r: no records found in %s, skipping.",
-                            spec.name,
-                            spec.data_dir,
-                        )
-                        continue
-
-                    ds = TrainingDataset(
-                        records=records,
-                        data_dir=Path(spec.data_dir),
-                        is_distillation=spec.is_distillation,
-                        **ds_kwargs,
-                    )
+                preloaded = self.distillation_records if spec.name == "_distillation" else None
+                ds, records = _load_dataset_from_spec(spec, keep_after=False, preloaded_records=preloaded)
+                if ds is None:
+                    logger.warning("Extra dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
+                    continue
                 datasets.append(ds)
                 sampler_configs.append(
                     {
@@ -556,6 +591,11 @@ class Trainer:
                 seed=self.cfg.seed,
             )
         else:
+            if pdb_ds is None:
+                raise RuntimeError(
+                    "No training data: --data-dir is empty and no extra_datasets configured. "
+                    "Provide --data-dir or define datasets in the config file."
+                )
             train_ds = pdb_ds
             train_sampler = self._build_train_sampler(pdb_ds)
 
@@ -573,13 +613,31 @@ class Trainer:
         )
 
         eval_dl = None
-        if self.eval_records:
-            eval_data_dir = Path(self.cfg.eval_data_dir) if self.cfg.eval_data_dir else Path(self.cfg.data_dir)
-            eval_ds = TrainingDataset(
-                records=self.eval_records,
-                data_dir=eval_data_dir,
-                **ds_kwargs,
+        eval_datasets = []
+
+        # Primary eval records (from date-based split on primary data_dir)
+        if self.eval_records and self.cfg.data_dir:
+            eval_datasets.append(
+                TrainingDataset(
+                    records=self.eval_records,
+                    data_dir=Path(self.cfg.data_dir),
+                    **ds_kwargs,
+                )
             )
+
+        # Eval datasets from config (eval_datasets YAML section)
+        for spec in self.cfg.eval_datasets:
+            ds, recs = _load_dataset_from_spec(spec, keep_after=True)
+            if ds is None:
+                logger.warning("Eval dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
+                continue
+            eval_datasets.append(ds)
+            logger.info("Eval dataset %r: %d records from %s", spec.name, len(recs), spec.data_dir)
+
+        if eval_datasets:
+            from torch.utils.data import ConcatDataset as ConcatDS
+
+            eval_ds = ConcatDS(eval_datasets) if len(eval_datasets) > 1 else eval_datasets[0]
             eval_sampler = self._build_eval_sampler(eval_ds)
             eval_dl = DataLoader(
                 eval_ds,
