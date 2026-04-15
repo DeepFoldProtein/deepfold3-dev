@@ -1,0 +1,125 @@
+training:
+  lr: 0.0018
+  weight_decay: 1.0e-8
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+  warmup_steps: 1000
+  start_decay_after: 50000
+  decay_every: 50000
+  decay_factor: 0.95
+  finetune_scheduler: af3
+  cosine_min_lr_ratio: 0.1
+  cosine_max_steps: 20000
+
+  grad_clip_norm: 10.0
+  accumulate_grad_batches: 32
+  ema_decay: 0.999
+
+  max_tokens: 384
+  max_atoms: 4096
+  max_msa_seqs: 512
+  max_recycles: 3
+
+  diffusion_batch_size: 48
+  diffusion_chunk_size: 16
+  mini_rollout_steps: 20
+  mini_rollout_samples: 1
+
+  alpha_diffusion: 4.0
+  alpha_smooth_lddt: 1.0
+  alpha_distogram: 0.03
+  alpha_confidence: 1.0e-4
+  alpha_pae: 0.0
+  alpha_bond: 0.0
+  nucleotide_loss_weight: 5.0
+  ligand_loss_weight: 10.0
+  region_loss_weights: {}
+
+  lddt_cutoffs: [0.5, 1.0, 2.0, 4.0]
+  lddt_inclusion_radius: 15.0
+  lddt_nucleotide_inclusion_radius: 30.0
+  lddt_min_distance: 1.0e-3
+  min_resolution: 0.1
+  max_resolution: 4.0
+
+  use_fused_ce_loss: false
+  fused_ce_chunk_n: 32
+
+  dtype: bf16
+  num_workers: 8
+  eval_num_workers: 2
+  prefetch_factor: 4
+  pin_memory: true
+  drop_last: true
+  find_unused_parameters: false
+  static_graph: true
+  train_confidence_only: false
+
+  max_steps: 100000
+  seed: 42
+  checkpoint_interval: 100
+  eval_interval: 500
+  log_interval: 1
+  log_microsteps: false
+  uniform_recycle: true
+  max_checkpoints: 500
+
+  load_strict: true
+  skip_load_optimizer: false
+  skip_load_scheduler: false
+  skip_load_step: false
+
+  wandb_enabled: true
+  wandb_project: deepfold3-stage0
+  wandb_run_name: null
+
+model:
+  num_recycles: 10
+  msa_crop_size: 512
+  evoformer:
+    num_layer: 4
+    msa_channel: 64
+    seq_channel: 384
+    pair_channel: 128
+  pairformer:
+    num_layer: 48
+    pair_channel: 128
+    seq_channel: 384
+  diffusion:
+    steps: 200
+    num_samples: 5
+    sigma_data: 16.0
+    p_mean: -1.2
+    p_std: 1.5
+  confidence:
+    num_layer: 4
+    num_plddt_bins: 50
+    num_distogram_bins: 64
+    max_error_bin: 31.0
+  template:
+    num_channels: 64
+    pairformer:
+      num_layer: 2
+  data:
+    max_templates: 4
+    max_neighborhood: 40
+    contiguous_crop_weight: 0.2
+    spatial_crop_weight: 0.4
+    interface_crop_weight: 0.4
+    interface_distance: 15.0
+    template_cutoff_days: 60
+    max_template_date: null
+    prefer_monomer_templates: true
+  optim:
+    use_fused_evo_attention: true
+    use_fused_pair_bias: true
+    use_fused_swiglu: true
+    use_fused_triangle_mul: true
+    use_fused_transition_pair: true
+    use_fused_ln_transpose: true
+    use_tiled_linear: true
+    tiled_linear_inference: true
+    tiled_opm_chunk: 0
+    use_torch_compile: false
+    use_gradient_checkpointing: true

@@ -313,6 +313,27 @@ class OptimConfig:
 
 
 @dataclass
+class DatasetConfig:
+    """Configuration for a training dataset source.
+
+    Attributes:
+        name: Identifier for logging.
+        data_dir: Path to data directory (structures/ + msa/).
+        weight: Sampling probability relative to primary dataset (1.0).
+        strategy: ``"weighted"`` (cluster-balanced) or ``"uniform"``.
+        is_distillation: If True, disables confidence/distogram losses.
+        format: ``"df3"`` (default) or ``"of3"`` (OpenFold 3 preprocessed).
+    """
+
+    name: str = ""
+    data_dir: str = ""
+    weight: float = 1.0
+    strategy: str = "uniform"
+    is_distillation: bool = False
+    format: str = "df3"
+
+
+@dataclass
 class TrainingConfig:
     """Training hyperparameters.
 
@@ -497,18 +518,9 @@ class TrainingConfig:
     distillation_weight: float = 0.25  # sampling weight relative to PDB (PDB gets 1.0)
 
     # Multi-dataset training: list of additional datasets beyond --data-dir.
-    # Each entry is a dict with keys:
-    #   name (str):          identifier for logging
-    #   data_dir (str):      path to data directory (structures/ + msa/)
-    #   weight (float):      sampling probability relative to primary dataset (1.0)
-    #   strategy (str):      "weighted" (cluster-balanced) or "uniform"
-    #   is_distillation (bool): if True, disables confidence/distogram losses
-    # Example JSON config:
-    #   {"training": {"extra_datasets": [
-    #       {"name": "afdb", "data_dir": "/data/afdb", "weight": 0.5,
-    #        "strategy": "uniform", "is_distillation": true}
-    #   ]}}
-    extra_datasets: list[dict] = field(default_factory=list)
+    # Can be defined in YAML/JSON config under ``datasets`` top-level key
+    # or via CLI ``--dataset name:path:weight:strategy:distill:format``.
+    extra_datasets: list[DatasetConfig] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate configuration values."""

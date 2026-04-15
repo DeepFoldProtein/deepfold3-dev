@@ -444,17 +444,18 @@ class Trainer:
         if (
             self.cfg.distillation_data_dir
             and self.distillation_records
-            and not any(s.get("name") == "_distillation" for s in extra_specs)
+            and not any(s.name == "_distillation" for s in extra_specs)
         ):
+            from deepfold3.model.config import DatasetConfig
+
             extra_specs.append(
-                {
-                    "name": "_distillation",
-                    "data_dir": self.cfg.distillation_data_dir,
-                    "weight": self.cfg.distillation_weight,
-                    "strategy": "uniform",
-                    "is_distillation": True,
-                    "_records": self.distillation_records,
-                }
+                DatasetConfig(
+                    name="_distillation",
+                    data_dir=self.cfg.distillation_data_dir,
+                    weight=self.cfg.distillation_weight,
+                    strategy="uniform",
+                    is_distillation=True,
+                )
             )
 
         if extra_specs:
@@ -474,38 +475,77 @@ class Trainer:
             ]
 
             for spec in extra_specs:
-                # Load records: from pre-loaded _records or by discovering from data_dir
-                records = spec.get("_records")
-                if records is None:
-                    records = discover_records(Path(spec["data_dir"]))
-                if not records:
-                    logger.warning(
-                        "Extra dataset %r: no records found in %s, skipping.", spec.get("name", "?"), spec["data_dir"]
-                    )
-                    continue
+                if spec.format == "of3":
+                    # On-the-fly OpenFold 3 dataset — no bulk conversion needed
+                    from deepfold3.data.module.of3_dataset import OF3Dataset, discover_of3_records
 
-                ds = TrainingDataset(
-                    records=records,
-                    data_dir=Path(spec["data_dir"]),
-                    is_distillation=spec.get("is_distillation", False),
-                    **ds_kwargs,
-                )
+                    records = discover_of3_records(Path(spec.data_dir))
+                    if not records:
+                        logger.warning(
+                            "Extra dataset %r: no OF3 records in %s, skipping.",
+                            spec.name,
+                            spec.data_dir,
+                        )
+                        continue
+
+                    of3_kwargs = {
+                        k: v
+                        for k, v in ds_kwargs.items()
+                        if k
+                        in (
+                            "max_tokens",
+                            "max_atoms",
+                            "max_msa_seqs",
+                            "max_neighborhood",
+                            "contiguous_crop_weight",
+                            "spatial_crop_weight",
+                            "interface_crop_weight",
+                            "interface_distance",
+                            "mmcif_dir",
+                            "max_templates",
+                        )
+                    }
+                    ds = OF3Dataset(
+                        records=records,
+                        of3_dir=Path(spec.data_dir),
+                        is_distillation=spec.is_distillation,
+                        **of3_kwargs,
+                    )
+                else:
+                    # Standard DF3 dataset
+                    records = self.distillation_records if spec.name == "_distillation" else None
+                    if records is None:
+                        records = discover_records(Path(spec.data_dir))
+                    if not records:
+                        logger.warning(
+                            "Extra dataset %r: no records found in %s, skipping.",
+                            spec.name,
+                            spec.data_dir,
+                        )
+                        continue
+
+                    ds = TrainingDataset(
+                        records=records,
+                        data_dir=Path(spec.data_dir),
+                        is_distillation=spec.is_distillation,
+                        **ds_kwargs,
+                    )
                 datasets.append(ds)
                 sampler_configs.append(
                     {
                         "records": records,
                         "dataset_len": len(ds),
-                        "weight": spec.get("weight", 1.0),
-                        "strategy": spec.get("strategy", "uniform"),
+                        "weight": spec.weight,
+                        "strategy": spec.strategy,
                     }
                 )
                 logger.info(
                     "Extra dataset %r: %d records, weight=%.2f, strategy=%s, distillation=%s",
-                    spec.get("name", "?"),
+                    spec.name,
                     len(records),
-                    spec.get("weight", 1.0),
-                    spec.get("strategy", "uniform"),
-                    spec.get("is_distillation", False),
+                    spec.weight,
+                    spec.strategy,
+                    spec.is_distillation,
                 )
 
             train_ds = ConcatDataset(datasets)

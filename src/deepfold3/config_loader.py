@@ -1,0 +1,143 @@
+"""Config file loading with YAML/JSON support and base-config inheritance.
+
+Supports:
+- JSON (``.json``) and YAML (``.yaml`` / ``.yml``) config files
+- ``base:`` key for config inheritance (recursive, with cycle detection)
+- Deep-merge semantics: dicts merge recursively, scalars/lists replace
+- Top-level ``datasets:`` key normalised into ``training.extra_datasets``
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import yaml
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base*, returning a new dict.
+
+    - Dicts: merged recursively (override keys win on conflict).
+    - Lists / scalars / ``None``: override replaces base entirely.
+    """
+    result = base.copy()
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _load_file(path: Path) -> dict:
+    """Load a JSON or YAML file, returning a dict (empty dict for empty files)."""
+    suffix = path.suffix.lower()
+    with open(path) as f:
+        if suffix == ".json":
+            return json.load(f)
+        elif suffix in (".yaml", ".yml"):
+            return yaml.safe_load(f) or {}
+        else:
+            raise ValueError(f"Unsupported config file extension: {suffix} (expected .json, .yaml, or .yml)")
+
+
+def resolve_config(config_path: str | Path, _seen: set[Path] | None = None) -> dict:
+    """Load a config file and recursively resolve ``base:`` inheritance.
+
+    Args:
+        config_path: Path to a JSON or YAML config file.
+        _seen: Internal set of already-visited paths for cycle detection.
+
+    Returns:
+        Fully-merged config dict with ``base`` key stripped.
+
+    Raises:
+        FileNotFoundError: If the config file or a referenced base does not exist.
+        ValueError: If a circular base reference is detected.
+    """
+    path = Path(config_path).resolve()
+    if _seen is None:
+        _seen = set()
+    if path in _seen:
+        chain = " -> ".join(str(p) for p in _seen) + f" -> {path}"
+        raise ValueError(f"Circular config base reference: {chain}")
+    _seen.add(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    data = _load_file(path)
+
+    base_ref = data.pop("base", None)
+    if base_ref is not None:
+        base_path = Path(base_ref)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        base_data = resolve_config(base_path, _seen)
+        data = deep_merge(base_data, data)
+
+    return data
+
+
+def normalize_datasets(raw: list[dict]) -> list[dict]:
+    """Validate and fill defaults for dataset entries.
+
+    Args:
+        raw: List of dataset dicts from YAML/JSON config.
+
+    Returns:
+        Normalised list of dicts ready for ``DatasetConfig`` construction.
+
+    Raises:
+        ValueError: If a required field (``name``, ``data_dir``) is missing.
+    """
+    valid_strategies = {"uniform", "weighted"}
+    valid_formats = {"df3", "of3"}
+    result = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"datasets[{i}]: expected a mapping, got {type(entry).__name__}")
+        for required in ("name", "data_dir"):
+            if required not in entry:
+                raise ValueError(f"datasets[{i}]: missing required field '{required}'")
+        strategy = entry.get("strategy", "uniform")
+        fmt = entry.get("format", "df3")
+        if strategy not in valid_strategies:
+            raise ValueError(f"datasets[{i}]: invalid strategy '{strategy}', must be one of {valid_strategies}")
+        if fmt not in valid_formats:
+            raise ValueError(f"datasets[{i}]: invalid format '{fmt}', must be one of {valid_formats}")
+        result.append(
+            {
+                "name": entry["name"],
+                "data_dir": entry["data_dir"],
+                "weight": float(entry.get("weight", 1.0)),
+                "strategy": strategy,
+                "is_distillation": bool(entry.get("is_distillation", False)),
+                "format": fmt,
+            }
+        )
+    return result
+
+
+def load_config(config_path: str | Path) -> dict:
+    """Load a config file (JSON or YAML) with base resolution and dataset normalisation.
+
+    This is the main entry point for config loading.  It:
+
+    1. Resolves ``base:`` inheritance chains via :func:`resolve_config`.
+    2. Moves a top-level ``datasets:`` key into ``training.extra_datasets``.
+    3. Returns a clean dict ready for application to ``TrainingConfig`` /
+       ``ModelConfig`` via ``_apply_overrides``.
+    """
+    data = resolve_config(config_path)
+
+    datasets_raw = data.pop("datasets", None)
+    if datasets_raw is not None:
+        normalised = normalize_datasets(datasets_raw)
+        training = data.setdefault("training", {})
+        # Config-defined datasets: set (not append) — base-inherited datasets
+        # are already merged by deep_merge, so the final list is authoritative.
+        training["extra_datasets"] = normalised
+
+    return data

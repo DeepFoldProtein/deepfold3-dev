@@ -19,7 +19,6 @@ Examples:
 from __future__ import annotations
 
 import faulthandler
-import json
 import logging
 import os
 import signal
@@ -61,7 +60,7 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
 @click.option("--output", required=True, type=click.Path(), help="Output directory for checkpoints and logs.")
 @click.option("--params", default="", help="Pretrained weights (.safetensors or .pt).")
 @click.option("--resume", default=None, type=click.Path(exists=True), help="Resume from checkpoint.")
-@click.option("--config", "config_path", default=None, type=click.Path(exists=True), help="Training config JSON.")
+@click.option("--config", "config_path", default=None, type=click.Path(exists=True), help="Training config (JSON or YAML).")
 @click.option("--lr", default=None, type=float, help="Override learning rate.")
 @click.option("--max-steps", default=None, type=int, help="Override max training steps.")
 @click.option("--max-tokens", default=None, type=int, help="Override max tokens per crop.")
@@ -93,8 +92,10 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     "extra_datasets",
     multiple=True,
     help=(
-        "Add an extra training dataset.  Format: name:path[:weight[:strategy[:distill]]].  "
+        "Add an extra training dataset.  Format: name:path[:weight[:strategy[:distill[:format]]]].  "
+        "format is 'df3' (default) or 'of3' (OpenFold 3 preprocessed, loaded on-the-fly).  "
         "Examples: --dataset afdb:/data/afdb:0.5:uniform:true  "
+        "--dataset of3_mono:/data/of3/preprocessed:0.5:uniform:true:of3  "
         "--dataset pdb2:/data/pdb2:1.0:weighted.  Can be repeated."
     ),
 )
@@ -138,7 +139,8 @@ def train(
     mmcif_dir: str | None,
 ) -> None:
     """Train DeepFold3 model."""
-    from deepfold3.model.config import ModelConfig, TrainingConfig
+    from deepfold3.config_loader import load_config
+    from deepfold3.model.config import DatasetConfig, ModelConfig, TrainingConfig
     from deepfold3.training.trainer import Trainer
 
     # Auto-create a per-run subdirectory under the user-supplied output path.
@@ -188,12 +190,14 @@ def train(
     model_cfg = ModelConfig()
 
     if config_path:
-        with open(config_path) as f:
-            overrides = json.load(f)
+        overrides = load_config(config_path)
 
         # Apply training config overrides
         for key, val in overrides.get("training", {}).items():
-            if hasattr(train_cfg, key):
+            if key == "extra_datasets":
+                # Convert dicts to DatasetConfig objects
+                train_cfg.extra_datasets = [DatasetConfig(**d) for d in val]
+            elif hasattr(train_cfg, key):
                 setattr(train_cfg, key, val)
 
         # Apply model config overrides (recursively for nested dataclasses)
@@ -321,25 +325,34 @@ def train(
         log.info("Loaded %d distillation records from %s", len(distillation_records), train_cfg.distillation_data_dir)
 
     # Parse --dataset CLI flags into extra_datasets config
+    existing_ds = {d.name: i for i, d in enumerate(train_cfg.extra_datasets)}
     for ds_spec in extra_datasets:
         parts = ds_spec.split(":")
         if len(parts) < 2:
-            raise click.BadParameter(f"--dataset format: name:path[:weight[:strategy[:distill]]], got: {ds_spec}")
-        entry = {
-            "name": parts[0],
-            "data_dir": parts[1],
-            "weight": float(parts[2]) if len(parts) > 2 else 1.0,
-            "strategy": parts[3] if len(parts) > 3 else "uniform",
-            "is_distillation": parts[4].lower() in ("true", "1", "yes") if len(parts) > 4 else False,
-        }
-        train_cfg.extra_datasets.append(entry)
+            raise click.BadParameter(
+                "--dataset format: name:path[:weight[:strategy[:distill[:format]]]], got: " + ds_spec
+            )
+        entry = DatasetConfig(
+            name=parts[0],
+            data_dir=parts[1],
+            weight=float(parts[2]) if len(parts) > 2 else 1.0,
+            strategy=parts[3] if len(parts) > 3 else "uniform",
+            is_distillation=parts[4].lower() in ("true", "1", "yes") if len(parts) > 4 else False,
+            format=parts[5] if len(parts) > 5 else "df3",
+        )
+        # CLI dataset with same name replaces config-defined one
+        if entry.name in existing_ds:
+            train_cfg.extra_datasets[existing_ds[entry.name]] = entry
+        else:
+            existing_ds[entry.name] = len(train_cfg.extra_datasets)
+            train_cfg.extra_datasets.append(entry)
         log.info(
             "CLI dataset: %s (dir=%s, weight=%.2f, strategy=%s, distill=%s)",
-            entry["name"],
-            entry["data_dir"],
-            entry["weight"],
-            entry["strategy"],
-            entry["is_distillation"],
+            entry.name,
+            entry.data_dir,
+            entry.weight,
+            entry.strategy,
+            entry.is_distillation,
         )
 
     trainer = Trainer(
