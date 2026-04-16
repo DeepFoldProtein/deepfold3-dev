@@ -484,7 +484,7 @@ class TrainingConfig:
     eval_before: bool = False  # run one eval pass before the training loop starts (also fires on resume)
     max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
     checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)
-    auto_resume: bool = True  # auto-detect latest checkpoint in output_dir
+    auto_resume: bool = False  # auto-detect latest checkpoint in output_dir
 
     # Multi-stage training (use --override or JSON config to set these per stage)
     train_confidence_only: bool = False  # freeze trunk, only train confidence head

@@ -150,8 +150,10 @@ def train(
     # Layout:  runs/<name>/<YYYYMMDD_HHMMSS>/{train.log, checkpoint_*.pt, ...}
     # - Rank 0 creates the subdir and writes INFO to stdout + train.log.
     # - Other ranks only emit WARNING/ERROR to stdout (prevents 8× duplication on DDP).
-    # - When resuming, we respect the existing --output if it already looks like a
-    #   timestamped run dir (contains a checkpoint or train.log).
+    # - Each invocation (including --resume) gets its own timestamped subdir,
+    #   unless --output already points directly at an existing run dir (has
+    #   train.log / checkpoint_*) and no --resume is given — in that case the
+    #   caller explicitly asked to continue in place.
     rank = int(os.environ.get("RANK", "0"))
     requested_output = Path(output)
     timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S")
@@ -159,7 +161,7 @@ def train(
     is_existing_run = requested_output.is_dir() and any(
         p.name == "train.log" or p.name.startswith("checkpoint_") for p in requested_output.iterdir()
     )
-    if resume is not None or is_existing_run:
+    if resume is None and is_existing_run:
         run_dir = requested_output
     else:
         run_dir = requested_output / timestamp

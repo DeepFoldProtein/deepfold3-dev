@@ -72,6 +72,7 @@ training:
   uniform_recycle: true
   max_checkpoints: 500
 
+  auto_resume: false
   load_strict: true
   skip_load_optimizer: false
   skip_load_scheduler: false
