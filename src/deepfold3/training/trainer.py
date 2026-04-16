@@ -700,7 +700,7 @@ class Trainer:
 
         return None
 
-    def _build_eval_sampler(self, eval_ds: TrainingDataset):
+    def _build_eval_sampler(self, eval_ds):
         """Build eval sampler — subsample with cluster-weighted probabilities.
 
         When ``eval_samples > 0``, uses :class:`WeightedEvalSampler` to
@@ -712,15 +712,31 @@ class Trainer:
         ``DistributedSampler`` (DDP) or ``None`` (single GPU).
         """
         n_eval = self.cfg.eval_samples
-        if n_eval <= 0 or n_eval >= len(self.eval_records):
+        ds_len = len(eval_ds)
+        if n_eval <= 0 or n_eval >= ds_len:
             if self.world_size > 1:
                 return DistributedSampler(eval_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False)
             return None
 
-        from deepfold3.data.sample.weighted import WeightedEvalSampler
+        # WeightedEvalSampler needs per-record cluster weights from
+        # self.eval_records.  When the eval set comes from YAML
+        # eval_datasets (or a ConcatDataset), eval_records may not cover
+        # the full dataset — fall back to a uniform random subset sampler.
+        if self.eval_records and len(self.eval_records) >= ds_len:
+            from deepfold3.data.sample.weighted import WeightedEvalSampler
 
-        return WeightedEvalSampler(
-            records=self.eval_records,
+            return WeightedEvalSampler(
+                records=self.eval_records,
+                n_samples=n_eval,
+                num_replicas=self.world_size,
+                rank=self.rank,
+                seed=self.cfg.seed,
+            )
+
+        from deepfold3.data.sample.weighted import UniformEvalSampler
+
+        return UniformEvalSampler(
+            n_records=ds_len,
             n_samples=n_eval,
             num_replicas=self.world_size,
             rank=self.rank,
@@ -948,9 +964,13 @@ class Trainer:
                         mini_rollout_samples=1,
                         seed=0,
                     )
-                    # Slice batch dim (always kept) before loss
-                    pred_0 = _slice_batch_dict(pred, 0, self.cfg.batch_size_per_rank)
-                    features_0 = _slice_batch_dict(features, 0, self.cfg.batch_size_per_rank)
+                    # Slice batch dim (always kept) before loss.
+                    # Use actual batch size from the data (not cfg) — the last
+                    # eval batch may be smaller than batch_size_per_rank when the
+                    # dataset size isn't evenly divisible.
+                    B_actual = features["res_type"].shape[0]
+                    pred_0 = _slice_batch_dict(pred, 0, B_actual)
+                    features_0 = _slice_batch_dict(features, 0, B_actual)
                     _, loss_dict = training_loss(pred_0, features_0, self.cfg)
 
                 for k, v in loss_dict.items():
@@ -959,7 +979,7 @@ class Trainer:
                 if self.is_main and self.cfg.log_microsteps:
                     logger.info("eval: %d/%d loss=%.2f", batch_idx + 1, n_batches, loss_dict["total"])
             except Exception as e:
-                logger.warning("Eval error at batch %d: %s", batch_idx, e)
+                logger.warning("Eval error at batch %d: %s", batch_idx, e, exc_info=True)
                 continue
 
         self.model.train()

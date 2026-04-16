@@ -41,6 +41,66 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Essential feature keys that every sample must contain for the model forward
+# pass and loss computation to produce a valid gradient.
+_REQUIRED_KEYS = {"res_type", "seq_mask", "atom_gt_positions", "atom_gt_mask", "msa", "msa_mask"}
+
+
+def _validate_features(feats: dict[str, torch.Tensor], sample_id: str) -> bool:
+    """Check that featurized sample is usable for training.
+
+    Returns True if valid, False if degenerate (empty, missing keys).
+    Callers should retry with a different sample on False.
+    """
+    missing = _REQUIRED_KEYS - feats.keys()
+    if missing:
+        logger.warning("Sample %s: missing features %s", sample_id, missing)
+        return False
+    N = feats["res_type"].shape[0]
+    if N == 0:
+        logger.warning("Sample %s: zero tokens after crop", sample_id)
+        return False
+    if not feats["seq_mask"].any():
+        logger.warning("Sample %s: seq_mask is all-zero", sample_id)
+        return False
+    return True
+
+
+# Exceptions that indicate bad data (retry-worthy), not programming bugs.
+_DATA_ERRORS = (OSError, EOFError, ValueError, zipfile.BadZipFile, RuntimeError, KeyError)
+
+
+def _retry_getitem(
+    dataset: torch.utils.data.Dataset,
+    idx: int,
+    load_fn,
+    id_fn,
+    max_attempts: int = 3,
+) -> dict[str, torch.Tensor]:
+    """Load a sample with retry on data errors or validation failure.
+
+    On failure, retries with a random different index.  Returns the last
+    successfully loaded features (even if validation failed) so the
+    DataLoader always gets a tensor dict — never an unhandled exception
+    that would desync DDP ranks.
+    """
+    orig_id = id_fn(idx)
+    last_feats: dict[str, torch.Tensor] | None = None
+    for _attempt in range(max_attempts):
+        try:
+            feats = load_fn(idx)
+            if _validate_features(feats, id_fn(idx)):
+                return feats
+            last_feats = feats
+        except _DATA_ERRORS as e:
+            logger.warning("Sample %s (attempt %d): %s", orig_id, _attempt + 1, e)
+        idx = random.randint(0, len(dataset) - 1)
+    # All retries exhausted — return last loaded feats (may be degenerate
+    # but at least has the right tensor structure for collation).
+    if last_feats is not None:
+        return last_feats
+    return load_fn(idx)
+
 
 class TrainingDataset(torch.utils.data.Dataset):
     """PyTorch dataset for DeepFold3 training.
@@ -140,6 +200,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return _retry_getitem(self, idx, self._load_sample, self._sample_id)
+
+    def _sample_id(self, idx: int) -> str:
+        if self.sampling_rows is not None:
+            return self.records[self.sampling_rows[idx].record_idx].id
+        return self.records[idx].id
+
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor]:
         # Resolve idx → record + optional crop anchor
         crop_anchor: tuple[str, int, int] | None = None
         if self.sampling_rows is not None:

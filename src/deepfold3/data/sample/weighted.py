@@ -315,3 +315,39 @@ class WeightedEvalSampler(Sampler[int]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
+
+
+class UniformEvalSampler(Sampler[int]):
+    """Uniform random fixed-size eval sampler (no cluster weights).
+
+    Like :class:`WeightedEvalSampler` but draws indices uniformly — used
+    when per-record cluster weights are not available (e.g. YAML
+    ``eval_datasets`` or ``ConcatDataset``).
+    """
+
+    def __init__(
+        self,
+        n_records: int,
+        n_samples: int = 50,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+    ):
+        self.n_records = n_records
+        self.n_samples = min(n_samples, n_records)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        indices = rng.choice(self.n_records, size=self.n_samples, replace=False)
+        shard = indices[self.rank :: self.num_replicas]
+        yield from shard.tolist()
+
+    def __len__(self) -> int:
+        return -(-self.n_samples // self.num_replicas)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch

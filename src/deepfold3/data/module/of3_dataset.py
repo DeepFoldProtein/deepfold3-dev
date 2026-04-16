@@ -24,6 +24,7 @@ import torch.utils.data
 from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
+from deepfold3.data.module.dataset import _retry_getitem
 from deepfold3.data.prepare.openfold3 import convert_of3_structure
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
@@ -367,6 +368,12 @@ class OF3Dataset(torch.utils.data.Dataset):
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return _retry_getitem(self, idx, self._load_sample, self._sample_id)
+
+    def _sample_id(self, idx: int) -> str:
+        return self.records[idx].id
+
+    def _load_sample(self, idx: int) -> dict[str, torch.Tensor]:
         record = self.records[idx]
         struct_id = record.id
         sample_dir = self.of3_dir / struct_id

@@ -42,13 +42,29 @@ def collate_fn(
         bucket_n = next_bucket(n_max)
         batch = [pad_features(sample, bucket_n=bucket_n)[0] for sample in batch]
 
-    keys = list(batch[0].keys())
     out: dict[str, torch.Tensor] = {}
+    all_keys = {k for sample in batch for k in sample}
 
-    for key in keys:
-        tensors = [sample[key] for sample in batch if key in sample]
-        if not tensors:
+    for key in all_keys:
+        tensors_present = [(i, sample[key]) for i, sample in enumerate(batch) if key in sample]
+        if not tensors_present:
             continue
+
+        # When a key appears in only some samples (e.g. mask channels from
+        # mixed datasets), fill missing entries with zeros so the batch dim
+        # is consistent and _slice_batch_dict can slice correctly.
+        # Skip scalars (0-dim) that aren't in all samples — zero-filling
+        # them changes semantics (e.g. resolution=0.0 vs absent).
+        if len(tensors_present) < len(batch):
+            ref = tensors_present[0][1]
+            if ref.dim() == 0:
+                continue
+            full: list[torch.Tensor] = [torch.zeros_like(ref) for _ in range(len(batch))]
+            for i, t in tensors_present:
+                full[i] = t
+            tensors = full
+        else:
+            tensors = [sample[key] for sample in batch]
 
         shapes = [t.shape for t in tensors]
         if len(shapes[0]) == 0:

@@ -655,10 +655,18 @@ def training_loss(
     rep_idx = features.get("token_to_rep_atom")
 
     losses: dict[str, torch.Tensor] = {}
-    total = gt_pos.new_zeros(())
+    # Anchor total to the distogram prediction (pair features or logits)
+    # so the grad path stays alive even when chunked diffusion detaches
+    # its contribution.  Distogram is always present and graph-connected.
+    _pair = pred["distogram_features"] if "distogram_features" in pred else pred["distogram"]
+    total = (_pair.view(-1)[0] * 0).float()
 
     # --- Token mask channels ---
-    fixed_mask = features.get(f"mask_{MASK_FIXED}")  # [N] bool or None
+    fixed_mask = features.get(f"mask_{MASK_FIXED}")  # [N] float or None
+    # Collation zero-fills mask channels for samples that lack them (mixed
+    # datasets). Treat all-zero as absent so the default atom_mask path is used.
+    if fixed_mask is not None and not fixed_mask.any():
+        fixed_mask = None
     region_label = features.get(f"mask_{MASK_REGION}")  # [N] int or None
     region_weights: torch.Tensor | None = None
     if region_label is not None and cfg.region_loss_weights:
