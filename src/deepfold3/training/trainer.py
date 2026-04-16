@@ -1162,9 +1162,10 @@ class Trainer:
         epoch = 0
         meters = DistributedAverageMeters(self.device)
         t0 = time.monotonic()
-        t_last_log = t0
-        t_last_microstep = t0
         t_last_ckpt = t0
+        # Pure microstep compute time accumulator (excludes eval / checkpoint /
+        # summary-log wall-clock). Flushed at each summary log.
+        microstep_compute_time = 0.0
         # _best_eval_loss is initialized in __init__ and may be overwritten
         # by _load_checkpoint; no need for getattr guard here.
 
@@ -1192,6 +1193,7 @@ class Trainer:
                 if self.effective_step >= self.cfg.max_steps:
                     break
 
+                t_microstep_start = time.monotonic()
                 try:
                     with torch.autocast(
                         device_type="cuda",
@@ -1239,17 +1241,14 @@ class Trainer:
                 loss_dict["_tokens"] = n_tokens
                 meters.update(loss_dict, n=1)
 
-                # Per-microstep timing log (debug). Triggered every microstep
-                # when ``cfg.log_microsteps`` is True. Reports per-microstep
-                # wall-clock and per-example wall-clock so iteration cost can
-                # be measured before reaching an effective optimizer step.
+                # Pure microstep compute time (forward + backward + step). Excludes
+                # anything that happens between iterations (eval, checkpoint, summary
+                # log), so rate / ETA stay stable across eval boundaries. Accumulated
+                # into ``microstep_compute_time`` for the effective-step summary log.
+                dt_micro = time.monotonic() - t_microstep_start
+                microstep_compute_time += dt_micro
+
                 if cfg.log_microsteps and self.is_main:
-                    now = time.monotonic()
-                    dt_micro = now - t_last_microstep
-                    t_last_microstep = now
-                    # System-wide throughput: examples processed per second.
-                    # Each microstep processes ``world_size × batch_size_per_rank``
-                    # examples in ``dt_micro`` seconds.
                     samples_per_microstep = self.world_size * cfg.batch_size_per_rank
                     samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)
                     # Position within the current accumulation window: 1..accumulate
@@ -1268,8 +1267,6 @@ class Trainer:
                         f"loss={loss.item():.4f} "
                         f"dt_micro={dt_micro:.2f}s samples/s={samples_per_sec:.3f}"
                     )
-                elif cfg.log_microsteps:
-                    t_last_microstep = time.monotonic()
 
                 # Release forward-pass outputs and input features immediately.
                 # Without this, local vars hold references to large GPU tensors
@@ -1286,17 +1283,23 @@ class Trainer:
                     avg, sums = meters.sync()
                     meters.reset()
 
+                    # Flush the compute-time accumulator regardless of is_main so
+                    # all ranks stay in sync if the flag ever changes.
+                    compute_time_window = microstep_compute_time
+                    microstep_compute_time = 0.0
+
                     if self.is_main:
                         grad_norm = self._last_grad_norm.item() if self._last_grad_norm is not None else float("nan")
-                        now = time.monotonic()
-                        elapsed = now - t0
-                        wall_since_log = now - t_last_log
-                        dt = wall_since_log / max(self.cfg.log_interval, 1)
-                        t_last_log = now
+                        elapsed = time.monotonic() - t0
+                        # ``dt`` is per-effective-step compute time (forward+backward+step).
+                        # Eval / checkpoint / logging time is intentionally excluded so the
+                        # displayed rate/ETA reflect pure training throughput.
+                        dt = compute_time_window / max(self.cfg.log_interval, 1)
                         lr = self.optimizer.param_groups[0]["lr"]
 
-                        # Throughput (global token sum from all ranks via all-reduce)
-                        tok_per_sec = sums.pop("_tokens", 0) / max(wall_since_log, 1e-9)
+                        # Throughput (global token sum from all ranks via all-reduce).
+                        # Same compute-time denominator as ``dt`` for a consistent picture.
+                        tok_per_sec = sums.pop("_tokens", 0) / max(compute_time_window, 1e-9)
                         avg.pop("_tokens", None)
 
                         # GPU memory
