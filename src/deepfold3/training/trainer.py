@@ -260,8 +260,7 @@ class Trainer:
                 if self.cfg.accumulate_grad_batches > 1:
                     reasons.append(f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}")
                 logger.info(
-                    "static_graph auto-disabled (%s): "
-                    "model.no_sync() is required, which conflicts with static_graph.",
+                    "static_graph auto-disabled (%s): model.no_sync() is required, which conflicts with static_graph.",
                     ", ".join(reasons),
                 )
             self.ddp_model = DDP(
@@ -958,10 +957,13 @@ class Trainer:
             features = self._prepare_features(features)
 
             try:
-                with torch.no_grad(), torch.autocast(
-                    device_type="cuda",
-                    dtype=self.cfg.torch_dtype,
-                    enabled=(self.cfg.dtype != "fp32"),
+                with (
+                    torch.no_grad(),
+                    torch.autocast(
+                        device_type="cuda",
+                        dtype=self.cfg.torch_dtype,
+                        enabled=(self.cfg.dtype != "fp32"),
+                    ),
                 ):
                     pred = self.model.forward_training(
                         features,
@@ -1360,24 +1362,6 @@ class Trainer:
                         need_ckpt = True
                         logger.info("Signal-triggered checkpoint requested")
 
-                # Sync shutdown flag across ranks at optimizer boundaries so
-                # all ranks exit together.  Uses all_reduce(MAX) so any rank's
-                # signal (SIGINT goes to all, SIGTERM may go to rank 0 only)
-                # propagates to everyone.
-                if on_opt_step_boundary and self.world_size > 1:
-                    shutdown_flag.fill_(int(self._shutdown_requested))
-                    dist.all_reduce(shutdown_flag, op=dist.ReduceOp.MAX)
-                    self._shutdown_requested = bool(shutdown_flag.item())
-
-                # Shutdown checkpoint: wait until we're at an opt-step
-                # boundary so the saved global_step lands on the end of a
-                # gradient-accumulation window — otherwise resume would
-                # start mid-window with empty .grad and apply a partial
-                # effective batch on the first opt step.
-                if self._shutdown_requested and on_opt_step_boundary and self.is_main:
-                    need_ckpt = True
-                    logger.info("Shutdown requested — saving checkpoint before exit")
-
                 if need_ckpt:
                     self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
                     t_last_ckpt = time.monotonic()
@@ -1390,9 +1374,35 @@ class Trainer:
                 if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
                     self._run_eval_and_track_best(eval_dl, output_dir)
 
-                # Only break at opt-step boundaries so we don't leave a
-                # half-accumulated window behind.
-                if self._shutdown_requested and on_opt_step_boundary:
+                # --- Shutdown ---
+                # Propagate on every microstep (cheap 1-elem all_reduce) so
+                # all ranks bail together, not just at opt-step boundaries.
+                # MAX so any rank's signal (SIGINT → all; SIGTERM may → rank 0
+                # only) reaches everyone.
+                if self.world_size > 1:
+                    shutdown_flag.fill_(int(self._shutdown_requested))
+                    dist.all_reduce(shutdown_flag, op=dist.ReduceOp.MAX)
+                    self._shutdown_requested = bool(shutdown_flag.item())
+
+                if self._shutdown_requested:
+                    # Mid-window: drop partial grads and rewind global_step
+                    # to the last completed boundary so resume starts a fresh
+                    # accumulation window. scheduler / scaler / EMA stay as-is
+                    # (they only advance on sync steps).
+                    partial = 0
+                    if not on_opt_step_boundary:
+                        partial = self.global_step - self.effective_step * cfg.accumulate_grad_batches
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.global_step = self.effective_step * cfg.accumulate_grad_batches
+                    if self.is_main:
+                        if partial:
+                            logger.info(
+                                f"Shutdown mid-window at step {self.effective_step}: discarded "
+                                f"{partial}/{cfg.accumulate_grad_batches} partial microsteps"
+                            )
+                        else:
+                            logger.info(f"Shutdown at step {self.effective_step}")
+                        self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
                     break
 
             if self._shutdown_requested:
@@ -1404,8 +1414,7 @@ class Trainer:
             if not self._shutdown_requested:
                 self._save_checkpoint(output_dir / "checkpoint_final.pt")
             logger.info(
-                f"Training {'interrupted' if self._shutdown_requested else 'complete'} "
-                f"at step {self.effective_step}"
+                f"Training {'interrupted' if self._shutdown_requested else 'complete'} at step {self.effective_step}"
             )
 
         if self._wandb is not None:

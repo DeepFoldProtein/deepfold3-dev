@@ -263,7 +263,9 @@ class TrainingDataset(torch.utils.data.Dataset):
                     try:
                         msa_obj = MSA.load(paired_path)
                         if msa_obj.is_empty:
-                            logger.warning("Empty paired MSA %s (shape %s) — skipping", paired_path, msa_obj.sequences.shape)
+                            logger.warning(
+                                "Empty paired MSA %s (shape %s) — skipping", paired_path, msa_obj.sequences.shape
+                            )
                         else:
                             paired_msa[chain_info.chain_id] = msa_obj
                     except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
