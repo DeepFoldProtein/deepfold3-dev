@@ -1252,9 +1252,16 @@ class Trainer:
                     # examples in ``dt_micro`` seconds.
                     samples_per_microstep = self.world_size * cfg.batch_size_per_rank
                     samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)
-                    in_step = self.global_step % cfg.accumulate_grad_batches
+                    # Position within the current accumulation window: 1..accumulate
+                    # (the accumulate-th microstep is the sync step that fires
+                    # optimizer.step and increments effective_step).  ``target`` is
+                    # the effective_step this microstep is building toward — on the
+                    # sync step it equals the just-incremented effective_step;
+                    # otherwise it's effective_step+1.
+                    in_step = ((self.global_step - 1) % cfg.accumulate_grad_batches) + 1
+                    target = self.effective_step if on_opt_step_boundary else self.effective_step + 1
                     logger.info(
-                        f"micro: effective={self.effective_step} "
+                        f"micro: target={target} "
                         f"global={self.global_step} "
                         f"in_step={in_step}/{cfg.accumulate_grad_batches} "
                         f"recycles={self._last_num_recycles} "
@@ -1359,7 +1366,12 @@ class Trainer:
                     dist.all_reduce(shutdown_flag, op=dist.ReduceOp.MAX)
                     self._shutdown_requested = bool(shutdown_flag.item())
 
-                if self._shutdown_requested and self.is_main:
+                # Shutdown checkpoint: wait until we're at an opt-step
+                # boundary so the saved global_step lands on the end of a
+                # gradient-accumulation window — otherwise resume would
+                # start mid-window with empty .grad and apply a partial
+                # effective batch on the first opt step.
+                if self._shutdown_requested and on_opt_step_boundary and self.is_main:
                     need_ckpt = True
                     logger.info("Shutdown requested — saving checkpoint before exit")
 
@@ -1375,7 +1387,9 @@ class Trainer:
                 if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
                     self._run_eval_and_track_best(eval_dl, output_dir)
 
-                if self._shutdown_requested:
+                # Only break at opt-step boundaries so we don't leave a
+                # half-accumulated window behind.
+                if self._shutdown_requested and on_opt_step_boundary:
                     break
 
             if self._shutdown_requested:
