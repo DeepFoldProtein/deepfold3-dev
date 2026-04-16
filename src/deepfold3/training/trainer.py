@@ -599,6 +599,7 @@ class Trainer:
             train_ds = ConcatDataset(datasets)
             train_sampler = MultiDatasetSampler(
                 dataset_configs=sampler_configs,
+                epoch_size=self.cfg.epoch_size,
                 num_replicas=self.world_size,
                 rank=self.rank,
                 seed=self.cfg.seed,
@@ -682,6 +683,7 @@ class Trainer:
 
             sampler = WeightedClusterSampler(
                 records=self.records,
+                epoch_size=self.cfg.epoch_size,
                 num_replicas=self.world_size,
                 rank=self.rank,
                 seed=self.cfg.seed,
@@ -715,7 +717,12 @@ class Trainer:
         ds_len = len(eval_ds)
         if n_eval <= 0 or n_eval >= ds_len:
             if self.world_size > 1:
-                return DistributedSampler(eval_ds, num_replicas=self.world_size, rank=self.rank, shuffle=False)
+                # shuffle=True so each eval call sees a different (still
+                # full-coverage) ordering; set_epoch(effective_step) is
+                # already called in the train loop to vary the seed.
+                return DistributedSampler(
+                    eval_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=self.cfg.seed
+                )
             return None
 
         # WeightedEvalSampler needs per-record cluster weights from
