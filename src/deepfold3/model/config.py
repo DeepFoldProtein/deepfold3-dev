@@ -481,6 +481,7 @@ class TrainingConfig:
     )
     batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
     epoch_size: int = 10000  # samples per synthetic epoch (sampler reseed cadence + DataLoader length)
+    eval_before: bool = False  # run one eval pass before the training loop starts (also fires on resume)
     max_checkpoints: int = 5  # keep N most recent checkpoints (0 = keep all)
     checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)
     auto_resume: bool = True  # auto-detect latest checkpoint in output_dir

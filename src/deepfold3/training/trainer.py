@@ -996,6 +996,21 @@ class Trainer:
 
         return {k: sum(v) / max(len(v), 1) for k, v in metrics.items()}
 
+    def _run_eval_and_track_best(self, eval_dl: DataLoader, output_dir: Path) -> None:
+        """Reseed eval sampler, run one eval pass, log metrics, save best checkpoint."""
+        if hasattr(eval_dl.sampler, "set_epoch"):
+            eval_dl.sampler.set_epoch(self.effective_step)
+        eval_metrics = self._evaluate(eval_dl)
+        if self.is_main:
+            logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
+            if self._wandb is not None:
+                self._wandb.log(eval_metrics, step=self.effective_step)
+            eval_total = eval_metrics.get("eval/total", float("inf"))
+            if eval_total < self._best_eval_loss:
+                self._best_eval_loss = eval_total
+                self._save_checkpoint(output_dir / "checkpoint_best.pt")
+                logger.info(f"New best eval loss: {eval_total:.4f}")
+
     # ------------------------------------------------------------------
     # Checkpointing
     # ------------------------------------------------------------------
@@ -1164,6 +1179,9 @@ class Trainer:
             signal.signal(signal.SIGINT, lambda *_: setattr(self, "_shutdown_requested", True))
 
         shutdown_flag = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+        if cfg.eval_before and eval_dl is not None:
+            self._run_eval_and_track_best(eval_dl, output_dir)
 
         while self.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
@@ -1355,19 +1373,7 @@ class Trainer:
                 # stays constant across ``accumulate_grad_batches`` microsteps
                 # and the check would trigger on every one of them.
                 if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
-                    if hasattr(eval_dl.sampler, "set_epoch"):
-                        eval_dl.sampler.set_epoch(self.effective_step)
-                    eval_metrics = self._evaluate(eval_dl)
-                    if self.is_main:
-                        logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
-                        if self._wandb is not None:
-                            self._wandb.log(eval_metrics, step=self.effective_step)
-                        # Best-model tracking
-                        eval_total = eval_metrics.get("eval/total", float("inf"))
-                        if eval_total < self._best_eval_loss:
-                            self._best_eval_loss = eval_total
-                            self._save_checkpoint(output_dir / "checkpoint_best.pt")
-                            logger.info(f"New best eval loss: {eval_total:.4f}")
+                    self._run_eval_and_track_best(eval_dl, output_dir)
 
                 if self._shutdown_requested:
                     break
