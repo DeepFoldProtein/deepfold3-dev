@@ -76,6 +76,7 @@ class Featurizer:
                 seq_mask [N] bool, pair_mask [N,N] bool,
                 frames_mask [N] bool, token_to_rep_atom [N] int64,
                 frame_atom_index [N,3] int64,
+                frame_token_index [N,3] int64,
                 ref_pos [N,M,3] float32, ref_mask [N,M] bool,
                 ref_element [N,M] int64, ref_charge [N,M] float32,
                 ref_atom_name_chars [N,M,4] int64,
@@ -245,22 +246,42 @@ class Featurizer:
 
         pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)  # [N, N]
 
-        # frames_mask starts as the polymer mask and is tightened below if
-        # any of the three frame atoms is missing from the residue.
-        # Also drives frame-aligned PAE (AF3 §4.3.2).
-        mol_types = tokens["mol_type"]
-        frames_mask_np = (
-            (mol_types == const.MOL_PROTEIN) | (mol_types == const.MOL_RNA) | (mol_types == const.MOL_DNA)
-        ).astype(bool)
-
-        # token_to_rep_atom: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand.
-        # frame_atom_index: indices of the three frame atoms — (N, CA, C) for
-        # proteins, (C1', C3', C4') for nucleic acids, (0, 0, 0) for ligand
-        # tokens (gated out via frames_mask).
+        # Frame features drive PAE (AF3 §4.3.2). ``frames_mask`` is set
+        # True only for tokens with a well-defined local rigid frame.
+        # ``frame_atom_index [N, 3]`` indexes atoms within a referenced
+        # token's dense slot; ``frame_token_index [N, 3]`` selects which
+        # token each frame atom comes from:
+        #   * polymer (protein/RNA/DNA) → (i, i, i): all three backbone
+        #     frame atoms are in the residue's own token.
+        #   * ligand / ion / glycan (single-atom token) → (a_tok, i, c_tok)
+        #     with a_tok / c_tok the nearest / 2nd-nearest atoms from other
+        #     tokens of the same chain. Invalid if the chain has fewer
+        #     than 3 atoms or the three atoms fall within 25° of colinear.
         from deepfold3.data.feature.ref_atoms import decode_atom_name_chars
 
         token_to_rep_atom = np.zeros(N, dtype=np.int64)
+        frames_mask_np = np.zeros(N, dtype=bool)
         frame_atom_index = np.zeros((N, 3), dtype=np.int64)
+        frame_token_index = np.tile(np.arange(N, dtype=np.int64)[:, None], (1, 3))
+
+        # Pre-collect ligand atom positions and per-chain token membership
+        # for the §4.3.2 nearest-neighbour lookup (O(n_chain) per ligand).
+        ligand_xyz = np.zeros((N, 3), dtype=np.float32)
+        ligand_present = np.zeros(N, dtype=bool)
+        ligand_by_chain: dict[int, list[int]] = {}
+        for i, tok in enumerate(tokens):
+            if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
+                continue
+            ligand_by_chain.setdefault(int(tok["asym_id"]), []).append(i)
+            atom_idx = int(tok["atom_idx"])
+            if atom_idx < len(data.structure.atoms):
+                atom = data.structure.atoms[atom_idx]
+                if bool(atom["is_present"]):
+                    ligand_xyz[i] = (float(atom["x"]), float(atom["y"]), float(atom["z"]))
+                    ligand_present[i] = True
+
+        _COS_25_DEG = 0.9063  # cos(25°) — colinearity cutoff (AF3 §4.3.2)
+
         for i, tok in enumerate(tokens):
             mt = int(tok["mol_type"])
             rt = int(tok["res_type"])
@@ -270,8 +291,8 @@ class Featurizer:
                 else:
                     token_to_rep_atom[i] = 4 if ref_mask[i, 4] else 1  # CB if present, else CA
                 frame_atom_index[i] = (0, 1, 2)
-                if not (ref_mask[i, 0] and ref_mask[i, 1] and ref_mask[i, 2]):
-                    frames_mask_np[i] = False
+                if ref_mask[i, 0] and ref_mask[i, 1] and ref_mask[i, 2]:
+                    frames_mask_np[i] = True
             elif mt in (const.MOL_RNA, const.MOL_DNA):
                 c1_idx = c3_idx = c4_idx = -1
                 for j in range(M):
@@ -288,8 +309,33 @@ class Featurizer:
                     token_to_rep_atom[i] = c1_idx
                 if c1_idx >= 0 and c3_idx >= 0 and c4_idx >= 0:
                     frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
-                else:
-                    frames_mask_np[i] = False
+                    frames_mask_np[i] = True
+            elif mt == const.MOL_NONPOLYMER:
+                if not ligand_present[i]:
+                    continue
+                neighbours = [
+                    j for j in ligand_by_chain.get(int(tok["asym_id"]), []) if j != i and ligand_present[j]
+                ]
+                if len(neighbours) < 2:
+                    continue  # covers single-atom chains (e.g. Na+, Cl-)
+                b_xyz = ligand_xyz[i]
+                neighbour_xyz = ligand_xyz[neighbours]  # [K, 3]
+                dists = np.linalg.norm(neighbour_xyz - b_xyz, axis=-1)
+                order = np.argsort(dists)
+                a_tok = neighbours[int(order[0])]
+                c_tok = neighbours[int(order[1])]
+                v_a = ligand_xyz[a_tok] - b_xyz
+                v_c = ligand_xyz[c_tok] - b_xyz
+                denom = float(np.linalg.norm(v_a) * np.linalg.norm(v_c))
+                if denom < 1e-6:
+                    continue  # coincident atoms → undefined angle
+                cos_ang = float(np.dot(v_a, v_c)) / denom
+                if abs(cos_ang) > _COS_25_DEG:
+                    continue  # within 25° of colinear
+                frame_token_index[i] = (a_tok, i, c_tok)
+                # frame_atom_index[i] stays (0, 0, 0) — ligand tokens store
+                # their single atom at slot 0.
+                frames_mask_np[i] = True
 
         frames_mask = torch.from_numpy(frames_mask_np)
 
@@ -328,6 +374,7 @@ class Featurizer:
             "frames_mask": frames_mask,
             "token_to_rep_atom": torch.from_numpy(token_to_rep_atom),
             "frame_atom_index": torch.from_numpy(frame_atom_index),
+            "frame_token_index": torch.from_numpy(frame_token_index),
             "ref_pos": torch.from_numpy(ref_pos),
             "ref_mask": torch.from_numpy(ref_mask),
             "ref_element": torch.from_numpy(ref_element),
@@ -1000,6 +1047,7 @@ class Featurizer:
             "frames_mask": torch.zeros(0, dtype=torch.bool),
             "token_to_rep_atom": torch.zeros(0, dtype=torch.int64),
             "frame_atom_index": torch.zeros(0, 3, dtype=torch.int64),
+            "frame_token_index": torch.zeros(0, 3, dtype=torch.int64),
             "ref_pos": torch.zeros(0, M, 3),
             "ref_mask": torch.zeros(0, M, dtype=torch.bool),
             "ref_element": torch.zeros(0, M, dtype=torch.int64),

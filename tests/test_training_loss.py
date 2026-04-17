@@ -9,11 +9,13 @@ from deepfold3.training.loss import (
     diffusion_mse_loss,
     distogram_loss,
     exp_resolved_loss,
+    express_coordinates_in_frame,
     pae_loss,
     pde_loss,
     plddt_loss,
     smooth_lddt_loss,
     training_loss,
+    weighted_rigid_align,
 )
 
 N, M, S, NUM_BINS = 8, 4, 2, 16
@@ -117,6 +119,158 @@ class TestPairwiseBinnedLoss:
 
 def _make_pae_mask(frames_mask: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
     return (frames_mask.bool().unsqueeze(-1) & pair_mask.bool()).float()
+
+
+class TestWeightedRigidAlign:
+    """Verify Kabsch-style weighted rigid alignment (AF3 §3.7.1 eq. 2)."""
+
+    def test_self_align_is_identity(self):
+        torch.manual_seed(0)
+        x = torch.randn(4, 20, 3)
+        w = torch.ones(4, 20)
+        out = weighted_rigid_align(x, x, w)
+        torch.testing.assert_close(out, x, atol=1e-4, rtol=1e-4)
+
+    def test_recovers_known_rotation(self):
+        """GT = R·pred + t → align should recover R·pred + t up to numerical error."""
+        torch.manual_seed(1)
+        n = 32
+        pred = torch.randn(n, 3)
+        # Build a known rotation from Gram-Schmidt of two random vectors
+        v0 = torch.randn(3)
+        v1 = torch.randn(3)
+        e0 = v0 / v0.norm()
+        e1 = v1 - (v1 @ e0) * e0
+        e1 = e1 / e1.norm()
+        e2 = torch.linalg.cross(e0, e1)
+        R = torch.stack([e0, e1, e2], dim=0)
+        t = torch.tensor([1.5, -0.7, 2.3])
+
+        gt = pred @ R.T + t  # ground truth is pred transformed
+        # weighted_rigid_align maps gt -> pred, so we feed (gt, pred) and
+        # expect the result to match pred.
+        w = torch.ones(n)
+        gt_aligned = weighted_rigid_align(gt, pred, w)
+        torch.testing.assert_close(gt_aligned, pred, atol=1e-4, rtol=1e-4)
+
+    def test_weight_zero_atoms_ignored(self):
+        """Atoms with weight=0 must not affect the alignment — verified by
+        pinning high weight on a subset that is already aligned."""
+        torch.manual_seed(2)
+        n = 40
+        pred = torch.randn(n, 3)
+        gt = pred.clone()
+        # Add big noise to the last 10 atoms; zero their weight.
+        gt[-10:] += torch.randn(10, 3) * 10.0
+        w = torch.ones(n)
+        w[-10:] = 0.0
+        out = weighted_rigid_align(gt, pred, w)
+        # The unmasked atoms should map back almost exactly to pred.
+        torch.testing.assert_close(out[:-10], pred[:-10], atol=1e-4, rtol=1e-4)
+
+    def test_batched(self):
+        """Works with a leading batch dim (per-sample alignment)."""
+        torch.manual_seed(3)
+        S, n = 4, 16
+        pred = torch.randn(S, n, 3)
+        # Each sample gets a different random rigid transform on GT
+        gt = pred + torch.randn(S, 1, 3)  # translation only per sample
+        w = torch.ones(S, n)
+        out = weighted_rigid_align(gt, pred, w)
+        torch.testing.assert_close(out, pred, atol=1e-4, rtol=1e-4)
+
+    def test_bf16_input_preserves_dtype_and_accuracy(self):
+        """SVD is forced to fp32 internally; caller's dtype is preserved."""
+        torch.manual_seed(4)
+        n = 24
+        pred = torch.randn(n, 3)
+        gt = pred + torch.tensor([0.5, -0.2, 1.0])
+        w = torch.ones(n)
+        out32 = weighted_rigid_align(gt, pred, w)
+        out_bf = weighted_rigid_align(gt.bfloat16(), pred.bfloat16(), w.bfloat16())
+        assert out_bf.dtype == torch.bfloat16
+        torch.testing.assert_close(out_bf.float(), out32, atol=0.05, rtol=0.02)
+
+    def test_stop_gradient_default(self):
+        """Default ``stop_gradient=True`` returns a detached, no-grad result."""
+        torch.manual_seed(5)
+        pred = torch.randn(10, 3, requires_grad=True)
+        gt = torch.randn(10, 3, requires_grad=True)
+        w = torch.ones(10)
+        out = weighted_rigid_align(gt, pred, w)
+        assert not out.requires_grad
+
+    def test_diffusion_mse_flag(self):
+        """``apply_rigid_align`` flag gates the call: True should reduce
+        the MSE vs. a pure-rotation-only perturbed GT."""
+        torch.manual_seed(6)
+        S, N, M = 2, 8, 4
+        pred = torch.randn(S, N, M, 3)
+        # GT is pred rotated by a random rigid transform per sample.
+        # Without rigid_align, MSE is large; with rigid_align, ~0.
+        gt = pred.clone()
+        for s in range(S):
+            v0, v1 = torch.randn(3), torch.randn(3)
+            e0 = v0 / v0.norm()
+            e1 = v1 - (v1 @ e0) * e0
+            e1 = e1 / e1.norm()
+            e2 = torch.linalg.cross(e0, e1)
+            R = torch.stack([e0, e1, e2], dim=0)
+            gt[s] = pred[s] @ R.T + torch.randn(3)
+        atom_mask = torch.ones(N, M, dtype=torch.bool)
+        noise_levels = torch.tensor([0.5, 2.0])
+
+        loss_off = diffusion_mse_loss(
+            pred, gt, atom_mask, noise_levels, apply_rigid_align=False
+        )
+        loss_on = diffusion_mse_loss(
+            pred, gt, atom_mask, noise_levels, apply_rigid_align=True
+        )
+        assert loss_on < loss_off * 0.01, (
+            f"rigid_align should collapse rotation-only error: {loss_on=} vs {loss_off=}"
+        )
+
+
+class TestExpressCoordinatesInFrame:
+    """Verify the rigid-frame transform runs in fp32 regardless of input dtype.
+
+    AF3 uses `jax.lax.Precision.HIGHEST` for geometric transforms; bf16
+    degrades orthonormality of the frame basis and skews PAE targets.
+    """
+
+    def test_preserves_input_dtype(self):
+        torch.manual_seed(0)
+        n = 8
+        rep = torch.randn(n, 3, dtype=torch.bfloat16)
+        frames = torch.randn(n, 3, 3, dtype=torch.bfloat16)
+        out = express_coordinates_in_frame(rep, frames)
+        assert out.dtype == torch.bfloat16, "output dtype must match input dtype"
+
+    def test_identity_point_is_origin(self):
+        """Placing the rep atom at ``b`` (frame origin) must give zero in
+        every local frame — verifies the matmul is not corrupted."""
+        torch.manual_seed(0)
+        n = 6
+        frames = torch.randn(n, 3, 3)
+        rep = frames[:, 1, :]  # rep[i] == b[i]
+        out = express_coordinates_in_frame(rep, frames)
+        # Diagonal entries (i, i) are trivially zero; the cross-pair entries
+        # measure rep[j] - b[i] projected into frame i. For rep == b this
+        # collapses to b[j] - b[i], not zero — only diagonal tests origin.
+        diag = out[torch.arange(n), torch.arange(n)]
+        assert torch.allclose(diag, torch.zeros_like(diag), atol=1e-6)
+
+    def test_bf16_accuracy_matches_fp32(self):
+        """bf16 inputs must produce the same transform as fp32 to within
+        ambient bf16 tolerance — the internal Gram-Schmidt is fp32, so the
+        basis itself is exact; only the final cast back loses precision."""
+        torch.manual_seed(1)
+        n = 8
+        rep_f = torch.randn(n, 3)
+        frames_f = torch.randn(n, 3, 3)
+        out_f = express_coordinates_in_frame(rep_f, frames_f)
+        out_b = express_coordinates_in_frame(rep_f.bfloat16(), frames_f.bfloat16())
+        torch.testing.assert_close(out_f, out_b.float(), atol=0.05, rtol=0.02)
 
 
 class TestPaeLoss:

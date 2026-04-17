@@ -92,6 +92,14 @@ class DiffusionConfig:
     # Training noise sampling (log-normal): t = sigma_data * exp(p_mean + p_std * z), z ~ N(0,1)
     p_mean: float = -1.2
     p_std: float = 1.5
+    # Disable autocast around the diffusion sampler (Protenix ``skip_amp``
+    # pattern, `configs_base.py:137-145`). When True, the method upcasts
+    # all float tensor inputs to fp32 and runs with autocast disabled, so
+    # the full denoising rollout executes in fp32. Warning: fused Triton
+    # kernels in the diffusion head (``use_fused_ada_transition``, etc.)
+    # assume bf16 inputs — disable those when enabling skip-amp.
+    skip_amp_sample: bool = False  # inference Euler-Maruyama (sample())
+    skip_amp_sample_training: bool = False  # training rollout (sample_training())
     transformer: DiffusionTransformerConfig = field(default_factory=DiffusionTransformerConfig)
     atom_cross_att: AtomCrossAttConfig = field(default_factory=AtomCrossAttConfig)
 
@@ -433,6 +441,13 @@ class TrainingConfig:
     # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
     nucleotide_loss_weight: float = 5.0
     ligand_loss_weight: float = 10.0
+
+    # AF3 §3.7.1 eq. 2: weighted rigid alignment of GT onto denoised before
+    # the diffusion MSE. Removes the global-rotation component of the error
+    # signal (the augmented GT is only random-rotated; the denoiser's output
+    # lives in a different frame when it's imperfect). Default True matches
+    # AF3; disable for A/B against the DF3 pre-alignment baseline.
+    use_rigid_align: bool = True
 
     # Region-based loss weighting (region_id → weight multiplier, e.g. {3: 5.0} for CDR-H3)
     region_loss_weights: dict[int, float] = field(default_factory=dict)

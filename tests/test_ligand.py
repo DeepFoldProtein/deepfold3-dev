@@ -11,6 +11,7 @@ import tempfile
 
 import numpy as np
 import pytest
+import torch
 
 from deepfold3.data import const
 
@@ -271,9 +272,133 @@ def test_featurize_protein_plus_ligand():
     assert "bond_matrix" in feats
     assert feats["bond_matrix"].shape == (N, N, 1)
 
-    # Check frames_mask: protein tokens True, ligand tokens False
+    # Check frames_mask: protein tokens True; 2-atom ligand chain → still
+    # False because a ligand frame needs ≥3 chain atoms (AF3 §4.3.2).
     assert feats["frames_mask"][:3].all()
     assert not feats["frames_mask"][3:].any()
 
+    # frame_token_index should default to (i, i, i) for polymer tokens.
+    assert (feats["frame_token_index"][:3] == torch.arange(3).unsqueeze(-1)).all()
+
     # Check ref_pos for ligand tokens has non-zero positions
     assert feats["ref_pos"][3, 0].abs().sum() > 0, "Ligand token should have non-zero ref_pos"
+
+
+def _featurize_with_ligand(ligand_positions: np.ndarray, ligand_names: list[str]):
+    """Helper: featurise a minimal (protein ``AAA`` + 3-atom ligand) complex.
+
+    Returns the feature dict. Needs network for protein CCD (same as
+    ``test_featurize_protein_plus_ligand``).
+    """
+    from deepfold3.data.ccd import CcdMolecule
+    from deepfold3.data.feature.featurizer import Featurizer
+    from deepfold3.data.module.dataset import _build_complex_structure_with_ligands, _sequence_to_msa
+    from deepfold3.data.tokenize.tokenizer import Tokenizer
+    from deepfold3.data.types import Input
+
+    n = len(ligand_names)
+    mol = CcdMolecule(
+        atom_names=ligand_names,
+        positions=ligand_positions.astype(np.float32),
+        elements=["C"] * n,
+        charges=[0.0] * n,
+        bonds=[(i, i + 1, 1) for i in range(n - 1)],
+        res_name="LIG",
+    )
+    structure = _build_complex_structure_with_ligands(
+        chains=[("AAA", const.MOL_PROTEIN, "A")],
+        ligand_chains=[(mol, "B")],
+    )
+    msa = _sequence_to_msa("AAA", const.MOL_PROTEIN)
+    inp = Input(structure=structure, paired_msa={}, unpaired_msa={0: msa})
+    tokenized = Tokenizer().tokenize(inp)
+    return Featurizer(max_msa_seqs=16).process(tokenized, training=False, random_rot=False)
+
+
+@pytest.mark.network
+def test_featurize_ligand_frame_triangle():
+    """3-atom ligand in triangle → AF3 §4.3.2 frame is valid; per-token
+    frame_token_index points to nearest / 2nd-nearest neighbours."""
+    import torch
+
+    # Triangle in 3D; token 0 (ligand offset 3) is at origin; distances 1, 1.414 respectively
+    pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    feats = _featurize_with_ligand(pos, ["C1", "C2", "C3"])
+
+    N = feats["res_type"].shape[0]
+    assert N == 6  # 3 protein + 3 ligand
+
+    # Protein tokens unchanged
+    assert feats["frames_mask"][:3].all()
+    assert (feats["frame_token_index"][:3] == torch.arange(3).unsqueeze(-1)).all()
+
+    # All 3 ligand tokens get valid frames (non-collinear triangle).
+    assert feats["frames_mask"][3:].all(), feats["frames_mask"]
+
+    # For token i = 3 (C1 at origin): nearest = C2 (dist 1.0), 2nd = C3 (dist 1.0 also
+    # — tie; either is acceptable, but both are ligand tokens, not the i itself).
+    frame_tok = feats["frame_token_index"]
+    # Middle column is always i itself (origin b of the frame).
+    assert frame_tok[3, 1].item() == 3
+    assert frame_tok[4, 1].item() == 4
+    assert frame_tok[5, 1].item() == 5
+    # a / c picks should be other ligand tokens in the same chain.
+    for i in (3, 4, 5):
+        a_tok, _, c_tok = frame_tok[i].tolist()
+        assert a_tok in {3, 4, 5} and a_tok != i
+        assert c_tok in {3, 4, 5} and c_tok != i
+        assert a_tok != c_tok
+
+
+@pytest.mark.network
+def test_featurize_ligand_frame_collinear():
+    """3 collinear atoms → frame is invalid (<25° deviation from colinear)."""
+    pos = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+    feats = _featurize_with_ligand(pos, ["C1", "C2", "C3"])
+
+    # Protein tokens still have valid frames.
+    assert feats["frames_mask"][:3].all()
+    # All 3 ligand tokens rejected — collinearity check fires for each.
+    assert not feats["frames_mask"][3:].any()
+
+
+@pytest.mark.network
+def test_featurize_single_atom_ion():
+    """Single-atom ligand chain (ion-like) → frame invalid: <3 chain atoms."""
+    pos = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    feats = _featurize_with_ligand(pos, ["NA"])
+
+    assert feats["frames_mask"][:3].all()  # protein unchanged
+    assert not feats["frames_mask"][3:].any()  # ion gets no frame
+
+
+@pytest.mark.network
+def test_featurize_ligand_frame_near_collinear_rejected():
+    """Arrangement 24° off colinear is rejected; 26° off is accepted."""
+    # 24°: just inside the 25° cutoff → rejected.
+    ang_rad = np.radians(180.0 - 24.0)
+    pos_24 = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [np.cos(ang_rad), np.sin(ang_rad), 0.0],
+        ],
+        dtype=np.float32,
+    )
+    feats_24 = _featurize_with_ligand(pos_24, ["C1", "C2", "C3"])
+    # Token 3 (at origin) sees neighbours along two directions within 24°
+    # of anti-parallel → collinearity rejects this frame.
+    assert not feats_24["frames_mask"][3].item()
+
+    # 26°: outside the 25° cutoff → accepted.
+    ang_rad = np.radians(180.0 - 26.0)
+    pos_26 = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [np.cos(ang_rad), np.sin(ang_rad), 0.0],
+        ],
+        dtype=np.float32,
+    )
+    feats_26 = _featurize_with_ligand(pos_26, ["C1", "C2", "C3"])
+    assert feats_26["frames_mask"][3].item()

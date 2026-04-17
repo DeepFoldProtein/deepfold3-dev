@@ -45,9 +45,7 @@ from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 # Dense atom indices for backbone atoms
-_N_IDX = 0
 _CA_IDX = 1
-_C_IDX = 2
 _CB_IDX = 3
 
 # GLY residue type index (uses CA instead of CB for pseudo-beta)
@@ -82,48 +80,6 @@ def pseudo_beta_from_positions(
     pb_mask = torch.where(is_gly, ca_mask, cb_mask)  # [N]
 
     return pb_pos, pb_mask
-
-
-def backbone_frames_from_positions(
-    positions: torch.Tensor,
-    mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build backbone local frames via Gram-Schmidt orthogonalization.
-
-    Frame is built from N, CA, C atoms following AF3 convention:
-        e1 = normalize(C - CA)
-        e2 = normalize(orthogonalize(N - CA, e1))
-        e3 = cross(e1, e2)
-
-    Args:
-        positions: [N, num_atoms, 3] dense atom positions.
-        mask: [N, num_atoms] dense atom mask.
-
-    Returns:
-        Tuple of (frames [N, 3, 3], frame_mask [N]) where frames[i] is a
-        rotation matrix [e1, e2, e3] (rows) for residue i.
-    """
-    eps = 1e-8
-    n_pos = positions[:, _N_IDX]  # [N, 3]
-    ca_pos = positions[:, _CA_IDX]  # [N, 3]
-    c_pos = positions[:, _C_IDX]  # [N, 3]
-
-    # Frame mask requires all three backbone atoms present
-    frame_mask = mask[:, _N_IDX] * mask[:, _CA_IDX] * mask[:, _C_IDX]  # [N]
-
-    # Gram-Schmidt: e1 from C-CA, e2 from N-CA orthogonalized to e1
-    v1 = c_pos - ca_pos  # [N, 3]
-    v2 = n_pos - ca_pos  # [N, 3]
-
-    e1 = v1 / (v1.norm(dim=-1, keepdim=True) + eps)
-    # Remove component along e1 from v2
-    u2 = v2 - (v2 * e1).sum(dim=-1, keepdim=True) * e1
-    e2 = u2 / (u2.norm(dim=-1, keepdim=True) + eps)
-    e3 = torch.cross(e1, e2, dim=-1)
-
-    # Stack as rotation matrix: [N, 3, 3] where row i is e_i
-    frames = torch.stack([e1, e2, e3], dim=1)  # [N, 3, 3]
-    return frames, frame_mask
 
 
 def dgram_from_positions_masked(
@@ -171,16 +127,25 @@ def _unit_vectors_from_frames(
     Returns:
         Tuple of (unit_vec_x, unit_vec_y, unit_vec_z, backbone_mask_2d)
         each [N, N] or [N, N, 1].
+
+    Frame transform + normalisation runs in fp32 (AF3 geometry precision
+    convention, matches ``express_coordinates_in_frame``). The featurizer
+    produces orthonormal frames, but under bf16 autocast the einsum and the
+    subsequent L2 normalise degrade near small displacements.
     """
     eps = 1e-8
+    out_dtype = translations.dtype
+    frames_f = frames.float()
+    translations_f = translations.float()
+
     # Displacement vectors: j_pos - i_pos → [..., N, N, 3]
-    disp = translations.unsqueeze(-2) - translations.unsqueeze(-3)
+    disp = translations_f.unsqueeze(-2) - translations_f.unsqueeze(-3)
 
     # Transform to local frame of residue i: frames[i] @ disp[i, j]
     # frames: [..., N, 3, 3], disp: [..., N, N, 3]
     # For each i: local_vec[i,j] = frames[i] @ disp[i,j]
     # Ellipsis carries optional leading batch dims through unchanged.
-    local_vec = torch.einsum("...iae,...ije->...ija", frames, disp)
+    local_vec = torch.einsum("...iae,...ije->...ija", frames_f, disp)
 
     # Normalize to unit vectors
     norm = local_vec.norm(dim=-1, keepdim=True).clamp(min=eps)
@@ -189,8 +154,8 @@ def _unit_vectors_from_frames(
     # Mask: both residues need valid backbone frames
     backbone_mask_2d = frame_mask.unsqueeze(-1) * frame_mask.unsqueeze(-2)  # [..., N, N]
 
-    # Apply mask
-    unit_vec = unit_vec * backbone_mask_2d.unsqueeze(-1)
+    # Apply mask, cast back to ambient dtype
+    unit_vec = (unit_vec * backbone_mask_2d.unsqueeze(-1).float()).to(out_dtype)
 
     return (
         unit_vec[..., 0:1],  # x component [N, N, 1]

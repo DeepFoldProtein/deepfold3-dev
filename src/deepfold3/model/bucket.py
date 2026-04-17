@@ -56,6 +56,7 @@ DIM0_KEYS = {
     "seq_mask",
     "frames_mask",
     "frame_atom_index",
+    "frame_token_index",
     "token_to_rep_atom",
     "ref_pos",
     "ref_mask",

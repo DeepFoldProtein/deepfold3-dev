@@ -129,6 +129,13 @@ model:
     sigma_data: 16.0
     p_mean: -1.2
     p_std: 1.5
+    # AF3 runs both inference (sample) and training (sample_training) in the
+    # global bf16 context with selective fp32 upcasts (Gram-Schmidt, Fourier
+    # embedding, attention softmax). Keep both flags off to match AF3.
+    # Enable only for Protenix-style full-fp32 diffusion (requires fused
+    # Triton kernels in the diffusion head to be disabled).
+    skip_amp_sample: false
+    skip_amp_sample_training: false
   confidence:
     num_layer: 4
     num_plddt_bins: 50

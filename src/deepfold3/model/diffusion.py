@@ -13,12 +13,30 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from contextlib import nullcontext
 from functools import partial as _partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+
+
+def _upcast_fp32(x):
+    """Recursively upcast float tensors to fp32 for autocast-disabled paths.
+
+    Non-float tensors (int masks, bool) and None pass through unchanged.
+    Dicts/lists/tuples are walked so nested feature dicts (``embeddings``)
+    are handled transparently.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.float() if x.is_floating_point() else x
+    if isinstance(x, dict):
+        return {k: _upcast_fp32(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        cast = [_upcast_fp32(v) for v in x]
+        return type(x)(cast)
+    return x
 
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncoderStatic
 from deepfold3.model.config import DiffusionConfig, OptimConfig
@@ -81,22 +99,30 @@ def _random_augmentation_from_vectors(
 ) -> torch.Tensor:
     """Apply random rigid augmentation using pre-sampled random vectors.
 
-    Matches AF3 diffusion_head.random_augmentation() exactly.
+    Matches AF3 diffusion_head.random_augmentation() exactly. Gram-Schmidt
+    and rotation apply use fp32 (AF3 `jax.lax.Precision.HIGHEST` in
+    diffusion_head.py:38,72) — orthogonality preservation is numerically
+    critical and breaks under bf16.
     """
+    out_dtype = positions.dtype
+    # Upcast for rotation / centering math (matches AF3 HIGHEST).
+    positions_f = positions.float()
     mask_f = mask.float().unsqueeze(-1)  # [N, M, 1]
     total = mask_f.sum().clamp(min=1e-6)
-    center = (positions * mask_f).sum(dim=(0, 1), keepdim=True) / total
-    pos = positions - center
+    center = (positions_f * mask_f).sum(dim=(0, 1), keepdim=True) / total
+    pos = positions_f - center
 
-    # Random rotation via Gram-Schmidt
-    e0 = v0 / v0.norm().clamp(min=1e-10)
-    v1_orth = v1 - e0 * torch.dot(v1, e0)
+    # Random rotation via Gram-Schmidt (fp32).
+    v0_f = v0.float()
+    v1_f = v1.float()
+    e0 = v0_f / v0_f.norm().clamp(min=1e-10)
+    v1_orth = v1_f - e0 * torch.dot(v1_f, e0)
     e1 = v1_orth / v1_orth.norm().clamp(min=1e-10)
     e2 = torch.linalg.cross(e0, e1)
     rot = torch.stack([e0, e1, e2], dim=0)
 
-    pos = pos @ rot + translation
-    return pos * mask_f
+    pos = pos @ rot + translation.float()
+    return (pos * mask_f).to(out_dtype)
 
 
 def _random_augmentation(
@@ -504,9 +530,17 @@ class DiffusionConditioningBlock(nn.Module):
 
         sigma: scalar or batch of noise levels.
         Returns: [..., fourier_dim]
+
+        Matches AF3 noise_level_embeddings.py:138-139 — weights/biases are
+        hardcoded fp32 constants in the reference. We upcast here to keep
+        the embedding numerically stable under bf16 autocast; downstream
+        LayerNorm/Linear in ``add_noise`` cast back to the ambient dtype.
         """
-        x = (1 / 4) * torch.log(sigma)
-        emb = x.unsqueeze(-1) * self.fourier_weight + self.fourier_bias
+        sigma_f = sigma.float()
+        x = (1 / 4) * torch.log(sigma_f)
+        w = self.fourier_weight.float()
+        b = self.fourier_bias.float()
+        emb = x.unsqueeze(-1) * w + b
         return torch.cos(2 * math.pi * emb)
 
     def compute_static(
@@ -876,6 +910,43 @@ class DiffusionHead(nn.Module):
         For batched inputs, returns [B, S, N, M, 3] and [B, S, N, M].
         """
         cfg = self.cfg
+        if cfg.skip_amp_sample:
+            # Protenix-style ``skip_amp.sample_diffusion``: upcast float
+            # inputs and run the full sampler with autocast disabled.
+            embeddings = _upcast_fp32(embeddings)
+            ref_pos = _upcast_fp32(ref_pos)
+            ref_charge = _upcast_fp32(ref_charge)
+            seq_mask = _upcast_fp32(seq_mask)
+            rel_feat = _upcast_fp32(rel_feat)
+            amp_ctx = torch.amp.autocast(device_type=ref_mask.device.type, enabled=False)
+        else:
+            amp_ctx = nullcontext()
+        with amp_ctx:
+            return self._sample_impl(
+                embeddings,
+                ref_pos,
+                ref_mask,
+                ref_element,
+                ref_charge,
+                ref_atom_name_chars,
+                seq_mask,
+                rel_feat,
+                generator,
+            )
+
+    def _sample_impl(
+        self,
+        embeddings: dict[str, torch.Tensor],
+        ref_pos: torch.Tensor,
+        ref_mask: torch.Tensor,
+        ref_element: torch.Tensor,
+        ref_charge: torch.Tensor,
+        ref_atom_name_chars: torch.Tensor,
+        seq_mask: torch.Tensor,
+        rel_feat: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> dict[str, torch.Tensor]:
+        cfg = self.cfg
         N, M = ref_mask.shape[-2:]
         device = ref_mask.device
         batch_shape = ref_mask.shape[:-2]  # () or (B,)
@@ -966,6 +1037,50 @@ class DiffusionHead(nn.Module):
             denoised: Denoised predictions [B?, S, N, M, 3].
             noise_levels: Sampled noise levels [B?, S].
         """
+        cfg = self.cfg
+        if cfg.skip_amp_sample_training:
+            # Protenix-style ``skip_amp.sample_diffusion_training``: upcast
+            # float inputs and run the training rollout with autocast off.
+            gt_positions = _upcast_fp32(gt_positions)
+            embeddings = _upcast_fp32(embeddings)
+            ref_pos = _upcast_fp32(ref_pos)
+            ref_charge = _upcast_fp32(ref_charge)
+            seq_mask = _upcast_fp32(seq_mask)
+            rel_feat = _upcast_fp32(rel_feat)
+            amp_ctx = torch.amp.autocast(device_type=gt_positions.device.type, enabled=False)
+        else:
+            amp_ctx = nullcontext()
+        with amp_ctx:
+            return self._sample_training_impl(
+                gt_positions,
+                gt_mask,
+                embeddings,
+                ref_pos,
+                ref_mask,
+                ref_element,
+                ref_charge,
+                ref_atom_name_chars,
+                seq_mask,
+                rel_feat,
+                num_samples,
+                static,
+            )
+
+    def _sample_training_impl(
+        self,
+        gt_positions: torch.Tensor,
+        gt_mask: torch.Tensor,
+        embeddings: dict[str, torch.Tensor],
+        ref_pos: torch.Tensor,
+        ref_mask: torch.Tensor,
+        ref_element: torch.Tensor,
+        ref_charge: torch.Tensor,
+        ref_atom_name_chars: torch.Tensor,
+        seq_mask: torch.Tensor,
+        rel_feat: torch.Tensor,
+        num_samples: int,
+        static: DiffusionStatic | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         batch_shape = gt_positions.shape[:-3]  # () or (B,)
         device = gt_positions.device

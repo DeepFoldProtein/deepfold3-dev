@@ -11,11 +11,92 @@ to avoid Python-level loops and unnecessary GPU synchronization.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F  # noqa: N812
 
 from deepfold3.data.masking import MASK_FIXED, MASK_REGION
 from deepfold3.model.config import TrainingConfig
+
+# ---------------------------------------------------------------------------
+# Weighted rigid alignment (AF3 Algorithm 28 / §3.7.1 eq. 2)
+# ---------------------------------------------------------------------------
+
+
+def weighted_rigid_align(
+    gt_pos: torch.Tensor,  # [..., K, 3] — point set to transform
+    pred_pos: torch.Tensor,  # [..., K, 3] — target
+    weights: torch.Tensor,  # [..., K] or [K] — per-point weights (0 = ignore)
+    eps: float = 1e-6,
+    stop_gradient: bool = True,
+) -> torch.Tensor:
+    """Weighted Kabsch alignment — rotate+translate ``gt_pos`` onto ``pred_pos``.
+
+    Implements AF3 eq. (2) in §3.7.1:
+    ``{x^GT-aligned} = weighted_rigid_align({x^GT}, {x}, {w})``.
+
+    Runs in fp32 with autocast disabled regardless of ambient precision —
+    ``torch.linalg.svd`` on the 3×3 covariance does not support bf16 and
+    orthogonality of the rotation is numerically critical (Protenix
+    ``model/loss.py:1136`` documents the same constraint).
+
+    When ``stop_gradient=True`` (AF3 default), the computation runs under
+    ``no_grad`` and the output is detached — gradients in the MSE flow
+    exclusively through ``pred_pos``, so the alignment acts as a rotation
+    target rather than a differentiable module.
+
+    Args:
+        gt_pos: Point set to rotate/translate onto ``pred_pos`` ``[..., K, 3]``.
+        pred_pos: Target point set ``[..., K, 3]``.
+        weights: Per-point non-negative weights, broadcastable to the batch
+            dims of ``gt_pos``. Zero weights drop the point entirely.
+        eps: Floor for the weight sum to avoid division by zero when an
+            entire batch is fully masked out.
+        stop_gradient: If True, run under ``no_grad`` and detach the output.
+
+    Returns:
+        ``gt_pos`` rigidly transformed onto ``pred_pos`` ``[..., K, 3]``,
+        in the input dtype of ``pred_pos``.
+    """
+    out_dtype = pred_pos.dtype
+    grad_ctx = torch.no_grad() if stop_gradient else nullcontext()
+    with grad_ctx, torch.amp.autocast(device_type=gt_pos.device.type, enabled=False):
+        gt32 = gt_pos.float()
+        pred32 = pred_pos.float()
+        w32 = weights.float()
+
+        # Broadcast weights to gt shape's leading dims.
+        while w32.dim() < gt32.dim() - 1:
+            w32 = w32.unsqueeze(0).expand(gt32.shape[: -1 - w32.dim()] + w32.shape)
+        w_exp = w32.unsqueeze(-1)  # [..., K, 1]
+        w_sum = w32.sum(dim=-1, keepdim=True).unsqueeze(-1).clamp(min=eps)  # [..., 1, 1]
+
+        gt_mu = (gt32 * w_exp).sum(dim=-2, keepdim=True) / w_sum  # [..., 1, 3]
+        pred_mu = (pred32 * w_exp).sum(dim=-2, keepdim=True) / w_sum
+
+        gt_c = gt32 - gt_mu
+        pred_c = pred32 - pred_mu
+
+        # Covariance H = Σ w · (gt_c)·(pred_c)^T → [..., 3, 3]
+        H = torch.matmul((gt_c * w_exp).transpose(-2, -1), pred_c)
+
+        U, _S, Vh = torch.linalg.svd(H)
+        U_T = U.transpose(-2, -1)
+        V = Vh.transpose(-2, -1)
+        # Reflection fix: R = V · diag(1, 1, sign(det(V·U^T))) · U^T
+        det = torch.linalg.det(torch.matmul(V, U_T))
+        ones = torch.ones_like(det)
+        diag = torch.diag_embed(torch.stack([ones, ones, det], dim=-1))
+        rot = torch.matmul(V, torch.matmul(diag, U_T))  # [..., 3, 3]
+
+        # Apply: (gt - μ_gt) @ R^T + μ_pred
+        gt_aligned = torch.matmul(gt_c, rot.transpose(-2, -1)) + pred_mu
+
+    if stop_gradient:
+        gt_aligned = gt_aligned.detach()
+    return gt_aligned.to(out_dtype)
+
 
 # ---------------------------------------------------------------------------
 # Smooth LDDT loss (diffusion)
@@ -116,6 +197,7 @@ def diffusion_mse_loss(
     ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 2] (token_a, token_b) ligand swaps
     asym_id: torch.Tensor | None = None,  # [N] int — per-token chain id
     entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
+    apply_rigid_align: bool = True,
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
 
@@ -182,21 +264,32 @@ def diffusion_mse_loss(
 
     mask = atom_mask.float()  # [N, M]
 
-    # Build per-token loss weight based on molecule type
+    # Build per-atom loss weight: molecule-type upweighting (DNA/RNA 5×, ligand 10×)
+    # multiplied by optional region weights. Shared by weighted_rigid_align and
+    # the final MSE reduction so the alignment target and loss target agree on
+    # which atoms matter (AF3 §3.7.1 eq. 4).
     if mol_type is not None:
         token_weight = torch.ones(mask.shape[0], device=mask.device)
         token_weight[mol_type == 1] = nucleotide_loss_weight  # RNA
         token_weight[mol_type == 2] = nucleotide_loss_weight  # DNA
         token_weight[mol_type == 3] = ligand_loss_weight
-        weight_mask = mask * token_weight.unsqueeze(-1)  # [N, M]
+        weight_2d = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
-        weight_mask = mask
-
-    # Apply region-based loss weighting (e.g. CDR-H3 upweighting)
+        weight_2d = mask
     if region_weights is not None:
-        weight_mask = weight_mask * region_weights.unsqueeze(-1)  # [N, M]
+        weight_2d = weight_2d * region_weights.unsqueeze(-1)  # [N, M]
 
-    weight_mask = weight_mask.unsqueeze(-1)  # [N, M, 1]
+    # AF3 §3.7.1 eq. 2: rigidly align GT onto pred per sample before MSE.
+    # Alignment output is detached — gradients flow through pred only.
+    if apply_rigid_align:
+        S = pred_pos.shape[0]
+        pred_flat = pred_pos.reshape(S, -1, 3)
+        gt_flat = gt_pos.reshape(S, -1, 3)
+        w_flat = weight_2d.reshape(-1)  # [N*M]
+        gt_flat = weighted_rigid_align(gt_flat, pred_flat, w_flat)
+        gt_pos = gt_flat.reshape_as(pred_pos)
+
+    weight_mask = weight_2d.unsqueeze(-1)  # [N, M, 1]
     n_weighted = weight_mask.sum().clamp(min=1)
 
     # Per-sample EDM weight [S]
@@ -304,7 +397,17 @@ def express_coordinates_in_frame(
     Returns:
         Local-frame coordinates ``[..., N, N, 3]`` where entry ``[i, j]`` is
         ``R_i^T @ (rep[j] - b_i)``.
+
+    Gram-Schmidt and the frame-transform matmul run in fp32 regardless of
+    ambient autocast precision — matches AF3's ``Precision.HIGHEST`` pattern
+    for geometric transforms (references/alphafold3 rotation_matrix.py:87,93).
+    Orthonormality of the rigid frame is numerically critical for PAE error
+    and degrades visibly under bf16.
     """
+    out_dtype = rep_pos.dtype
+    rep_pos = rep_pos.float()
+    frame_pos = frame_pos.float()
+
     a = frame_pos[..., 0, :]
     b = frame_pos[..., 1, :]
     c = frame_pos[..., 2, :]
@@ -321,7 +424,8 @@ def express_coordinates_in_frame(
     r_transposed = torch.stack([e1, e2, e3], dim=-2)  # [..., N, 3, 3]
     rel = rep_pos.unsqueeze(-3) - b.unsqueeze(-2)  # [..., N, N, 3]
     # matmul: [..., N, 1, 3, 3] @ [..., N, N, 3, 1] → [..., N, N, 3, 1]
-    return torch.matmul(r_transposed.unsqueeze(-3), rel.unsqueeze(-1)).squeeze(-1)
+    result = torch.matmul(r_transposed.unsqueeze(-3), rel.unsqueeze(-1)).squeeze(-1)
+    return result.to(out_dtype)
 
 
 def pae_loss(
@@ -601,6 +705,7 @@ def diffusion_only_loss(
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
+            apply_rigid_align=cfg.use_rigid_align,
         )
         components["diffusion_mse"] = l_mse.detach()
 
@@ -699,6 +804,7 @@ def training_loss(
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
+            apply_rigid_align=cfg.use_rigid_align,
         )
         losses["diffusion_mse"] = l_mse
 
@@ -825,12 +931,16 @@ def training_loss(
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_resolved
 
             if cfg.alpha_pae > 0:
-                frame_idx = features.get("frame_atom_index")  # [N, 3] int
+                frame_idx = features.get("frame_atom_index")  # [N, 3] int — atom slot within referenced token
+                frame_tok = features.get("frame_token_index")  # [N, 3] int — which token each frame atom comes from
                 frames_mask = features.get("frames_mask")  # [N] bool
                 if frame_idx is not None and frames_mask is not None:
-                    arange_n3 = torch.arange(N, device=gt_pos.device).unsqueeze(-1).expand(N, 3)
-                    gt_frames_atoms = gt_pos[arange_n3, frame_idx]  # [N, 3, 3]
-                    mini_frames_atoms = mini_pos[:, arange_n3, frame_idx]  # [S, N, 3, 3]
+                    if frame_tok is None:
+                        # Back-compat for caches produced before §4.3.2 ligand frames:
+                        # every frame atom came from the token's own slot layout.
+                        frame_tok = torch.arange(N, device=gt_pos.device).unsqueeze(-1).expand(N, 3)
+                    gt_frames_atoms = gt_pos[frame_tok, frame_idx]  # [N, 3, 3]
+                    mini_frames_atoms = mini_pos[:, frame_tok, frame_idx]  # [S, N, 3, 3]
 
                     pair_mask_feat = features.get("pair_mask")
                     if pair_mask_feat is None:
