@@ -75,6 +75,38 @@ def _slice_batch_dict(d: dict, b: int, batch_size: int) -> dict:
     return out
 
 
+def _yaml_safe(value):
+    """Recursively convert tuples to lists so the result is `yaml.safe_dump` clean."""
+    if isinstance(value, tuple):
+        return [_yaml_safe(v) for v in value]
+    if isinstance(value, list):
+        return [_yaml_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _yaml_safe(v) for k, v in value.items()}
+    return value
+
+
+def serialize_run_config(train_cfg: TrainingConfig, model_cfg: ModelConfig) -> dict:
+    """Build a round-trippable resolved-config dict.
+
+    Mirrors the input YAML layout accepted by :func:`deepfold3.config_loader.load_config`:
+    top-level ``training``, ``model``, optional ``datasets`` and ``eval_datasets``.
+    The result can be re-fed via ``--config`` to reproduce the run.
+    """
+    train_dict = _yaml_safe(dataclasses.asdict(train_cfg))
+    extras = train_dict.pop("extra_datasets", []) or []
+    evals = train_dict.pop("eval_datasets", []) or []
+    out: dict = {
+        "training": train_dict,
+        "model": _yaml_safe(dataclasses.asdict(model_cfg)),
+    }
+    if extras:
+        out["datasets"] = extras
+    if evals:
+        out["eval_datasets"] = evals
+    return out
+
+
 class DistributedAverageMeters:
     """Group of named metrics with deferred DDP all-reduce.
 
@@ -163,12 +195,14 @@ class Trainer:
         records: list | None = None,
         eval_records: list | None = None,
         distillation_records: list | None = None,
+        provenance: dict | None = None,
     ):
         self.model_cfg = model_cfg
         self.cfg = train_cfg
         self.records = records or []
         self.eval_records = eval_records or []
         self.distillation_records = distillation_records or []
+        self.provenance = provenance
 
         # Will be set during setup
         self.model: DeepFold3 | None = None
@@ -1141,11 +1175,24 @@ class Trainer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Save resolved config (all CLI/YAML overrides applied) for reproducibility.
+        # Layout mirrors configs/*.yaml so the dump can be re-fed via --config.
         if self.is_main:
             config_out = output_dir / "config.yaml"
             with open(config_out, "w") as f:
-                yaml.dump(dataclasses.asdict(self.cfg), f, default_flow_style=False, sort_keys=False)
+                yaml.safe_dump(
+                    serialize_run_config(self.cfg, self.model_cfg),
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                )
             logger.info(f"Resolved config saved to {config_out}")
+            if self.provenance is not None:
+                prov_out = output_dir / "provenance.yaml"
+                with open(prov_out, "w") as f:
+                    yaml.safe_dump(
+                        _yaml_safe(self.provenance), f, default_flow_style=False, sort_keys=False
+                    )
+                logger.info(f"Run provenance saved to {prov_out}")
 
         # Auto-resume: find latest checkpoint in output_dir if none specified
         if resume_from is not None:

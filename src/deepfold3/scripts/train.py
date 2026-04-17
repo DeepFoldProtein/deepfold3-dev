@@ -25,9 +25,11 @@ from __future__ import annotations
 import faulthandler
 import logging
 import os
+import platform
 import signal
+import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -39,6 +41,66 @@ from deepfold3.scripts import cli
 faulthandler.enable()
 if hasattr(faulthandler, "register"):
     faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True, chain=True)
+
+
+def _git_info() -> dict:
+    """Return ``{commit, branch, dirty}`` from the current git checkout, best-effort."""
+    repo_dir = Path(__file__).resolve().parent
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                cwd=repo_dir,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    info: dict = {}
+    commit = _run(["rev-parse", "HEAD"])
+    if commit:
+        info["commit"] = commit
+    branch = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+    if branch:
+        info["branch"] = branch
+    status = _run(["status", "--porcelain"])
+    if status is not None:
+        info["dirty"] = bool(status)
+    return info
+
+
+def _build_provenance(
+    *,
+    config_path: str | None,
+    cli_argv: list[str],
+    overrides: list[str],
+    cli_datasets: list[str],
+) -> dict:
+    """Best-effort run-provenance dict: argv, config path, git, host, env."""
+    import torch
+
+    prov: dict = {
+        "start_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cli_argv": list(cli_argv),
+        "config_path": str(Path(config_path).resolve()) if config_path else None,
+        "overrides": list(overrides),
+        "cli_datasets": list(cli_datasets),
+        "host": platform.node(),
+        "python": platform.python_version(),
+        "torch": {"version": str(torch.__version__), "cuda": str(torch.version.cuda) if torch.version.cuda else None},
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+    }
+    git = _git_info()
+    if git:
+        prov["git"] = git
+    return prov
 
 
 def _apply_overrides(cfg: object, overrides: dict) -> None:
@@ -352,12 +414,20 @@ def train(
             entry.is_distillation,
         )
 
+    provenance = _build_provenance(
+        config_path=config_path,
+        cli_argv=sys.argv,
+        overrides=list(override),
+        cli_datasets=list(extra_datasets),
+    )
+
     trainer = Trainer(
         model_cfg=model_cfg,
         train_cfg=train_cfg,
         records=records,
         eval_records=eval_records,
         distillation_records=distillation_records,
+        provenance=provenance,
     )
     trainer.run(resume_from=resume)
 
