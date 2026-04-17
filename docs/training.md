@@ -166,6 +166,32 @@ During training, the number of recycles is randomly sampled per microstep: `n �
 - Optimizer steps only on accumulation boundaries
 - **NaN detection**: distributed all-reduce ensures all ranks agree on NaN/Inf; affected steps are skipped with a warning
 
+### Mixed Precision
+
+Training runs under `bf16` autocast by default (`TrainingConfig.dtype`). A few numerically sensitive regions are pinned to `fp32` via `ModelConfig.precision` (`PrecisionConfig`):
+
+| Flag | Default | Region |
+|------|:-------:|--------|
+| `fp32_loss` | `true` | `training_loss()` — softmax / CE see fp32 logits |
+| `fp32_confidence_head` | `true` | ConfidenceHead final LN+Linear + distance embedding |
+| `fp32_distogram_head` | `false` | DistogramHead logit projection |
+| `fp32_diffusion_sample` | `false` | Inference Euler-Maruyama sampler (mirrors `DiffusionConfig.skip_amp_sample`) |
+| `fp32_diffusion_sample_training` | `false` | Training-time rollout (mirrors `DiffusionConfig.skip_amp_sample_training`) |
+
+Each flag disables `torch.autocast("cuda")` over its scope and upcasts inputs to fp32. Rigid alignment (`weighted_rigid_align` in `training/loss.py`) and ligand frame construction (`express_coordinates_in_frame`) are always fp32 — they hold their own `autocast(enabled=False)` contexts regardless of these flags.
+
+Flip `fp32_distogram_head: true` if the per-pair distogram loss exceeds `ln(num_bins) ≈ 4.16`, which signals bf16 overflow in the final projection. Expected runtime cost is <5% — the guarded regions are tiny head-level matmuls.
+
+YAML:
+
+```yaml
+model:
+  precision:
+    fp32_loss: true
+    fp32_confidence_head: true
+    fp32_distogram_head: false
+```
+
 ### Experiment Tracking
 
 Optional WandB integration: `--wandb <project>`. Logs train/eval losses, learning rate, epoch, and gradient norms. Only rank 0 logs.

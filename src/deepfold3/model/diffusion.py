@@ -21,26 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
-
-def _upcast_fp32(x):
-    """Recursively upcast float tensors to fp32 for autocast-disabled paths.
-
-    Non-float tensors (int masks, bool) and None pass through unchanged.
-    Dicts/lists/tuples are walked so nested feature dicts (``embeddings``)
-    are handled transparently.
-    """
-    if isinstance(x, torch.Tensor):
-        return x.float() if x.is_floating_point() else x
-    if isinstance(x, dict):
-        return {k: _upcast_fp32(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        cast = [_upcast_fp32(v) for v in x]
-        return type(x)(cast)
-    return x
-
 from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncoderStatic
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
+from deepfold3.model.precision import upcast_fp32 as _upcast_fp32
 from deepfold3.model.primitives import LinearNoBias, af3_linear_init_
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")

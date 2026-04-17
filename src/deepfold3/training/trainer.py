@@ -37,6 +37,7 @@ from deepfold3.data.module.collate import collate_fn
 from deepfold3.data.module.dataset import TrainingDataset
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.model.model import DeepFold3
+from deepfold3.model.precision import fp32_guard
 from deepfold3.training.ema import EMA
 from deepfold3.training.loss import training_loss
 from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
@@ -837,13 +838,16 @@ class Trainer:
 
         # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice per
         # batch element and average (even for B=1, since the batch dim is kept).
+        # ``fp32_loss`` runs the combined loss with autocast disabled so
+        # softmax / CE always see fp32 logits.
+        loss_fn = fp32_guard(self.model_cfg.precision.fp32_loss)(training_loss)
         B = cfg.batch_size_per_rank
         losses_list: list[torch.Tensor] = []
         loss_dict_acc: dict[str, torch.Tensor] = {}
         for b in range(B):
             pred_b = _slice_batch_dict(pred, b, B)
             features_b = _slice_batch_dict(features, b, B)
-            loss_b, ld_b = training_loss(pred_b, features_b, cfg)
+            loss_b, ld_b = loss_fn(pred_b, features_b, cfg)
             losses_list.append(loss_b)
             for k, v in ld_b.items():
                 if k in loss_dict_acc:
@@ -995,7 +999,8 @@ class Trainer:
                     B_actual = features["res_type"].shape[0]
                     pred_0 = _slice_batch_dict(pred, 0, B_actual)
                     features_0 = _slice_batch_dict(features, 0, B_actual)
-                    _, loss_dict = training_loss(pred_0, features_0, self.cfg)
+                    eval_loss_fn = fp32_guard(self.model_cfg.precision.fp32_loss)(training_loss)
+                    _, loss_dict = eval_loss_fn(pred_0, features_0, self.cfg)
 
                 for k, v in loss_dict.items():
                     metrics.setdefault(f"eval/{k}", []).append(v.item())

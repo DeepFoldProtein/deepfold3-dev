@@ -578,6 +578,32 @@ class DistogramConfig:
 
 
 @dataclass
+class PrecisionConfig:
+    """Regions to pin in fp32 while the rest of the network runs in the
+    ``TrainingConfig.dtype`` autocast context.
+
+    Each flag, when True, disables autocast and upcasts that region's inputs
+    to fp32. Use to guard numerically sensitive projections (especially
+    final logit heads) against bf16 overflow.
+    """
+
+    # Compute ``training_loss`` in fp32.
+    fp32_loss: bool = True
+    # Run ConfidenceHead final LN+Linear blocks and the distance embedding in fp32.
+    fp32_confidence_head: bool = True
+    # Run DistogramHead.half_logits in fp32. Off by default; flip on if the
+    # distogram loss shows bursts beyond its theoretical max (ln(num_bins)).
+    fp32_distogram_head: bool = False
+    # Run the diffusion sampler (inference) in fp32. Mirrors
+    # ``DiffusionConfig.skip_amp_sample`` — ``ModelConfig.__post_init__``
+    # keeps the two in sync.
+    fp32_diffusion_sample: bool = False
+    # Run the training-time diffusion rollout in fp32. Mirrors
+    # ``DiffusionConfig.skip_amp_sample_training``.
+    fp32_diffusion_sample_training: bool = False
+
+
+@dataclass
 class DataConfig:
     max_templates: int = 4
     max_neighborhood: int = 40
@@ -618,8 +644,21 @@ class ModelConfig:
     distogram: DistogramConfig = field(default_factory=DistogramConfig)
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     num_recycles: int = 10
     # MSA rows fed to the Evoformer per recycle. Defaults to AF3's
     # Nmsa = 16384 (the same cap used by the featurizer), so per-recycle
     # subsampling is a no-op when the featurizer already capped.
     msa_crop_size: int = 16_384
+
+    def __post_init__(self):
+        # Mirror the legacy ``DiffusionConfig.skip_amp_sample*`` flags onto the
+        # unified ``PrecisionConfig`` fields so setting either side has the
+        # same effect regardless of entry point.
+        def _mirror(pre_field: str, diff_field: str) -> None:
+            val = bool(getattr(self.precision, pre_field) or getattr(self.diffusion, diff_field))
+            setattr(self.precision, pre_field, val)
+            setattr(self.diffusion, diff_field, val)
+
+        _mirror("fp32_diffusion_sample", "skip_amp_sample")
+        _mirror("fp32_diffusion_sample_training", "skip_amp_sample_training")

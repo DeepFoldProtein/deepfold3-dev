@@ -167,3 +167,10 @@ model:
     tiled_opm_chunk: 0
     use_torch_compile: false
     use_gradient_checkpointing: true
+  # Regions pinned to fp32 while the rest of the net runs under bf16 autocast.
+  # Flip ``fp32_distogram_head`` on if the distogram loss shows bursts beyond
+  # its theoretical max (ln(num_bins) ≈ 4.16).
+  precision:
+    fp32_loss: true
+    fp32_confidence_head: true
+    fp32_distogram_head: false

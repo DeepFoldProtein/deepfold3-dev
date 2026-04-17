@@ -24,6 +24,7 @@ from deepfold3.model.config import DistogramConfig, ModelConfig, OptimConfig
 from deepfold3.model.diffusion import DiffusionHead
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
+from deepfold3.model.precision import fp32_scope
 from deepfold3.model.primitives import LinearNoBias
 
 # Disable the determinism metadata check that compares saved vs recomputed
@@ -60,20 +61,27 @@ class DistogramHead(nn.Module):
         half_logits ← half_logits
     """
 
-    def __init__(self, pair_channels: int = 128, cfg: DistogramConfig | None = None):
+    def __init__(
+        self,
+        pair_channels: int = 128,
+        cfg: DistogramConfig | None = None,
+        fp32: bool = False,
+    ):
         super().__init__()
         if cfg is None:
             cfg = DistogramConfig()
         self.num_bins = cfg.num_bins
         self.first_break = cfg.first_break
         self.last_break = cfg.last_break
+        self.fp32 = fp32
         # AF3: half_logits uses final_init (zeros)
         self.half_logits = LinearNoBias(pair_channels, self.num_bins, initializer="zeros")
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
         """Symmetrised logits [..., N, N, num_bins]."""
-        h = self.half_logits(pair)
-        return h + h.transpose(-3, -2)  # symmetrise
+        with fp32_scope(self.fp32):
+            h = self.half_logits(pair.float() if self.fp32 else pair)
+        return h + h.transpose(-3, -2)
 
     def expected_distance(self, pair: torch.Tensor) -> torch.Tensor:
         """Expected Cβ–Cβ distance in Å, shape [..., N, N]."""
@@ -128,10 +136,14 @@ class DeepFold3(nn.Module):
         )
 
         # Confidence head
-        self.confidence_head = ConfidenceHead(cc, optim=cfg.optim)
+        self.confidence_head = ConfidenceHead(
+            cc, optim=cfg.optim, fp32=cfg.precision.fp32_confidence_head
+        )
 
         # Distogram head
-        self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram)
+        self.distogram_head = DistogramHead(
+            ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head
+        )
 
     def state_dict(self, *args, **kwargs):
         """Return state dict without fused kernel parameters."""

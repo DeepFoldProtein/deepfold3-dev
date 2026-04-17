@@ -29,6 +29,7 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock
+from deepfold3.model.precision import fp32_scope
 from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
@@ -58,10 +59,17 @@ class ConfidenceHead(nn.Module):
         distogram_feat_project → distogram_feat_project (LinearNoBias)
     """
 
-    def __init__(self, cfg: ConfidenceConfig, target_feat_dim: int = 447, optim: OptimConfig | None = None):
+    def __init__(
+        self,
+        cfg: ConfidenceConfig,
+        target_feat_dim: int = 447,
+        optim: OptimConfig | None = None,
+        fp32: bool = False,
+    ):
         super().__init__()
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
+        self.fp32 = fp32
 
         # _embed_features: target_feat outer-sum + distogram from positions
         self.left_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
@@ -116,13 +124,13 @@ class ConfidenceHead(nn.Module):
         out = self.left_target_feat_project(target_feat).unsqueeze(-2)  # [..., N, 1, c_pair]
         out = out + self.right_target_feat_project(target_feat).unsqueeze(-3)  # [..., 1, N, c_pair]
 
-        # Distogram from predicted positions
-        dgram = dgram_from_positions(positions)  # [N, N, num_bins]
-        dgram = dgram * pair_mask[..., None]
+        # Distogram from predicted positions. fp32 guards the squared-distance
+        # computation against bf16 catastrophic cancellation at small gaps.
+        with fp32_scope(self.fp32):
+            dgram = dgram_from_positions(positions.float() if self.fp32 else positions)
+            dgram = dgram * pair_mask[..., None]
 
-        out = out + self.distogram_feat_project(dgram)
-
-        return out
+        return out + self.distogram_feat_project(dgram.to(out.dtype))
 
     def forward(
         self,
@@ -261,18 +269,21 @@ class ConfidenceHead(nn.Module):
         for layer in self.layers:
             pair_act, single_act = layer(pair_act, single_act, pair_mask, seq_mask)
 
-        pair_act = pair_act.float()
-        single_act = single_act.float()
+        # fp32_scope is what actually holds LN + matmul in fp32: a bare
+        # ``.float()`` upcast is otherwise re-downcast by autocast on entry.
+        with fp32_scope(self.fp32):
+            pair_act = pair_act.float()
+            single_act = single_act.float()
 
-        plddt = self.plddt_logits(self.plddt_logits_ln(single_act))
-        exp_res = self.exp_resolved_logits(self.exp_resolved_ln(single_act))
+            plddt = self.plddt_logits(self.plddt_logits_ln(single_act))
+            exp_res = self.exp_resolved_logits(self.exp_resolved_ln(single_act))
 
-        if return_pre_logits:
-            pae = self.pae_logits_ln(pair_act)
-            pde = self.pde_logits_ln(pair_act)
-        else:
-            pae = self.pae_logits(self.pae_logits_ln(pair_act))
-            pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
-            pde = pde_half + pde_half.transpose(-3, -2)
+            if return_pre_logits:
+                pae = self.pae_logits_ln(pair_act)
+                pde = self.pde_logits_ln(pair_act)
+            else:
+                pae = self.pae_logits(self.pae_logits_ln(pair_act))
+                pde_half = self.pde_half_logits(self.pde_logits_ln(pair_act))
+                pde = pde_half + pde_half.transpose(-3, -2)
 
         return plddt, exp_res, pae, pde
