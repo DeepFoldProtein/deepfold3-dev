@@ -99,6 +99,45 @@ def weighted_rigid_align(
 
 
 # ---------------------------------------------------------------------------
+# Numerically safe self-cdist
+# ---------------------------------------------------------------------------
+
+
+class _SafeSelfCdist(torch.autograd.Function):
+    """Self pairwise-distance matrix with a singularity-free backward.
+
+    ``torch.cdist(x, x)`` has backward ``(x_i - x_j) / d_ij``, which is
+    NaN/inf when two predicted points coincide. We keep the fused ``cdist``
+    forward for memory, and compute the backward as
+    ``(x_i - x_j) / sqrt(d_ij^2 + eps)`` so the Jacobian norm is bounded
+    by ``1/sqrt(2)`` instead of diverging at ``d = 0``.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, eps: float) -> torch.Tensor:
+        d = torch.cdist(x, x)
+        ctx.save_for_backward(x, d)
+        ctx.eps = eps
+        return d
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x, d = ctx.saved_tensors
+        # d is symmetric; symmetrize the upstream grad so each unordered
+        # pair contributes once to both x_i and x_j.
+        sym_grad = grad_out + grad_out.transpose(-2, -1)
+        d_safe = torch.sqrt(d * d + ctx.eps)
+        diff = x.unsqueeze(-2) - x.unsqueeze(-3)  # [..., A, A, 3]
+        scale = (sym_grad / d_safe).unsqueeze(-1)
+        grad_x = (scale * diff).sum(-2)
+        return grad_x, None
+
+
+def _safe_self_cdist(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    return _SafeSelfCdist.apply(x, eps)
+
+
+# ---------------------------------------------------------------------------
 # Smooth LDDT loss (diffusion)
 # ---------------------------------------------------------------------------
 
@@ -165,7 +204,7 @@ def smooth_lddt_loss(
 
     # Batch over S: [S, A, 3]
     pred_flat = pred_pos.reshape(S, -1, 3)[:, flat_mask]
-    pred_dist = torch.cdist(pred_flat, pred_flat)  # [S, A, A]
+    pred_dist = _safe_self_cdist(pred_flat)  # [S, A, A]
     dist_diff = (pred_dist - gt_dist.unsqueeze(0)).abs()  # [S, A, A]
 
     # Vectorize over cutoffs: [C] tensor
@@ -561,7 +600,8 @@ def bond_loss(
     # Vectorized gather: [S, B_bonds, 3]
     pos1 = pred_pos[:, t1, a1]
     pos2 = pred_pos[:, t2, a2]
-    pred_dist = (pos1 - pos2).norm(dim=-1)  # [S, B_bonds]
+    # eps inside the sqrt: bounded backward at coincident atoms (AF3 §5.3 Eq. 5).
+    pred_dist = torch.sqrt(((pos1 - pos2) ** 2).sum(dim=-1) + 1e-6)  # [S, B_bonds]
 
     mse_per_sample = ((pred_dist - gt_distances.unsqueeze(0)) ** 2 * mask.unsqueeze(0)).sum(dim=-1) / n_bonds
 

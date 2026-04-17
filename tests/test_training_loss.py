@@ -6,6 +6,7 @@ import torch
 
 from deepfold3.training.loss import (
     _pairwise_binned_loss,
+    _safe_self_cdist,
     diffusion_mse_loss,
     distogram_loss,
     exp_resolved_loss,
@@ -35,6 +36,34 @@ def _masks():
 # ---------------------------------------------------------------------------
 # Individual loss functions
 # ---------------------------------------------------------------------------
+
+
+class TestSafeSelfCdist:
+    def test_forward_matches_cdist(self):
+        x = _randn(S, N, 3)
+        torch.testing.assert_close(_safe_self_cdist(x), torch.cdist(x, x))
+
+    def test_backward_matches_cdist_non_singular(self):
+        # With well-separated points, the eps-floored backward should match
+        # torch.cdist to machine precision in fp64.
+        x_a = _randn(S, N, 3).double().requires_grad_(True)
+        x_b = x_a.detach().clone().requires_grad_(True)
+        _safe_self_cdist(x_a, eps=1e-20).sum().backward()
+        torch.cdist(x_b, x_b).sum().backward()
+        torch.testing.assert_close(x_a.grad, x_b.grad, atol=1e-10, rtol=1e-10)
+
+    def test_gradcheck(self):
+        # eps=1e-3 keeps the Jacobian smooth enough for finite-difference checks.
+        x = _randn(1, 5, 3).double().requires_grad_(True)
+        assert torch.autograd.gradcheck(lambda z: _safe_self_cdist(z, eps=1e-3), (x,), eps=1e-6, atol=1e-4)
+
+    def test_backward_finite_at_coincident_points(self):
+        # torch.cdist backward produces NaN/inf when two points coincide
+        # within fp rounding; the safe version must stay finite.
+        x = torch.zeros(1, 4, 3, requires_grad=True)
+        x.data[0, 1].fill_(1e-9)
+        (g,) = torch.autograd.grad(_safe_self_cdist(x, eps=1e-6).sum(), x)
+        assert g.isfinite().all()
 
 
 class TestSmoothLddtLoss:
