@@ -184,11 +184,16 @@ def train(
         force=True,
     )
 
-    # Load bulk CCD if provided
+    # Load bulk CCD if provided. Force the gemmi parse here (not on first
+    # lookup) so the ~110 MB document is populated BEFORE DataLoader workers
+    # and/or per-rank processes fork. Otherwise each worker re-parses the
+    # file independently (32+ copies on a typical 8-GPU node, ~6 s each +
+    # ~110 MB RAM per copy).
     if ccd:
-        from deepfold3.data.ccd import set_ccd_components_path
+        from deepfold3.data.ccd import fetch_ccd_block, set_ccd_components_path
 
         set_ccd_components_path(ccd)
+        fetch_ccd_block("HOH")  # eager parse; any code triggers the lazy load
 
     # Build config from defaults + JSON override + CLI overrides
     train_cfg = TrainingConfig()

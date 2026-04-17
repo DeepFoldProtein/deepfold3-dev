@@ -187,6 +187,10 @@ class Trainer:
         self._last_grad_norm: torch.Tensor | None = None
         self._best_eval_loss: float = float("inf")
         self._last_num_recycles: int = 0
+        # GPU NaN/Inf accumulator — ORed across microsteps, all-reduced once
+        # per opt step. Materialised lazily on first optimizer step (so we
+        # pick up the final device after ``setup_distributed``).
+        self._nan_accum: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Distributed setup
@@ -831,9 +835,8 @@ class Trainer:
                 loss_cfg=loss_cfg_arg,
             )
 
-        # Loss computation. ``training_loss`` assumes unbatched ``[N, ...]``
-        # features. Slice per batch element and average (even for B=1,
-        # since we always keep the batch dim).
+        # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice per
+        # batch element and average (even for B=1, since the batch dim is kept).
         B = cfg.batch_size_per_rank
         losses_list: list[torch.Tensor] = []
         loss_dict_acc: dict[str, torch.Tensor] = {}
@@ -846,7 +849,7 @@ class Trainer:
                 if k in loss_dict_acc:
                     loss_dict_acc[k] = loss_dict_acc[k] + v
                 else:
-                    loss_dict_acc[k] = v.clone()
+                    loss_dict_acc[k] = v
         total_loss = torch.stack(losses_list).mean()
         loss_dict = {k: v / B for k, v in loss_dict_acc.items()}
         return total_loss, loss_dict
@@ -874,12 +877,25 @@ class Trainer:
         all-reduce until the final microstep — otherwise every backward
         fires a redundant all-reduce per microstep.
 
+        NaN/Inf detection runs once per optimizer step at the sync
+        boundary (instead of once per microstep) via ``_nan_accum``: each
+        microstep ORs its local NaN flag into the accumulator on-device
+        with no collective. At the sync boundary a single ``all_reduce``
+        checks whether any rank saw a bad loss across the whole window —
+        if so, all grads are zeroed and the opt step is skipped. This
+        replaces N per-window collectives (one per microstep) with 1.
+
         Args:
             loss: Scalar loss tensor from ``_training_step()``.
 
         Returns:
-            True if an optimizer step was taken (sync boundary).
+            True if an optimizer step was taken (effective_step advanced).
         """
+        # Per-microstep local NaN/Inf flag (no collective, no CPU sync).
+        if self._nan_accum is None:
+            self._nan_accum = torch.zeros((), device=loss.device)
+        self._nan_accum.add_((torch.isnan(loss) | torch.isinf(loss)).float())
+
         next_step = self.global_step + 1
         is_sync_step = next_step % self.cfg.accumulate_grad_batches == 0
 
@@ -890,44 +906,43 @@ class Trainer:
 
         self.global_step = next_step
 
-        if is_sync_step:
-            self.scaler.unscale_(self.optimizer)
+        if not is_sync_step:
+            return False
 
-            # Always compute the global pre-clip grad norm for logging,
-            # even when grad_clip_norm <= 0 (use a huge cap as no-op).
-            clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
-            self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
-
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
-
-            self.effective_step += 1
-
-            if self.ema is not None:
-                self.ema.update(self.model)
-
-        return is_sync_step
-
-    # ------------------------------------------------------------------
-    # NaN detection
-    # ------------------------------------------------------------------
-
-    def _check_nan(self, loss: torch.Tensor) -> bool:
-        """Check if loss is NaN/Inf across all ranks.
-
-        In distributed mode, uses all-reduce so all ranks agree on
-        whether to skip the batch (prevents hangs from rank divergence).
-
-        Returns:
-            True if loss is NaN/Inf on any rank.
-        """
-        # Use bitwise OR to avoid Python bool conversion triggering two GPU syncs
-        flag = (torch.isnan(loss) | torch.isinf(loss)).float()
+        # Sync boundary: single collective for NaN check across ranks +
+        # all microsteps in this accumulation window.
         if self.world_size > 1:
-            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-        return flag.item() > 0  # single GPU sync
+            dist.all_reduce(self._nan_accum, op=dist.ReduceOp.MAX)
+        nan_detected = self._nan_accum.item() > 0  # one CPU sync per opt step
+        self._nan_accum.zero_()
+
+        if nan_detected:
+            # Any microstep on any rank produced NaN/Inf — discard the whole
+            # accumulation window (NaN would have propagated via DDP all_reduce
+            # on the sync-step backward above).
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.is_main:
+                logger.warning(f"Step {self.effective_step}: NaN/Inf loss in accumulation window, skipping")
+            return False
+
+        self.scaler.unscale_(self.optimizer)
+
+        # Always compute the global pre-clip grad norm for logging,
+        # even when grad_clip_norm <= 0 (use a huge cap as no-op).
+        clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
+        self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step()
+
+        self.effective_step += 1
+
+        if self.ema is not None:
+            self.ema.update(self.model)
+
+        return True
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -1221,15 +1236,10 @@ class Trainer:
                     self.global_step += 1
                     continue
 
-                # Distributed NaN check
-                if self._check_nan(loss):
-                    if self.is_main:
-                        logger.warning(f"Step {self.effective_step}: NaN/Inf loss, skipping")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
-                    del loss, loss_dict
-                    continue
-
+                # NaN/Inf detection is deferred to the opt-step boundary inside
+                # ``_optimizer_step`` — a single all-reduce per window replaces
+                # one-per-microstep. Backward runs unconditionally here; any
+                # NaN grads are discarded at the boundary before the opt step.
                 on_opt_step_boundary = self._optimizer_step(loss)
 
                 # Accumulate logging metrics locally (no collective).

@@ -51,6 +51,25 @@ class EMA:
             if param.requires_grad and not _is_fused(name):
                 self.shadow[name] = param.data.clone()
 
+        # Parallel-indexed lists consumed by ``torch._foreach_lerp_`` in
+        # ``update``. Invalidated whenever ``shadow``/``param.data`` references
+        # change (apply/restore swap, load_state_dict).
+        self._cached_model_id: int | None = None
+        self._shadow_list: list[torch.Tensor] = []
+        self._param_list: list[torch.Tensor] = []
+
+    def _invalidate_cache(self) -> None:
+        self._cached_model_id = None
+
+    def _rebuild_foreach_lists(self, model: nn.Module) -> None:
+        self._shadow_list = []
+        self._param_list = []
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self._shadow_list.append(self.shadow[name])
+                self._param_list.append(param.data)
+        self._cached_model_id = id(model)
+
     def update(self, model: nn.Module) -> None:
         """Update shadow parameters with current model parameters.
 
@@ -62,10 +81,11 @@ class EMA:
         self.num_updates += 1
         decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
 
+        if self._cached_model_id != id(model):
+            self._rebuild_foreach_lists(model)
+
         with torch.no_grad():
-            for name, param in model.named_parameters():
-                if name in self.shadow:
-                    self.shadow[name].lerp_(param.data, 1.0 - decay)
+            torch._foreach_lerp_(self._shadow_list, self._param_list, 1.0 - decay)
 
     def apply(self, model: nn.Module) -> None:
         """Swap model parameters with EMA shadow parameters in-place.
@@ -80,6 +100,7 @@ class EMA:
         for name, param in model.named_parameters():
             if name in self.shadow:
                 self.shadow[name], param.data = param.data, self.shadow[name]
+        self._invalidate_cache()
         _sync_fused(model)
 
     def restore(self, model: nn.Module) -> None:
@@ -93,6 +114,7 @@ class EMA:
         for name, param in model.named_parameters():
             if name in self.shadow:
                 self.shadow[name], param.data = param.data, self.shadow[name]
+        self._invalidate_cache()
         _sync_fused(model)
 
     def state_dict(self) -> dict:
@@ -112,3 +134,4 @@ class EMA:
         self.decay = state["decay"]
         self.num_updates = state["num_updates"]
         self.shadow = {k: v.clone() for k, v in state["shadow"].items()}
+        self._invalidate_cache()
