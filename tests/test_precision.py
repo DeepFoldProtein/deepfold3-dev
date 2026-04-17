@@ -134,17 +134,13 @@ class TestDistogramHeadPrecision:
         assert head.fp32 is True
 
     def test_fp32_true_outputs_fp32(self):
-        head = DistogramHead(
-            pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=True
-        )
+        head = DistogramHead(pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=True)
         pair = torch.randn(5, 5, 16, dtype=torch.bfloat16)
         out = head(pair)
         assert out.dtype == torch.float32
 
     def test_fp32_false_follows_cpu_autocast(self):
-        head = DistogramHead(
-            pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=False
-        )
+        head = DistogramHead(pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=False)
         pair = torch.randn(5, 5, 16)
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             out = head(pair)
@@ -152,9 +148,7 @@ class TestDistogramHeadPrecision:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_fp32_true_overrides_cuda_autocast(self):
-        head = DistogramHead(
-            pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=True
-        ).cuda()
+        head = DistogramHead(pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=True).cuda()
         pair = torch.randn(5, 5, 16, device="cuda")
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = head(pair)
@@ -162,9 +156,7 @@ class TestDistogramHeadPrecision:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_fp32_false_follows_cuda_autocast(self):
-        head = DistogramHead(
-            pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=False
-        ).cuda()
+        head = DistogramHead(pair_channels=16, cfg=DistogramConfig(num_bins=8), fp32=False).cuda()
         pair = torch.randn(5, 5, 16, device="cuda")
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             out = head(pair)

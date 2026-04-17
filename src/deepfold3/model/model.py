@@ -136,14 +136,10 @@ class DeepFold3(nn.Module):
         )
 
         # Confidence head
-        self.confidence_head = ConfidenceHead(
-            cc, optim=cfg.optim, fp32=cfg.precision.fp32_confidence_head
-        )
+        self.confidence_head = ConfidenceHead(cc, optim=cfg.optim, fp32=cfg.precision.fp32_confidence_head)
 
         # Distogram head
-        self.distogram_head = DistogramHead(
-            ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head
-        )
+        self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head)
 
     def state_dict(self, *args, **kwargs):
         """Return state dict without fused kernel parameters."""

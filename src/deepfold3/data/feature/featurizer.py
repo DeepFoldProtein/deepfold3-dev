@@ -313,9 +313,7 @@ class Featurizer:
             elif mt == const.MOL_NONPOLYMER:
                 if not ligand_present[i]:
                     continue
-                neighbours = [
-                    j for j in ligand_by_chain.get(int(tok["asym_id"]), []) if j != i and ligand_present[j]
-                ]
+                neighbours = [j for j in ligand_by_chain.get(int(tok["asym_id"]), []) if j != i and ligand_present[j]]
                 if len(neighbours) < 2:
                     continue  # covers single-atom chains (e.g. Na+, Cl-)
                 b_xyz = ligand_xyz[i]

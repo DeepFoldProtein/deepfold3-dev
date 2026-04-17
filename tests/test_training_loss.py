@@ -220,15 +220,9 @@ class TestWeightedRigidAlign:
         atom_mask = torch.ones(N, M, dtype=torch.bool)
         noise_levels = torch.tensor([0.5, 2.0])
 
-        loss_off = diffusion_mse_loss(
-            pred, gt, atom_mask, noise_levels, apply_rigid_align=False
-        )
-        loss_on = diffusion_mse_loss(
-            pred, gt, atom_mask, noise_levels, apply_rigid_align=True
-        )
-        assert loss_on < loss_off * 0.01, (
-            f"rigid_align should collapse rotation-only error: {loss_on=} vs {loss_off=}"
-        )
+        loss_off = diffusion_mse_loss(pred, gt, atom_mask, noise_levels, apply_rigid_align=False)
+        loss_on = diffusion_mse_loss(pred, gt, atom_mask, noise_levels, apply_rigid_align=True)
+        assert loss_on < loss_off * 0.01, f"rigid_align should collapse rotation-only error: {loss_on=} vs {loss_off=}"
 
 
 class TestExpressCoordinatesInFrame:
