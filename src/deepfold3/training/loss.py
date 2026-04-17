@@ -172,6 +172,31 @@ def single_repr_reg_loss(
     return (per_token * mask).sum() / n_valid
 
 
+def pair_repr_reg_loss(
+    pair: torch.Tensor,  # [..., N, N, C]
+    pair_mask: torch.Tensor,  # [..., N, N] (bool or float)
+    p: int,
+) -> torch.Tensor:
+    """Per-pair ``L_p`` magnitude of the pair representation, pair-mask averaged.
+
+    Same shape as :func:`single_repr_reg_loss` but reduced over the pair grid.
+    IntFold reports the activation explosion first appears in the Transition
+    of later Pairformer layers before reaching the single track — watching
+    this catches the failure mode one step earlier.
+    """
+    if p not in (1, 2):
+        raise ValueError(f"pair_reg_p must be 1 or 2, got {p}")
+    mask = pair_mask.float()
+    n_valid = mask.sum().clamp(min=1)
+    C = pair.shape[-1]
+    p32 = pair.float()
+    if p == 1:
+        per_pair = p32.abs().sum(dim=-1) / C
+    else:
+        per_pair = (p32 * p32).sum(dim=-1) / C
+    return (per_pair * mask).sum() / n_valid
+
+
 # ---------------------------------------------------------------------------
 # Smooth LDDT loss (diffusion)
 # ---------------------------------------------------------------------------
@@ -853,8 +878,9 @@ def training_loss(
         region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
 
     # --- Single-representation magnitude regularization ---
-    # ``alpha_single_reg is None`` disables entirely; 0.0 is observation-only
-    # (compute under no_grad and log); >0 adds ``alpha * L_p`` to the total.
+    # ``alpha_{single,pair}_reg is None`` disables entirely; 0.0 is
+    # observation-only (compute under no_grad and log); >0 adds
+    # ``alpha * L_p`` to the total.
     if cfg.alpha_single_reg is not None and "single" in pred:
         if cfg.alpha_single_reg > 0:
             l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
@@ -863,6 +889,18 @@ def training_loss(
             with torch.no_grad():
                 l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
         losses[f"single_l{cfg.single_reg_p}"] = l_sreg
+
+    if cfg.alpha_pair_reg is not None and "pair" in pred:
+        pmask = features.get("pair_mask")
+        if pmask is None:
+            pmask = seq_mask.unsqueeze(-1) & seq_mask.unsqueeze(-2)
+        if cfg.alpha_pair_reg > 0:
+            l_preg = pair_repr_reg_loss(pred["pair"], pmask, cfg.pair_reg_p)
+            total = total + cfg.alpha_pair_reg * l_preg
+        else:
+            with torch.no_grad():
+                l_preg = pair_repr_reg_loss(pred["pair"], pmask, cfg.pair_reg_p)
+        losses[f"pair_l{cfg.pair_reg_p}"] = l_preg
 
     # --- Diffusion loss ---
     # When ``forward_training`` ran the chunked-diffusion path, it already

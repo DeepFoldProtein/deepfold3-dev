@@ -434,10 +434,11 @@ class DeepFold3(nn.Module):
         embeddings["target_feat"] = target_feat
 
         pred: dict[str, torch.Tensor] = {}
-        # Expose the attached single representation for the magnitude
-        # regularizer / observer in ``training_loss``.  The reference alone
+        # Expose the attached single / pair representations for the magnitude
+        # regularizers / observers in ``training_loss``.  The reference alone
         # does not extend the autograd graph; only the loss call does.
         pred["single"] = embeddings["single"]
+        pred["pair"] = embeddings["pair"]
 
         # --- 2. Diffusion training step ---
         chunked = (

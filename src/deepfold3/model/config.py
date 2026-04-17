@@ -450,6 +450,10 @@ class TrainingConfig:
     #                    (try ~1e-4 with p=2 to start regularizing).
     single_reg_p: int = 2
     alpha_single_reg: float | None = None
+    # Same pattern for the pair representation (Pairformer transitions are
+    # where IntFold observes the explosion *first*).
+    pair_reg_p: int = 2
+    alpha_pair_reg: float | None = None
 
     # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
     nucleotide_loss_weight: float = 5.0
