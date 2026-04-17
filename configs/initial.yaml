@@ -135,7 +135,7 @@ model:
     # Enable only for Protenix-style full-fp32 diffusion (requires fused
     # Triton kernels in the diffusion head to be disabled).
     skip_amp_sample: false
-    skip_amp_sample_training: false
+    skip_amp_sample_training: true
   confidence:
     num_layer: 4
     num_plddt_bins: 50
@@ -173,4 +173,4 @@ model:
   precision:
     fp32_loss: true
     fp32_confidence_head: true
-    fp32_distogram_head: false
+    fp32_distogram_head: true
