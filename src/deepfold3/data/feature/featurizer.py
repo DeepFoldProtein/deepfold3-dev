@@ -244,8 +244,6 @@ class Featurizer:
         # AF3 stores the raw mean (arctan transform is applied separately in create_msa_feat).
         deletion_mean = del_matrix_tensor.float().mean(dim=0)  # [N]
 
-        pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)  # [N, N]
-
         # Frame features drive PAE (AF3 §4.3.2). ``frames_mask`` is set
         # True only for tokens with a well-defined local rigid frame.
         # ``frame_atom_index [N, 3]`` indexes atoms within a referenced
@@ -260,6 +258,7 @@ class Featurizer:
         from deepfold3.data.feature.ref_atoms import decode_atom_name_chars
 
         token_to_rep_atom = np.zeros(N, dtype=np.int64)
+        rep_atom_present = np.zeros(N, dtype=bool)
         frames_mask_np = np.zeros(N, dtype=bool)
         frame_atom_index = np.zeros((N, 3), dtype=np.int64)
         frame_token_index = np.tile(np.arange(N, dtype=np.int64)[:, None], (1, 3))
@@ -288,8 +287,14 @@ class Featurizer:
             if mt == const.MOL_PROTEIN:
                 if rt == 7:  # GLY
                     token_to_rep_atom[i] = 1  # CA
-                else:
-                    token_to_rep_atom[i] = 4 if ref_mask[i, 4] else 1  # CB if present, else CA
+                    rep_atom_present[i] = bool(ref_mask[i, 1])
+                elif ref_mask[i, 4]:
+                    token_to_rep_atom[i] = 4  # CB
+                    rep_atom_present[i] = True
+                elif ref_mask[i, 1]:
+                    token_to_rep_atom[i] = 1  # CA fallback
+                    rep_atom_present[i] = True
+                # else: both CB and CA missing — rep_atom_present stays False
                 frame_atom_index[i] = (0, 1, 2)
                 if ref_mask[i, 0] and ref_mask[i, 1] and ref_mask[i, 2]:
                     frames_mask_np[i] = True
@@ -307,12 +312,14 @@ class Featurizer:
                         c4_idx = j
                 if c1_idx >= 0:
                     token_to_rep_atom[i] = c1_idx
+                    rep_atom_present[i] = True
                 if c1_idx >= 0 and c3_idx >= 0 and c4_idx >= 0:
                     frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
                     frames_mask_np[i] = True
             elif mt == const.MOL_NONPOLYMER:
                 if not ligand_present[i]:
                     continue
+                rep_atom_present[i] = True  # ligand atom at slot 0 (verified present above)
                 neighbours = [j for j in ligand_by_chain.get(int(tok["asym_id"]), []) if j != i and ligand_present[j]]
                 if len(neighbours) < 2:
                     continue  # covers single-atom chains (e.g. Na+, Cl-)
@@ -334,6 +341,11 @@ class Featurizer:
                 # frame_atom_index[i] stays (0, 0, 0) — ligand tokens store
                 # their single atom at slot 0.
                 frames_mask_np[i] = True
+
+        # Mask tokens without a valid rep atom so distogram / confidence
+        # targets don't read garbage coordinates at ``gt_pos[i, rep_idx]``.
+        seq_mask = seq_mask & torch.from_numpy(rep_atom_present)
+        pair_mask = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)  # [N, N]
 
         frames_mask = torch.from_numpy(frames_mask_np)
 
