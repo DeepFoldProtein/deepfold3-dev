@@ -438,6 +438,19 @@ class TrainingConfig:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0
 
+    # Single-representation magnitude regularization.  IntFold observed
+    # activation explosions in later PairFormer transitions preceding the
+    # gradient spikes from the diffusion loss backward; a mild penalty on
+    # the single repr bounds magnitudes before they escape.
+    #   ``single_reg_p``   — per-token norm (1 = Σ|s|/C, 2 = Σs²/C).
+    #   ``alpha_single_reg`` — master switch + weight:
+    #       * ``None`` → disabled entirely (no compute, no log).
+    #       * ``0.0``  → log-only observation (computed under no_grad).
+    #       * ``> 0``  → log + add ``alpha * L_p`` to total loss
+    #                    (try ~1e-4 with p=2 to start regularizing).
+    single_reg_p: int = 2
+    alpha_single_reg: float | None = None
+
     # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
     nucleotide_loss_weight: float = 5.0
     ligand_loss_weight: float = 10.0

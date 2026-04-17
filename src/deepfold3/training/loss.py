@@ -138,6 +138,41 @@ def _safe_self_cdist(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Single-representation magnitude regularization (IntFold §4.x)
+# ---------------------------------------------------------------------------
+
+
+def single_repr_reg_loss(
+    single: torch.Tensor,  # [..., N, C]
+    seq_mask: torch.Tensor,  # [..., N] (bool or float)
+    p: int,  # 1 or 2
+) -> torch.Tensor:
+    """Per-token ``L_p`` magnitude of the single representation, seq-mask averaged.
+
+    ``p=1`` returns ``mean_{valid(b,i)}  Σ_c |s[b,i,c]| / C``.
+    ``p=2`` returns ``mean_{valid(b,i)}  Σ_c s[b,i,c]² / C`` (squared, no sqrt
+    — the gradient scales with the activation, so the penalty grows
+    quadratically when magnitudes explode, which is IntFold's failure mode).
+
+    Normalising by the channel count ``C`` keeps the value ~O(1) under healthy
+    training regardless of model width. Computed in fp32 regardless of ambient
+    autocast — large activations can overflow under bf16 and this loss exists
+    precisely to trigger on magnitude blow-ups.
+    """
+    if p not in (1, 2):
+        raise ValueError(f"single_reg_p must be 1 or 2, got {p}")
+    mask = seq_mask.float()
+    n_valid = mask.sum().clamp(min=1)
+    C = single.shape[-1]
+    s32 = single.float()
+    if p == 1:
+        per_token = s32.abs().sum(dim=-1) / C
+    else:
+        per_token = (s32 * s32).sum(dim=-1) / C
+    return (per_token * mask).sum() / n_valid
+
+
+# ---------------------------------------------------------------------------
 # Smooth LDDT loss (diffusion)
 # ---------------------------------------------------------------------------
 
@@ -816,6 +851,18 @@ def training_loss(
     region_weights: torch.Tensor | None = None
     if region_label is not None and cfg.region_loss_weights:
         region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
+
+    # --- Single-representation magnitude regularization ---
+    # ``alpha_single_reg is None`` disables entirely; 0.0 is observation-only
+    # (compute under no_grad and log); >0 adds ``alpha * L_p`` to the total.
+    if cfg.alpha_single_reg is not None and "single" in pred:
+        if cfg.alpha_single_reg > 0:
+            l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
+            total = total + cfg.alpha_single_reg * l_sreg
+        else:
+            with torch.no_grad():
+                l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
+        losses[f"single_l{cfg.single_reg_p}"] = l_sreg
 
     # --- Diffusion loss ---
     # When ``forward_training`` ran the chunked-diffusion path, it already
