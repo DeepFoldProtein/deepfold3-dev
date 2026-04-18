@@ -105,16 +105,18 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 
 ### Loss Components
 
-| Loss | Weight | Description |
-|------|--------|-------------|
-| Diffusion MSE | `alpha_diffusion` (4.0) | EDM-weighted MSE: w(σ) = (σ²+σ_d²)/(σ·σ_d)²; mol-type reweight: DNA/RNA 5×, ligand 10× |
-| Smooth LDDT | `alpha_diffusion` (4.0) | Distance-based accuracy (cutoffs: 0.5, 1.0, 2.0, 4.0 Å) |
-| Bond violation | `alpha_diffusion × alpha_bond` (0) | MSE on bonded atom distances vs observed GT; enable for stage 2 |
-| Distogram | `alpha_distogram` (0.03) | Cross-entropy on 64-bin distance predictions |
-| pLDDT | `alpha_confidence` (1e-4) | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å |
-| PDE | `alpha_confidence` (1e-4) | Predicted distance error cross-entropy |
-| exp_resolved | `alpha_confidence` (1e-4) | Binary resolved/unresolved classification |
-| PAE | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1) |
+| Loss            | Weight                             | Description                                                                                                                                                                    |
+| --------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Diffusion MSE   | `alpha_diffusion` (4.0)            | EDM-weighted MSE: w(σ) = (σ²+σ_d²)/(σ·σ_d)²; mol-type reweight: DNA/RNA 5×, ligand 10×                                                                                         |
+| Smooth LDDT     | `alpha_diffusion` (4.0)            | Distance-based accuracy (cutoffs: 0.5, 1.0, 2.0, 4.0 Å)                                                                                                                        |
+| Bond violation  | `alpha_diffusion × alpha_bond` (0) | MSE on bonded atom distances vs observed GT; enable for stage 2                                                                                                                |
+| Distogram       | `alpha_distogram` (0.03)           | Cross-entropy on 64-bin distance predictions                                                                                                                                   |
+| pLDDT           | `alpha_confidence` (1e-4)          | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å                                                                                                |
+| PDE             | `alpha_confidence` (1e-4)          | Predicted distance error cross-entropy                                                                                                                                         |
+| exp_resolved    | `alpha_confidence` (1e-4)          | Binary resolved/unresolved classification                                                                                                                                      |
+| PAE             | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1)                                                                                         |
+| Single-repr reg | `alpha_single_reg` (0)             | Magnitude regularizer on trunk single output: mean per-token Σ_c &#124;s&#124;^p / C. Observation-only at α=0.                                                                 |
+| Pair-repr reg   | `alpha_pair_reg` (1e-4)            | Same form on pair output. Controls DistogramHead logit magnitude; prevents late-trajectory distogram destabilization (see [regularization-story.md](regularization-story.md)). |
 
 ### LR Schedule
 
@@ -170,13 +172,13 @@ During training, the number of recycles is randomly sampled per microstep: `n �
 
 Training runs under `bf16` autocast by default (`TrainingConfig.dtype`). A few numerically sensitive regions are pinned to `fp32` via `ModelConfig.precision` (`PrecisionConfig`):
 
-| Flag | Default | Region |
-|------|:-------:|--------|
-| `fp32_loss` | `true` | `training_loss()` — softmax / CE see fp32 logits |
-| `fp32_confidence_head` | `true` | ConfidenceHead final LN+Linear + distance embedding |
-| `fp32_distogram_head` | `false` | DistogramHead logit projection |
-| `fp32_diffusion_sample` | `false` | Inference Euler-Maruyama sampler (mirrors `DiffusionConfig.skip_amp_sample`) |
-| `fp32_diffusion_sample_training` | `false` | Training-time rollout (mirrors `DiffusionConfig.skip_amp_sample_training`) |
+| Flag                             | Default | Region                                                                       |
+| -------------------------------- | :-----: | ---------------------------------------------------------------------------- |
+| `fp32_loss`                      | `true`  | `training_loss()` — softmax / CE see fp32 logits                             |
+| `fp32_confidence_head`           | `true`  | ConfidenceHead final LN+Linear + distance embedding                          |
+| `fp32_distogram_head`            | `false` | DistogramHead logit projection                                               |
+| `fp32_diffusion_sample`          | `false` | Inference Euler-Maruyama sampler (mirrors `DiffusionConfig.skip_amp_sample`) |
+| `fp32_diffusion_sample_training` | `false` | Training-time rollout (mirrors `DiffusionConfig.skip_amp_sample_training`)   |
 
 Each flag disables `torch.autocast("cuda")` over its scope and upcasts inputs to fp32. Rigid alignment (`weighted_rigid_align` in `training/loss.py`) and ligand frame construction (`express_coordinates_in_frame`) are always fp32 — they hold their own `autocast(enabled=False)` contexts regardless of these flags.
 
@@ -299,13 +301,13 @@ deepfold3 train --data-dir /data/pdb --output runs/exp1 \
 
 **Fields per dataset:**
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `name` | (required) | Identifier for logging |
-| `data_dir` | (required) | Path to `structures/` + `msa/` |
-| `weight` | 1.0 | Relative sampling probability (primary dataset always 1.0) |
-| `strategy` | `"uniform"` | `"weighted"` (cluster-balanced) or `"uniform"` |
-| `is_distillation` | `false` | If true, disables confidence/distogram losses for this dataset |
+| Field             | Default     | Description                                                    |
+| ----------------- | ----------- | -------------------------------------------------------------- |
+| `name`            | (required)  | Identifier for logging                                         |
+| `data_dir`        | (required)  | Path to `structures/` + `msa/`                                 |
+| `weight`          | 1.0         | Relative sampling probability (primary dataset always 1.0)     |
+| `strategy`        | `"uniform"` | `"weighted"` (cluster-balanced) or `"uniform"`                 |
+| `is_distillation` | `false`     | If true, disables confidence/distogram losses for this dataset |
 
 The primary dataset (`--data-dir`) always uses cluster-weighted sampling when cluster IDs are available. Extra datasets are combined via `ConcatDataset` + `MultiDatasetSampler`, which draws samples from each dataset proportionally to weights.
 
@@ -383,7 +385,7 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ \
 
 This runs a two-phase pipeline: (1) unpaired search for all unique sequences, then (2) paired search per multimer record using MMseqs2's `pairaln` taxonomy-based pairing. Paired MSAs are written as `{record_id}_paired_{chain_idx}.npz` and referenced via `ChainInfo.paired_msa_id` in the manifest.
 
-The featurizer merges paired and unpaired MSAs into a single full-width `[S, N]` tensor: paired rows first (cross-chain aligned), then dense unpaired rows (all chains' row *i* on the same full-width row). See `docs/data-pipeline.md` § Paired MSA for the full row layout and comparison with OpenFold 3 and Protenix.
+The featurizer merges paired and unpaired MSAs into a single full-width `[S, N]` tensor: paired rows first (cross-chain aligned), then dense unpaired rows (all chains' row _i_ on the same full-width row). See `docs/data-pipeline.md` § Paired MSA for the full row layout and comparison with OpenFold 3 and Protenix.
 
 ### Distillation Datasets (AFDB, ESMFold, etc.)
 
@@ -422,6 +424,7 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
 The converter handles mol-type mapping (OF3 uses `PROTEIN=0, RNA=1, DNA=2, LIGAND=3` while DeepFold3 uses `PROTEIN=0, DNA=1, RNA=2, NONPOLYMER=3`), bond remapping, and entity/chain grouping.
 
 Supported OF3 directory layouts:
+
 - Nested: `{pdb_id}/{pdb_id}.npz`
 - RODA monomer: `{id}/structure.npz`
 - Flat: `{pdb_id}.npz`
@@ -461,13 +464,24 @@ AF3 trains in 4 stages (Table 6 of supplementary). Each loads weights from the p
 ### Stage 1: Initial Training
 
 ```json
-{"alpha_diffusion": 4.0, "alpha_pae": 0.0, "alpha_bond": 0.0, "diffusion_batch_size": 48, "max_tokens": 384}
+{
+  "alpha_diffusion": 4.0,
+  "alpha_pae": 0.0,
+  "alpha_bond": 0.0,
+  "diffusion_batch_size": 48,
+  "max_tokens": 384
+}
 ```
 
 ### Fine-tune 1: Structure (crop 640)
 
 ```json
-{"alpha_bond": 1.0, "alpha_smooth_lddt": null, "diffusion_batch_size": 32, "max_tokens": 640}
+{
+  "alpha_bond": 1.0,
+  "alpha_smooth_lddt": null,
+  "diffusion_batch_size": 32,
+  "max_tokens": 640
+}
 ```
 
 Bond loss on, smooth LDDT off. Disorder PDB distillation weight reduced to 0.01; masked diffusion for non-protein disabled. Load Stage 1 checkpoint with `--params`.
@@ -475,7 +489,7 @@ Bond loss on, smooth LDDT off. Disorder PDB distillation weight reduced to 0.01;
 ### Fine-tune 2: Structure (crop 768)
 
 ```json
-{"alpha_bond": 1.0, "diffusion_batch_size": 32, "max_tokens": 768}
+{ "alpha_bond": 1.0, "diffusion_batch_size": 32, "max_tokens": 768 }
 ```
 
 Smooth LDDT back on (default). Transcription factor distillation sets enabled. Disorder PDB weight back to 0.02. Load Fine-tune 1 checkpoint with `--params`.
@@ -483,7 +497,14 @@ Smooth LDDT back on (default). Transcription factor distillation sets enabled. D
 ### Fine-tune 3: Confidence
 
 ```json
-{"train_confidence_only": true, "alpha_diffusion": 0.0, "alpha_distogram": 0.0, "alpha_pae": 1.0, "diffusion_batch_size": 32, "max_tokens": 768}
+{
+  "train_confidence_only": true,
+  "alpha_diffusion": 0.0,
+  "alpha_distogram": 0.0,
+  "alpha_pae": 1.0,
+  "diffusion_batch_size": 32,
+  "max_tokens": 768
+}
 ```
 
 Freezes all parameters except confidence head. Only confidence losses (pLDDT, PDE, PAE, exp_resolved) are active. Max chains increased to 50. Load Fine-tune 2 checkpoint with `--params`.
@@ -494,42 +515,42 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 
 ### ✅ Matching
 
-| Paper section | Item | Implementation |
-|---|---|---|
-| §2.5.1 | Weighted PDB sampling (β/α weights, chain+interface) | `data/sample/weighted.py` |
-| §2.5.3 | Protein 40% clustering | wwPDB clusters via `data/prepare/clustering.py` |
-| §2.5.3 | 100% clustering for nucleic acids + peptides | Hash-based cluster_id = 100% identity; `scripts/prepare.py:_apply_clusters` |
-| §2.5.3 | CCD identity clustering for ligands | `ChainInfo.res_name` + `_apply_clusters` maps `ccd_{res_name}` |
-| §2.5.4 | Resolution ≤ 9Å, max 300 chains, min 4 residues | `data/prepare/filters.py` |
-| §2.5.4 | Clashing chains (30%/1.7Å, iterative 3-level tie-break) | `data/prepare/filters.py:filter_clashing_chains` |
-| §2.5.4 | Consecutive Cα > 10Å | `data/prepare/filters.py` |
-| §2.6 | Standard AA/nucleotide = 1 token, ligand = per-atom | `data/tokenize/tokenizer.py` |
-| §2.7 | Cropping weights (0.2/0.4/0.4), interface 15Å | `data/crop/cropper.py` |
-| §2.8 | ref_pos (random rot+trans), ref_element (one-hot 128) | `data/feature/featurizer.py` |
-| §2.8 | token_bonds filtered to < 2.4Å during training | `data/feature/featurizer.py:_build_bond_features` |
-| §3.7.1 | Diffusion batch 48, MSE mol-type weight (5×/10×) | `model/config.py`, `training/loss.py` |
-| §3.7.1 | EDM weighting, smooth LDDT (15/30Å radii) | `training/loss.py` |
-| §3.7.1 | Bond loss (Eq. 5 — GT distances) | `training/loss.py:bond_loss` |
-| §3.7.1 | Cross-entity bonds (disulfide, metal, covalent) | `data/prepare/structure.py` extracts from `_struct_conn`; `tokenizer.py` propagates with atom indices |
-| §2.5.4 | >20 polymer chains → greedy select 20 maximising interfaces | `data/prepare/filters.py:select_interface_chains` |
-| §2.5.3 | Modified residue normalization for clustering | `data/prepare/structure.py:_chain_sequence` uses `_NONSTANDARD_TO_STANDARD` |
-| §2.5.4 | CCD atom name validation | `data/ccd.py:build_atom_name_cache` + `process_mmcif(ccd_atom_names=...)` |
-| §2.5.4 | Leaving atom removal | `process_mmcif(ccd_leaving_atoms=...)` parses `pdbx_leaving_atom_flag` from `_struct_conn` |
-| §2.6 | Modified residue per-atom tokenization | `data/tokenize/tokenizer.py` checks `is_standard`; non-standard → per-atom |
-| §5.3 | Loss weights (α_diff=4, α_disto=0.03, α_conf=1e-4) | `model/config.py` |
-| §5.4 | Adam β₁=0.9 β₂=0.95 ε=1e-8, LR 1.8e-3, warmup 1000 | `model/config.py` |
-| §5.4 | LR decay 0.95/50k, grad clip 10, batch 256 | `model/config.py`, `training/trainer.py` |
+| Paper section | Item                                                        | Implementation                                                                                        |
+| ------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| §2.5.1        | Weighted PDB sampling (β/α weights, chain+interface)        | `data/sample/weighted.py`                                                                             |
+| §2.5.3        | Protein 40% clustering                                      | wwPDB clusters via `data/prepare/clustering.py`                                                       |
+| §2.5.3        | 100% clustering for nucleic acids + peptides                | Hash-based cluster_id = 100% identity; `scripts/prepare.py:_apply_clusters`                           |
+| §2.5.3        | CCD identity clustering for ligands                         | `ChainInfo.res_name` + `_apply_clusters` maps `ccd_{res_name}`                                        |
+| §2.5.4        | Resolution ≤ 9Å, max 300 chains, min 4 residues             | `data/prepare/filters.py`                                                                             |
+| §2.5.4        | Clashing chains (30%/1.7Å, iterative 3-level tie-break)     | `data/prepare/filters.py:filter_clashing_chains`                                                      |
+| §2.5.4        | Consecutive Cα > 10Å                                        | `data/prepare/filters.py`                                                                             |
+| §2.6          | Standard AA/nucleotide = 1 token, ligand = per-atom         | `data/tokenize/tokenizer.py`                                                                          |
+| §2.7          | Cropping weights (0.2/0.4/0.4), interface 15Å               | `data/crop/cropper.py`                                                                                |
+| §2.8          | ref_pos (random rot+trans), ref_element (one-hot 128)       | `data/feature/featurizer.py`                                                                          |
+| §2.8          | token_bonds filtered to < 2.4Å during training              | `data/feature/featurizer.py:_build_bond_features`                                                     |
+| §3.7.1        | Diffusion batch 48, MSE mol-type weight (5×/10×)            | `model/config.py`, `training/loss.py`                                                                 |
+| §3.7.1        | EDM weighting, smooth LDDT (15/30Å radii)                   | `training/loss.py`                                                                                    |
+| §3.7.1        | Bond loss (Eq. 5 — GT distances)                            | `training/loss.py:bond_loss`                                                                          |
+| §3.7.1        | Cross-entity bonds (disulfide, metal, covalent)             | `data/prepare/structure.py` extracts from `_struct_conn`; `tokenizer.py` propagates with atom indices |
+| §2.5.4        | >20 polymer chains → greedy select 20 maximising interfaces | `data/prepare/filters.py:select_interface_chains`                                                     |
+| §2.5.3        | Modified residue normalization for clustering               | `data/prepare/structure.py:_chain_sequence` uses `_NONSTANDARD_TO_STANDARD`                           |
+| §2.5.4        | CCD atom name validation                                    | `data/ccd.py:build_atom_name_cache` + `process_mmcif(ccd_atom_names=...)`                             |
+| §2.5.4        | Leaving atom removal                                        | `process_mmcif(ccd_leaving_atoms=...)` parses `pdbx_leaving_atom_flag` from `_struct_conn`            |
+| §2.6          | Modified residue per-atom tokenization                      | `data/tokenize/tokenizer.py` checks `is_standard`; non-standard → per-atom                            |
+| §5.3          | Loss weights (α_diff=4, α_disto=0.03, α_conf=1e-4)          | `model/config.py`                                                                                     |
+| §5.4          | Adam β₁=0.9 β₂=0.95 ε=1e-8, LR 1.8e-3, warmup 1000          | `model/config.py`                                                                                     |
+| §5.4          | LR decay 0.95/50k, grad clip 10, batch 256                  | `model/config.py`, `training/trainer.py`                                                              |
 
 ### ⚠️ Divergences
 
-| Paper section | Item | Our approach | Impact |
-|---|---|---|---|
-| §3.7.1 | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
+| Paper section | Item               | Our approach                                        | Impact                                    |
+| ------------- | ------------------ | --------------------------------------------------- | ----------------------------------------- |
+| §3.7.1        | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
 
 ### ❌ Missing (known gaps)
 
-| Paper section | Item | Notes |
-|---|---|---|
+| Paper section | Item                                                               | Notes                                                  |
+| ------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
 | §5.2, Table 6 | Masked diffusion loss for non-protein in disorder PDB distillation | Not applicable — diffusion without masking is intended |
 
 ### Stage Configuration Quick Reference
@@ -566,9 +587,9 @@ src/deepfold3/training/
 
 ## Module Dependencies
 
-| Module | Depends On |
-|--------|-----------|
-| `loss.py` | `model.config.TrainingConfig` |
-| `ema.py` | `torch.nn`, `model.config.OptimConfig` |
-| `scheduler.py` | `torch.optim`, `model.config.TrainingConfig` |
-| `trainer.py` | All above + `model.model.DeepFold3`, `data.module.*` |
+| Module         | Depends On                                           |
+| -------------- | ---------------------------------------------------- |
+| `loss.py`      | `model.config.TrainingConfig`                        |
+| `ema.py`       | `torch.nn`, `model.config.OptimConfig`               |
+| `scheduler.py` | `torch.optim`, `model.config.TrainingConfig`         |
+| `trainer.py`   | All above + `model.model.DeepFold3`, `data.module.*` |

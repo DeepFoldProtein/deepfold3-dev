@@ -37,13 +37,13 @@ training:
   ligand_loss_weight: 10.0
   region_loss_weights: {}
 
-  # IntFold-style single-repr magnitude telemetry.  alpha=0.0 logs
-  # single_l2 per step under no_grad; bump to ~1e-4 to regularize.
+  # Magnitude regularizers on trunk outputs (mean per-token Σ_c |x|^p / C).
+  # Pair reg bounds DistogramHead logit magnitude; alpha=0 = observation-only.
   single_reg_p: 2
   alpha_single_reg: 0.0
 
   pair_reg_p: 2
-  alpha_pair_reg: 0.0
+  alpha_pair_reg: 1.0e-4
 
   lddt_cutoffs: [0.5, 1.0, 2.0, 4.0]
   lddt_inclusion_radius: 15.0
