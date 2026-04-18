@@ -46,24 +46,19 @@ logger = logging.getLogger(__name__)
 _REQUIRED_KEYS = {"res_type", "seq_mask", "atom_gt_positions", "atom_gt_mask", "msa", "msa_mask"}
 
 
-def _validate_features(feats: dict[str, torch.Tensor], sample_id: str) -> bool:
+def _validate_features(feats: dict[str, torch.Tensor]) -> str | None:
     """Check that featurized sample is usable for training.
 
-    Returns True if valid, False if degenerate (empty, missing keys).
-    Callers should retry with a different sample on False.
+    Returns ``None`` if valid, or a short reason string if degenerate.
     """
     missing = _REQUIRED_KEYS - feats.keys()
     if missing:
-        logger.warning("Sample %s: missing features %s", sample_id, missing)
-        return False
-    N = feats["res_type"].shape[0]
-    if N == 0:
-        logger.warning("Sample %s: zero tokens after crop", sample_id)
-        return False
+        return f"missing features {missing}"
+    if feats["res_type"].shape[0] == 0:
+        return "zero tokens after crop"
     if not feats["seq_mask"].any():
-        logger.warning("Sample %s: seq_mask is all-zero", sample_id)
-        return False
-    return True
+        return "seq_mask is all-zero"
+    return None
 
 
 # Exceptions that indicate bad data (retry-worthy), not programming bugs.
@@ -86,17 +81,19 @@ def _retry_getitem(
     """
     orig_id = id_fn(idx)
     last_feats: dict[str, torch.Tensor] | None = None
-    for _attempt in range(max_attempts):
+    for attempt in range(1, max_attempts + 1):
+        sid = id_fn(idx)
         try:
             feats = load_fn(idx)
-            if _validate_features(feats, id_fn(idx)):
+            reason = _validate_features(feats)
+            if reason is None:
                 return feats
+            logger.warning("Sample %s (attempt %d): %s", sid, attempt, reason)
             last_feats = feats
         except _DATA_ERRORS as e:
-            logger.warning("Sample %s (attempt %d): %s", orig_id, _attempt + 1, e)
+            logger.warning("Sample %s (attempt %d): %s", sid, attempt, e)
         idx = random.randint(0, len(dataset) - 1)
-    # All retries exhausted — return last loaded feats (may be degenerate
-    # but at least has the right tensor structure for collation).
+    logger.error("Sample %s: all %d retries exhausted, returning degenerate feats", orig_id, max_attempts)
     if last_feats is not None:
         return last_feats
     return load_fn(idx)

@@ -151,16 +151,37 @@ class DistributedAverageMeters:
         Both dicts share the same keys. ``averages`` divides by global count
         (for losses). ``sums`` gives the raw global totals (for counters like
         token counts that should not be averaged).
+
+        Per-rank key sets can diverge during a window: ``training_loss``
+        returns early for distillation samples (no distogram/confidence
+        keys), so ranks that drew mostly distillation samples end up with
+        fewer keys than others. Packing different-sized tensors into
+        ``all_reduce`` causes NCCL to hang / time out. We fix this by
+        ``all_gather_object`` of the local key list and pack the union,
+        filling missing entries with zero — the pack shape is then
+        invariant across ranks.
         """
-        if not self._sums:
+        multi = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        if multi:
+            local_keys = sorted(self._sums.keys())
+            gathered: list[list[str] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_keys)
+            keys = sorted({k for ks in gathered if ks for k in ks})
+        else:
+            keys = sorted(self._sums.keys())
+
+        if not keys:
             return {}, {}
-        keys = sorted(self._sums.keys())
+
         # Pack [sum_k0, sum_k1, ..., sum_kN-1, count] into one f64 tensor.
-        packed = torch.empty(len(keys) + 1, dtype=torch.float64, device=self.device)
+        # Keys missing locally are packed as 0 without mutating ``self._sums``
+        # so the window-local key set stays bounded to what this rank saw.
+        packed = torch.zeros(len(keys) + 1, dtype=torch.float64, device=self.device)
         for i, k in enumerate(keys):
-            packed[i] = self._sums[k]
+            if k in self._sums:
+                packed[i] = self._sums[k]
         packed[-1] = float(self._count)
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if multi:
             dist.all_reduce(packed, op=dist.ReduceOp.SUM)
         global_count = packed[-1].item()
         if global_count == 0:
@@ -1386,10 +1407,11 @@ class Trainer:
                 del loss, loss_dict, features
 
                 # --- Logging ---
-                # Gate on ``on_opt_step_boundary`` (returned by
-                # ``_optimizer_step``) so the log always fires AFTER
-                # ``clip_grad_norm`` has populated ``_last_grad_norm``.
-                if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0 and meters.count > 0:
+                # Gate fires after clip_grad_norm populates ``_last_grad_norm``.
+                # Collective: ``meters.sync`` issues ``all_gather_object`` +
+                # ``all_reduce``, so the gate MUST be identical on all ranks
+                # (no per-rank conditions like ``meters.count > 0``).
+                if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0:
                     avg, sums = meters.sync()
                     meters.reset()
 
