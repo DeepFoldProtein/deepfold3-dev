@@ -92,6 +92,13 @@ class DiffusionConfig:
     # Training noise sampling (log-normal): t = sigma_data * exp(p_mean + p_std * z), z ~ N(0,1)
     p_mean: float = -1.2
     p_std: float = 1.5
+    # EDM diffusion-MSE weight w = (σ² + σ_d²)/(σ·σ_d)² → 1/σ² as σ→0, so a
+    # rare small-σ draw in the log-normal's left tail can concentrate the
+    # gradient in one sample and spike grad_norm by orders of magnitude.
+    # Clamp σ from below during training sampling to cap w ≤ 1/σ_min² + 1/σ_d².
+    # σ_min = 0.1 gives w ≲ 100; tighten/loosen via override.
+    clamp_train_sigma: bool = False
+    train_sigma_min: float = 0.1
     # Disable autocast around the diffusion sampler (Protenix ``skip_amp``
     # pattern, `configs_base.py:137-145`). When True, the method upcasts
     # all float tensor inputs to fp32 and runs with autocast disabled, so
@@ -408,6 +415,9 @@ class TrainingConfig:
     # Gradient
     grad_clip_norm: float = 10.0
     accumulate_grad_batches: int = 1
+    # Raise RuntimeError after this many consecutive opt-step skips from
+    # non-finite loss/grads. 0 or negative disables the check.
+    max_consecutive_nan_skips: int = 5
 
     # EMA
     ema_decay: float = 0.999

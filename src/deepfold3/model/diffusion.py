@@ -1077,6 +1077,10 @@ class DiffusionHead(nn.Module):
         noise_levels = cfg.sigma_data * torch.exp(
             cfg.p_mean + cfg.p_std * torch.randn(*batch_shape, num_samples, device=device)
         )  # [B?, S]
+        # Floor σ so the EDM weight 1/σ² + 1/σ_d² stays bounded — without this
+        # the rare left-tail draw spikes grad_norm by orders of magnitude.
+        if cfg.clamp_train_sigma:
+            noise_levels = noise_levels.clamp(min=cfg.train_sigma_min)
 
         # Add noise
         nl = noise_levels

@@ -23,6 +23,7 @@ import time
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -222,10 +223,13 @@ class Trainer:
         self._last_grad_norm: torch.Tensor | None = None
         self._best_eval_loss: float = float("inf")
         self._last_num_recycles: int = 0
-        # GPU NaN/Inf accumulator — ORed across microsteps, all-reduced once
-        # per opt step. Materialised lazily on first optimizer step (so we
-        # pick up the final device after ``setup_distributed``).
+        # GPU NaN/Inf accumulator — ORed across microsteps, all-gathered once
+        # per opt step (so we can surface the offending rank(s)). Materialised
+        # lazily on first optimizer step (so we pick up the final device after
+        # ``setup_distributed``).
         self._nan_accum: torch.Tensor | None = None
+        self._nan_gather_buf: torch.Tensor | None = None
+        self._consecutive_nan_skips: int = 0
 
     # ------------------------------------------------------------------
     # Distributed setup
@@ -918,10 +922,14 @@ class Trainer:
         NaN/Inf detection runs once per optimizer step at the sync
         boundary (instead of once per microstep) via ``_nan_accum``: each
         microstep ORs its local NaN flag into the accumulator on-device
-        with no collective. At the sync boundary a single ``all_reduce``
-        checks whether any rank saw a bad loss across the whole window —
-        if so, all grads are zeroed and the opt step is skipped. This
-        replaces N per-window collectives (one per microstep) with 1.
+        with no collective. At the sync boundary a single
+        ``all_gather_into_tensor`` reports which rank(s) saw a bad loss
+        across the whole window — if any, all grads are zeroed and the
+        opt step is skipped. A second check after ``clip_grad_norm_``
+        catches finite-loss / NaN-gradient paths (e.g. log/sqrt/div)
+        that would otherwise corrupt weights via ``optimizer.step``.
+        ``cfg.max_consecutive_nan_skips`` bounds how many skips in a row
+        we tolerate before raising to fail fast.
 
         Args:
             loss: Scalar loss tensor from ``_training_step()``.
@@ -930,9 +938,11 @@ class Trainer:
             True if an optimizer step was taken (effective_step advanced).
         """
         # Per-microstep local NaN/Inf flag (no collective, no CPU sync).
+        # Shape [1] (not scalar) so ``all_gather_into_tensor`` can concatenate
+        # across ranks into ``_nan_gather_buf`` of shape [world_size].
         if self._nan_accum is None:
-            self._nan_accum = torch.zeros((), device=loss.device)
-        self._nan_accum.add_((torch.isnan(loss) | torch.isinf(loss)).float())
+            self._nan_accum = torch.zeros(1, device=loss.device)
+        self._nan_accum.add_((torch.isnan(loss) | torch.isinf(loss)).float().view(1))
 
         next_step = self.global_step + 1
         is_sync_step = next_step % self.cfg.accumulate_grad_batches == 0
@@ -948,11 +958,19 @@ class Trainer:
             return False
 
         # Sync boundary: single collective for NaN check across ranks +
-        # all microsteps in this accumulation window.
+        # all microsteps in this accumulation window. Use all_gather so the
+        # warning can name the offending rank(s).
         if self.world_size > 1:
-            dist.all_reduce(self._nan_accum, op=dist.ReduceOp.MAX)
-        nan_detected = self._nan_accum.item() > 0  # one CPU sync per opt step
+            if self._nan_gather_buf is None:
+                self._nan_gather_buf = torch.zeros(self.world_size, device=self._nan_accum.device)
+            dist.all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
+            nan_flags = self._nan_gather_buf
+        else:
+            nan_flags = self._nan_accum
+        nan_detected = bool(nan_flags.any().item())  # one CPU sync per opt step
         self._nan_accum.zero_()
+
+        attempted_step = self.effective_step + 1
 
         if nan_detected:
             # Any microstep on any rank produced NaN/Inf — discard the whole
@@ -960,7 +978,11 @@ class Trainer:
             # on the sync-step backward above).
             self.optimizer.zero_grad(set_to_none=True)
             if self.is_main:
-                logger.warning(f"Step {self.effective_step}: NaN/Inf loss in accumulation window, skipping")
+                bad_ranks = (nan_flags > 0).nonzero(as_tuple=False).flatten().tolist()
+                logger.warning(
+                    f"Step {attempted_step}: NaN/Inf loss in accumulation window (ranks={bad_ranks}), skipping"
+                )
+            self._on_nan_skip(attempted_step, reason="loss")
             return False
 
         self.scaler.unscale_(self.optimizer)
@@ -968,7 +990,19 @@ class Trainer:
         # Always compute the global pre-clip grad norm for logging,
         # even when grad_clip_norm <= 0 (use a huge cap as no-op).
         clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
-        self._last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
+        self._last_grad_norm = grad_norm
+
+        # clip_grad_norm_ returns a NaN/Inf total when ANY param grad is
+        # non-finite, so this single check covers the whole model. Without
+        # it, a finite loss with non-finite grads (log/sqrt/div paths)
+        # silently corrupts weights via optimizer.step.
+        if not bool(torch.isfinite(grad_norm).item()):
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.is_main:
+                logger.warning(f"Step {attempted_step}: NaN/Inf in grads (norm={grad_norm.item():.3e}), skipping")
+            self._on_nan_skip(attempted_step, reason="grad")
+            return False
 
         self.scaler.step(self.optimizer)
         self.scaler.update()
@@ -976,11 +1010,25 @@ class Trainer:
         self.scheduler.step()
 
         self.effective_step += 1
+        self._consecutive_nan_skips = 0
 
         if self.ema is not None:
             self.ema.update(self.model)
 
         return True
+
+    def _on_nan_skip(self, attempted_step: int, *, reason: Literal["loss", "grad"]) -> None:
+        """Increment the skip counter and abort training if it exceeds the limit."""
+        self._consecutive_nan_skips += 1
+        limit = self.cfg.max_consecutive_nan_skips
+        if limit > 0 and self._consecutive_nan_skips >= limit:
+            msg = (
+                f"Aborting: {self._consecutive_nan_skips} consecutive non-finite "
+                f"{reason} skips at step {attempted_step} (limit={limit})."
+            )
+            if self.is_main:
+                logger.critical(msg)
+            raise RuntimeError(msg)
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -1189,9 +1237,7 @@ class Trainer:
             if self.provenance is not None:
                 prov_out = output_dir / "provenance.yaml"
                 with open(prov_out, "w") as f:
-                    yaml.safe_dump(
-                        _yaml_safe(self.provenance), f, default_flow_style=False, sort_keys=False
-                    )
+                    yaml.safe_dump(_yaml_safe(self.provenance), f, default_flow_style=False, sort_keys=False)
                 logger.info(f"Run provenance saved to {prov_out}")
 
         # Auto-resume: find latest checkpoint in output_dir if none specified
