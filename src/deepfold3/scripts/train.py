@@ -29,7 +29,7 @@ import platform
 import signal
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -87,7 +87,7 @@ def _build_provenance(
     import torch
 
     prov: dict = {
-        "start_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "start_time": datetime.now(UTC).isoformat(timespec="seconds"),
         "cli_argv": list(cli_argv),
         "config_path": str(Path(config_path).resolve()) if config_path else None,
         "overrides": list(overrides),
@@ -230,8 +230,10 @@ def train(
 
     if rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Best-effort broadcast via filesystem: other ranks read the same path.
-    # Update ``output`` so the Trainer checkpoints into the run dir.
+    # Non-rank-0 ranks don't create directories or open file handlers, so
+    # sub-second timestamp drift across ranks is harmless: ``output`` is
+    # consumed by the Trainer only for checkpoint writes, which happen on
+    # rank 0 where the path is guaranteed correct.
     output = str(run_dir)
 
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -239,8 +241,12 @@ def train(
         log_file = run_dir / "train.log"
         handlers.append(logging.FileHandler(log_file))
 
+    # INFO on every rank: deadlock diagnosis requires seeing where each rank
+    # was last. Per-rank file separation is done by torchrun via
+    # ``--redirects 3 --tee 3`` (writes ``<run_dir>/attempt_*/<rank>/stdout.log``);
+    # no Python-side file-handler juggling needed.
     logging.basicConfig(
-        level=logging.INFO if rank == 0 else logging.WARNING,
+        level=logging.INFO,
         format=f"%(asctime)s [%(levelname)s] [rank{rank}] %(name)s: %(message)s",
         handlers=handlers,
         force=True,
@@ -429,7 +435,14 @@ def train(
         distillation_records=distillation_records,
         provenance=provenance,
     )
-    trainer.run(resume_from=resume)
+    try:
+        trainer.run(resume_from=resume)
+    except BaseException:
+        # Log with rank tag before re-raising: peers will hang in NCCL until
+        # torchrun reaps them, so the first-failing rank's traceback is the
+        # only diagnostic signal pointing at root cause.
+        log.exception("rank %d: trainer.run raised; peers may hang until torchrun reaps them", rank)
+        raise
 
 
 # Allow running as module for torchrun: python -m deepfold3.scripts.train

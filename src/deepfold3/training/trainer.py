@@ -14,66 +14,45 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
-import platform
-import random
-import re
-import signal
 import time
-from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Literal
 
-import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import yaml
 from torch.amp import GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 
 from deepfold3.data.module.collate import collate_fn
-from deepfold3.data.module.dataset import TrainingDataset
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.model.model import DeepFold3
-from deepfold3.model.precision import fp32_guard
+from deepfold3.training.accumulator import AccumulationLoop
+from deepfold3.training.checkpointing import CheckpointManager, load_pretrained_weights
+from deepfold3.training.data import build_dataloaders
+from deepfold3.training.distributed import DistInfo, destroy_process_group_safely, init_process_group
 from deepfold3.training.ema import EMA
-from deepfold3.training.loss import training_loss
+from deepfold3.training.eval import run_eval
+from deepfold3.training.logging_payload import build_step_payload
+from deepfold3.training.meters import DistributedAverageMeters
+from deepfold3.training.optim import (
+    WrappedOptimizer,
+    build_optimizer,
+    freeze_for_confidence,
+    is_chunked_diffusion_active,
+    wrap_ddp,
+)
 from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
+from deepfold3.training.signals import CheckpointRequestHandler, ShutdownCoordinator
+from deepfold3.training.state import TrainState, seed_everything
+from deepfold3.training.step import scaled_backward, training_step
+from deepfold3.training.tracking import StdoutTracker, Tracker, TrackerHub, WandBTracker
 
 # Bucket-padded collation keeps Triton kernel input shapes (and the
 # persistent autotune cache keys) deterministic across microsteps.
 _collate_bucket_pad = partial(collate_fn, bucket_pad=True)
 
 logger = logging.getLogger(__name__)
-
-
-def _slice_batch_dict(d: dict, b: int, batch_size: int) -> dict:
-    """Slice each tensor value in ``d`` along dim 0 at index ``b``.
-
-    Only tensors whose leading dim equals ``batch_size`` are sliced.
-    Shared weight tensors (e.g. ``pae_weight: [num_bins, c_pair]``),
-    pre-aggregated scalars (``__diffusion_total__``), and other shapes
-    that don't carry the batch dim pass through unchanged. Sub-dicts
-    are recursed into.
-
-    Used by the per-batch loss loop in ``_training_step`` when
-    ``batch_size_per_rank > 1``.
-    """
-    out: dict = {}
-    for k, v in d.items():
-        if isinstance(v, torch.Tensor):
-            if v.dim() >= 1 and v.shape[0] == batch_size:
-                out[k] = v[b]
-            else:
-                out[k] = v
-        elif isinstance(v, dict):
-            out[k] = _slice_batch_dict(v, b, batch_size)
-        else:
-            out[k] = v
-    return out
 
 
 def _yaml_safe(value):
@@ -106,96 +85,6 @@ def serialize_run_config(train_cfg: TrainingConfig, model_cfg: ModelConfig) -> d
     if evals:
         out["eval_datasets"] = evals
     return out
-
-
-class DistributedAverageMeters:
-    """Group of named metrics with deferred DDP all-reduce.
-
-    Per-step ``update`` is collective-free — values accumulate locally as GPU
-    tensors. ``sync`` packs all metric sums + a shared count into a single
-    f64 tensor and does ONE ``all_reduce`` to compute the global weighted
-    average across ranks. The "all-reduce only at log time" pattern avoids
-    the per-step sync barrier that would otherwise serialize fast and slow
-    ranks at every step.
-
-    Important: ``sync`` MUST be called by every rank in lockstep (it issues a
-    collective). Place the call right after the optimizer step, where DDP's
-    own gradient all-reduce has already synchronized the ranks for free —
-    this makes the meter's all-reduce essentially zero-cost.
-    """
-
-    def __init__(self, device: torch.device):
-        self.device = device
-        self._sums: dict[str, torch.Tensor] = {}  # f64 device tensors
-        self._count: int = 0
-
-    def update(self, values: dict[str, torch.Tensor], n: int = 1) -> None:
-        """Accumulate a step's metrics. Tensors are detached and stored on device."""
-        for k, v in values.items():
-            # Squeeze to scalar — with batch_per_rank > 1 the per-batch
-            # loss loop may produce 0-d or 1-element tensors.
-            v_f64 = v.detach().to(torch.float64).squeeze() * n
-            if k in self._sums:
-                self._sums[k] += v_f64
-            else:
-                self._sums[k] = v_f64.clone()
-        self._count += n
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    def sync(self) -> tuple[dict[str, float], dict[str, float]]:
-        """All-reduce across ranks and return ``(averages, sums)``.
-
-        Both dicts share the same keys. ``averages`` divides by global count
-        (for losses). ``sums`` gives the raw global totals (for counters like
-        token counts that should not be averaged).
-
-        Per-rank key sets can diverge during a window: ``training_loss``
-        returns early for distillation samples (no distogram/confidence
-        keys), so ranks that drew mostly distillation samples end up with
-        fewer keys than others. Packing different-sized tensors into
-        ``all_reduce`` causes NCCL to hang / time out. We fix this by
-        ``all_gather_object`` of the local key list and pack the union,
-        filling missing entries with zero — the pack shape is then
-        invariant across ranks.
-        """
-        multi = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-        if multi:
-            local_keys = sorted(self._sums.keys())
-            gathered: list[list[str] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, local_keys)
-            keys = sorted({k for ks in gathered if ks for k in ks})
-        else:
-            keys = sorted(self._sums.keys())
-
-        if not keys:
-            return {}, {}
-
-        # Pack [sum_k0, sum_k1, ..., sum_kN-1, count] into one f64 tensor.
-        # Keys missing locally are packed as 0 without mutating ``self._sums``
-        # so the window-local key set stays bounded to what this rank saw.
-        packed = torch.zeros(len(keys) + 1, dtype=torch.float64, device=self.device)
-        for i, k in enumerate(keys):
-            if k in self._sums:
-                packed[i] = self._sums[k]
-        packed[-1] = float(self._count)
-        if multi:
-            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-        global_count = packed[-1].item()
-        if global_count == 0:
-            return dict.fromkeys(keys, 0.0), dict.fromkeys(keys, 0.0)
-        # Single GPU→CPU sync at the very end.
-        raw = packed[:-1].tolist()
-        sums = dict(zip(keys, raw, strict=True))
-        averaged = {k: v / global_count for k, v in sums.items()}
-        return averaged, sums
-
-    def reset(self) -> None:
-        for t in self._sums.values():
-            t.zero_()
-        self._count = 0
 
 
 class Trainer:
@@ -233,51 +122,26 @@ class Trainer:
         self.scheduler: AF3LRScheduler | None = None
         self.ema: EMA | None = None
         self.scaler: GradScaler | None = None
-        self._wandb = None
+        self.trackers: TrackerHub | None = None
+        self.accumulator: AccumulationLoop | None = None
+        self.ckpt_manager: CheckpointManager | None = None
+        self.wrapped_optimizer: WrappedOptimizer | None = None
 
-        self.global_step = 0
-        self.effective_step = 0
-        self.rank = 0
-        self.world_size = 1
-        self.local_rank = 0
-        self.is_main = True
-        self._last_grad_norm: torch.Tensor | None = None
-        self._best_eval_loss: float = float("inf")
-        self._last_num_recycles: int = 0
-        # GPU NaN/Inf accumulator — ORed across microsteps, all-gathered once
-        # per opt step (so we can surface the offending rank(s)). Materialised
-        # lazily on first optimizer step (so we pick up the final device after
-        # ``setup_distributed``).
-        self._nan_accum: torch.Tensor | None = None
-        self._nan_gather_buf: torch.Tensor | None = None
-        self._consecutive_nan_skips: int = 0
+        # Canonical state objects, populated during ``run``.
+        self.dist: DistInfo | None = None
+        self.state = TrainState()
 
     # ------------------------------------------------------------------
     # Distributed setup
     # ------------------------------------------------------------------
 
     def _init_distributed(self) -> None:
-        """Initialize process group if running in distributed mode."""
-        if "RANK" in os.environ:
-            self.rank = int(os.environ["RANK"])
-            self.world_size = int(os.environ["WORLD_SIZE"])
-            self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            dist.init_process_group(backend="nccl")
-            torch.cuda.set_device(self.local_rank)
-        else:
-            self.local_rank = 0
-
-        self.is_main = self.rank == 0
-        self.device = torch.device(f"cuda:{self.local_rank}" if torch.cuda.is_available() else "cpu")
+        """Bring up the process group — delegates to :func:`init_process_group`."""
+        self.dist = init_process_group()
 
     def _seed_everything(self) -> None:
-        """Set seeds for reproducibility, offset by rank."""
-        seed = self.cfg.seed + self.rank
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+        """Seed all RNGs with a per-rank offset."""
+        seed_everything(self.cfg.seed, self.dist.rank)
 
     # ------------------------------------------------------------------
     # Model and optimizer setup
@@ -285,7 +149,7 @@ class Trainer:
 
     def _init_model(self) -> None:
         """Create model, optimizer, scheduler, EMA, and wrap in DDP."""
-        self.model = DeepFold3(self.model_cfg).to(self.device)
+        self.model = DeepFold3(self.model_cfg).to(self.dist.device)
 
         # Load pretrained weights if specified
         if self.cfg.params_path:
@@ -293,94 +157,15 @@ class Trainer:
 
         # Freeze parameters for confidence-only training (stage 3)
         if self.cfg.train_confidence_only:
-            self._freeze_for_confidence_only()
+            freeze_for_confidence(self.model)
 
-        # Wrap in DDP. ``static_graph=True`` is safe in the unchunked path:
-        #   * Recycles 1..N-1 run inside ``torch.no_grad()`` (model.py:396-409),
-        #     so only the last recycle is in the autograd graph and the graph
-        #     topology is identical iteration-to-iteration regardless of
-        #     ``num_recycles``.
-        #   * Gradient accumulation uses ``no_sync()`` on non-final
-        #     microsteps (see ``_optimizer_step``), so only the final
-        #     backward per optimizer step triggers DDP sync.
-        # Confidence-loss resolution gating is a tensor multiply (loss.py)
-        # rather than a Python branch, so the set of grad-receiving parameters
-        # is also identical every step.
-        #
-        # ``static_graph=True`` is INCOMPATIBLE with ``model.no_sync()``:
-        # PyTorch raises if the two are combined.  ``no_sync`` is used in
-        # two places: (a) chunked-diffusion to defer DDP all_reduce until
-        # after the outer aux backward, and (b) gradient-accumulation
-        # microsteps in ``_optimizer_step`` to defer sync until the final
-        # microstep.  Auto-disable ``static_graph`` when either is active.
-        chunked_diffusion = self._chunked_diffusion_active()
-        needs_no_sync = chunked_diffusion or self.cfg.accumulate_grad_batches > 1
-        use_static_graph = self.cfg.static_graph and not needs_no_sync
-        if self.world_size > 1:
-            if self.is_main and self.cfg.static_graph and not use_static_graph:
-                reasons = []
-                if chunked_diffusion:
-                    reasons.append(f"diffusion_chunk_size={self.cfg.diffusion_chunk_size}")
-                if self.cfg.accumulate_grad_batches > 1:
-                    reasons.append(f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}")
-                logger.info(
-                    "static_graph auto-disabled (%s): model.no_sync() is required, which conflicts with static_graph.",
-                    ", ".join(reasons),
-                )
-            self.ddp_model = DDP(
-                self.model,
-                device_ids=[self.local_rank],
-                find_unused_parameters=self.cfg.find_unused_parameters,
-                static_graph=use_static_graph,
-                bucket_cap_mb=self.cfg.bucket_cap_mb,
-                gradient_as_bucket_view=self.cfg.gradient_as_bucket_view,
-            )
-        else:
-            self.ddp_model = self.model
-
-        # AdamW with decoupled weight decay. Protenix / nanoGPT convention:
-        # decay 2D+ params (matmul weights, embeddings); skip 1D params
-        # (LayerNorm gamma/beta, biases) — applying L2 to scale/shift terms
-        # collapses them and hurts training stability.
-        #
-        # Additional refinement: many AF3 projections are ``LinearNoBias(1, C)``
-        # or ``LinearNoBias(C, 1)`` — scalar-input or scalar-output linears that
-        # behave as per-channel scale factors. Their weight is technically 2D
-        # (``[C, 1]`` or ``[1, C]``) but semantically equivalent to a 1D param.
-        # We treat any 2D weight where ``min(shape) == 1`` as no-decay.
-        decay_params = []
-        no_decay_params = []
-        for param in self.model.parameters():
-            if not param.requires_grad:
-                continue
-            if param.dim() < 2 or min(param.shape) == 1:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        param_groups = [
-            {"params": decay_params, "weight_decay": self.cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
-
-        # Use the fused AdamW kernel on CUDA — single kernel launch per param
-        # group, ~1.3-1.5x faster than the foreach implementation at our scale.
-        use_fused_adam = torch.cuda.is_available()
-        self.optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=self.cfg.lr,
-            betas=self.cfg.betas,
-            eps=self.cfg.eps,
-            fused=use_fused_adam,
+        self.ddp_model, use_static_graph = wrap_ddp(self.model, self.dist, self.cfg)
+        self.accumulator = AccumulationLoop(
+            ddp_model=self.ddp_model,
+            dist=self.dist,
+            num_steps=self.cfg.accumulate_grad_batches,
         )
-        if self.is_main:
-            n_decay = sum(p.numel() for p in decay_params) / 1e6
-            n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
-            logger.info(
-                f"AdamW: fused={use_fused_adam}, weight_decay={self.cfg.weight_decay} "
-                f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
-            )
-
+        self.optimizer = build_optimizer(self.model, self.cfg, is_main=self.dist.is_main)
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
         # EMA
@@ -390,749 +175,150 @@ class Trainer:
         # Mixed precision scaler (only for fp16; bf16 doesn't need scaling)
         self.scaler = GradScaler("cuda", enabled=(self.cfg.dtype == "fp16"))
 
-        if self.is_main:
+        self.wrapped_optimizer = WrappedOptimizer(
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            model=self.model,
+            dist_info=self.dist,
+            cfg=self.cfg,
+        )
+
+        self.ckpt_manager = CheckpointManager(
+            max_checkpoints=self.cfg.max_checkpoints,
+            strict=self.cfg.load_strict,
+            device=self.dist.device,
+        )
+
+        if self.dist.is_main:
             n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
             n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6
             logger.info(f"Model parameters: {n_params:.1f}M total, {n_trainable:.1f}M trainable")
             logger.info(
-                f"DDP: world_size={self.world_size}, static_graph={use_static_graph}, "
+                f"DDP: world_size={self.dist.world_size}, static_graph={use_static_graph}, "
                 f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}"
             )
 
-    def _freeze_for_confidence_only(self) -> None:
-        """Freeze all parameters except confidence head for stage 3 training."""
-        for name, param in self.model.named_parameters():
-            if "confidence" not in name:
-                param.requires_grad_(False)
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logger.info(f"Confidence-only training: {trainable / 1e6:.1f}M trainable parameters")
-
     def _load_pretrained(self, path: str) -> None:
-        """Load pretrained weights from safetensors or checkpoint.
+        """Thin wrapper around :func:`load_pretrained_weights`."""
+        load_pretrained_weights(
+            self.model, path, strict=self.cfg.load_strict, is_main=self.dist.is_main, device=self.dist.device
+        )
 
-        Args:
-            path: Path to ``.safetensors`` or ``.pt`` file.
+    def _init_trackers(self) -> None:
+        """Build a :class:`TrackerHub` from the training config.
+
+        Non-main ranks get an empty hub so ``log()`` is a safe no-op on
+        every rank. On rank 0 the hub always contains a ``StdoutTracker``
+        plus a ``WandBTracker`` when ``wandb_enabled`` + a non-empty
+        ``wandb_project`` are set.
         """
-        p = Path(path)
-        strict = self.cfg.load_strict
-        if p.suffix == ".safetensors":
-            from safetensors.torch import load_file
-
-            state = load_file(str(p), device=str(self.device))
-            self.model.load_state_dict(state, strict=strict)
-            if self.is_main:
-                logger.info(f"Loaded pretrained weights from {p}")
-        elif p.suffix == ".pt":
-            ckpt = torch.load(str(p), map_location=self.device, weights_only=False)
-            if "model" in ckpt:
-                self.model.load_state_dict(ckpt["model"], strict=strict)
+        trackers: list[Tracker] = [StdoutTracker()]
+        if self.dist.is_main and self.cfg.wandb_enabled:
+            if not self.cfg.wandb_project:
+                logger.warning("wandb_enabled=True but wandb_project is empty; skipping wandb init")
             else:
-                self.model.load_state_dict(ckpt, strict=strict)
-            if self.is_main:
-                logger.info(f"Loaded pretrained weights from {p}")
-
-    def _init_wandb(self) -> None:
-        """Initialize Weights & Biases logging if configured.
-
-        Gated on ``wandb_enabled`` (explicit on/off) and ``wandb_project``
-        (the W&B project name). The run name is either the user-provided
-        ``wandb_run_name`` *as-is*, or — when unset — ``{output_dir}_{ts}``
-        where ``ts = YYYYMMDD-HHMMSS`` so multiple runs into the same
-        output directory don't collapse into one wandb run.
-        """
-        if not self.cfg.wandb_enabled or not self.is_main:
-            return
-        if not self.cfg.wandb_project:
-            logger.warning("wandb_enabled=True but wandb_project is empty; skipping wandb init")
-            return
-        try:
-            import dataclasses
-
-            import wandb
-
-            if self.cfg.wandb_run_name:
-                run_name = self.cfg.wandb_run_name
-            else:
-                run_name = Path(self.cfg.output_dir).name
-
-            self._wandb = wandb
-            wandb.init(
-                project=self.cfg.wandb_project,
-                entity=self.cfg.wandb_entity or None,
-                name=run_name,
-                config=dataclasses.asdict(self.cfg),
-            )
-            wandb.define_metric("train/step")
-            wandb.define_metric("train/*", step_metric="train/step")
-            wandb.define_metric("eval/*", step_metric="train/step")
-            wandb.define_metric("system/*", step_metric="train/step")
-            logger.info(f"WandB initialized: project={self.cfg.wandb_project}, run={run_name}")
-        except ImportError:
-            logger.warning("wandb not installed, skipping experiment tracking")
+                run_name = self.cfg.wandb_run_name or Path(self.cfg.output_dir).name
+                trackers.append(
+                    WandBTracker(
+                        project=self.cfg.wandb_project,
+                        entity=self.cfg.wandb_entity,
+                        run_name=run_name,
+                    )
+                )
+        self.trackers = TrackerHub(trackers, is_main=self.dist.is_main)
+        self.trackers.start(dataclasses.asdict(self.cfg))
 
     # ------------------------------------------------------------------
     # Data setup
     # ------------------------------------------------------------------
 
     def _init_dataloaders(self) -> tuple[DataLoader, DataLoader | None]:
-        """Create training and optional evaluation dataloaders.
-
-        Supports multi-dataset training via ``extra_datasets`` config or
-        the legacy ``distillation_data_dir`` option.  The primary dataset
-        (``--data-dir``) always uses cluster-weighted sampling when cluster
-        IDs are available; extra datasets specify their own strategy.
-
-        Returns:
-            Tuple of ``(train_dl, eval_dl)``.  ``eval_dl`` is ``None``
-            when no evaluation records are provided.
-        """
-        ds_kwargs = dict(
-            max_tokens=self.cfg.max_tokens,
-            max_atoms=self.cfg.max_atoms,
-            max_msa_seqs=self.cfg.max_msa_seqs,
-            mmcif_dir=Path(self.cfg.mmcif_dir) if self.cfg.mmcif_dir else None,
-            max_templates=self.model_cfg.data.max_templates,
-            template_cutoff_days=self.model_cfg.data.template_cutoff_days,
-            max_template_date=self.model_cfg.data.max_template_date,
-            prefer_monomer_templates=self.model_cfg.data.prefer_monomer_templates,
-            max_neighborhood=self.model_cfg.data.max_neighborhood,
-            contiguous_crop_weight=self.model_cfg.data.contiguous_crop_weight,
-            spatial_crop_weight=self.model_cfg.data.spatial_crop_weight,
-            interface_crop_weight=self.model_cfg.data.interface_crop_weight,
-            interface_distance=self.model_cfg.data.interface_distance,
-            max_chains=self.model_cfg.data.max_chains,
-        )
-
-        # Keys accepted by OF3Dataset (subset of ds_kwargs)
-        _OF3_KWARGS = {
-            "max_tokens",
-            "max_atoms",
-            "max_msa_seqs",
-            "max_neighborhood",
-            "contiguous_crop_weight",
-            "spatial_crop_weight",
-            "interface_crop_weight",
-            "interface_distance",
-            "mmcif_dir",
-            "max_templates",
-        }
-        of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in _OF3_KWARGS}
-
-        # Cache discovered records by (data_dir, format) to avoid re-scanning
-        _record_cache: dict[tuple[str, str], list] = {}
-
-        def _discover(data_dir: str, fmt: str) -> list:
-            key = (data_dir, fmt)
-            if key not in _record_cache:
-                if fmt == "of3":
-                    from deepfold3.data.module.of3_dataset import discover_of3_records
-
-                    _record_cache[key] = discover_of3_records(Path(data_dir))
-                else:
-                    from deepfold3.data.prepare.manifest import discover_records
-
-                    _record_cache[key] = discover_records(Path(data_dir))
-            # Return a copy so cutoff filtering doesn't mutate the cache
-            return list(_record_cache[key])
-
-        def _apply_cutoff(records, cutoff: str, *, keep_after: bool):
-            """Filter records by release date cutoff."""
-            if not cutoff:
-                return records
-            filtered = []
-            for r in records:
-                released = r.structure_info.released if r.structure_info else None
-                if released is None:
-                    if not keep_after:
-                        filtered.append(r)
-                elif keep_after:
-                    if released > cutoff:
-                        filtered.append(r)
-                else:
-                    if released <= cutoff:
-                        filtered.append(r)
-            return filtered
-
-        def _load_dataset_from_spec(spec, *, keep_after: bool, preloaded_records=None):
-            """Load a dataset from a DatasetConfig spec.
-
-            Returns (dataset, records) or (None, []) if no records found.
-            """
-            if preloaded_records is not None:
-                records = preloaded_records
-            else:
-                records = _discover(spec.data_dir, spec.format)
-            if spec.cutoff_date:
-                records = _apply_cutoff(records, spec.cutoff_date, keep_after=keep_after)
-            if not records:
-                return None, []
-            if spec.format == "of3":
-                from deepfold3.data.module.of3_dataset import OF3Dataset
-
-                ds = OF3Dataset(
-                    records=records,
-                    of3_dir=Path(spec.data_dir),
-                    is_distillation=spec.is_distillation,
-                    **of3_kwargs,
-                )
-            else:
-                ds = TrainingDataset(
-                    records=records,
-                    data_dir=Path(spec.data_dir),
-                    is_distillation=spec.is_distillation,
-                    **ds_kwargs,
-                )
-            return ds, records
-
-        # Primary (PDB) dataset — may be empty when only extra_datasets are used
-        pdb_ds = None
-        if self.records and self.cfg.data_dir:
-            pdb_ds = TrainingDataset(
-                records=self.records,
-                data_dir=Path(self.cfg.data_dir),
-                is_distillation=False,
-                **ds_kwargs,
-            )
-
-        # Collect extra datasets from config
-        extra_specs = list(self.cfg.extra_datasets)
-
-        # Legacy: convert distillation_data_dir to an extra_datasets entry
-        if (
-            self.cfg.distillation_data_dir
-            and self.distillation_records
-            and not any(s.name == "_distillation" for s in extra_specs)
-        ):
-            from deepfold3.model.config import DatasetConfig
-
-            extra_specs.append(
-                DatasetConfig(
-                    name="_distillation",
-                    data_dir=self.cfg.distillation_data_dir,
-                    weight=self.cfg.distillation_weight,
-                    strategy="uniform",
-                    is_distillation=True,
-                )
-            )
-
-        if extra_specs:
-            from torch.utils.data import ConcatDataset
-
-            from deepfold3.data.sample.multi import MultiDatasetSampler
-
-            datasets = []
-            sampler_configs = []
-
-            # Only include primary dataset if it has records
-            if pdb_ds is not None and len(pdb_ds) > 0:
-                datasets.append(pdb_ds)
-                sampler_configs.append(
-                    {
-                        "records": self.records,
-                        "dataset_len": len(pdb_ds),
-                        "weight": 1.0,
-                        "strategy": "weighted",
-                    },
-                )
-
-            for spec in extra_specs:
-                preloaded = self.distillation_records if spec.name == "_distillation" else None
-                ds, records = _load_dataset_from_spec(spec, keep_after=False, preloaded_records=preloaded)
-                if ds is None:
-                    logger.warning("Extra dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
-                    continue
-                datasets.append(ds)
-                sampler_configs.append(
-                    {
-                        "records": records,
-                        "dataset_len": len(ds),
-                        "weight": spec.weight,
-                        "strategy": spec.strategy,
-                    }
-                )
-                logger.info(
-                    "Extra dataset %r: %d records, weight=%.2f, strategy=%s, distillation=%s",
-                    spec.name,
-                    len(records),
-                    spec.weight,
-                    spec.strategy,
-                    spec.is_distillation,
-                )
-
-            train_ds = ConcatDataset(datasets)
-            train_sampler = MultiDatasetSampler(
-                dataset_configs=sampler_configs,
-                epoch_size=self.cfg.epoch_size,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                seed=self.cfg.seed,
-            )
-        else:
-            if pdb_ds is None:
-                raise RuntimeError(
-                    "No training data: --data-dir is empty and no extra_datasets configured. "
-                    "Provide --data-dir or define datasets in the config file."
-                )
-            train_ds = pdb_ds
-            train_sampler = self._build_train_sampler(pdb_ds)
-
-        train_dl = DataLoader(
-            train_ds,
-            batch_size=self.cfg.batch_size_per_rank,
-            sampler=train_sampler,
-            shuffle=(train_sampler is None),
-            collate_fn=_collate_bucket_pad,
-            num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
-            drop_last=self.cfg.drop_last,
-            persistent_workers=self.cfg.num_workers > 0,
-            prefetch_factor=self.cfg.prefetch_factor if self.cfg.num_workers > 0 else None,
-        )
-
-        eval_dl = None
-        eval_datasets = []
-
-        # Primary eval records (from date-based split on primary data_dir)
-        if self.eval_records and self.cfg.data_dir:
-            eval_datasets.append(
-                TrainingDataset(
-                    records=self.eval_records,
-                    data_dir=Path(self.cfg.data_dir),
-                    **ds_kwargs,
-                )
-            )
-
-        # Eval datasets from config (eval_datasets YAML section)
-        for spec in self.cfg.eval_datasets:
-            ds, recs = _load_dataset_from_spec(spec, keep_after=True)
-            if ds is None:
-                logger.warning("Eval dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
-                continue
-            eval_datasets.append(ds)
-            logger.info("Eval dataset %r: %d records from %s", spec.name, len(recs), spec.data_dir)
-
-        if eval_datasets:
-            from torch.utils.data import ConcatDataset as ConcatDS
-
-            eval_ds = ConcatDS(eval_datasets) if len(eval_datasets) > 1 else eval_datasets[0]
-            eval_sampler = self._build_eval_sampler(eval_ds)
-            eval_dl = DataLoader(
-                eval_ds,
-                batch_size=self.cfg.batch_size_per_rank,
-                sampler=eval_sampler,
-                shuffle=False,
-                collate_fn=_collate_bucket_pad,
-                num_workers=self.cfg.eval_num_workers,
-                pin_memory=self.cfg.pin_memory,
-                persistent_workers=self.cfg.eval_num_workers > 0,
-                prefetch_factor=self.cfg.prefetch_factor if self.cfg.eval_num_workers > 0 else None,
-            )
-
-        return train_dl, eval_dl
-
-    def _build_train_sampler(self, train_ds: TrainingDataset):
-        """Build training sampler — weighted or distributed.
-
-        For ``WeightedClusterSampler`` we also attach the sampler's flat
-        ``rows`` table to ``train_ds.sampling_rows`` so the dataset's
-        ``__getitem__`` can resolve each sampled index back to a record
-        and the chain/interface anchor that earned the draw — closing
-        the loop the AF3 §2.5.1 sampler depends on.
-        """
-        has_real_clusters = any(isinstance(c.cluster_id, int) for r in self.records for c in r.chains)
-
-        if has_real_clusters:
-            from deepfold3.data.sample.weighted import WeightedClusterSampler
-
-            sampler = WeightedClusterSampler(
-                records=self.records,
-                epoch_size=self.cfg.epoch_size,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                seed=self.cfg.seed,
-            )
-            train_ds.sampling_rows = sampler.rows
-            return sampler
-
-        if self.world_size > 1:
-            return DistributedSampler(
-                train_ds,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                shuffle=True,
-                seed=self.cfg.seed,
-            )
-
-        return None
-
-    def _build_eval_sampler(self, eval_ds):
-        """Build eval sampler — subsample with cluster-weighted probabilities.
-
-        When ``eval_samples > 0``, uses :class:`WeightedEvalSampler` to
-        draw a fixed-size subset each eval pass using per-record cluster
-        weights (so large families aren't over-represented). Each pass
-        gets a different subset via ``set_epoch(effective_step)``.
-
-        When ``eval_samples == 0`` (use all), falls back to a plain
-        ``DistributedSampler`` (DDP) or ``None`` (single GPU).
-        """
-        n_eval = self.cfg.eval_samples
-        ds_len = len(eval_ds)
-        if n_eval <= 0 or n_eval >= ds_len:
-            if self.world_size > 1:
-                # shuffle=True so each eval call sees a different (still
-                # full-coverage) ordering; set_epoch(effective_step) is
-                # already called in the train loop to vary the seed.
-                return DistributedSampler(
-                    eval_ds, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=self.cfg.seed
-                )
-            return None
-
-        # WeightedEvalSampler needs per-record cluster weights from
-        # self.eval_records.  When the eval set comes from YAML
-        # eval_datasets (or a ConcatDataset), eval_records may not cover
-        # the full dataset — fall back to a uniform random subset sampler.
-        if self.eval_records and len(self.eval_records) >= ds_len:
-            from deepfold3.data.sample.weighted import WeightedEvalSampler
-
-            return WeightedEvalSampler(
-                records=self.eval_records,
-                n_samples=n_eval,
-                num_replicas=self.world_size,
-                rank=self.rank,
-                seed=self.cfg.seed,
-            )
-
-        from deepfold3.data.sample.weighted import UniformEvalSampler
-
-        return UniformEvalSampler(
-            n_records=ds_len,
-            n_samples=n_eval,
-            num_replicas=self.world_size,
-            rank=self.rank,
-            seed=self.cfg.seed,
+        """Thin wrapper around :func:`build_dataloaders`."""
+        return build_dataloaders(
+            cfg=self.cfg,
+            model_cfg=self.model_cfg,
+            dist=self.dist,
+            records=self.records,
+            eval_records=self.eval_records,
+            distillation_records=self.distillation_records,
         )
 
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
 
-    def _prepare_features(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Move features to device.
-
-        Always keeps the leading ``[B, ...]`` batch dimension so every
-        module consistently takes the batched code path (even when
-        ``batch_size_per_rank == 1``).
-        """
-        return {k: v.to(self.device, non_blocking=True) for k, v in features.items()}
-
     def _training_step(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Run one forward pass and compute all losses.
-
-        Delegates to :meth:`DeepFold3.forward_training` for the full
-        training pipeline (evoformer, diffusion, confidence, distogram),
-        then computes the combined loss.
-
-        Args:
-            features: Batched feature dict from the dataloader.
-
-        Returns:
-            Tuple of ``(total_loss, loss_dict)``.
-        """
-        cfg = self.cfg
-        features = self._prepare_features(features)
-
-        # Number of recycles per microstep. AF3 convention: total trunk
-        # passes = num_recycles + 1, sampled uniformly from {0..max_recycles}.
-        # max_recycles=3 → up to 4 trunk passes (matches AF3 paper).
-        # Two modes:
-        #   * uniform_recycle=True (default): all DDP ranks pick the SAME
-        #     num_recycles via a fresh ``random.Random`` seeded from
-        #     ``(cfg.seed, global_step)`` — both identical on every rank.
-        #     Avoids the straggler effect where one rank does 3 no_grad
-        #     warmup passes and another does 0, blocking DDP all_reduce
-        #     on the slowest rank (~4× wasted compute at max_recycles=3).
-        #   * uniform_recycle=False: legacy per-rank Python random — each
-        #     rank picks independently from its own seeded RNG. Trains on
-        #     more diverse recycle counts per global batch but pays the
-        #     straggler cost.
-        if cfg.uniform_recycle:
-            num_recycles = random.Random(cfg.seed + self.global_step).randint(0, cfg.max_recycles)
-        else:
-            num_recycles = random.randint(0, cfg.max_recycles)
-        # Stash for ``log_microsteps`` debug logging in the outer train loop.
-        self._last_num_recycles = num_recycles
-
-        # Chunked-diffusion path: ``forward_training`` back-props each chunk
-        # internally and runs the trunk flow-back at the end of the chunked
-        # block. Those backwards must run under ``model.no_sync()`` so DDP
-        # doesn't fire an all_reduce per chunk. The aux backward (in
-        # ``_optimizer_step``) runs OUTSIDE no_sync and fires the single
-        # DDP all_reduce per microstep.
-        chunked = self._chunked_diffusion_active()
-        if chunked:
-            sync_ctx = self.ddp_model.no_sync() if self.world_size > 1 else nullcontext()
-            backward_fn = self._scaled_backward
-            loss_cfg_arg = cfg
-            chunk_size_arg = cfg.diffusion_chunk_size
-        else:
-            sync_ctx = nullcontext()
-            backward_fn = None
-            loss_cfg_arg = None
-            chunk_size_arg = 0
-
-        with sync_ctx:
-            pred = self.model.forward_training(
-                features,
-                num_recycles=num_recycles,
-                diffusion_batch_size=cfg.diffusion_batch_size,
-                mini_rollout_steps=cfg.mini_rollout_steps,
-                mini_rollout_samples=cfg.mini_rollout_samples,
-                seed=self.global_step,
-                fused_ce=cfg.use_fused_ce_loss,
-                diffusion_chunk_size=chunk_size_arg,
-                backward_fn=backward_fn,
-                loss_cfg=loss_cfg_arg,
-            )
-
-        # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice per
-        # batch element and average (even for B=1, since the batch dim is kept).
-        # ``fp32_loss`` runs the combined loss with autocast disabled so
-        # softmax / CE always see fp32 logits.
-        loss_fn = fp32_guard(self.model_cfg.precision.fp32_loss)(training_loss)
-        B = cfg.batch_size_per_rank
-        losses_list: list[torch.Tensor] = []
-        loss_dict_acc: dict[str, torch.Tensor] = {}
-        for b in range(B):
-            pred_b = _slice_batch_dict(pred, b, B)
-            features_b = _slice_batch_dict(features, b, B)
-            loss_b, ld_b = loss_fn(pred_b, features_b, cfg)
-            losses_list.append(loss_b)
-            for k, v in ld_b.items():
-                if k in loss_dict_acc:
-                    loss_dict_acc[k] = loss_dict_acc[k] + v
-                else:
-                    loss_dict_acc[k] = v
-        total_loss = torch.stack(losses_list).mean()
-        loss_dict = {k: v / B for k, v in loss_dict_acc.items()}
+        """Thin wrapper around :func:`training_step` — keeps the call sites tidy."""
+        total_loss, loss_dict, num_recycles = training_step(
+            self.model,
+            features,
+            cfg=self.cfg,
+            model_cfg=self.model_cfg,
+            global_step=self.state.global_step,
+            accumulator=self.accumulator,
+            scaler=self.scaler,
+            device=self.dist.device,
+        )
+        self.state.last_num_recycles = num_recycles
         return total_loss, loss_dict
 
     def _chunked_diffusion_active(self) -> bool:
-        cfg = self.cfg
-        return cfg.diffusion_chunk_size > 0 and cfg.diffusion_batch_size % cfg.diffusion_chunk_size == 0
+        return is_chunked_diffusion_active(self.cfg)
 
     def _scaled_backward(self, loss: torch.Tensor) -> None:
-        """``scaler.scale(loss / accumulate).backward()`` — used by both the
-        chunked-diffusion per-chunk callback and the outer ``_optimizer_step``.
-        """
-        scaled = loss / self.cfg.accumulate_grad_batches
-        self.scaler.scale(scaled).backward()
+        scaled_backward(self.scaler, loss, self.cfg.accumulate_grad_batches)
 
     # ------------------------------------------------------------------
     # Optimizer step
     # ------------------------------------------------------------------
 
     def _optimizer_step(self, loss: torch.Tensor) -> bool:
-        """Backward pass, gradient clipping, and optimizer step.
+        """Accumulate the microstep's NaN flag, backward, and — on sync — step.
 
-        When ``accumulate_grad_batches > 1``, non-final microsteps run
-        under ``ddp_model.no_sync()`` so DDP defers the gradient
-        all-reduce until the final microstep — otherwise every backward
-        fires a redundant all-reduce per microstep.
-
-        NaN/Inf detection runs once per optimizer step at the sync
-        boundary (instead of once per microstep) via ``_nan_accum``: each
-        microstep ORs its local NaN flag into the accumulator on-device
-        with no collective. At the sync boundary a single
-        ``all_gather_into_tensor`` reports which rank(s) saw a bad loss
-        across the whole window — if any, all grads are zeroed and the
-        opt step is skipped. A second check after ``clip_grad_norm_``
-        catches finite-loss / NaN-gradient paths (e.g. log/sqrt/div)
-        that would otherwise corrupt weights via ``optimizer.step``.
-        ``cfg.max_consecutive_nan_skips`` bounds how many skips in a row
-        we tolerate before raising to fail fast.
-
-        Args:
-            loss: Scalar loss tensor from ``_training_step()``.
-
-        Returns:
-            True if an optimizer step was taken (effective_step advanced).
+        Delegates the NaN collective + unscale + clip + step contract
+        to :class:`WrappedOptimizer`; this shell handles the
+        no_sync/sync-step DDP gating and EMA update.
         """
-        # Per-microstep local NaN/Inf flag (no collective, no CPU sync).
-        # Shape [1] (not scalar) so ``all_gather_into_tensor`` can concatenate
-        # across ranks into ``_nan_gather_buf`` of shape [world_size].
-        if self._nan_accum is None:
-            self._nan_accum = torch.zeros(1, device=loss.device)
-        self._nan_accum.add_((torch.isnan(loss) | torch.isinf(loss)).float().view(1))
+        self.wrapped_optimizer.add_microstep_loss(loss)
 
-        next_step = self.global_step + 1
-        is_sync_step = next_step % self.cfg.accumulate_grad_batches == 0
-
-        # Suppress DDP gradient all-reduce on non-final accumulation steps.
-        sync_ctx = self.ddp_model.no_sync() if (not is_sync_step and self.world_size > 1) else nullcontext()
-        with sync_ctx:
+        is_sync_step = self.accumulator.is_sync_step(self.state.global_step)
+        with self.accumulator.step_context(is_sync_step=is_sync_step):
             self._scaled_backward(loss)
-
-        self.global_step = next_step
+        self.state.global_step += 1
 
         if not is_sync_step:
             return False
 
-        # Sync boundary: single collective for NaN check across ranks +
-        # all microsteps in this accumulation window. Use all_gather so the
-        # warning can name the offending rank(s).
-        if self.world_size > 1:
-            if self._nan_gather_buf is None:
-                self._nan_gather_buf = torch.zeros(self.world_size, device=self._nan_accum.device)
-            dist.all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
-            nan_flags = self._nan_gather_buf
-        else:
-            nan_flags = self._nan_accum
-        nan_detected = bool(nan_flags.any().item())  # one CPU sync per opt step
-        self._nan_accum.zero_()
-
-        attempted_step = self.effective_step + 1
-
-        if nan_detected:
-            # Any microstep on any rank produced NaN/Inf — discard the whole
-            # accumulation window (NaN would have propagated via DDP all_reduce
-            # on the sync-step backward above).
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.is_main:
-                bad_ranks = (nan_flags > 0).nonzero(as_tuple=False).flatten().tolist()
-                logger.warning(
-                    f"Step {attempted_step}: NaN/Inf loss in accumulation window (ranks={bad_ranks}), skipping"
-                )
-            self._on_nan_skip(attempted_step, reason="loss")
-            return False
-
-        self.scaler.unscale_(self.optimizer)
-
-        # Always compute the global pre-clip grad norm for logging,
-        # even when grad_clip_norm <= 0 (use a huge cap as no-op).
-        clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
-        self._last_grad_norm = grad_norm
-
-        # clip_grad_norm_ returns a NaN/Inf total when ANY param grad is
-        # non-finite, so this single check covers the whole model. Without
-        # it, a finite loss with non-finite grads (log/sqrt/div paths)
-        # silently corrupts weights via optimizer.step.
-        if not bool(torch.isfinite(grad_norm).item()):
-            self.optimizer.zero_grad(set_to_none=True)
-            if self.is_main:
-                logger.warning(f"Step {attempted_step}: NaN/Inf in grads (norm={grad_norm.item():.3e}), skipping")
-            self._on_nan_skip(attempted_step, reason="grad")
-            return False
-
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
-        self.scheduler.step()
-
-        self.effective_step += 1
-        self._consecutive_nan_skips = 0
-
-        if self.ema is not None:
+        result = self.wrapped_optimizer.step_or_skip(self.state)
+        if result.advanced and self.ema is not None:
             self.ema.update(self.model)
-
-        return True
-
-    def _on_nan_skip(self, attempted_step: int, *, reason: Literal["loss", "grad"]) -> None:
-        """Increment the skip counter and abort training if it exceeds the limit."""
-        self._consecutive_nan_skips += 1
-        limit = self.cfg.max_consecutive_nan_skips
-        if limit > 0 and self._consecutive_nan_skips >= limit:
-            msg = (
-                f"Aborting: {self._consecutive_nan_skips} consecutive non-finite "
-                f"{reason} skips at step {attempted_step} (limit={limit})."
-            )
-            if self.is_main:
-                logger.critical(msg)
-            raise RuntimeError(msg)
+        return result.advanced
 
     # ------------------------------------------------------------------
     # Evaluation
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def _evaluate(self, eval_dl: DataLoader) -> dict[str, float]:
-        """Run evaluation on the eval set.
-
-        Swaps in EMA weights if available, runs forward_training on each
-        batch, computes losses and distogram lDDT, then restores weights.
-
-        Args:
-            eval_dl: Evaluation dataloader.
-
-        Returns:
-            Dict mapping metric names to averaged values.
-        """
-        if self.ema is not None:
-            self.ema.apply(self.model)
-
-        self.model.eval()
-        metrics: dict[str, list[float]] = {}
-        n_batches = len(eval_dl)
-
-        for batch_idx, features in enumerate(eval_dl):
-            features = self._prepare_features(features)
-
-            try:
-                with (
-                    torch.no_grad(),
-                    torch.autocast(
-                        device_type="cuda",
-                        dtype=self.cfg.torch_dtype,
-                        enabled=(self.cfg.dtype != "fp32"),
-                    ),
-                ):
-                    pred = self.model.forward_training(
-                        features,
-                        num_recycles=min(self.cfg.max_recycles, 4),
-                        diffusion_batch_size=1,
-                        mini_rollout_steps=self.cfg.mini_rollout_steps,
-                        mini_rollout_samples=1,
-                        seed=0,
-                    )
-                    # Slice batch dim (always kept) before loss.
-                    # Use actual batch size from the data (not cfg) — the last
-                    # eval batch may be smaller than batch_size_per_rank when the
-                    # dataset size isn't evenly divisible.
-                    B_actual = features["res_type"].shape[0]
-                    pred_0 = _slice_batch_dict(pred, 0, B_actual)
-                    features_0 = _slice_batch_dict(features, 0, B_actual)
-                    eval_loss_fn = fp32_guard(self.model_cfg.precision.fp32_loss)(training_loss)
-                    _, loss_dict = eval_loss_fn(pred_0, features_0, self.cfg)
-
-                for k, v in loss_dict.items():
-                    metrics.setdefault(f"eval/{k}", []).append(v.item())
-
-                if self.is_main and self.cfg.log_microsteps:
-                    logger.info("eval: %d/%d loss=%.2f", batch_idx + 1, n_batches, loss_dict["total"])
-            except Exception as e:
-                logger.warning("Eval error at batch %d: %s", batch_idx, e, exc_info=True)
-                continue
-
-        self.model.train()
-
-        if self.ema is not None:
-            self.ema.restore(self.model)
-
-        return {k: sum(v) / max(len(v), 1) for k, v in metrics.items()}
-
     def _run_eval_and_track_best(self, eval_dl: DataLoader, output_dir: Path) -> None:
         """Reseed eval sampler, run one eval pass, log metrics, save best checkpoint."""
         if hasattr(eval_dl.sampler, "set_epoch"):
-            eval_dl.sampler.set_epoch(self.effective_step)
-        eval_metrics = self._evaluate(eval_dl)
-        if self.is_main:
-            logger.info(f"Eval at step {self.effective_step}: {eval_metrics}")
-            if self._wandb is not None:
-                self._wandb.log(eval_metrics, step=self.effective_step)
+            eval_dl.sampler.set_epoch(self.state.effective_step)
+        eval_metrics = run_eval(
+            self.model,
+            self.ema,
+            eval_dl,
+            self.cfg,
+            self.model_cfg,
+            device=self.dist.device,
+            is_main=self.dist.is_main,
+            log_microsteps=self.cfg.log_microsteps,
+        )
+        if self.dist.is_main:
+            logger.info(f"Eval at step {self.state.effective_step}: {eval_metrics}")
+            self.trackers.log(eval_metrics, step=self.state.effective_step)
             eval_total = eval_metrics.get("eval/total", float("inf"))
-            if eval_total < self._best_eval_loss:
-                self._best_eval_loss = eval_total
+            if eval_total < self.state.best_eval_loss:
+                self.state.best_eval_loss = eval_total
                 self._save_checkpoint(output_dir / "checkpoint_best.pt")
                 logger.info(f"New best eval loss: {eval_total:.4f}")
 
@@ -1141,84 +327,34 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, path: Path) -> None:
-        """Save model, optimizer, scheduler, EMA, and step counters.
-
-        Args:
-            path: File path for the checkpoint ``.pt`` file.
-        """
-        state = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "global_step": self.global_step,
-            "effective_step": self.effective_step,
-            "best_eval_loss": self._best_eval_loss,
-            "model_cfg": self.model_cfg,
-            "train_cfg": self.cfg,
-        }
-        if self.ema is not None:
-            state["ema"] = self.ema.state_dict()
-        torch.save(state, path)
-        logger.info(f"Saved checkpoint to {path}")
-
-        # Rotate old checkpoints
-        if self.cfg.max_checkpoints > 0:
-            self._rotate_checkpoints(path.parent)
-
-    def _rotate_checkpoints(self, output_dir: Path) -> None:
-        """Keep only the N most recent checkpoints."""
-        pattern = "checkpoint_*.pt"
-        ckpts = sorted(output_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
-        # Exclude checkpoint_final.pt from rotation
-        ckpts = [c for c in ckpts if "final" not in c.stem and "best" not in c.stem]
-        while len(ckpts) > self.cfg.max_checkpoints:
-            old = ckpts.pop(0)
-            old.unlink()
-            logger.info(f"Removed old checkpoint: {old}")
+        """Save checkpoint via :class:`CheckpointManager`."""
+        self.ckpt_manager.save(
+            path,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            ema=self.ema,
+            state=self.state,
+            model_cfg=self.model_cfg,
+            train_cfg=self.cfg,
+        )
 
     @staticmethod
     def _find_latest_checkpoint(output_dir: Path) -> Path | None:
-        """Find the checkpoint with the highest step number in *output_dir*."""
-        best_step, best_path = -1, None
-        for p in output_dir.glob("checkpoint_*.pt"):
-            m = re.search(r"checkpoint_(\d+)\.pt$", p.name)
-            if m:
-                step = int(m.group(1))
-                if step > best_step:
-                    best_step, best_path = step, p
-        return best_path
+        return CheckpointManager.find_latest(output_dir)
 
     def _load_checkpoint(self, path: Path) -> None:
-        """Resume training from a checkpoint.
-
-        Handles DDP ``module.`` prefix stripping automatically.
-        Supports partial loading via config flags.
-
-        Args:
-            path: Path to a checkpoint saved by ``_save_checkpoint()``.
-        """
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        # Handle DDP module. prefix
-        state_dict = ckpt["model"]
-        if any(k.startswith("module.") for k in state_dict):
-            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-        self.model.load_state_dict(state_dict, strict=self.cfg.load_strict)
-
-        if "optimizer" in ckpt and not self.cfg.skip_load_optimizer:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-        if "scheduler" in ckpt and not self.cfg.skip_load_scheduler:
-            self.scheduler.load_state_dict(ckpt["scheduler"])
-        if "ema" in ckpt and self.ema is not None:
-            self.ema.load_state_dict(ckpt["ema"])
-
-        if not self.cfg.skip_load_step:
-            self.global_step = ckpt.get("global_step", 0)
-            self.effective_step = ckpt.get("effective_step", 0)
-        self._best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
-
-        if self.is_main:
-            logger.info(f"Resumed from {path} at step {self.effective_step}")
+        """Load checkpoint via :class:`CheckpointManager`."""
+        self.ckpt_manager.load(
+            path,
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            ema=self.ema,
+            state=self.state,
+            train_cfg=self.cfg,
+            is_main=self.dist.is_main,
+        )
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -1237,7 +373,7 @@ class Trainer:
         self._seed_everything()
 
         self._init_model()
-        self._init_wandb()
+        self._init_trackers()
 
         train_dl, eval_dl = self._init_dataloaders()
         output_dir = Path(self.cfg.output_dir)
@@ -1245,7 +381,7 @@ class Trainer:
 
         # Save resolved config (all CLI/YAML overrides applied) for reproducibility.
         # Layout mirrors configs/*.yaml so the dump can be re-fed via --config.
-        if self.is_main:
+        if self.dist.is_main:
             config_out = output_dir / "config.yaml"
             with open(config_out, "w") as f:
                 yaml.safe_dump(
@@ -1270,10 +406,10 @@ class Trainer:
                 self._load_checkpoint(latest)
 
         cfg = self.cfg
-        if self.is_main:
+        if self.dist.is_main:
             tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
-            effective_batch_size = cfg.batch_size_per_rank * self.world_size * cfg.accumulate_grad_batches
-            tokens_per_opt_step = tokens_per_rank * self.world_size * cfg.accumulate_grad_batches
+            effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
+            tokens_per_opt_step = tokens_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
             logger.info(f"Starting training: max_steps={cfg.max_steps}")
             logger.info(f"  confidence_only={cfg.train_confidence_only}")
             logger.info(f"  lr={cfg.lr}, warmup={cfg.warmup_steps}, scheduler={cfg.finetune_scheduler}")
@@ -1282,7 +418,7 @@ class Trainer:
                 f"max_msa_seqs={cfg.max_msa_seqs}, max_recycles={cfg.max_recycles}"
             )
             logger.info(
-                f"  batch: world_size={self.world_size}, batch_per_rank={cfg.batch_size_per_rank}, "
+                f"  batch: world_size={self.dist.world_size}, batch_per_rank={cfg.batch_size_per_rank}, "
                 f"accumulate={cfg.accumulate_grad_batches} → "
                 f"effective_batch_size={effective_batch_size} (tokens_per_opt_step={tokens_per_opt_step})"
             )
@@ -1296,7 +432,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
 
         epoch = 0
-        meters = DistributedAverageMeters(self.device)
+        meters = DistributedAverageMeters(self.dist.device)
         t0 = time.monotonic()
         t_last_ckpt = t0
         # Pure microstep compute time accumulator (excludes eval / checkpoint /
@@ -1307,53 +443,35 @@ class Trainer:
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
-        self._checkpoint_requested = False
-        self._shutdown_requested = False
-        if platform.system() != "Windows":
-            signal.signal(signal.SIGUSR2, lambda *_: setattr(self, "_checkpoint_requested", True))
-
-            signal.signal(signal.SIGTERM, lambda *_: setattr(self, "_shutdown_requested", True))
-            signal.signal(signal.SIGINT, lambda *_: setattr(self, "_shutdown_requested", True))
-
-        shutdown_flag = torch.zeros(1, dtype=torch.int32, device=self.device)
+        shutdown = ShutdownCoordinator(self.dist)
+        ckpt_request = CheckpointRequestHandler()
 
         if cfg.eval_before and eval_dl is not None:
             self._run_eval_and_track_best(eval_dl, output_dir)
 
-        while self.effective_step < self.cfg.max_steps:
+        while self.state.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
 
             for features in train_dl:
-                if self.effective_step >= self.cfg.max_steps:
+                if self.state.effective_step >= self.cfg.max_steps:
                     break
 
                 t_microstep_start = time.monotonic()
-                try:
-                    with torch.autocast(
-                        device_type="cuda",
-                        dtype=self.cfg.torch_dtype,
-                        enabled=(self.cfg.dtype != "fp32"),
-                    ):
-                        loss, loss_dict = self._training_step(features)
-                except torch.cuda.OutOfMemoryError as e:
-                    logger.warning(
-                        f"Step {self.effective_step}: OOM, skipping batch: {e}",
-                        exc_info=True,
-                    )
-                    torch.cuda.empty_cache()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
-                    continue
-                except Exception as e:
-                    logger.warning(
-                        f"Step {self.effective_step}: skipping batch ({e})",
-                        exc_info=True,
-                    )
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
-                    continue
+                # No except-and-continue on OOM/exception: ``continue`` skips
+                # the per-microstep shutdown_flag all_reduce + the sync-boundary
+                # NaN all_gather, which desynchronizes collective participation
+                # across ranks → peers hang on a 600s NCCL watchdog. Fail hard
+                # so torchrun reaps the whole process group; the surviving
+                # traceback (logged via the rank-tagged handler in train.py)
+                # identifies the offending rank.
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=self.cfg.torch_dtype,
+                    enabled=(self.cfg.dtype != "fp32"),
+                ):
+                    loss, loss_dict = self._training_step(features)
 
                 # NaN/Inf detection is deferred to the opt-step boundary inside
                 # ``_optimizer_step`` — a single all-reduce per window replaces
@@ -1367,7 +485,7 @@ class Trainer:
                 n_tokens = (
                     seq_mask.sum()
                     if seq_mask is not None
-                    else torch.tensor(cfg.max_tokens * cfg.batch_size_per_rank, device=self.device)
+                    else torch.tensor(cfg.max_tokens * cfg.batch_size_per_rank, device=self.dist.device)
                 )
                 loss_dict["_tokens"] = n_tokens
                 meters.update(loss_dict, n=1)
@@ -1379,8 +497,8 @@ class Trainer:
                 dt_micro = time.monotonic() - t_microstep_start
                 microstep_compute_time += dt_micro
 
-                if cfg.log_microsteps and self.is_main:
-                    samples_per_microstep = self.world_size * cfg.batch_size_per_rank
+                if cfg.log_microsteps and self.dist.is_main:
+                    samples_per_microstep = self.dist.world_size * cfg.batch_size_per_rank
                     samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)
                     # Position within the current accumulation window: 1..accumulate
                     # (the accumulate-th microstep is the sync step that fires
@@ -1388,13 +506,13 @@ class Trainer:
                     # the effective_step this microstep is building toward — on the
                     # sync step it equals the just-incremented effective_step;
                     # otherwise it's effective_step+1.
-                    in_step = ((self.global_step - 1) % cfg.accumulate_grad_batches) + 1
-                    target = self.effective_step if on_opt_step_boundary else self.effective_step + 1
+                    in_step = ((self.state.global_step - 1) % cfg.accumulate_grad_batches) + 1
+                    target = self.state.effective_step if on_opt_step_boundary else self.state.effective_step + 1
                     logger.info(
                         f"micro: target={target} "
-                        f"global={self.global_step} "
+                        f"global={self.state.global_step} "
                         f"in_step={in_step}/{cfg.accumulate_grad_batches} "
-                        f"recycles={self._last_num_recycles} "
+                        f"recycles={self.state.last_num_recycles} "
                         f"loss={loss.item():.4f} "
                         f"dt_micro={dt_micro:.2f}s samples/s={samples_per_sec:.3f}"
                     )
@@ -1411,7 +529,7 @@ class Trainer:
                 # Collective: ``meters.sync`` issues ``all_gather_object`` +
                 # ``all_reduce``, so the gate MUST be identical on all ranks
                 # (no per-rank conditions like ``meters.count > 0``).
-                if on_opt_step_boundary and self.effective_step % self.cfg.log_interval == 0:
+                if on_opt_step_boundary and self.state.effective_step % self.cfg.log_interval == 0:
                     avg, sums = meters.sync()
                     meters.reset()
 
@@ -1420,8 +538,10 @@ class Trainer:
                     compute_time_window = microstep_compute_time
                     microstep_compute_time = 0.0
 
-                    if self.is_main:
-                        grad_norm = self._last_grad_norm.item() if self._last_grad_norm is not None else float("nan")
+                    if self.dist.is_main:
+                        grad_norm = (
+                            self.state.last_grad_norm.item() if self.state.last_grad_norm is not None else float("nan")
+                        )
                         elapsed = time.monotonic() - t0
                         # ``dt`` is per-effective-step compute time (forward+backward+step).
                         # Eval / checkpoint / logging time is intentionally excluded so the
@@ -1438,12 +558,12 @@ class Trainer:
                         peak_mem_gb = torch.cuda.max_memory_allocated() / (1 << 30) if torch.cuda.is_available() else 0
 
                         # ETA
-                        remaining = cfg.max_steps - self.effective_step
+                        remaining = cfg.max_steps - self.state.effective_step
                         eta_sec = remaining * dt
                         eta_h, eta_rem = divmod(int(eta_sec), 3600)
                         eta_str = f"{eta_h}:{eta_rem // 60:02d}" if eta_h > 0 else f"{int(eta_sec // 60)}m"
 
-                        parts = [f"step={self.effective_step}"]
+                        parts = [f"step={self.state.effective_step}"]
                         parts.append(f"loss={avg.get('total', 0):.4f}")
                         for k, v in sorted(avg.items()):
                             if k != "total":
@@ -1460,40 +580,36 @@ class Trainer:
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
 
-                        if self._wandb is not None:
-                            log_data = {f"train/{k}": v for k, v in avg.items()}
-                            log_data["train/step"] = self.effective_step
-                            log_data["train/lr"] = lr
-                            log_data["train/epoch"] = epoch
-                            log_data["train/grad_norm"] = grad_norm
-                            log_data["train/step_time_s"] = dt
-                            log_data["train/tokens_per_sec"] = tok_per_sec
-                            log_data["system/gpu_memory_allocated_gb"] = (
-                                torch.cuda.memory_allocated() / (1 << 30) if torch.cuda.is_available() else 0
-                            )
-                            log_data["system/gpu_memory_reserved_gb"] = (
-                                torch.cuda.memory_reserved() / (1 << 30) if torch.cuda.is_available() else 0
-                            )
-                            log_data["system/gpu_peak_memory_gb"] = peak_mem_gb
-                            self._wandb.log(log_data, step=self.effective_step)
+                        self.trackers.log(
+                            build_step_payload(
+                                avg=avg,
+                                effective_step=self.state.effective_step,
+                                lr=lr,
+                                epoch=epoch,
+                                grad_norm=grad_norm,
+                                dt=dt,
+                                tok_per_sec=tok_per_sec,
+                                peak_mem_gb=peak_mem_gb,
+                            ),
+                            step=self.state.effective_step,
+                        )
 
                 # --- Checkpoint (before eval so weights are saved even if eval crashes) ---
                 need_ckpt = False
-                if on_opt_step_boundary and self.is_main:
-                    if self.effective_step % self.cfg.checkpoint_interval == 0:
+                if on_opt_step_boundary and self.dist.is_main:
+                    if self.state.effective_step % self.cfg.checkpoint_interval == 0:
                         need_ckpt = True
                     elif (
                         cfg.checkpoint_every_hours > 0
                         and (time.monotonic() - t_last_ckpt) / 3600 >= cfg.checkpoint_every_hours
                     ):
                         need_ckpt = True
-                    elif self._checkpoint_requested:
-                        self._checkpoint_requested = False
+                    elif ckpt_request.consume():
                         need_ckpt = True
                         logger.info("Signal-triggered checkpoint requested")
 
                 if need_ckpt:
-                    self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
+                    self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
                     t_last_ckpt = time.monotonic()
 
                 # --- Evaluation ---
@@ -1501,60 +617,54 @@ class Trainer:
                 # per effective step — without the gate, ``effective_step``
                 # stays constant across ``accumulate_grad_batches`` microsteps
                 # and the check would trigger on every one of them.
-                if on_opt_step_boundary and eval_dl is not None and self.effective_step % self.cfg.eval_interval == 0:
+                if (
+                    on_opt_step_boundary
+                    and eval_dl is not None
+                    and self.state.effective_step % self.cfg.eval_interval == 0
+                ):
                     self._run_eval_and_track_best(eval_dl, output_dir)
 
                 # --- Shutdown ---
                 # Propagate on every microstep (cheap 1-elem all_reduce) so
                 # all ranks bail together, not just at opt-step boundaries.
-                # MAX so any rank's signal (SIGINT → all; SIGTERM may → rank 0
-                # only) reaches everyone.
-                if self.world_size > 1:
-                    shutdown_flag.fill_(int(self._shutdown_requested))
-                    dist.all_reduce(shutdown_flag, op=dist.ReduceOp.MAX)
-                    self._shutdown_requested = bool(shutdown_flag.item())
+                shutdown_now = shutdown.tick()
 
-                if self._shutdown_requested:
+                if shutdown_now:
                     # Mid-window: drop partial grads and rewind global_step
                     # to the last completed boundary so resume starts a fresh
                     # accumulation window. scheduler / scaler / EMA stay as-is
                     # (they only advance on sync steps).
                     partial = 0
                     if not on_opt_step_boundary:
-                        partial = self.global_step - self.effective_step * cfg.accumulate_grad_batches
+                        partial = self.state.global_step - self.state.effective_step * cfg.accumulate_grad_batches
                         self.optimizer.zero_grad(set_to_none=True)
-                        self.global_step = self.effective_step * cfg.accumulate_grad_batches
-                    if self.is_main:
+                        self.state.global_step = self.state.effective_step * cfg.accumulate_grad_batches
+                    if self.dist.is_main:
                         if partial:
                             logger.info(
-                                f"Shutdown mid-window at step {self.effective_step}: discarded "
+                                f"Shutdown mid-window at step {self.state.effective_step}: discarded "
                                 f"{partial}/{cfg.accumulate_grad_batches} partial microsteps"
                             )
                         else:
-                            logger.info(f"Shutdown at step {self.effective_step}")
-                        self._save_checkpoint(output_dir / f"checkpoint_{self.effective_step}.pt")
+                            logger.info(f"Shutdown at step {self.state.effective_step}")
+                        self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
                     break
 
-            if self._shutdown_requested:
+            if shutdown.requested:
                 break
             epoch += 1
 
         # Final checkpoint
-        if self.is_main:
-            if not self._shutdown_requested:
+        if self.dist.is_main:
+            if not shutdown.requested:
                 self._save_checkpoint(output_dir / "checkpoint_final.pt")
             logger.info(
-                f"Training {'interrupted' if self._shutdown_requested else 'complete'} at step {self.effective_step}"
+                f"Training {'interrupted' if shutdown.requested else 'complete'} at step {self.state.effective_step}"
             )
 
-        if self._wandb is not None:
-            self._wandb.finish()
+        if self.trackers is not None:
+            self.trackers.finish()
 
-        # Per PyTorch reference: every trainer process must call
-        # ``destroy_process_group`` exactly once at the end. The call is a
-        # collective — all ranks must reach it, so it lives AFTER the
-        # training loop (not in a ``try/finally`` which could fire at
-        # different times on different ranks and cause a deadlock).
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()  # ensure all ranks finished before teardown
-            dist.destroy_process_group()
+        # Collective teardown — see ``destroy_process_group_safely`` for the
+        # ordering rationale (must live outside ``try/finally``).
+        destroy_process_group_safely()

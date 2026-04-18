@@ -1,0 +1,144 @@
+"""Per-microstep forward + loss computation (pre-backward).
+
+Moved out of ``trainer.py`` so the inner loop can be read without
+paging through ~100 lines of forward-pass + per-batch loss reduction.
+All functions are pure — they take explicit state (``global_step``,
+``scaler``, ``accumulator``) rather than reaching into a trainer
+instance.
+"""
+
+from __future__ import annotations
+
+import random
+from collections.abc import Callable
+
+import torch
+from torch.amp import GradScaler
+
+from deepfold3.model.config import ModelConfig, TrainingConfig
+from deepfold3.model.model import DeepFold3
+from deepfold3.model.precision import fp32_guard
+from deepfold3.training.accumulator import AccumulationLoop
+from deepfold3.training.collectives import slice_batch_dict
+from deepfold3.training.loss import training_loss
+from deepfold3.training.optim import is_chunked_diffusion_active
+
+
+def prepare_features(
+    features: dict[str, torch.Tensor],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Move features to ``device``, keeping the leading batch dim.
+
+    Keeping ``[B, ...]`` consistent makes every downstream module take
+    the batched code path regardless of ``batch_size_per_rank``.
+    """
+    return {k: v.to(device, non_blocking=True) for k, v in features.items()}
+
+
+def scaled_backward(scaler: GradScaler, loss: torch.Tensor, accumulate: int) -> None:
+    """``scaler.scale(loss / accumulate).backward()``.
+
+    Shared between the chunked-diffusion per-chunk callback and the
+    outer aux backward in ``_optimizer_step``.
+    """
+    scaler.scale(loss / accumulate).backward()
+
+
+def pick_num_recycles(cfg: TrainingConfig, global_step: int) -> int:
+    """Sample ``num_recycles`` for this microstep.
+
+    Two modes:
+
+    * ``uniform_recycle=True`` (default): all DDP ranks pick the SAME
+      ``num_recycles`` via a fresh ``random.Random`` seeded from
+      ``(cfg.seed, global_step)`` — both identical on every rank. Avoids
+      the straggler effect where one rank does 3 no_grad warmup passes
+      and another does 0, blocking DDP all_reduce on the slowest rank
+      (~4× wasted compute at ``max_recycles=3``).
+    * ``uniform_recycle=False``: legacy per-rank Python random — each
+      rank picks independently from its own seeded RNG. Trains on more
+      diverse recycle counts per global batch but pays the straggler
+      cost.
+    """
+    if cfg.uniform_recycle:
+        return random.Random(cfg.seed + global_step).randint(0, cfg.max_recycles)
+    return random.randint(0, cfg.max_recycles)
+
+
+def training_step(
+    model: DeepFold3,
+    features: dict[str, torch.Tensor],
+    *,
+    cfg: TrainingConfig,
+    model_cfg: ModelConfig,
+    global_step: int,
+    accumulator: AccumulationLoop,
+    scaler: GradScaler,
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], int]:
+    """Run one forward pass + compute losses for all batch elements.
+
+    Returns ``(total_loss, loss_dict, num_recycles)``. The chunked
+    diffusion path back-props each chunk internally via
+    ``scaled_backward``; those per-chunk backwards run under
+    ``accumulator.chunk_context`` so DDP doesn't all_reduce per chunk
+    — the final aux backward fires the single per-microstep all_reduce.
+    """
+    features = prepare_features(features, device)
+
+    num_recycles = pick_num_recycles(cfg, global_step)
+
+    chunked = is_chunked_diffusion_active(cfg)
+    backward_fn: Callable[[torch.Tensor], None] | None
+    loss_cfg_arg: TrainingConfig | None
+    if chunked:
+
+        def backward_fn(loss: torch.Tensor) -> None:
+            scaled_backward(scaler, loss, cfg.accumulate_grad_batches)
+
+        loss_cfg_arg = cfg
+        chunk_size_arg = cfg.diffusion_chunk_size
+    else:
+        backward_fn = None
+        loss_cfg_arg = None
+        chunk_size_arg = 0
+
+    with accumulator.chunk_context(chunked_diffusion=chunked):
+        pred = model.forward_training(
+            features,
+            num_recycles=num_recycles,
+            diffusion_batch_size=cfg.diffusion_batch_size,
+            mini_rollout_steps=cfg.mini_rollout_steps,
+            mini_rollout_samples=cfg.mini_rollout_samples,
+            seed=global_step,
+            fused_ce=cfg.use_fused_ce_loss,
+            diffusion_chunk_size=chunk_size_arg,
+            backward_fn=backward_fn,
+            loss_cfg=loss_cfg_arg,
+        )
+
+    # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice
+    # per batch element and average (even for B=1, since the batch dim
+    # is kept). ``fp32_loss`` runs the combined loss with autocast
+    # disabled so softmax / CE always see fp32 logits.
+    loss_fn = fp32_guard(model_cfg.precision.fp32_loss)(training_loss)
+    batch_size = cfg.batch_size_per_rank
+    losses_list: list[torch.Tensor] = []
+    loss_dict_acc: dict[str, torch.Tensor] = {}
+    for b in range(batch_size):
+        pred_b = slice_batch_dict(pred, b, batch_size)
+        features_b = slice_batch_dict(features, b, batch_size)
+        loss_b, ld_b = loss_fn(pred_b, features_b, cfg)
+        losses_list.append(loss_b)
+        for k, v in ld_b.items():
+            if k in loss_dict_acc:
+                loss_dict_acc[k] = loss_dict_acc[k] + v
+            else:
+                loss_dict_acc[k] = v
+    total_loss = torch.stack(losses_list).mean()
+    loss_dict = {k: v / batch_size for k, v in loss_dict_acc.items()}
+    return total_loss, loss_dict, num_recycles
+
+
+__all__ = ["prepare_features", "scaled_backward", "pick_num_recycles", "training_step"]

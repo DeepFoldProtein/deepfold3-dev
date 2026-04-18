@@ -25,7 +25,7 @@ from deepfold3.model.diffusion import DiffusionHead
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import LinearNoBias
+from deepfold3.model.primitives import LayerNorm, LinearNoBias
 
 # Disable the determinism metadata check that compares saved vs recomputed
 # tensor shapes.  View reshapes inside checkpointed functions (e.g.
@@ -66,6 +66,7 @@ class DistogramHead(nn.Module):
         pair_channels: int = 128,
         cfg: DistogramConfig | None = None,
         fp32: bool = False,
+        use_half_logits_ln: bool | None = None,
     ):
         super().__init__()
         if cfg is None:
@@ -74,13 +75,20 @@ class DistogramHead(nn.Module):
         self.first_break = cfg.first_break
         self.last_break = cfg.last_break
         self.fp32 = fp32
+        # Explicit arg wins over cfg; otherwise use the cfg default.
+        if use_half_logits_ln is None:
+            use_half_logits_ln = bool(getattr(cfg, "use_half_logits_ln", False))
+        self.half_logits_ln = LayerNorm(pair_channels) if use_half_logits_ln else None
         # AF3: half_logits uses final_init (zeros)
         self.half_logits = LinearNoBias(pair_channels, self.num_bins, initializer="zeros")
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
         """Symmetrised logits [..., N, N, num_bins]."""
         with fp32_scope(self.fp32):
-            h = self.half_logits(pair.float() if self.fp32 else pair)
+            z = pair.float() if self.fp32 else pair
+            if self.half_logits_ln is not None:
+                z = self.half_logits_ln(z)
+            h = self.half_logits(z)
         return h + h.transpose(-3, -2)
 
     def expected_distance(self, pair: torch.Tensor) -> torch.Tensor:

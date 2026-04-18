@@ -8,6 +8,10 @@ The kernel expects 5D tensors in [B, N_seq, N_res, H, D] layout (DeepFold3
 convention) and internally transposes to [B, N_seq, H, N_res, D] for tiling.
 """
 
+# ``O`` is the Flash-Attention-paper output tensor; the single-letter name is
+# domain convention we preserve for readability against the published math.
+# ruff: noqa: E741
+
 from __future__ import annotations
 
 import torch

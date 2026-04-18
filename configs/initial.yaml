@@ -41,9 +41,8 @@ training:
   # Pair reg bounds DistogramHead logit magnitude; alpha=0 = observation-only.
   single_reg_p: 2
   alpha_single_reg: 0.0
-
   pair_reg_p: 2
-  alpha_pair_reg: 1.0e-4
+  alpha_pair_reg: 0.1
 
   lddt_cutoffs: [0.5, 1.0, 2.0, 4.0]
   lddt_inclusion_radius: 15.0

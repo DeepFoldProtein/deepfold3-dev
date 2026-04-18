@@ -602,6 +602,13 @@ class DistogramConfig:
     num_bins: int = 64
     first_break: float = 2.3125
     last_break: float = 21.6875
+    # Insert a LayerNorm before ``half_logits``. Off by default — AF3
+    # / Protenix / Boltz / OpenFold-3 all feed raw pair into a bare
+    # linear here. Turn on to decouple distogram logit magnitude from
+    # ``‖z‖``; useful as an alternative / complement to
+    # ``alpha_pair_reg``. Mirrors the ``pae_logits_ln`` / ``pde_logits_ln``
+    # pattern already used in ``ConfidenceHead``.
+    use_half_logits_ln: bool = False
 
 
 @dataclass

@@ -178,6 +178,7 @@ af3.bin
 
 # Training run outputs (checkpoints, logs, tensorboard, etc.)
 /runs/
+/tmp/
 
 # Weights & Biases
 wandb/
