@@ -24,15 +24,22 @@ def collate_fn(
     batch: list[dict[str, torch.Tensor]],
     *,
     bucket_pad: bool = False,
+    fixed_bucket_n: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Pad and stack a list of feature dicts into a batched dict.
 
     Args:
         batch: List of per-sample feature dicts from the dataset.
-        bucket_pad: If True, each sample's N dim is rounded up to the next
-            bucket size from :data:`deepfold3.model.bucket.BUCKET_SIZES` via
-            :func:`deepfold3.model.bucket.pad_features`. Required for the
-            Triton autotune cache to stay warm in production training.
+        bucket_pad: If True, each sample's N dim is rounded up to a bucket
+            size via :func:`deepfold3.model.bucket.pad_features`. Required
+            for the Triton autotune cache to stay warm in production.
+        fixed_bucket_n: If given (and ``bucket_pad`` is True), pad every
+            sample to **this exact N** regardless of its local size. Set to
+            ``cfg.max_tokens`` in distributed training so every rank
+            produces identical-shape batches — without it each rank picks
+            a different local bucket (via ``next_bucket(batch_n_max)``) and
+            the rank with the longest crop stalls the collective on every
+            step. When ``None``, falls back to per-batch ``next_bucket``.
     """
     if not batch:
         return {}
@@ -47,8 +54,11 @@ def collate_fn(
             sidecar = {k: v for k, v in sample.items() if not isinstance(v, torch.Tensor)}
             sidecars.append(sidecar)
             tensor_batch.append({k: v for k, v in sample.items() if isinstance(v, torch.Tensor)})
-        n_max = max(sample["res_type"].shape[0] for sample in tensor_batch if "res_type" in sample)
-        bucket_n = next_bucket(n_max)
+        if fixed_bucket_n is not None:
+            bucket_n = fixed_bucket_n
+        else:
+            n_max = max(sample["res_type"].shape[0] for sample in tensor_batch if "res_type" in sample)
+            bucket_n = next_bucket(n_max)
         padded = [pad_features(sample, bucket_n=bucket_n)[0] for sample in tensor_batch]
         batch = [{**p, **s} for p, s in zip(padded, sidecars, strict=True)]
 

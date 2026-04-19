@@ -29,8 +29,13 @@ from deepfold3.training.distributed import DistInfo
 logger = logging.getLogger(__name__)
 
 # Bucket-padded collation keeps Triton kernel input shapes (and the
-# persistent autotune cache keys) deterministic across microsteps.
-_collate_bucket_pad = partial(collate_fn, bucket_pad=True)
+# persistent autotune cache keys) deterministic across microsteps. For
+# distributed training we ALSO force ``fixed_bucket_n=cfg.max_tokens`` so
+# every rank emits batches of identical N — otherwise each rank picks a
+# local bucket via ``next_bucket(batch_n_max)`` and the rank with the
+# longest crop stalls every per-step collective (the 58 s multi-node tax).
+def _make_bucket_collate(max_tokens: int):
+    return partial(collate_fn, bucket_pad=True, fixed_bucket_n=max_tokens)
 
 
 def _apply_cutoff(records: list, cutoff: str, *, keep_after: bool) -> list:
@@ -316,7 +321,7 @@ def build_dataloaders(
         batch_size=cfg.batch_size_per_rank,
         sampler=train_sampler,
         shuffle=(train_sampler is None),
-        collate_fn=_collate_bucket_pad,
+        collate_fn=_make_bucket_collate(cfg.max_tokens),
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         drop_last=cfg.drop_last,
@@ -353,7 +358,7 @@ def build_dataloaders(
             batch_size=cfg.batch_size_per_rank,
             sampler=eval_sampler,
             shuffle=False,
-            collate_fn=_collate_bucket_pad,
+            collate_fn=_make_bucket_collate(cfg.max_tokens),
             num_workers=cfg.eval_num_workers,
             pin_memory=cfg.pin_memory,
             persistent_workers=cfg.eval_num_workers > 0,
