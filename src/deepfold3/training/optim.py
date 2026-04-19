@@ -128,6 +128,34 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
     return optimizer
 
 
+class _DDPTrainingForward(nn.Module):
+    """Expose ``DeepFold3.forward_training()`` as the wrapped module's ``forward``.
+
+    DDP's gradient reducer is primed inside ``ddp_model.__call__`` via
+    ``_pre_forward``/``prepare_for_backward`` — if that path never runs,
+    no bucket AllReduce is scheduled for the upcoming backward and each
+    rank trains on its own local gradients (silent DDP-no-sync bug).
+
+    DF3's training entry point is a bespoke method ``forward_training``
+    distinct from the inference ``forward``, so we put a tiny shim whose
+    ``forward`` routes to it. Parameters auto-register via ``self.df3 =
+    df3``, so ``ddp_model.parameters()`` returns the underlying DF3
+    params unchanged — checkpoint save/load and EMA still see the raw
+    DeepFold3 via ``self.model`` on the trainer.
+    """
+
+    def __init__(self, df3: nn.Module) -> None:
+        super().__init__()
+        self.df3 = df3
+
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        return self.df3.forward_training(features, **kwargs)
+
+
 def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.Module, bool]:
     """Wrap the model in :class:`DistributedDataParallel` (if distributed).
 
@@ -155,7 +183,9 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
     use_static_graph = cfg.static_graph and not needs_no_sync
 
     if not dist.is_distributed:
-        return model, use_static_graph
+        # Still wrap so the training call path is uniform, even though
+        # there's no gradient sync to schedule.
+        return _DDPTrainingForward(model), use_static_graph
 
     if cfg.static_graph and not use_static_graph:
         reasons = []
@@ -169,7 +199,7 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
         )
 
     ddp_model = DDP(
-        model,
+        _DDPTrainingForward(model),
         device_ids=[dist.local_rank],
         find_unused_parameters=cfg.find_unused_parameters,
         static_graph=use_static_graph,

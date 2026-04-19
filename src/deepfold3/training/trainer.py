@@ -288,8 +288,11 @@ class Trainer:
 
     def _training_step(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Thin wrapper around :func:`training_step` — keeps the call sites tidy."""
+        # MUST pass the DDP-wrapped model so that DDP's ``_pre_forward`` runs
+        # and primes the reducer for the upcoming backward — otherwise the
+        # bucket AllReduce is never scheduled and ranks train independently.
         total_loss, loss_dict, num_recycles = training_step(
-            self.model,
+            self.ddp_model,
             features,
             cfg=self.cfg,
             model_cfg=self.model_cfg,

@@ -105,7 +105,13 @@ def training_step(
         chunk_size_arg = 0
 
     with accumulator.chunk_context(chunked_diffusion=chunked):
-        pred = model.forward_training(
+        # ``model`` is the DDP-wrapped ``_DDPTrainingForward`` (see
+        # ``wrap_ddp``), whose ``forward`` routes to
+        # ``DeepFold3.forward_training``. Calling it via ``__call__`` is
+        # what triggers DDP's ``_pre_forward`` → reducer priming; calling
+        # ``forward_training`` directly bypasses DDP and silently drops
+        # gradient sync.
+        pred = model(
             features,
             num_recycles=num_recycles,
             diffusion_batch_size=cfg.diffusion_batch_size,
