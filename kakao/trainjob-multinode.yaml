@@ -189,10 +189,14 @@ spec:
       - name: NCCL_P2P_LEVEL
         value: "NVL"
       - name: NCCL_DEBUG
-        value: "INFO"
+        # WARN: silence all steady-state INIT/TUNING spam. Flip to INFO only
+        # when debugging comm setup or a new HCA/topology.
+        value: "WARN"
       - name: NCCL_DEBUG_SUBSYS
-        # INIT-only in steady state. Use INIT,COLL for perf investigation.
-        value: "INIT,COLL"
+        # INIT = comm setup/timings. TUNING = algo/proto choice per msg size
+        # (logged once per size, no per-collective spam). Use INIT,COLL only
+        # when you actually need the per-AllReduce stream trace.
+        value: "INIT,TUNING"
       - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
         value: "1"
       - name: TORCH_FR_BUFFER_SIZE
