@@ -449,6 +449,18 @@ class WrappedOptimizer:
                 self._account_skip(state, attempted_step, reason="grad")
                 return StepResult(advanced=False, was_nan=True, reason="grad", grad_norm=grad_norm, nan_ranks=bad_ranks)
 
+            # Surface grad-norm spikes that stay below the NaN/Inf skip
+            # trigger — gives per-rank record_ids for examples driving the
+            # spike without waiting for a hard blow-up.
+            log_threshold = self.cfg.grad_norm_log_threshold
+            if log_threshold > 0 and self._window_record_ids:
+                grad_norm_val = grad_norm.item()
+                if grad_norm_val > log_threshold:
+                    logger.warning(
+                        f"Step {attempted_step}: rank {self.dist.rank} grad_norm={grad_norm_val:.3e} "
+                        f"exceeded log_threshold={log_threshold:.3e} window record_ids={self._window_record_ids}"
+                    )
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)

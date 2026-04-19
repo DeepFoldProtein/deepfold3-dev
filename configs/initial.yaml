@@ -14,7 +14,8 @@ training:
 
   grad_clip_norm: 10.0
   grad_norm_fp64: true
-  accumulate_grad_batches: 16
+  grad_norm_log_threshold: 50.0
+  accumulate_grad_batches: 2
   ema_decay: 0.999
 
   max_tokens: 384

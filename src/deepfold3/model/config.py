@@ -425,6 +425,11 @@ class TrainingConfig:
     # to preserve bit-exact parity with the historical ``clip_grad_norm_``
     # path; enable when training at high grad magnitudes.
     grad_norm_fp64: bool = False
+    # When the observed (pre-clip) grad-norm exceeds this threshold, each
+    # rank logs the record_ids that contributed to its accumulation window.
+    # 0 disables. Useful for identifying examples that drive grad spikes
+    # but stay below the NaN/Inf skip trigger.
+    grad_norm_log_threshold: float = 0.0
 
     # EMA
     ema_decay: float = 0.999
