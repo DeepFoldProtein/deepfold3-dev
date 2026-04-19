@@ -265,3 +265,133 @@ class TestRealignMapping:
         result = _realign_mapping("AB", "ABCDE", m)
         # AlignmentError caught → returns original mapping
         assert result == m
+
+    def test_hit_past_seqres_end_returns_empty(self):
+        """Hit span entirely past the end of seqres — drop cleanly."""
+        from deepfold3.data.parse.templates import _realign_mapping
+
+        # seqres is 10 chars but mapping points at seqres positions 765..850
+        # (DB/mmCIF drift scenario).
+        seqres = "ABCDEFGHIJ"
+        struct_seq = "ABCDEFGHI"  # 1 shorter, so no short-circuit
+        m = {0: 765, 1: 800, 2: 850}
+        result = _realign_mapping(seqres, struct_seq, m)
+        assert result == {}
+
+    def test_hit_partially_past_seqres_end_returns_empty(self):
+        """Hit span partially past seqres end — also drop cleanly."""
+        from deepfold3.data.parse.templates import _realign_mapping
+
+        seqres = "ABCDEFGHIJ"  # length 10
+        struct_seq = "ABCDEFGHI"  # length 9
+        # start=5 is in bounds, end=15 exceeds seqres length
+        m = {0: 5, 1: 14}
+        result = _realign_mapping(seqres, struct_seq, m)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# _get_chain_sequences (microheterogeneity handling)
+# ---------------------------------------------------------------------------
+
+
+_MICROHET_CIF = """
+data_test
+_entry.id test
+loop_
+_entity.id
+_entity.type
+_entity.pdbx_description
+1 polymer "Test chain"
+#
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 ALA n
+1 2 CYS n
+1 3 MSE y
+1 3 MET y
+1 4 GLY n
+#
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_asym_id
+ATOM 1 C CA . ALA A 1 1 1 0.0 0.0 0.0 1.0 20.0 A
+ATOM 2 C CA . CYS A 1 2 2 3.8 0.0 0.0 1.0 20.0 A
+ATOM 3 C CA A MSE A 1 3 3 7.6 0.0 0.0 0.5 20.0 A
+ATOM 4 C CA B MET A 1 3 3 7.6 0.1 0.0 0.5 20.0 A
+ATOM 5 C CA . GLY A 1 4 4 11.4 0.0 0.0 1.0 20.0 A
+"""
+
+
+class TestGetChainSequencesMicrohet:
+    """Regression: microheterogeneity must not desync seqres and struct_seq."""
+
+    def _load(self):
+        gemmi = pytest.importorskip("gemmi")
+        from deepfold3.data.parse.templates import _get_chain_sequences
+
+        doc = gemmi.cif.read_string(_MICROHET_CIF)
+        st = gemmi.make_structure_from_block(doc[0])
+        st.setup_entities()
+        chain = st[0][0]
+        return _get_chain_sequences(st, chain)
+
+    def test_struct_seq_collapses_microhet(self):
+        """One residue per seqid — the MSE/MET pair becomes a single 'm'."""
+        seqres, struct_seq = self._load()
+        # Primary alternative at the microhet site is MSE (one_letter='m').
+        assert struct_seq == "ACmG"
+
+    def test_seqres_no_blank_microhet(self):
+        """seqres must not contain whitespace from 'MSE,MET' comma-joined names."""
+        seqres, _ = self._load()
+        assert seqres == "ACmG"
+        assert " " not in seqres
+
+    def test_lengths_match(self):
+        """seqres and struct_seq must have the same length for realignment to work."""
+        seqres, struct_seq = self._load()
+        assert len(seqres) == len(struct_seq)
+
+    def test_realign_does_not_error_on_microhet(self):
+        """The bug from the training log: realign must succeed, not raise."""
+        from deepfold3.data.parse.templates import _realign_mapping
+
+        seqres, struct_seq = self._load()
+        # Structure is no longer longer than seqres → realign returns a mapping.
+        result = _realign_mapping(seqres, struct_seq, {0: 0, 1: 1, 2: 2, 3: 3})
+        assert result == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+class TestOneLetterWhitespace:
+    """``_one_letter`` must treat blank one-letter codes as unknown."""
+
+    def test_blank_code_returns_x(self):
+        gemmi = pytest.importorskip("gemmi")
+        from deepfold3.data.parse.templates import _one_letter
+
+        # 'MSE,MET' is not a real residue name — gemmi returns one_letter_code=' '.
+        info = gemmi.find_tabulated_residue("MSE,MET")
+        assert _one_letter(info) == "X"
+
+    def test_none_returns_x(self):
+        from deepfold3.data.parse.templates import _one_letter
+
+        assert _one_letter(None) == "X"

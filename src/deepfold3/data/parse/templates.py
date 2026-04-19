@@ -532,9 +532,32 @@ def _parse_mmcif_chain(
 
 
 def _one_letter(info) -> str:
-    """Extract one-letter code from a gemmi ResidueInfo, defaulting to 'X'."""
+    """Extract one-letter code from a gemmi ResidueInfo, defaulting to 'X'.
+
+    Also treats whitespace codes as 'X' — ``find_tabulated_residue`` returns a
+    record with ``one_letter_code = ' '`` for unrecognised names (including the
+    ``"MSE,MET"``-style comma-joined strings gemmi emits at microheterogeneity
+    positions in ``entity.full_sequence``).
+    """
+    if info is None:
+        return "X"
     c = info.one_letter_code
-    return c if c and c not in ("?", "\0") else "X"
+    if not c or c in ("?", "\0") or not c.strip():
+        return "X"
+    return c
+
+
+def _seqres_one_letter(item) -> str:
+    """One-letter code for a seqres monomer name, handling microhet alternatives.
+
+    Gemmi encodes microheterogeneity as a comma-joined name (e.g. ``"MSE,MET"``)
+    in ``entity.full_sequence``. Use the first alternative so the seqres length
+    matches ``polymer.first_conformer()`` on the structure side.
+    """
+    primary = str(item).split(",", 1)[0].strip()
+    if not primary:
+        return "X"
+    return _one_letter(gemmi.find_tabulated_residue(primary))
 
 
 def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
@@ -548,19 +571,31 @@ def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
     if not polymer:
         return None, ""
 
-    struct_seq = "".join(_one_letter(gemmi.find_tabulated_residue(res.name)) for res in polymer)
+    # first_conformer() collapses microheterogeneity (multiple residues sharing
+    # the same seqid) to a single residue so struct_seq stays aligned 1:1 with
+    # seqres and with the residue lookup used downstream.
+    struct_seq = "".join(
+        _one_letter(gemmi.find_tabulated_residue(res.name)) for res in polymer.first_conformer()
+    )
 
     entity = st.get_entity_of(polymer)
     if entity is None or not entity.full_sequence:
         return None, struct_seq
 
-    seqres = "".join(_one_letter(gemmi.find_tabulated_residue(str(item))) for item in entity.full_sequence)
+    seqres = "".join(_seqres_one_letter(item) for item in entity.full_sequence)
     return seqres, struct_seq
 
 
 def _build_polymer_lookup(chain, max_atoms: int) -> dict[int, tuple[int, np.ndarray, np.ndarray]]:
-    """Build 0-based sequential index → residue features from a chain's polymer."""
-    return {idx: _extract_residue_features(res, max_atoms) for idx, res in enumerate(chain.get_polymer())}
+    """Build 0-based sequential index → residue features from a chain's polymer.
+
+    Uses ``first_conformer()`` so indices match ``_get_chain_sequences`` at
+    microheterogeneity sites.
+    """
+    return {
+        idx: _extract_residue_features(res, max_atoms)
+        for idx, res in enumerate(chain.get_polymer().first_conformer())
+    }
 
 
 def _fill_template_features(
@@ -622,6 +657,22 @@ def _realign_mapping(
     seqres_values = sorted(set(query_to_seqres.values()))
     start = seqres_values[0]
     end = seqres_values[-1] + 1
+
+    # Hit can fall entirely or partially past the end of this chain's seqres —
+    # typically a DB/mmCIF drift (PDB100 index pointed at a polymer length that
+    # no longer matches ``entity.full_sequence`` for the chain we selected, or
+    # the wrong chain was picked). Any "direct mapping" fallback would point at
+    # seqres indices that don't exist in ``residue_lookup`` downstream, so drop
+    # the hit cleanly.
+    if end > len(seqres):
+        logger.debug(
+            "Template realignment: hit span [%d:%d) exceeds seqres length %d — dropping hit",
+            start,
+            end,
+            len(seqres),
+        )
+        return {}
+
     hit_subseq = seqres[start:end]
 
     # Make mapping values relative to hit subsequence
