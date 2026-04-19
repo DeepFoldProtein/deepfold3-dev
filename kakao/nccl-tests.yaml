@@ -1,0 +1,207 @@
+# nccl-tests allreduce benchmark on 8 nodes × 8 B200 = 64 ranks.
+#
+# Purpose: establish the actual peak allreduce bandwidth of our IB fabric
+# independent of DF3. Compare vs DF3's 77s/step to decide whether inter-node
+# collective bandwidth is the ceiling or the model is model-bound.
+#
+# Uses the same deepspeed-llm runtime / Multus 8×IB / NCCL env as the training
+# job. First run compiles nccl-tests into /home/jovyan/.local (vv137-workspace
+# PVC) and caches it; subsequent runs reuse.
+#
+# Submit:  kubectl -n kbm-g-np-kias apply -f kakao/nccl-tests.yaml
+# Logs:    kubectl -n kbm-g-np-kias logs -f $(kubectl -n kbm-g-np-kias \
+#             get pods -l job-name=df3-nccltest-launcher-0 -o name | head -1)
+# Cancel:  kubectl -n kbm-g-np-kias delete trainjob df3-nccltest
+
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: df3-nccltest
+  namespace: kbm-g-np-kias
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: deepspeed-llm
+  trainer:
+    # mpirun with -np 64 launches one rank per GPU directly (no torchrun
+    # needed — nccl-tests is a single binary, not a Python entry).
+    numNodes: 8
+    numProcPerNode: 8
+    command:
+      - mpirun
+      - "--hostfile"
+      - /etc/mpi/hostfile
+      - "-np"
+      - "64"
+      - "--bind-to"
+      - "none"
+      # Pin OpenMPI's own internal channels (BTL = per-rank msgs, OOB =
+      # mpirun↔daemon control) to Calico eth0. Without this, OMPI auto-
+      # detects interfaces and picks Multus IPs (10.1.x.x) that aren't
+      # mutually routable — peer MPI connect() fails. This mirrors what
+      # we set for NCCL via NCCL_SOCKET_IFNAME=eth0, but for MPI's layer.
+      - "--mca"
+      - "btl_tcp_if_include"
+      - "eth0"
+      - "--mca"
+      - "oob_tcp_if_include"
+      - "eth0"
+      - "-x"
+      - NCCL_IB_DISABLE
+      - "-x"
+      - NCCL_IB_HCA
+      - "-x"
+      - NCCL_SOCKET_IFNAME
+      - "-x"
+      - NCCL_NVLS_ENABLE
+      - "-x"
+      - NCCL_P2P_LEVEL
+      - "-x"
+      - NCCL_DEBUG
+      - "-x"
+      - NCCL_DEBUG_SUBSYS
+      - "-x"
+      - JOBSET_NAME
+      - "-x"
+      - PATH
+      - "-x"
+      - LD_LIBRARY_PATH
+      - "-x"
+      - NCCL_TEST_BIN
+      - bash
+      - "-lc"
+      - |
+        set -euo pipefail
+
+        NCCL_TESTS_DIR=/home/jovyan/.local/nccl-tests
+        SENTINEL=${NCCL_TESTS_DIR}/.built
+
+        # Source must be pre-cloned from the notebook (deepspeed-runtime
+        # container has no `git`). Clone command run from the gateway:
+        #   git clone --depth 1 https://github.com/NVIDIA/nccl-tests.git \
+        #       /home/jovyan/.local/nccl-tests
+        if [ ! -f "${NCCL_TESTS_DIR}/Makefile" ]; then
+          echo "FATAL: ${NCCL_TESTS_DIR}/Makefile missing — clone source first"
+          exit 1
+        fi
+
+        if [ "${OMPI_COMM_WORLD_RANK}" = "0" ]; then
+          if [ ! -f "${SENTINEL}" ]; then
+            echo "[rank0] building nccl-tests in ${NCCL_TESTS_DIR}"
+            cd ${NCCL_TESTS_DIR}
+            # MPI lives at Debian's packaged OpenMPI path on this image
+            # (not /usr/local/mpi). CUDA is at /usr/local/cuda.
+            make MPI=1 MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi \
+                 CUDA_HOME=/usr/local/cuda \
+                 -j 8
+            touch ${SENTINEL}
+            echo "[rank0] build ready"
+          else
+            echo "[rank0] reusing ${NCCL_TESTS_DIR}"
+          fi
+        else
+          until [ -f "${SENTINEL}" ]; do sleep 3; done
+        fi
+
+        export RANK=${OMPI_COMM_WORLD_RANK}
+        export WORLD_SIZE=${OMPI_COMM_WORLD_SIZE}
+        export LOCAL_RANK=${OMPI_COMM_WORLD_LOCAL_RANK}
+        echo "RANK=${RANK} LOCAL_RANK=${LOCAL_RANK} HOST=$(hostname)"
+
+        # MPI can't be Init'd twice in the same process — each test must be
+        # its own submission. Override via env NCCL_TEST_BIN:
+        #   all_reduce_perf (default), all_gather_perf, reduce_scatter_perf,
+        #   broadcast_perf, alltoall_perf, sendrecv_perf, scatter_perf,
+        #   gather_perf, reduce_perf.
+        BIN=${NCCL_TESTS_DIR}/build/${NCCL_TEST_BIN:-all_reduce_perf}
+        if [ ! -x "${BIN}" ]; then
+          echo "FATAL: ${BIN} missing after build"
+          exit 1
+        fi
+        # Sweep: 8B → 8G, ×2, 1 GPU/proc, 20 iters + 5 warmup.
+        exec ${BIN} -b 8 -e 8G -f 2 -g 1 -n 20 -w 5
+    env:
+      - name: NCCL_IB_DISABLE
+        value: "0"
+      - name: NCCL_IB_HCA
+        value: "mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
+      - name: NCCL_SOCKET_IFNAME
+        value: "eth0"
+      - name: NCCL_NVLS_ENABLE
+        value: "1"
+      - name: NCCL_P2P_LEVEL
+        value: "NVL"
+      - name: NCCL_DEBUG
+        value: "INFO"
+      - name: NCCL_DEBUG_SUBSYS
+        value: "INIT"
+      - name: NCCL_TEST_BIN
+        # Which nccl-tests binary to run. Change per submission.
+        value: "all_gather_perf"
+      - name: PATH
+        value: "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      - name: LD_LIBRARY_PATH
+        value: "/usr/local/cuda/lib64:/usr/local/nccl/lib:/usr/local/mpi/lib"
+      - name: JOBSET_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+    resourcesPerNode:
+      requests:
+        cpu: "96"
+        memory: 1Ti
+        nvidia.com/gpu: "8"
+        nvidia.com/mlnxnics: "8"
+      limits:
+        cpu: "96"
+        memory: 1Ti
+        nvidia.com/gpu: "8"
+        nvidia.com/mlnxnics: "8"
+  podTemplateOverrides:
+    - targetJobs:
+        - name: launcher
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /home/jovyan
+                name: home
+              - mountPath: /dev/shm
+                name: dshm
+        volumes:
+          - name: home
+            persistentVolumeClaim:
+              claimName: vv137-workspace
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi
+    - targetJobs:
+        - name: node
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /home/jovyan
+                name: home
+              - mountPath: /dev/shm
+                name: dshm
+        volumes:
+          - name: home
+            persistentVolumeClaim:
+              claimName: vv137-workspace
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 64Gi

@@ -1,0 +1,318 @@
+# DeepFold3 multi-node training — 8 nodes × 8 B200 (= 64 ranks) on Kakao Cloud.
+#
+# Topology assumptions:
+#   * deepspeed-llm TrainingRuntime (OpenMPI launcher + IB sidecar image)
+#   * per-node:  8× B200,  8× mlnxnics,  64 CPU,  1 Ti mem
+#   * PVC `vv137-workspace` holds /home/jovyan (repo, .venv, uv/triton cache)
+#   * PVC `deepfold3-sync`  holds /data     (training + mmCIF mirror)
+#
+# Placeholders (replaced by kakao/submit.sh at apply time):
+#   __JOB_NAME__    — k8s resource name (DNS-1123)
+#   __RUN_NAME__    — wandb run name + output subdir
+#   __WANDB_PROJECT__
+#   __WANDB_ENTITY__
+#   __EXTRA_ARGS__  — extra CLI args for deepfold3 train (e.g. --resume …)
+#
+# Pre-requisites (see kakao/submit.sh header):
+#   kc apply -f ../../nipa-kakao/examples/esm2/trainruntime-deepspeed.yaml  # once
+#   kubectl create secret generic wandb-api-key \
+#       --from-literal=api-key="$WANDB_API_KEY" -n kbm-g-np-kias            # once
+#
+# Submit:  bash kakao/submit.sh <run-name>
+# Status:  kc get trainjob __JOB_NAME__
+# Logs:    kc logs -f $(kc get pods -l job-name=__JOB_NAME__-launcher-0 -o name | head -1)
+# Per-rank stdout: /home/jovyan/work/deepfold3-dev/runs/__RUN_NAME__/logs/rank_*.log
+# Cancel:  kc delete trainjob __JOB_NAME__
+
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: __JOB_NAME__
+  namespace: kbm-g-np-kias
+spec:
+  runtimeRef:
+    apiGroup: trainer.kubeflow.org
+    kind: TrainingRuntime
+    name: deepspeed-llm
+  trainer:
+    # numProcPerNode=1 → MPI launches ONE agent per node (8 total). Each agent
+    # then runs torchrun --nproc-per-node=8 to fan out the 8 GPU workers in-proc.
+    # Benefits over -np 64 direct: native --redirects/--tee per-rank logs, no
+    # per-rank PATH/env propagation issues, matches runs/notes byte-for-byte.
+    numNodes: 8
+    numProcPerNode: 1
+    command:
+      - mpirun
+      - "--hostfile"
+      - /etc/mpi/hostfile
+      - "-np"
+      - "8"                             # one torchrun agent per node
+      - "--bind-to"
+      - "none"
+      - "-x"
+      - NCCL_IB_DISABLE
+      - "-x"
+      - NCCL_IB_HCA
+      - "-x"
+      - NCCL_SOCKET_IFNAME
+      - "-x"
+      - NCCL_NVLS_ENABLE
+      - "-x"
+      - NCCL_P2P_LEVEL
+      - "-x"
+      - NCCL_DEBUG
+      - "-x"
+      - NCCL_DEBUG_SUBSYS
+      - "-x"
+      - TORCH_NCCL_ASYNC_ERROR_HANDLING
+      - "-x"
+      - TORCH_FR_BUFFER_SIZE
+      - "-x"
+      - WANDB_API_KEY
+      - "-x"
+      - JOBSET_NAME
+      - "-x"
+      - RUN_NAME
+      - "-x"
+      - WANDB_PROJECT
+      - "-x"
+      - WANDB_ENTITY
+      - "-x"
+      - EXTRA_ARGS
+      - "-x"
+      - UV_CACHE_DIR
+      - "-x"
+      - UV_PYTHON_INSTALL_DIR
+      - "-x"
+      - TRITON_CACHE_DIR
+      - "-x"
+      - PYTORCH_KERNEL_CACHE_PATH
+      - "-x"
+      - XDG_CACHE_HOME
+      - "-x"
+      - HF_HOME
+      - "-x"
+      - PYTHONUNBUFFERED
+      - "-x"
+      - OMP_NUM_THREADS
+      - "-x"
+      - TORCH_DISTRIBUTED_DEBUG
+      - bash
+      - "-lc"
+      - |
+        set -euo pipefail
+
+        NODE_RANK=${OMPI_COMM_WORLD_RANK}
+        MASTER_ADDR=${JOBSET_NAME}-launcher-0-0.${JOBSET_NAME}
+        MASTER_PORT=29500
+
+        REPO=/home/jovyan/work/deepfold3-dev
+        VENV=${REPO}/.venv
+        RUN_DIR=${REPO}/runs/${RUN_NAME}
+        LOG_DIR=${RUN_DIR}/logs
+
+        # --- fast-start install (NODE_RANK=0 only, sentinel on PVC) ---------
+        # uv cache, the venv, AND uv-managed Python all live on vv137-workspace
+        # so every node resolves the .venv/bin/python symlink to the same PVC
+        # path. Sentinel keyed on uv.lock hash auto-invalidates on dep edits.
+        LOCK_HASH=$(sha256sum ${REPO}/uv.lock | cut -c1-16)
+        SENTINEL="${VENV}/.sync-done.${LOCK_HASH}"
+        if [ "${NODE_RANK}" = "0" ]; then
+          if [ ! -f "${SENTINEL}" ]; then
+            echo "[node0] rebuilding ${VENV} via uv sync --frozen (lock=${LOCK_HASH})"
+            rm -rf ${VENV}
+            pip install --no-cache-dir uv
+            (cd ${REPO} && uv sync --frozen --python 3.11)
+            touch ${SENTINEL}
+            echo "[node0] venv ready"
+          else
+            echo "[node0] reusing ${VENV} (lock=${LOCK_HASH} matches)"
+          fi
+        else
+          # Poll the PVC sentinel; node0 can take several minutes on cold cache.
+          until [ -f "${SENTINEL}" ]; do sleep 5; done
+        fi
+
+        export PATH=${VENV}/bin:${PATH}
+
+        mkdir -p ${LOG_DIR}
+        cd ${REPO}
+        echo "NODE_RANK=${NODE_RANK} HOST=$(hostname) PYTHON=$(readlink -f $(which python))"
+
+        # torchrun fans out 8 worker procs locally; --redirects 3 --tee 3 gives
+        # us per-rank stdout.log files under ${LOG_DIR}/attempt_*/<rank>/ which
+        # is what the inf-grad investigation flow expects.
+        exec torchrun \
+          --nnodes=8 \
+          --nproc-per-node=8 \
+          --node-rank=${NODE_RANK} \
+          --master-addr=${MASTER_ADDR} \
+          --master-port=${MASTER_PORT} \
+          --redirects 3 --tee 3 \
+          --log-dir=${LOG_DIR} \
+          -m deepfold3.scripts.train \
+          --config configs/initial.yaml \
+          --output ${RUN_DIR} \
+          --ccd /data/components.cif.gz \
+          --mmcif-dir /data/pdb/divided \
+          --wandb ${WANDB_PROJECT} \
+          --wandb-entity ${WANDB_ENTITY} \
+          --override wandb_run_name=${RUN_NAME} \
+          --override seed=99 \
+          --override epoch_size=100000 \
+          ${EXTRA_ARGS}
+    env:
+      - name: NCCL_IB_DISABLE
+        value: "0"
+      - name: NCCL_IB_HCA
+        # The 8 Multus-attached 400 Gb/sec NDR HCAs on this cluster. All 22
+        # mlx5 devices are visible in /sys/class/infiniband (host leak), but
+        # only these 8 are bound to the pod's net-attach-defs. Without this,
+        # NCCL auto-probe picks unreachable HCAs and falls back to TCP over
+        # eth0 (Calico), cutting throughput ~2×. Regenerate from the Multus
+        # network-status annotation if the cluster PCI layout ever changes.
+        value: "mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
+      - name: NCCL_SOCKET_IFNAME
+        # Pin NCCL OOB (bootstrap + small control msgs) to the Calico pod
+        # network. Without this, NCCL may pick one of the Multus net1..net8
+        # interfaces for OOB, whose IPs come from per-pod IPAM pools that
+        # aren't mutually routable — we saw node-0-6 hang on socketPollConnect
+        # to 10.1.25.x owned by another pod. eth0 is the shared Calico layer
+        # and is always reachable via service DNS.
+        value: "eth0"
+      - name: NCCL_NVLS_ENABLE
+        # NVLink SHARP in-network reduction on B200 NVLink5. Moves intra-node
+        # allreduce accumulation into the NVSwitch so GPUs stream-and-receive
+        # instead of full ring. NCCL ≥ 2.19 auto-enables on supported HW but
+        # explicit avoids auto-detect quirks.
+        value: "1"
+      - name: NCCL_P2P_LEVEL
+        value: "NVL"
+      - name: NCCL_DEBUG
+        value: "INFO"
+      - name: NCCL_DEBUG_SUBSYS
+        # INIT-only in steady state. Use INIT,COLL for perf investigation.
+        value: "INIT,COLL"
+      - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+        value: "1"
+      - name: TORCH_FR_BUFFER_SIZE
+        value: "20000"
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: TORCH_DISTRIBUTED_DEBUG
+        # DETAIL logs per-iteration forward/backward/comm timings. Noisy in
+        # production — enable only for perf investigation runs.
+        value: "DETAIL"
+      - name: OMP_NUM_THREADS
+        # 12 CPUs per GPU (= per rank): 4 DataLoader workers × OMP=3 threads.
+        # Trainer procs are CUDA-bound so their thread budget is headroom.
+        # 8 ranks × (4 workers × 3 threads) = 96 threads/node = 96 cores exactly.
+        value: "3"
+      - name: UV_CACHE_DIR
+        value: "/home/jovyan/.cache/uv"
+      - name: UV_PYTHON_INSTALL_DIR
+        # uv-managed python MUST live on the shared PVC — otherwise
+        # .venv/bin/python symlinks to the launcher-only ephemeral FS
+        # and the other 56 ranks break with ModuleNotFoundError.
+        value: "/home/jovyan/.cache/uv/python"
+      - name: TRITON_CACHE_DIR
+        value: "/home/jovyan/.triton/autotune"
+      - name: PYTORCH_KERNEL_CACHE_PATH
+        # Torch's JIT kernel cache. Default ($HOME/.cache/torch/kernels)
+        # resolves to /home/mpiuser/.cache on the ephemeral container FS.
+        value: "/home/jovyan/.cache/torch/kernels"
+      - name: XDG_CACHE_HOME
+        # Catch-all: any XDG-compliant tool that isn't already overridden
+        # lands on the PVC instead of /home/mpiuser/.cache.
+        value: "/home/jovyan/.cache"
+      - name: HF_HOME
+        value: "/home/jovyan/.cache/huggingface"
+      - name: RUN_NAME
+        value: "__RUN_NAME__"
+      - name: WANDB_PROJECT
+        value: "__WANDB_PROJECT__"
+      - name: WANDB_ENTITY
+        value: "__WANDB_ENTITY__"
+      - name: EXTRA_ARGS
+        value: "__EXTRA_ARGS__"
+      - name: WANDB_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: wandb-api-key
+            key: api-key
+      - name: JOBSET_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+    resourcesPerNode:
+      requests:
+        cpu: "96"                       # 12 CPU × 8 GPU
+        memory: 1Ti
+        nvidia.com/gpu: "8"
+        nvidia.com/mlnxnics: "8"
+      limits:
+        cpu: "96"
+        memory: 1Ti
+        nvidia.com/gpu: "8"
+        nvidia.com/mlnxnics: "8"
+  podTemplateOverrides:
+    - targetJobs:
+        - name: launcher
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+          # 8 NIC attachments (one per mlnxnic) — Multus requires the net-attach-def
+          # name repeated once per interface to bind all 8 mlx5 devices.
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /home/jovyan
+                name: home
+              - mountPath: /data
+                name: data
+              - mountPath: /dev/shm
+                name: dshm
+        volumes:
+          - name: home
+            persistentVolumeClaim:
+              claimName: vv137-workspace
+          - name: data
+            persistentVolumeClaim:
+              claimName: deepfold3-sync
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 128Gi
+    - targetJobs:
+        - name: node
+      metadata:
+        annotations:
+          sidecar.istio.io/inject: "false"
+          # 8 NIC attachments (one per mlnxnic) — Multus requires the net-attach-def
+          # name repeated once per interface to bind all 8 mlx5 devices.
+          k8s.v1.cni.cncf.io/networks: |-
+            kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
+      spec:
+        containers:
+          - name: node
+            volumeMounts:
+              - mountPath: /home/jovyan
+                name: home
+              - mountPath: /data
+                name: data
+              - mountPath: /dev/shm
+                name: dshm
+        volumes:
+          - name: home
+            persistentVolumeClaim:
+              claimName: vv137-workspace
+          - name: data
+            persistentVolumeClaim:
+              claimName: deepfold3-sync
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 128Gi
