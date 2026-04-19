@@ -213,6 +213,7 @@ def build_dataloaders(
                 records=recs,
                 of3_dir=Path(spec.data_dir),
                 is_distillation=spec.is_distillation,
+                name=spec.name,
                 **of3_kwargs,
             )
         else:
@@ -220,6 +221,7 @@ def build_dataloaders(
                 records=recs,
                 data_dir=Path(spec.data_dir),
                 is_distillation=spec.is_distillation,
+                name=spec.name,
                 **ds_kwargs,
             )
         return ds, recs
@@ -231,6 +233,7 @@ def build_dataloaders(
             records=records,
             data_dir=Path(cfg.data_dir),
             is_distillation=False,
+            name="main",
             **ds_kwargs,
         )
 

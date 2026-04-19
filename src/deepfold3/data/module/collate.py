@@ -38,9 +38,19 @@ def collate_fn(
         return {}
 
     if bucket_pad:
-        n_max = max(sample["res_type"].shape[0] for sample in batch if "res_type" in sample)
+        # Strip non-tensor diagnostics (e.g. ``_record_id``) before bucket
+        # padding — ``pad_features`` only knows tensor shapes and would
+        # warn "unknown key" on every microstep otherwise. Reattach after.
+        sidecars: list[dict] = []
+        tensor_batch: list[dict] = []
+        for sample in batch:
+            sidecar = {k: v for k, v in sample.items() if not isinstance(v, torch.Tensor)}
+            sidecars.append(sidecar)
+            tensor_batch.append({k: v for k, v in sample.items() if isinstance(v, torch.Tensor)})
+        n_max = max(sample["res_type"].shape[0] for sample in tensor_batch if "res_type" in sample)
         bucket_n = next_bucket(n_max)
-        batch = [pad_features(sample, bucket_n=bucket_n)[0] for sample in batch]
+        padded = [pad_features(sample, bucket_n=bucket_n)[0] for sample in tensor_batch]
+        batch = [{**p, **s} for p, s in zip(padded, sidecars, strict=True)]
 
     out: dict[str, torch.Tensor] = {}
     all_keys = {k for sample in batch for k in sample}
@@ -48,6 +58,16 @@ def collate_fn(
     for key in all_keys:
         tensors_present = [(i, sample[key]) for i, sample in enumerate(batch) if key in sample]
         if not tensors_present:
+            continue
+
+        # Non-tensor fields (e.g. ``_record_id`` strings for diagnostics) are
+        # passed through as a plain Python list aligned with the batch dim.
+        # Missing samples get None so positional indexing stays consistent.
+        if not isinstance(tensors_present[0][1], torch.Tensor):
+            values: list = [None] * len(batch)
+            for i, v in tensors_present:
+                values[i] = v
+            out[key] = values
             continue
 
         # When a key appears in only some samples (e.g. mask channels from

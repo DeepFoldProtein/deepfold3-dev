@@ -44,6 +44,23 @@ class StructureFilterConfig:
         max_ca_dist: Maximum consecutive CA distance in Å.
         clash_freq: Fraction of atoms clashing to reject a chain.
         clash_dist: Distance threshold in Å for clashing.
+        max_unk_fraction: Max fraction of UNK residues allowed per polymer
+            chain. None = only reject 100%-UNK chains (legacy behaviour).
+            A value like 0.1 rejects any chain where >10% of resolved
+            residues are unknown (typical PATCHR offenders sit at 1–4%;
+            set higher to keep those but reject truly uninterpretable
+            chains).
+
+    Structure-quality filter (reject the whole record when any threshold
+    is exceeded; all chains are marked invalid):
+        max_tight_clashes: Max allowed heavy-atom pairs below
+            ``tight_clash_dist``. None disables. These are true geometric
+            corruptions (atoms at <0.8 Å indicate modelling errors or
+            assembly bugs), not chain-level clashes from the docking
+            filter above.
+        tight_clash_dist: Distance threshold (Å) for the tight-clash
+            count. Default 0.8 — non-bonded heavy atoms at this distance
+            are never chemically meaningful.
     """
 
     # Structure-level (disabled by default unless noted)
@@ -62,6 +79,11 @@ class StructureFilterConfig:
     max_ca_dist: float = 10.0
     clash_freq: float = 0.3
     clash_dist: float = 1.7
+    max_unk_fraction: float | None = None
+
+    # Structure-quality (reject whole record)
+    max_tight_clashes: int | None = None
+    tight_clash_dist: float = 0.8
 
 
 def _get_chain_residues(structure: Structure, chain_info: ChainInfo) -> np.ndarray:
@@ -102,6 +124,81 @@ def filter_unknown(structure: Structure, chain_info: ChainInfo) -> bool:
         return not np.all(res_types == 20)
     else:
         return not np.all(res_types == 30)
+
+
+def _unk_fraction(structure: Structure, chain_info: ChainInfo) -> float:
+    """Fraction of resolved residues that are UNK in a polymer chain."""
+    residues = _get_chain_residues(structure, chain_info)
+    resolved = residues["is_present"] & (residues["atom_num"] > 0)
+    n_resolved = int(resolved.sum())
+    if n_resolved == 0:
+        return 0.0
+    unk_code = 20 if chain_info.mol_type == const.MOL_PROTEIN else 30
+    n_unk = int(((residues["res_type"] == unk_code) & resolved).sum())
+    return n_unk / n_resolved
+
+
+def filter_unknown_fraction(
+    structure: Structure,
+    chain_info: ChainInfo,
+    max_fraction: float,
+) -> bool:
+    """Reject polymer chains whose UNK fraction exceeds ``max_fraction``."""
+    if chain_info.mol_type == const.MOL_NONPOLYMER:
+        return True
+    return _unk_fraction(structure, chain_info) <= max_fraction
+
+
+def count_tight_clashes(structure: Structure, dist: float = 0.8) -> int:
+    """Count heavy-atom pairs closer than ``dist`` Å across the whole structure.
+
+    Excludes hydrogens and unresolved atoms. Excludes directly bonded
+    atoms (some CCD entries have legitimately short reference bond
+    lengths for metals / aromatic systems — bonding info from
+    ``structure.bonds`` masks those pairs so a normal covalent bond
+    doesn't count as a clash).
+
+    Unlike :func:`filter_clashing_chains`, which flags chains that clash
+    with each other at ~1.7 Å (typical interface-clash threshold), this
+    detects true atomic overlap (e.g. <0.8 Å) — a sign of structural
+    corruption, not just a docking issue. A single such pair in the loss
+    produces wildly large gradients.
+    """
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        return 0
+
+    atoms = structure.atoms
+    present = atoms["is_present"]
+    heavy = atoms["element"] != 1  # skip H
+    mask = present & heavy
+    if not mask.any():
+        return 0
+
+    coords = np.column_stack(
+        [atoms["x"][mask], atoms["y"][mask], atoms["z"][mask]]
+    ).astype(np.float64)
+    # Map filtered indices back to original atom indices so we can
+    # dedupe directly-bonded pairs from ``structure.bonds``.
+    orig_idx = np.flatnonzero(mask)
+    inv: dict[int, int] = {int(o): i for i, o in enumerate(orig_idx)}
+
+    tree = KDTree(coords)
+    pairs = tree.query_pairs(dist, output_type="set")  # (i, j) with i < j
+    if not pairs:
+        return 0
+
+    # Mask bonded pairs (either direction).
+    bonded: set[tuple[int, int]] = set()
+    for b in structure.bonds:
+        a1, a2 = int(b["atom_1"]), int(b["atom_2"])
+        i, j = inv.get(a1), inv.get(a2)
+        if i is None or j is None:
+            continue
+        bonded.add((i, j) if i < j else (j, i))
+
+    return len(pairs - bonded)
 
 
 def filter_consecutive_ca(
@@ -334,6 +431,12 @@ def filter_structure(
         elif not filter_unknown(structure, ci):
             reasons[ci.chain_name] = "all residues unknown"
             ci.valid = False
+        elif cfg.max_unk_fraction is not None and not filter_unknown_fraction(
+            structure, ci, cfg.max_unk_fraction
+        ):
+            frac = _unk_fraction(structure, ci)
+            reasons[ci.chain_name] = f"UNK fraction {frac:.2f} > {cfg.max_unk_fraction:.2f}"
+            ci.valid = False
         elif not filter_consecutive_ca(structure, ci, cfg.max_ca_dist):
             reasons[ci.chain_name] = f"consecutive CA > {cfg.max_ca_dist:.0f} Å"
             ci.valid = False
@@ -344,6 +447,22 @@ def filter_structure(
         if ci.chain_id in clashing:
             reasons[ci.chain_name] = "chain clashing"
             ci.valid = False
+
+    # Record-level tight-clash gate: atoms closer than ~0.8 Å are not
+    # chemically meaningful. Even a single such pair can produce
+    # non-finite gradients through the smooth-LDDT / distogram paths on
+    # early training. Reject the whole record by marking every chain
+    # invalid.
+    if cfg.max_tight_clashes is not None:
+        n_tight = count_tight_clashes(structure, cfg.tight_clash_dist)
+        if n_tight > cfg.max_tight_clashes:
+            for ci in record.chains:
+                if ci.valid:
+                    reasons[ci.chain_name] = (
+                        f"record tight-clash {n_tight} > max {cfg.max_tight_clashes} "
+                        f"(< {cfg.tight_clash_dist:.2f} Å)"
+                    )
+                    ci.valid = False
 
     # NOTE: chain selection (>20 polymer chains → keep 20 maximising interfaces)
     # is NOT applied here.  It belongs at training time (sampler/dataset) because

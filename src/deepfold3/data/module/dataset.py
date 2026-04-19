@@ -132,8 +132,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         interface_distance: float = 15.0,
         max_chains: int = 0,
         sampling_rows: list | None = None,
+        name: str = "",
     ):
         self.records = records
+        # Dataset label used to disambiguate record ids in NaN-skip logs
+        # and ``deepfold3 inspect-example`` triage. Record ids are NOT
+        # guaranteed unique across extra datasets, so the trainer emits
+        # ``{name}:{record.id}`` when ``name`` is set.
+        self.name = name
         # Optional flat sampling-row table from ``WeightedClusterSampler``.
         # When set, ``__getitem__`` interprets the index as a row id and
         # routes the row's anchor (chain or interface) into the cropper.
@@ -302,6 +308,13 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         # Distillation flag: disables confidence/distogram losses
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
+
+        # Non-tensor diagnostic: record id threads through the trainer so that
+        # NaN/Inf skips can name the offending example. Popped in trainer.py
+        # before the forward pass so it never reaches the model. Prefixed
+        # with the dataset name when set so record ids stay unambiguous
+        # across ``--dataset`` extras that can share raw PDB ids.
+        feats["_record_id"] = f"{self.name}:{record.id}" if self.name else record.id
 
         return feats
 

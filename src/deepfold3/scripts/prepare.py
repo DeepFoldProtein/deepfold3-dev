@@ -341,6 +341,28 @@ def _apply_clusters(records: list, cluster_file: Path) -> int:
     "--max-total-residues", default=16384, type=int, show_default=True, help="Max total residues per structure."
 )
 @click.option("--min-polymer-chains", default=1, type=int, show_default=True, help="Min polymer chains per structure.")
+@click.option(
+    "--max-unk-fraction",
+    default=None,
+    type=float,
+    help="Reject polymer chains whose UNK fraction exceeds this (e.g. 0.1 = >10%% UNK). "
+    "Disabled by default; only 100%%-UNK chains are rejected.",
+)
+@click.option(
+    "--max-tight-clashes",
+    default=None,
+    type=int,
+    help="Reject records with more than this many heavy-atom pairs closer than "
+    "--tight-clash-dist (bonded pairs excluded). Typical setting: 0 (strict) or 5. "
+    "Disabled by default.",
+)
+@click.option(
+    "--tight-clash-dist",
+    default=0.8,
+    type=float,
+    show_default=True,
+    help="Distance threshold (Å) for the tight-clash count.",
+)
 @click.option("--no-assembly", is_flag=True, help="Skip assembly expansion (use asymmetric unit).")
 @click.option(
     "--ccd",
@@ -382,6 +404,9 @@ def prepare(
     max_chains: int,
     max_total_residues: int,
     min_polymer_chains: int,
+    max_unk_fraction: float | None,
+    max_tight_clashes: int | None,
+    tight_clash_dist: float,
     no_assembly: bool,
     ccd: str | None,
     cluster_file: str | None,
@@ -425,6 +450,9 @@ def prepare(
         max_chains=max_chains,
         max_total_residues=max_total_residues,
         min_polymer_chains=min_polymer_chains,
+        max_unk_fraction=max_unk_fraction,
+        max_tight_clashes=max_tight_clashes,
+        tight_clash_dist=tight_clash_dist,
     )
 
     mmcif_path = Path(mmcif_dir)

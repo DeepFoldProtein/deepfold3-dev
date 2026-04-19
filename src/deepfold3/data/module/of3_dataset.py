@@ -344,8 +344,12 @@ class OF3Dataset(torch.utils.data.Dataset):
         interface_distance: float = 15.0,
         mmcif_dir: Path | None = None,
         max_templates: int = 4,
+        name: str = "",
     ):
         self.records = records
+        # Dataset label used to disambiguate record ids in NaN-skip logs.
+        # See ``TrainingDataset.__init__`` for the full rationale.
+        self.name = name
         self.of3_dir = Path(of3_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
@@ -414,6 +418,10 @@ class OF3Dataset(torch.utils.data.Dataset):
 
         # 6. Distillation flag
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
+
+        # NaN-skip diagnostic (same protocol as TrainingDataset): prefix
+        # with dataset name when set so extras don't collide on raw PDB ids.
+        feats["_record_id"] = f"{self.name}:{record.id}" if self.name else record.id
 
         return feats
 

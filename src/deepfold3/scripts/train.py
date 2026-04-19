@@ -208,32 +208,10 @@ def train(
     from deepfold3.model.config import DatasetConfig, ModelConfig, TrainingConfig
     from deepfold3.training.trainer import Trainer
 
-    # Auto-create a per-run subdirectory under the user-supplied output path.
-    # Layout:  runs/<name>/<YYYYMMDD_HHMMSS>/{train.log, checkpoint_*.pt, ...}
-    # - Rank 0 creates the subdir and writes INFO to stdout + train.log.
-    # - Other ranks only emit WARNING/ERROR to stdout (prevents 8× duplication on DDP).
-    # - Each invocation (including --resume) gets its own timestamped subdir,
-    #   unless --output already points directly at an existing run dir (has
-    #   train.log / checkpoint_*) and no --resume is given — in that case the
-    #   caller explicitly asked to continue in place.
     rank = int(os.environ.get("RANK", "0"))
-    requested_output = Path(output)
-    timestamp = datetime.now().strftime(r"%Y%m%d_%H%M%S")
-
-    is_existing_run = requested_output.is_dir() and any(
-        p.name == "train.log" or p.name.startswith("checkpoint_") for p in requested_output.iterdir()
-    )
-    if resume is None and is_existing_run:
-        run_dir = requested_output
-    else:
-        run_dir = requested_output / timestamp
-
+    run_dir = Path(output)
     if rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
-    # Non-rank-0 ranks don't create directories or open file handlers, so
-    # sub-second timestamp drift across ranks is harmless: ``output`` is
-    # consumed by the Trainer only for checkpoint writes, which happen on
-    # rank 0 where the path is guaranteed correct.
     output = str(run_dir)
 
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
