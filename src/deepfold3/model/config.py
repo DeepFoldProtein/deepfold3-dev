@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -418,6 +419,12 @@ class TrainingConfig:
     # Raise RuntimeError after this many consecutive opt-step skips from
     # non-finite loss/grads. 0 or negative disables the check.
     max_consecutive_nan_skips: int = 5
+    # Compute the grad-norm reduction in fp64 (upcast per-param L2² before
+    # summing). Removes spurious non-finite grad-norms from fp32 reduction
+    # overflow that differs across ranks by summation order. Default off
+    # to preserve bit-exact parity with the historical ``clip_grad_norm_``
+    # path; enable when training at high grad magnitudes.
+    grad_norm_fp64: bool = False
 
     # EMA
     ema_decay: float = 0.999
@@ -510,6 +517,10 @@ class TrainingConfig:
     static_graph: bool = True
     bucket_cap_mb: int = 25
     gradient_as_bucket_view: bool = True
+    # NCCL watchdog + ``collective_guard`` barrier deadline. Named sync
+    # points in the trainer surface cross-rank desync as ``RuntimeError``
+    # with the guard name, instead of an anonymous NCCL timeout.
+    collective_timeout_s: float = 600.0
 
     # Run control
     max_steps: int = 200000
@@ -582,8 +593,8 @@ class TrainingConfig:
             )
         if self.decay_every <= 0:
             raise ValueError(f"decay_every must be > 0, got {self.decay_every}")
-        if self.dtype not in ("bf16", "fp16", "fp32"):
-            raise ValueError(f"dtype must be 'bf16', 'fp16', or 'fp32', got '{self.dtype}'")
+        if self.dtype not in _COMPUTE_DTYPE_CHOICES:
+            raise ValueError(f"dtype must be one of {_COMPUTE_DTYPE_CHOICES}, got '{self.dtype}'")
         if self.accumulate_grad_batches < 1:
             raise ValueError(f"accumulate_grad_batches must be >= 1, got {self.accumulate_grad_batches}")
         if self.max_recycles < 0:
@@ -595,6 +606,9 @@ class TrainingConfig:
         import torch
 
         return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
+
+
+_COMPUTE_DTYPE_CHOICES: tuple[str, ...] = ("bf16", "fp16", "fp32")
 
 
 @dataclass
@@ -613,12 +627,22 @@ class DistogramConfig:
 
 @dataclass
 class PrecisionConfig:
-    """Regions to pin in fp32 while the rest of the network runs in the
-    ``TrainingConfig.dtype`` autocast context.
+    """Mixed-precision policy — region guards + non-compute dtype axes.
 
-    Each flag, when True, disables autocast and upcasts that region's inputs
-    to fp32. Use to guard numerically sensitive projections (especially
-    final logit heads) against bf16 overflow.
+    Two flavours of knob live here:
+
+    * ``fp32_*`` region flags: disable autocast and upcast that specific
+      region's inputs to fp32. Use to guard numerically sensitive
+      projections (especially final logit heads) against bf16 overflow.
+    * ``{grad_acc,reduce,loss}_dtype`` axes: the DS-inspired policy knobs
+      for gradient accumulation / DDP all-reduce / loss computation.
+      Compute dtype remains governed by ``TrainingConfig.dtype`` (the
+      autocast context); these axes compose on top.
+
+    Defaults preserve the pre-refactor behaviour bit-for-bit: grads
+    accumulate and all-reduce in fp32, losses are fp32. ``reduce_dtype
+    = "bf16"`` is an opt-in speedup (registers DDP's ``bf16_compress``
+    comm hook and halves all-reduce bandwidth at a small numeric cost).
     """
 
     # Compute ``training_loss`` in fp32.
@@ -635,6 +659,53 @@ class PrecisionConfig:
     # Run the training-time diffusion rollout in fp32. Mirrors
     # ``DiffusionConfig.skip_amp_sample_training``.
     fp32_diffusion_sample_training: bool = False
+
+    # Gradient accumulation dtype. DeepSpeed-inspired contract — master
+    # weights stay fp32 (AdamW requirement), grads accumulate across
+    # microsteps in this dtype. ``bf16`` is incompatible with
+    # ``accumulate_grad_batches > 1`` (bf16 rounding swallows small
+    # contributions); asserted at trainer startup.
+    grad_acc_dtype: Literal["bf16", "fp32"] = "fp32"
+    # DDP all-reduce dtype. ``fp32`` (default) uses PyTorch's stock
+    # allreduce. ``bf16`` registers ``bf16_compress_hook``, halving
+    # inter-rank bandwidth; the cost is one-extra-cast per bucket and
+    # mild numerical drift vs. fp32 allreduce.
+    reduce_dtype: Literal["bf16", "fp32"] = "fp32"
+    # Loss-computation dtype. Always ``fp32`` today; kept as a knob to
+    # make the policy explicit and to reserve the axis for future bf16-
+    # loss experiments.
+    loss_dtype: Literal["fp32"] = "fp32"
+
+    def __post_init__(self) -> None:
+        if self.grad_acc_dtype not in ("bf16", "fp32"):
+            raise ValueError(f"grad_acc_dtype must be 'bf16' or 'fp32', got {self.grad_acc_dtype!r}")
+        if self.reduce_dtype not in ("bf16", "fp32"):
+            raise ValueError(f"reduce_dtype must be 'bf16' or 'fp32', got {self.reduce_dtype!r}")
+        if self.loss_dtype != "fp32":
+            raise ValueError(f"loss_dtype must be 'fp32' (other values reserved), got {self.loss_dtype!r}")
+
+    @classmethod
+    def from_shorthand(cls, shorthand: str, **overrides) -> PrecisionConfig:
+        """Build a policy from a single string (sugar for common presets).
+
+        ``"bf16-mixed"`` → grad_acc=fp32, reduce=bf16, loss=fp32 (maximum bandwidth savings).
+        ``"bf16-safe"``  → grad_acc=fp32, reduce=fp32, loss=fp32 (current DF3 default).
+        ``"fp16-mixed"`` → grad_acc=fp32, reduce=bf16, loss=fp32 (GradScaler required).
+        ``"fp32"``       → grad_acc=fp32, reduce=fp32, loss=fp32.
+
+        The shorthand only sets the non-compute axes; compute dtype is
+        governed by ``TrainingConfig.dtype``. ``overrides`` override any
+        axis post-expansion (including the region-guard flags).
+        """
+        presets: dict[str, dict[str, str]] = {
+            "bf16-mixed": {"grad_acc_dtype": "fp32", "reduce_dtype": "bf16", "loss_dtype": "fp32"},
+            "bf16-safe": {"grad_acc_dtype": "fp32", "reduce_dtype": "fp32", "loss_dtype": "fp32"},
+            "fp16-mixed": {"grad_acc_dtype": "fp32", "reduce_dtype": "bf16", "loss_dtype": "fp32"},
+            "fp32": {"grad_acc_dtype": "fp32", "reduce_dtype": "fp32", "loss_dtype": "fp32"},
+        }
+        if shorthand not in presets:
+            raise ValueError(f"unknown precision shorthand {shorthand!r}; choices: {sorted(presets)}")
+        return cls(**{**presets[shorthand], **overrides})
 
 
 @dataclass

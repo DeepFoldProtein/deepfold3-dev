@@ -22,6 +22,7 @@ import torch.nn as nn
 
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.training.ema import EMA
+from deepfold3.training.rank_zero import rank_zero_info
 from deepfold3.training.scheduler import AF3LRScheduler
 from deepfold3.training.state import TrainState
 
@@ -33,7 +34,6 @@ def load_pretrained_weights(
     path: str | Path,
     *,
     strict: bool,
-    is_main: bool,
     device: torch.device,
 ) -> None:
     """Load pretrained weights from ``.safetensors`` or ``.pt``.
@@ -48,14 +48,12 @@ def load_pretrained_weights(
 
         state = load_file(str(p), device=str(device))
         model.load_state_dict(state, strict=strict)
-        if is_main:
-            logger.info(f"Loaded pretrained weights from {p}")
+        rank_zero_info(f"Loaded pretrained weights from {p}")
     elif p.suffix == ".pt":
         ckpt = torch.load(str(p), map_location=device, weights_only=False)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         model.load_state_dict(state, strict=strict)
-        if is_main:
-            logger.info(f"Loaded pretrained weights from {p}")
+        rank_zero_info(f"Loaded pretrained weights from {p}")
 
 
 class CheckpointManager:
@@ -133,7 +131,6 @@ class CheckpointManager:
         ema: EMA | None,
         state: TrainState,
         train_cfg: TrainingConfig,
-        is_main: bool,
     ) -> None:
         """Resume training state from ``path``, mutating the live objects in place.
 
@@ -160,8 +157,7 @@ class CheckpointManager:
             state.effective_step = ckpt.get("effective_step", 0)
         state.best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
 
-        if is_main:
-            logger.info(f"Resumed from {path} at step {state.effective_step}")
+        rank_zero_info(f"Resumed from {path} at step {state.effective_step}")
 
     # ----- discovery -----
 

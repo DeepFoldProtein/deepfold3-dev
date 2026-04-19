@@ -12,9 +12,12 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+from deepfold3.training.rank_zero import rank_zero_only
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +40,7 @@ class DistInfo:
         return self.world_size > 1
 
 
-def init_process_group() -> DistInfo:
+def init_process_group(*, timeout_s: float = 600.0) -> DistInfo:
     """Initialize NCCL and return the captured :class:`DistInfo`.
 
     Reads ``RANK`` / ``WORLD_SIZE`` / ``LOCAL_RANK`` from the environment
@@ -47,6 +50,9 @@ def init_process_group() -> DistInfo:
     ``torch.cuda.set_device(local_rank)`` MUST run before any model
     construction — it pins the Triton autotune cache fingerprint to the
     correct GPU (see ``memory/reference_triton_cache.md``).
+
+    ``timeout_s`` configures the NCCL watchdog deadline; the same value
+    is used by ``collective_guard`` as its attribution horizon.
     """
     if "RANK" in os.environ:
         rank = int(os.environ["RANK"])
@@ -58,12 +64,20 @@ def init_process_group() -> DistInfo:
         # ``barrier(): using the device under current context`` warning.
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=device,
+            timeout=timedelta(seconds=timeout_s),
+        )
     else:
         rank = 0
         world_size = 1
         local_rank = 0
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    # Re-sync the rank-zero gate with the authoritative rank. Env-var
+    # detection at import time is best-effort; this is the canonical one.
+    rank_zero_only.rank = rank
 
     return DistInfo(rank=rank, world_size=world_size, local_rank=local_rank, device=device)
 

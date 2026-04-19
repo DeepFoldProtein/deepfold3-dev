@@ -104,12 +104,15 @@ class TrackerHub:
     """Fan-out over a list of :class:`Tracker` instances.
 
     All methods are no-ops on non-main ranks so callers can invoke
-    ``hub.log(...)`` unconditionally without guarding on rank.
+    ``hub.log(...)`` unconditionally without guarding on rank. Rank
+    membership is read from ``rank_zero_only.rank`` — the single source
+    of rank truth across the trainer.
     """
 
-    def __init__(self, trackers: list[Tracker], is_main: bool) -> None:
-        self._trackers = list(trackers) if is_main else []
-        self._is_main = is_main
+    def __init__(self, trackers: list[Tracker]) -> None:
+        from deepfold3.training.rank_zero import rank_zero_only
+
+        self._trackers = list(trackers) if rank_zero_only.rank == 0 else []
 
     def start(self, config: dict[str, Any]) -> None:
         for t in self._trackers:
@@ -122,7 +125,3 @@ class TrackerHub:
     def finish(self) -> None:
         for t in self._trackers:
             t.finish()
-
-    @property
-    def is_main(self) -> bool:
-        return self._is_main

@@ -13,6 +13,7 @@ training:
   cosine_max_steps: 20000
 
   grad_clip_norm: 10.0
+  grad_norm_fp64: true
   accumulate_grad_batches: 16
   ema_decay: 0.999
 
@@ -64,6 +65,8 @@ training:
   static_graph: true
   bucket_cap_mb: 25
   gradient_as_bucket_view: true
+  # NCCL watchdog deadline (also used by ``collective_guard`` to attribute hangs).
+  collective_timeout_s: 600.0
   train_confidence_only: false
 
   max_steps: 100_000
@@ -174,10 +177,19 @@ model:
     tiled_opm_chunk: 0
     use_torch_compile: false
     use_gradient_checkpointing: true
-  # Regions pinned to fp32 while the rest of the net runs under bf16 autocast.
-  # Flip ``fp32_distogram_head`` on if the distogram loss shows bursts beyond
-  # its theoretical max (ln(num_bins) ≈ 4.16).
+  # Mixed-precision policy. Two sets of knobs:
+  # - ``fp32_*`` region guards pin numerically sensitive projections to fp32
+  #   while the rest of the net runs under bf16 autocast. Flip
+  #   ``fp32_distogram_head`` on if the distogram loss shows bursts beyond
+  #   its theoretical max (ln(num_bins) ≈ 4.16).
+  # - ``{grad_acc,reduce,loss}_dtype`` govern downstream precision axes:
+  #   grad accumulation across microsteps, DDP allreduce, and loss computation.
+  #   Defaults match pre-refactor DF3 (all fp32). Set ``reduce_dtype: bf16``
+  #   to register DDP's bf16_compress hook and halve allreduce bandwidth.
   precision:
     fp32_loss: true
     fp32_confidence_head: true
     fp32_distogram_head: true
+    grad_acc_dtype: fp32
+    reduce_dtype: fp32
+    loss_dtype: fp32

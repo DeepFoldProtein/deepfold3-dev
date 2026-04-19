@@ -21,10 +21,43 @@ from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from deepfold3.model.config import TrainingConfig
+from deepfold3.training.collective_guard import collective_guard
 from deepfold3.training.distributed import DistInfo
+from deepfold3.training.rank_zero import rank_zero_critical, rank_zero_info, rank_zero_warn
 from deepfold3.training.state import TrainState
 
 logger = logging.getLogger(__name__)
+
+
+def _clip_grad_norm_fp64(parameters, max_norm: float) -> torch.Tensor:
+    """Deterministic-precision analogue of ``torch.nn.utils.clip_grad_norm_``.
+
+    Accumulates per-param L2² in fp64, then takes sqrt and clips in place.
+    Headroom beyond fp32 prevents the sum-of-squares from overflowing on
+    one rank while staying finite on another (torch fp32 reduction order
+    is device-dependent), which otherwise triggers spurious whole-window
+    skips at the collective consensus check in :meth:`step_or_skip`.
+
+    Returns an fp32 scalar matching ``clip_grad_norm_``'s contract
+    (including non-finite pass-through when any grad is NaN/Inf).
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.zeros((), dtype=torch.float32, device="cpu")
+    # vector_norm(g, 2) in fp32, square in fp64 — fp64 sum has ~1e308
+    # headroom so realistic grads never overflow the reduction.
+    sq = torch.stack([torch.linalg.vector_norm(g, 2).to(torch.float64).pow_(2) for g in grads])
+    total_fp64 = sq.sum().sqrt()
+    total = total_fp64.to(torch.float32)
+    if torch.isfinite(total) and max_norm != float("inf"):
+        coef = torch.clamp(max_norm / (total + 1e-6), max=1.0)
+        # Cast coef once per param-dtype group to avoid per-grad .to() churn.
+        by_dtype: dict[torch.dtype, list[torch.Tensor]] = {}
+        for g in grads:
+            by_dtype.setdefault(g.dtype, []).append(g)
+        for dtype, gs in by_dtype.items():
+            torch._foreach_mul_(gs, coef.to(dtype))
+    return total
 
 
 def is_chunked_diffusion_active(cfg: TrainingConfig) -> bool:
@@ -43,10 +76,10 @@ def freeze_for_confidence(model: nn.Module) -> None:
         if "confidence" not in name:
             param.requires_grad_(False)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Confidence-only training: {trainable / 1e6:.1f}M trainable parameters")
+    rank_zero_info(f"Confidence-only training: {trainable / 1e6:.1f}M trainable parameters")
 
 
-def build_optimizer(model: nn.Module, cfg: TrainingConfig, *, is_main: bool) -> torch.optim.Optimizer:
+def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
     """Build AdamW with decoupled weight decay.
 
     Protenix / nanoGPT convention: decay 2D+ params (matmul weights,
@@ -86,13 +119,12 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig, *, is_main: bool) -> 
         eps=cfg.eps,
         fused=use_fused_adam,
     )
-    if is_main:
-        n_decay = sum(p.numel() for p in decay_params) / 1e6
-        n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
-        logger.info(
-            f"AdamW: fused={use_fused_adam}, weight_decay={cfg.weight_decay} "
-            f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
-        )
+    n_decay = sum(p.numel() for p in decay_params) / 1e6
+    n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
+    rank_zero_info(
+        f"AdamW: fused={use_fused_adam}, weight_decay={cfg.weight_decay} "
+        f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
+    )
     return optimizer
 
 
@@ -125,13 +157,13 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
     if not dist.is_distributed:
         return model, use_static_graph
 
-    if dist.is_main and cfg.static_graph and not use_static_graph:
+    if cfg.static_graph and not use_static_graph:
         reasons = []
         if chunked_diffusion:
             reasons.append(f"diffusion_chunk_size={cfg.diffusion_chunk_size}")
         if cfg.accumulate_grad_batches > 1:
             reasons.append(f"accumulate_grad_batches={cfg.accumulate_grad_batches}")
-        logger.info(
+        rank_zero_info(
             "static_graph auto-disabled (%s): model.no_sync() is required, which conflicts with static_graph.",
             ", ".join(reasons),
         )
@@ -145,6 +177,23 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
         gradient_as_bucket_view=cfg.gradient_as_bucket_view,
     )
     return ddp_model, use_static_graph
+
+
+def register_reduce_hook(ddp_model: nn.Module, reduce_dtype: str) -> str:
+    """Install the DDP allreduce comm hook matching ``reduce_dtype``.
+
+    Returns a human-readable hook name for logging. No-op (returns
+    ``"default (fp32 allreduce)"``) when ``reduce_dtype == "fp32"`` —
+    DDP's stock allreduce already preserves fp32. ``"bf16"`` registers
+    PyTorch's ``bf16_compress_hook`` which halves allreduce bandwidth
+    at the cost of one bf16 cast per bucket.
+    """
+    if reduce_dtype == "bf16":
+        from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as ddp_hooks
+
+        ddp_model.register_comm_hook(state=None, hook=ddp_hooks.bf16_compress_hook)
+        return "bf16_compress"
+    return "default (fp32 allreduce)"
 
 
 @dataclass
@@ -165,6 +214,28 @@ class WrappedOptimizer:
     backward (to OR the local NaN flag into the on-device accumulator)
     and :meth:`step_or_skip` at the sync boundary (to run the single
     cross-rank collective, unscale + clip, and either step or skip).
+
+    Precision contract (DeepSpeed-inspired; enforced at construction +
+    lazily after the first step):
+
+    * **Master weights are fp32.** Asserted at ``__init__`` on every
+      trainable parameter. AdamW's moment state is fp32-or-nothing — a
+      bf16 param would force bf16 moments, whose rounding error swallows
+      weight updates on most steps.
+    * **Optimizer state is fp32.** Adam's ``exp_avg`` / ``exp_avg_sq``
+      are asserted once on the first successful step (lazy — the tensors
+      don't exist until ``.step()`` runs). A checkpoint load that
+      downgrades either dtype will fail here with a clear message.
+    * **Gradients arrive in the compute dtype** (bf16/fp16 under
+      autocast, fp32 otherwise). Unscale (if ``fp16``) → clip via
+      :func:`_clip_grad_norm_fp64` → cross-rank NaN consensus all run
+      before ``optimizer.step``. Grad-accumulation dtype is
+      ``precision.grad_acc_dtype``; with ``accumulate_grad_batches > 1``
+      only ``fp32`` is safe (validated upstream in the trainer).
+    * **Reductions (all-reduce + grad-norm)** stay in fp32 regardless
+      of ``precision.reduce_dtype``. The comm-hook downcast (when
+      ``reduce_dtype=='bf16'``) is PyTorch-internal and invisible to
+      this class.
 
     Invariants preserved verbatim from the pre-refactor trainer:
 
@@ -198,105 +269,199 @@ class WrappedOptimizer:
         self._nan_accum: torch.Tensor | None = None
         self._nan_gather_buf: torch.Tensor | None = None
         self._grad_norm_gather_buf: torch.Tensor | None = None
+        # Record ids of every sample that contributed to the current
+        # accumulation window on THIS rank. Reset in ``step_or_skip`` so
+        # each window starts empty; logged on NaN/Inf skip to identify
+        # offending examples.
+        self._window_record_ids: list[str] = []
+        self._state_dtype_checked = False
+
+        self._assert_master_weight_dtype()
+
+    def _assert_master_weight_dtype(self) -> None:
+        """Every trainable param must be fp32 (master-weight invariant).
+
+        A bf16 parameter would force AdamW to store moments in bf16,
+        whose rounding error swallows the (lr * moment) update on most
+        steps. Autocast keeps the *forward* in bf16; the parameter
+        itself must stay fp32.
+        """
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                if param.dtype != torch.float32:
+                    raise ValueError(
+                        f"WrappedOptimizer requires fp32 master weights, got dtype={param.dtype} "
+                        f"for a parameter with shape {tuple(param.shape)}. Autocast controls the "
+                        "forward-pass dtype; parameters themselves must stay fp32."
+                    )
+
+    def _assert_state_dtype(self) -> None:
+        """Assert Adam moment state is fp32. Runs once, after the first step."""
+        if self._state_dtype_checked:
+            return
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for key in ("exp_avg", "exp_avg_sq"):
+                    tensor = state.get(key)
+                    if tensor is not None and tensor.dtype != torch.float32:
+                        raise ValueError(
+                            f"AdamW state['{key}'] must be fp32, got {tensor.dtype}. This usually "
+                            "means a checkpoint was loaded from a bf16-optimizer run; upcast the "
+                            "moments in the checkpoint before resuming."
+                        )
+        self._state_dtype_checked = True
 
     # ----- per-microstep -----
 
-    def add_microstep_loss(self, loss: torch.Tensor) -> None:
+    def add_microstep_loss(self, loss: torch.Tensor, record_ids: list[str | None] | None = None) -> None:
         """OR the local NaN/Inf flag into the on-device accumulator.
 
         No collective, no CPU sync — this is called on every microstep.
+        ``record_ids`` (one per sample in the microstep batch) are
+        appended to the window's diagnostic list.
         """
         if self._nan_accum is None:
             self._nan_accum = torch.zeros(1, device=loss.device)
         self._nan_accum.add_((torch.isnan(loss) | torch.isinf(loss)).float().view(1))
+        if record_ids:
+            for rid in record_ids:
+                if rid is not None:
+                    self._window_record_ids.append(rid)
 
     # ----- sync boundary -----
+
+    def _unscale_clip_and_measure(self, state: TrainState) -> torch.Tensor:
+        """Unscale → clip → measure, in a single ordered block.
+
+        ORDER INVARIANT — do not reorder:
+
+        1. ``scaler.unscale_`` divides grads by the loss scale AND sets the
+           scaler's internal per-device ``found_inf`` flag.
+        2. ``clip_grad_norm_`` sees the unscaled grads and returns a
+           non-finite total whenever any grad is non-finite (bf16 overflow,
+           NaN/Inf from log/sqrt/div, etc).
+        3. The returned ``grad_norm`` is the single source of truth for
+           the collective skip decision in :meth:`step_or_skip`.
+
+        Encapsulating the sequence here prevents a future refactor from
+        reordering the statements and reintroducing the drift bug: if
+        ``scaler.step`` runs before our ``isfinite(grad_norm)`` check
+        clears it, it may silently skip on some ranks (per-device
+        ``found_inf``) while advancing on others → param drift without
+        any observable log line.
+        """
+        self.scaler.unscale_(self.optimizer)
+
+        clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
+        if self.cfg.grad_norm_fp64:
+            grad_norm = _clip_grad_norm_fp64(self.model.parameters(), clip).detach()
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
+        state.last_grad_norm = grad_norm
+        return grad_norm
 
     def step_or_skip(self, state: TrainState) -> StepResult:
         """Run the collective NaN check, then either step or skip.
 
         MUST be called by EVERY rank when ``is_sync_step`` is true.
         Dropping the call on any rank desyncs the
-        ``all_gather_into_tensor`` below and hangs NCCL.
+        ``all_gather_into_tensor`` below and hangs NCCL. The outer
+        ``collective_guard`` attaches the region name to any watchdog
+        failure so hangs point here instead of at an anonymous
+        all_gather deep in the call chain.
         """
         assert self._nan_accum is not None, "add_microstep_loss must run at least once before step_or_skip"
 
-        # Sync boundary: single collective for NaN check across ranks +
-        # all microsteps in this accumulation window. ``all_gather`` so
-        # the warning can name the offending rank(s).
-        if self.dist.is_distributed:
-            if self._nan_gather_buf is None:
-                self._nan_gather_buf = torch.zeros(self.dist.world_size, device=self._nan_accum.device)
-            dist.all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
-            nan_flags = self._nan_gather_buf
-        else:
-            nan_flags = self._nan_accum
-        nan_detected = bool(nan_flags.any().item())  # one CPU sync per opt step
-        self._nan_accum.zero_()
+        with collective_guard("step_or_skip", self.dist):
+            # Sync boundary: single collective for NaN check across ranks +
+            # all microsteps in this accumulation window. ``all_gather`` so
+            # the warning can name the offending rank(s).
+            if self.dist.is_distributed:
+                if self._nan_gather_buf is None:
+                    self._nan_gather_buf = torch.zeros(self.dist.world_size, device=self._nan_accum.device)
+                dist.all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
+                nan_flags = self._nan_gather_buf
+            else:
+                nan_flags = self._nan_accum
+            nan_detected = bool(nan_flags.any().item())  # one CPU sync per opt step
+            self._nan_accum.zero_()
 
-        attempted_step = state.effective_step + 1
+            attempted_step = state.effective_step + 1
 
-        if nan_detected:
-            # Any microstep on any rank produced NaN/Inf — discard the
-            # whole accumulation window. NaN would have propagated via
-            # DDP all_reduce on the sync-step backward.
-            self.optimizer.zero_grad(set_to_none=True)
-            bad_ranks = (nan_flags > 0).nonzero(as_tuple=False).flatten().tolist()
-            if self.dist.is_main:
-                logger.warning(
+            if nan_detected:
+                # Any microstep on any rank produced NaN/Inf — discard the
+                # whole accumulation window. NaN would have propagated via
+                # DDP all_reduce on the sync-step backward.
+                self.optimizer.zero_grad(set_to_none=True)
+                bad_ranks = (nan_flags > 0).nonzero(as_tuple=False).flatten().tolist()
+                rank_zero_warn(
                     f"Step {attempted_step}: NaN/Inf loss in accumulation window (ranks={bad_ranks}), skipping"
                 )
-            self._account_skip(state, attempted_step, reason="loss")
-            return StepResult(advanced=False, was_nan=True, reason="loss", grad_norm=None, nan_ranks=bad_ranks)
+                # Per-rank: only the rank whose data triggered the NaN knows
+                # the offending record ids. Log locally from there; no string
+                # broadcast needed (NCCL doesn't handle variadic strings well).
+                if self.dist.rank in bad_ranks and self._window_record_ids:
+                    logger.warning(
+                        f"Step {attempted_step}: rank {self.dist.rank} NaN/Inf loss window "
+                        f"record_ids={self._window_record_ids}"
+                    )
+                self._window_record_ids.clear()
+                self._account_skip(state, attempted_step, reason="loss")
+                return StepResult(advanced=False, was_nan=True, reason="loss", grad_norm=None, nan_ranks=bad_ranks)
 
-        self.scaler.unscale_(self.optimizer)
+            grad_norm = self._unscale_clip_and_measure(state)
 
-        # Always compute the global pre-clip grad norm for logging,
-        # even when grad_clip_norm <= 0 (use a huge cap as no-op).
-        clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
-        state.last_grad_norm = grad_norm
-
-        # clip_grad_norm_ returns a NaN/Inf total when ANY param grad
-        # is non-finite, so this single check covers the whole model.
-        # Without it, a finite loss with non-finite grads (log/sqrt/div
-        # paths) silently corrupts weights via optimizer.step.
-        #
-        # Collective consensus: even with DDP-synced grads, bf16 rounding
-        # in ``clip_grad_norm_``'s sum-of-squared-norms can overflow on
-        # one rank but stay finite on another. A per-rank ``isfinite``
-        # check then returns different ``advanced`` values → ranks
-        # disagree on ``on_opt_step_boundary`` → the log/ckpt/eval gates
-        # in ``trainer._run_inner`` diverge → NCCL hang. All-gather the
-        # scalar so every rank sees the same vector, then reduce with
-        # ``any()`` for identical advance/skip decisions.
-        if self.dist.is_distributed:
-            if self._grad_norm_gather_buf is None:
-                self._grad_norm_gather_buf = torch.zeros(self.dist.world_size, device=grad_norm.device)
-            dist.all_gather_into_tensor(self._grad_norm_gather_buf, grad_norm.view(1))
-            grad_norms_per_rank = self._grad_norm_gather_buf
-        else:
-            grad_norms_per_rank = grad_norm.view(1)
-        grad_finite_per_rank = torch.isfinite(grad_norms_per_rank)
-        if not bool(grad_finite_per_rank.all().item()):
-            self.optimizer.zero_grad(set_to_none=True)
-            bad_ranks = (~grad_finite_per_rank).nonzero(as_tuple=False).flatten().tolist()
-            if self.dist.is_main:
+            # clip_grad_norm_ returns a NaN/Inf total when ANY param grad
+            # is non-finite, so this single check covers the whole model.
+            # Without it, a finite loss with non-finite grads (log/sqrt/div
+            # paths) silently corrupts weights via optimizer.step.
+            #
+            # Collective consensus: even with DDP-synced grads, bf16 rounding
+            # in ``clip_grad_norm_``'s sum-of-squared-norms can overflow on
+            # one rank but stay finite on another. A per-rank ``isfinite``
+            # check then returns different ``advanced`` values → ranks
+            # disagree on ``on_opt_step_boundary`` → the log/ckpt/eval gates
+            # in ``trainer._run_inner`` diverge → NCCL hang. All-gather the
+            # scalar so every rank sees the same vector, then reduce with
+            # ``any()`` for identical advance/skip decisions.
+            if self.dist.is_distributed:
+                if self._grad_norm_gather_buf is None:
+                    self._grad_norm_gather_buf = torch.zeros(self.dist.world_size, device=grad_norm.device)
+                dist.all_gather_into_tensor(self._grad_norm_gather_buf, grad_norm.view(1))
+                grad_norms_per_rank = self._grad_norm_gather_buf
+            else:
+                grad_norms_per_rank = grad_norm.view(1)
+            grad_finite_per_rank = torch.isfinite(grad_norms_per_rank)
+            if not bool(grad_finite_per_rank.all().item()):
+                self.optimizer.zero_grad(set_to_none=True)
+                bad_ranks = (~grad_finite_per_rank).nonzero(as_tuple=False).flatten().tolist()
                 per_rank = ", ".join(f"rank{r}={grad_norms_per_rank[r].item():.3e}" for r in bad_ranks)
-                logger.warning(
-                    f"Step {attempted_step}: NaN/Inf in grads (ranks={bad_ranks}, {per_rank}), skipping"
-                )
-            self._account_skip(state, attempted_step, reason="grad")
-            return StepResult(advanced=False, was_nan=True, reason="grad", grad_norm=grad_norm, nan_ranks=bad_ranks)
+                rank_zero_warn(f"Step {attempted_step}: NaN/Inf in grads (ranks={bad_ranks}, {per_rank}), skipping")
+                if self.dist.rank in bad_ranks and self._window_record_ids:
+                    logger.warning(
+                        f"Step {attempted_step}: rank {self.dist.rank} NaN/Inf grad window "
+                        f"record_ids={self._window_record_ids}"
+                    )
+                self._window_record_ids.clear()
+                self._account_skip(state, attempted_step, reason="grad")
+                return StepResult(advanced=False, was_nan=True, reason="grad", grad_norm=grad_norm, nan_ranks=bad_ranks)
 
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad(set_to_none=True)
-        self.scheduler.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
+            # Lazy — Adam moments only exist after the first successful
+            # ``.step()``. Raises on bf16 moment state (see
+            # ``_assert_state_dtype``).
+            self._assert_state_dtype()
 
-        state.effective_step += 1
-        state.consecutive_nan_skips = 0
-        return StepResult(advanced=True, was_nan=False, reason=None, grad_norm=grad_norm, nan_ranks=[])
+            self._window_record_ids.clear()
+            state.effective_step += 1
+            state.consecutive_nan_skips = 0
+            return StepResult(advanced=True, was_nan=False, reason=None, grad_norm=grad_norm, nan_ranks=[])
 
     def _account_skip(self, state: TrainState, attempted_step: int, *, reason: Literal["loss", "grad"]) -> None:
         """Bump the consecutive-skip counter and raise if it exceeds the limit.
@@ -313,6 +478,5 @@ class WrappedOptimizer:
                 f"Aborting: {state.consecutive_nan_skips} consecutive non-finite "
                 f"{reason} skips at step {attempted_step} (limit={limit})."
             )
-            if self.dist.is_main:
-                logger.critical(msg)
+            rank_zero_critical(msg)
             raise RuntimeError(msg)

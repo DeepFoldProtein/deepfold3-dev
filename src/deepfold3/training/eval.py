@@ -18,6 +18,7 @@ from deepfold3.model.precision import fp32_guard
 from deepfold3.training.collectives import slice_batch_dict
 from deepfold3.training.ema import EMA
 from deepfold3.training.loss import training_loss
+from deepfold3.training.rank_zero import rank_zero_info
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,6 @@ def run_eval(
     model_cfg: ModelConfig,
     *,
     device: torch.device,
-    is_main: bool,
     log_microsteps: bool,
 ) -> dict[str, float]:
     """Run one evaluation pass.
@@ -53,6 +53,7 @@ def run_eval(
     n_batches = len(eval_dl)
 
     for batch_idx, features in enumerate(eval_dl):
+        features.pop("_record_id", None)
         features = _prepare_features(features, device)
 
         try:
@@ -85,8 +86,8 @@ def run_eval(
             for k, v in loss_dict.items():
                 metrics.setdefault(f"eval/{k}", []).append(v.item())
 
-            if is_main and log_microsteps:
-                logger.info("eval: %d/%d loss=%.2f", batch_idx + 1, n_batches, loss_dict["total"])
+            if log_microsteps:
+                rank_zero_info("eval: %d/%d loss=%.2f", batch_idx + 1, n_batches, loss_dict["total"])
         except Exception as e:
             # NOTE: ``except: continue`` inside a loop that calls into
             # ``forward_training`` is the class of pattern that caused

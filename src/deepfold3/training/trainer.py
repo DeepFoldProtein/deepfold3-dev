@@ -28,6 +28,8 @@ from deepfold3.data.module.collate import collate_fn
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.model.model import DeepFold3
 from deepfold3.training.accumulator import AccumulationLoop
+from deepfold3.training.callbacks import CallbackHub
+from deepfold3.training.callbacks.ema_callback import EMACallback
 from deepfold3.training.checkpointing import CheckpointManager, load_pretrained_weights
 from deepfold3.training.data import build_dataloaders
 from deepfold3.training.distributed import DistInfo, destroy_process_group_safely, init_process_group
@@ -40,8 +42,10 @@ from deepfold3.training.optim import (
     build_optimizer,
     freeze_for_confidence,
     is_chunked_diffusion_active,
+    register_reduce_hook,
     wrap_ddp,
 )
+from deepfold3.training.rank_zero import rank_zero_info, rank_zero_warn
 from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
 from deepfold3.training.signals import CheckpointRequestHandler, ShutdownCoordinator
 from deepfold3.training.state import TrainState, seed_everything
@@ -115,7 +119,6 @@ class Trainer:
         self.distillation_records = distillation_records or []
         self.provenance = provenance
 
-        # Will be set during setup
         self.model: DeepFold3 | None = None
         self.ddp_model: nn.Module | None = None
         self.optimizer: torch.optim.Optimizer | None = None
@@ -126,8 +129,7 @@ class Trainer:
         self.accumulator: AccumulationLoop | None = None
         self.ckpt_manager: CheckpointManager | None = None
         self.wrapped_optimizer: WrappedOptimizer | None = None
-
-        # Canonical state objects, populated during ``run``.
+        self.callbacks: CallbackHub = CallbackHub()
         self.dist: DistInfo | None = None
         self.state = TrainState()
 
@@ -137,7 +139,7 @@ class Trainer:
 
     def _init_distributed(self) -> None:
         """Bring up the process group — delegates to :func:`init_process_group`."""
-        self.dist = init_process_group()
+        self.dist = init_process_group(timeout_s=self.cfg.collective_timeout_s)
 
     def _seed_everything(self) -> None:
         """Seed all RNGs with a per-rank offset."""
@@ -160,17 +162,20 @@ class Trainer:
             freeze_for_confidence(self.model)
 
         self.ddp_model, use_static_graph = wrap_ddp(self.model, self.dist, self.cfg)
+        self._install_precision_policy()
         self.accumulator = AccumulationLoop(
             ddp_model=self.ddp_model,
             dist=self.dist,
             num_steps=self.cfg.accumulate_grad_batches,
         )
-        self.optimizer = build_optimizer(self.model, self.cfg, is_main=self.dist.is_main)
+        self.optimizer = build_optimizer(self.model, self.cfg)
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
-        # EMA
+        # EMA — owned by the trainer (for eval swap + checkpoint save/load),
+        # driven by ``EMACallback`` on every successful optimizer step.
         if self.cfg.ema_decay > 0:
             self.ema = EMA(self.model, decay=self.cfg.ema_decay)
+            self.callbacks.append(EMACallback(self.ema))
 
         # Mixed precision scaler (only for fp16; bf16 doesn't need scaling)
         self.scaler = GradScaler("cuda", enabled=(self.cfg.dtype == "fp16"))
@@ -190,20 +195,53 @@ class Trainer:
             device=self.dist.device,
         )
 
-        if self.dist.is_main:
-            n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
-            n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6
-            logger.info(f"Model parameters: {n_params:.1f}M total, {n_trainable:.1f}M trainable")
-            logger.info(
-                f"DDP: world_size={self.dist.world_size}, static_graph={use_static_graph}, "
-                f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}"
+        n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
+        n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6
+        rank_zero_info(f"Model parameters: {n_params:.1f}M total, {n_trainable:.1f}M trainable")
+        rank_zero_info(
+            f"DDP: world_size={self.dist.world_size}, static_graph={use_static_graph}, "
+            f"accumulate_grad_batches={self.cfg.accumulate_grad_batches}"
+        )
+
+    def _install_precision_policy(self) -> None:
+        """Validate cross-config precision invariants and install the comm hook.
+
+        Runs after ``wrap_ddp`` (needs the DDP-wrapped model). Fails
+        loud on combinations that would otherwise silently drift:
+        bf16 grad-accum across microsteps drops small contributions;
+        bf16 reduce on an fp32-compute run downcasts for no benefit.
+        """
+        precision = self.model_cfg.precision
+        if precision.grad_acc_dtype == "bf16" and self.cfg.accumulate_grad_batches > 1:
+            raise ValueError(
+                f"grad_acc_dtype='bf16' is incompatible with accumulate_grad_batches="
+                f"{self.cfg.accumulate_grad_batches} (>1): bf16 rounding silently drops "
+                "small microstep contributions from the accumulator. Use 'fp32' for grad_acc."
             )
+        if self.cfg.dtype == "fp32" and precision.reduce_dtype == "bf16":
+            raise ValueError(
+                "reduce_dtype='bf16' is incompatible with compute dtype='fp32' — the hook "
+                "downcasts fp32 grads to bf16 before allreduce, losing precision without "
+                "any bandwidth benefit in an fp32 run."
+            )
+
+        comm_hook_name = (
+            register_reduce_hook(self.ddp_model, precision.reduce_dtype)
+            if self.dist.is_distributed
+            else "default (fp32 allreduce)"
+        )
+        rank_zero_info(
+            "Precision policy: compute=%s, grad_acc=%s, reduce=%s, loss=%s; comm_hook=%s",
+            self.cfg.dtype,
+            precision.grad_acc_dtype,
+            precision.reduce_dtype,
+            precision.loss_dtype,
+            comm_hook_name,
+        )
 
     def _load_pretrained(self, path: str) -> None:
         """Thin wrapper around :func:`load_pretrained_weights`."""
-        load_pretrained_weights(
-            self.model, path, strict=self.cfg.load_strict, is_main=self.dist.is_main, device=self.dist.device
-        )
+        load_pretrained_weights(self.model, path, strict=self.cfg.load_strict, device=self.dist.device)
 
     def _init_trackers(self) -> None:
         """Build a :class:`TrackerHub` from the training config.
@@ -216,7 +254,7 @@ class Trainer:
         trackers: list[Tracker] = [StdoutTracker()]
         if self.dist.is_main and self.cfg.wandb_enabled:
             if not self.cfg.wandb_project:
-                logger.warning("wandb_enabled=True but wandb_project is empty; skipping wandb init")
+                rank_zero_warn("wandb_enabled=True but wandb_project is empty; skipping wandb init")
             else:
                 run_name = self.cfg.wandb_run_name or Path(self.cfg.output_dir).name
                 trackers.append(
@@ -226,7 +264,7 @@ class Trainer:
                         run_name=run_name,
                     )
                 )
-        self.trackers = TrackerHub(trackers, is_main=self.dist.is_main)
+        self.trackers = TrackerHub(trackers)
         self.trackers.start(dataclasses.asdict(self.cfg))
 
     # ------------------------------------------------------------------
@@ -273,14 +311,16 @@ class Trainer:
     # Optimizer step
     # ------------------------------------------------------------------
 
-    def _optimizer_step(self, loss: torch.Tensor) -> bool:
+    def _optimizer_step(self, loss: torch.Tensor, record_ids: list[str | None] | None = None) -> bool:
         """Accumulate the microstep's NaN flag, backward, and — on sync — step.
 
         Delegates the NaN collective + unscale + clip + step contract
         to :class:`WrappedOptimizer`; this shell handles the
-        no_sync/sync-step DDP gating and EMA update.
+        no_sync/sync-step DDP gating and EMA update. ``record_ids`` are
+        the dataset ids of the samples in this microstep's batch, used
+        for NaN-skip diagnostics.
         """
-        self.wrapped_optimizer.add_microstep_loss(loss)
+        self.wrapped_optimizer.add_microstep_loss(loss, record_ids=record_ids)
 
         is_sync_step = self.accumulator.is_sync_step(self.state.global_step)
         with self.accumulator.step_context(is_sync_step=is_sync_step):
@@ -291,8 +331,10 @@ class Trainer:
             return False
 
         result = self.wrapped_optimizer.step_or_skip(self.state)
-        if result.advanced and self.ema is not None:
-            self.ema.update(self.model)
+        if result.advanced:
+            self.callbacks.on_step_end(self, result)
+        else:
+            self.callbacks.on_skip_step(self, result)
         return result.advanced
 
     # ------------------------------------------------------------------
@@ -310,7 +352,6 @@ class Trainer:
             self.cfg,
             self.model_cfg,
             device=self.dist.device,
-            is_main=self.dist.is_main,
             log_microsteps=self.cfg.log_microsteps,
         )
         if self.dist.is_main:
@@ -353,7 +394,6 @@ class Trainer:
             ema=self.ema,
             state=self.state,
             train_cfg=self.cfg,
-            is_main=self.dist.is_main,
         )
 
     # ------------------------------------------------------------------
@@ -406,27 +446,26 @@ class Trainer:
                 self._load_checkpoint(latest)
 
         cfg = self.cfg
-        if self.dist.is_main:
-            tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
-            effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
-            tokens_per_opt_step = tokens_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
-            logger.info(f"Starting training: max_steps={cfg.max_steps}")
-            logger.info(f"  confidence_only={cfg.train_confidence_only}")
-            logger.info(f"  lr={cfg.lr}, warmup={cfg.warmup_steps}, scheduler={cfg.finetune_scheduler}")
-            logger.info(
-                f"  crop: max_tokens={cfg.max_tokens}, max_atoms={cfg.max_atoms}, "
-                f"max_msa_seqs={cfg.max_msa_seqs}, max_recycles={cfg.max_recycles}"
-            )
-            logger.info(
-                f"  batch: world_size={self.dist.world_size}, batch_per_rank={cfg.batch_size_per_rank}, "
-                f"accumulate={cfg.accumulate_grad_batches} → "
-                f"effective_batch_size={effective_batch_size} (tokens_per_opt_step={tokens_per_opt_step})"
-            )
-            logger.info(
-                f"  diffusion: batch_size={cfg.diffusion_batch_size}, chunk_size={cfg.diffusion_chunk_size}, "
-                f"mini_rollout_steps={cfg.mini_rollout_steps}, mini_rollout_samples={cfg.mini_rollout_samples}"
-            )
-            logger.info(f"  dtype={cfg.dtype}, grad_clip={cfg.grad_clip_norm}, ema_decay={cfg.ema_decay}")
+        tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
+        effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
+        tokens_per_opt_step = tokens_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
+        rank_zero_info(f"Starting training: max_steps={cfg.max_steps}")
+        rank_zero_info(f"  confidence_only={cfg.train_confidence_only}")
+        rank_zero_info(f"  lr={cfg.lr}, warmup={cfg.warmup_steps}, scheduler={cfg.finetune_scheduler}")
+        rank_zero_info(
+            f"  crop: max_tokens={cfg.max_tokens}, max_atoms={cfg.max_atoms}, "
+            f"max_msa_seqs={cfg.max_msa_seqs}, max_recycles={cfg.max_recycles}"
+        )
+        rank_zero_info(
+            f"  batch: world_size={self.dist.world_size}, batch_per_rank={cfg.batch_size_per_rank}, "
+            f"accumulate={cfg.accumulate_grad_batches} → "
+            f"effective_batch_size={effective_batch_size} (tokens_per_opt_step={tokens_per_opt_step})"
+        )
+        rank_zero_info(
+            f"  diffusion: batch_size={cfg.diffusion_batch_size}, chunk_size={cfg.diffusion_chunk_size}, "
+            f"mini_rollout_steps={cfg.mini_rollout_steps}, mini_rollout_samples={cfg.mini_rollout_samples}"
+        )
+        rank_zero_info(f"  dtype={cfg.dtype}, grad_clip={cfg.grad_clip_norm}, ema_decay={cfg.ema_decay}")
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -438,8 +477,6 @@ class Trainer:
         # Pure microstep compute time accumulator (excludes eval / checkpoint /
         # summary-log wall-clock). Flushed at each summary log.
         microstep_compute_time = 0.0
-        # _best_eval_loss is initialized in __init__ and may be overwritten
-        # by _load_checkpoint; no need for getattr guard here.
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
@@ -459,6 +496,11 @@ class Trainer:
                     break
 
                 t_microstep_start = time.monotonic()
+                # Non-tensor diagnostic: pop before the forward pass so the
+                # model / ``prepare_features`` never see a string. Threaded
+                # into the optimizer so NaN-skip warnings can name the
+                # offending record(s).
+                record_ids = features.pop("_record_id", None)
                 # No except-and-continue on OOM/exception: ``continue`` skips
                 # the per-microstep shutdown_flag all_reduce + the sync-boundary
                 # NaN all_gather, which desynchronizes collective participation
@@ -477,7 +519,7 @@ class Trainer:
                 # ``_optimizer_step`` — a single all-reduce per window replaces
                 # one-per-microstep. Backward runs unconditionally here; any
                 # NaN grads are discarded at the boundary before the opt step.
-                on_opt_step_boundary = self._optimizer_step(loss)
+                on_opt_step_boundary = self._optimizer_step(loss, record_ids=record_ids)
 
                 # Accumulate logging metrics locally (no collective).
                 # Inject token count so it rides the same all-reduce as losses.
@@ -497,7 +539,7 @@ class Trainer:
                 dt_micro = time.monotonic() - t_microstep_start
                 microstep_compute_time += dt_micro
 
-                if cfg.log_microsteps and self.dist.is_main:
+                if cfg.log_microsteps:
                     samples_per_microstep = self.dist.world_size * cfg.batch_size_per_rank
                     samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)
                     # Position within the current accumulation window: 1..accumulate
@@ -508,7 +550,7 @@ class Trainer:
                     # otherwise it's effective_step+1.
                     in_step = ((self.state.global_step - 1) % cfg.accumulate_grad_batches) + 1
                     target = self.state.effective_step if on_opt_step_boundary else self.state.effective_step + 1
-                    logger.info(
+                    rank_zero_info(
                         f"micro: target={target} "
                         f"global={self.state.global_step} "
                         f"in_step={in_step}/{cfg.accumulate_grad_batches} "
