@@ -327,6 +327,11 @@ class OF3Dataset(torch.utils.data.Dataset):
         is_distillation: Mark samples as distillation (disables confidence loss).
         mmcif_dir: PDB mmCIF mirror for template extraction (optional).
         max_templates: Maximum templates per sample (AF3 §2.4).
+        max_template_date: Hard cutoff on template release date (ISO YYYY-MM-DD).
+            Hits with ``release_date > max_template_date`` are dropped. OF3
+            ``template.npz`` carries ``release_date`` per hit; records without
+            a date fail the filter and are dropped when the cutoff is set.
+            ``None`` disables the filter (match pre-existing behavior).
     """
 
     def __init__(
@@ -344,6 +349,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         interface_distance: float = 15.0,
         mmcif_dir: Path | None = None,
         max_templates: int = 4,
+        max_template_date: str | None = None,
         name: str = "",
     ):
         self.records = records
@@ -357,6 +363,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         self.is_distillation = is_distillation
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
         self.max_templates = max_templates
+        self.max_template_date = max_template_date
 
         self.tokenizer = Tokenizer()
         self.cropper = Cropper(
@@ -440,9 +447,17 @@ class OF3Dataset(torch.utils.data.Dataset):
         if not hits:
             return None
 
-        # Drop self-hits (template PDB matches query ID)
+        # AF3 §2.4: drop self-hits + enforce hard release-date cutoff. Distillation
+        # queries have no meaningful ``released`` date, so the per-query
+        # ``release - cutoff_days`` tightening used by the PATCHR path doesn't apply.
         record_id_upper = live_record.id.upper()
-        filtered = [h for h in hits if h.template_pdb_id.upper() != record_id_upper]
+        cutoff = self.max_template_date
+        filtered = [
+            h
+            for h in hits
+            if h.template_pdb_id.upper() != record_id_upper
+            and (cutoff is None or (h.release_date is not None and h.release_date <= cutoff))
+        ]
         if not filtered:
             return None
 

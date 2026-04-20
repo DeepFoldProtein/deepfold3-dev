@@ -781,6 +781,8 @@ B200_PRETUNED: dict[str, dict[str, dict[str, Any]]] = {
             "num_stages": 3,
         },
     },
+    # Autotuned on first run per (SEQ_LEN, DIM); no B200 pretuned configs yet.
+    "_attn_bwd_db": {},
     "_attn_fwd": {
         "SEQ_LEN1024_DIM32": {
             "BLOCK_SIZE_Q": 16,

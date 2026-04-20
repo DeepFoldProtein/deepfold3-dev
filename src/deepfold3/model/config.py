@@ -49,6 +49,8 @@ class EvoformerConfig:
     msa_attention: MSAAttentionConfig = field(default_factory=MSAAttentionConfig)
     outer_product_num_channel: int = 32
     pair_attention: GridAttentionConfig = field(default_factory=GridAttentionConfig)
+    msa_dropout: float = 0.15
+    pair_dropout: float = 0.25
 
 
 @dataclass
@@ -60,6 +62,7 @@ class PairFormerConfig:
     single_attention_num_head: int = 16
     single_key_dim: int = 384
     single_value_dim: int = 384
+    pair_dropout: float = 0.25
 
 
 @dataclass
@@ -136,6 +139,7 @@ class TemplatePairFormerConfig:
     num_channels: int = 64
     num_heads: int = 4
     num_intermediate_factor: int = 2
+    pair_dropout: float = 0.25
 
 
 @dataclass

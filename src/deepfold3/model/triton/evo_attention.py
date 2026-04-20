@@ -160,6 +160,14 @@ if HAS_TRITON:
         for nw in (4, 8)
     ]
 
+    _ATTN_BWD_DB_CONFIGS = [
+        triton.Config({"BLOCK_SIZE_Q": bq, "BLOCK_SIZE_KV": bkv}, num_stages=ns, num_warps=nw)
+        for bq in (16, 32, 64)
+        for bkv in (16, 32, 64)
+        for ns in (1, 2, 3)
+        for nw in (4, 8)
+    ]
+
     @persistent_autotune(configs=_ATTN_FWD_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
         {
@@ -365,7 +373,6 @@ if HAS_TRITON:
         dQ,
         dK,
         dV,
-        d_pair_bias,
         M,
         D,
         stride_batch,
@@ -379,10 +386,6 @@ if HAS_TRITON:
         stride_mask_batch,
         stride_mask_msa,
         stride_mask_seq,
-        stride_d_pair_bias_batch,
-        stride_d_pair_bias_head,
-        stride_d_pair_bias_seq1,
-        stride_d_pair_bias_seq2,
         HEAD,
         N_SEQ,
         SEQ_LEN,
@@ -465,12 +468,6 @@ if HAS_TRITON:
             + offs_q[:, None] * stride_pair_bias_seq1
             + offs_kv[None, :] * stride_pair_bias_seq2
         )
-        d_pair_bias_block_ptr = (
-            d_pair_bias
-            + (index_batch * stride_d_pair_bias_batch + index_head * stride_d_pair_bias_head).to(tl.int64)
-            + (offs_q[:, None] * stride_d_pair_bias_seq1)
-            + (offs_kv[None, :] * stride_d_pair_bias_seq2)
-        )
         res_mask_block_ptr = (
             res_mask
             + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
@@ -526,13 +523,6 @@ if HAS_TRITON:
             P_block = tl.math.exp2((QK_block - M_block) * inv_ln2)
             dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
             dS_block = P_block * (dP_block - Di[:, None])
-
-            tl.atomic_add(
-                d_pair_bias_block_ptr,
-                dS_block,
-                mask=(offs_q[:, None] < SEQ_LEN) & ((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN),
-                sem="relaxed",
-            )
             dS_block = dS_block.to(K_T_block.dtype)
 
             dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
@@ -540,7 +530,6 @@ if HAS_TRITON:
             kT_ptrs += BLOCK_SIZE_KV * stride_seq
             vT_ptrs += BLOCK_SIZE_KV * stride_seq
             pair_bias_block_ptr += BLOCK_SIZE_KV * stride_pair_bias_seq2
-            d_pair_bias_block_ptr += BLOCK_SIZE_KV * stride_d_pair_bias_seq2
             res_mask_block_ptr += BLOCK_SIZE_KV * stride_mask_seq
 
         dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :]
@@ -554,6 +543,183 @@ if HAS_TRITON:
                 tl.store(dQ_block_ptrs, dQ_block, mask=offs_q[:, None] < SEQ_LEN)
             else:
                 tl.store(dQ_block_ptrs, dQ_block, mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM))
+
+    @persistent_autotune(configs=_ATTN_BWD_DB_CONFIGS, key=["SEQ_LEN", "DIM"])
+    @triton.heuristics(
+        {
+            "EVEN_Q": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_Q"] == 0,
+            "EVEN_KV": lambda args: args["SEQ_LEN"] % args["BLOCK_SIZE_KV"] == 0,
+            "EVEN_DIM": lambda args: args["DIM"] == args["BLOCK_DIM"],
+        }
+    )
+    @triton.jit
+    def _attn_bwd_db(
+        Q,
+        K,
+        V,
+        res_mask,
+        pair_bias,
+        softmax_scale,
+        dO,
+        d_pair_bias,
+        M,
+        D,
+        stride_batch,
+        stride_head,
+        stride_msa,
+        stride_seq,
+        stride_pair_bias_batch,
+        stride_pair_bias_head,
+        stride_pair_bias_seq1,
+        stride_pair_bias_seq2,
+        stride_mask_batch,
+        stride_mask_msa,
+        stride_mask_seq,
+        stride_d_pair_bias_batch,
+        stride_d_pair_bias_head,
+        stride_d_pair_bias_seq1,
+        stride_d_pair_bias_seq2,
+        HEAD,
+        N_SEQ,
+        SEQ_LEN,
+        BLOCK_DIM: tl.constexpr,
+        DIM: tl.constexpr,
+        EVEN_Q: tl.constexpr,
+        EVEN_KV: tl.constexpr,
+        EVEN_DIM: tl.constexpr,
+        BLOCK_SIZE_Q: tl.constexpr,
+        BLOCK_SIZE_KV: tl.constexpr,
+    ):
+        """d_pair_bias: one program per (i_block, j_block, batch*head) tile, loops
+        N_SEQ internally, accumulates fp32 locally, single non-atomic store. Bitwise
+        deterministic by construction.
+        """
+        index_i = tl.program_id(0).to(tl.int64)
+        index_j = tl.program_id(1).to(tl.int64)
+        index_batch_head = tl.program_id(2).to(tl.int64)
+        index_batch = index_batch_head // HEAD
+        index_head = index_batch_head % HEAD
+
+        offs_q = index_i * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        offs_kv = index_j * BLOCK_SIZE_KV + tl.arange(0, BLOCK_SIZE_KV)
+        offs_dim = tl.arange(0, BLOCK_DIM)
+
+        pair_bias_block_ptr = (
+            pair_bias
+            + (index_batch * stride_pair_bias_batch + index_head * stride_pair_bias_head)
+            + offs_q[:, None] * stride_pair_bias_seq1
+            + offs_kv[None, :] * stride_pair_bias_seq2
+        )
+        d_pair_bias_block_ptr = (
+            d_pair_bias
+            + (index_batch * stride_d_pair_bias_batch + index_head * stride_d_pair_bias_head)
+            + offs_q[:, None] * stride_d_pair_bias_seq1
+            + offs_kv[None, :] * stride_d_pair_bias_seq2
+        )
+
+        mask_q = offs_q[:, None] < SEQ_LEN
+        mask_kv = offs_kv[None, :] < SEQ_LEN
+        tile_mask = mask_q & mask_kv
+
+        # pair_bias tile is shared across all N_SEQ MSA rows — load once.
+        if EVEN_Q & EVEN_KV:
+            pb = tl.load(pair_bias_block_ptr)
+        else:
+            pb = tl.load(pair_bias_block_ptr, mask=tile_mask, other=float("-inf"))
+
+        db_block = tl.zeros([BLOCK_SIZE_Q, BLOCK_SIZE_KV], dtype=tl.float32)
+
+        inv_ln2: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+
+        for index_msa in range(0, N_SEQ):
+            base_qkv = (
+                index_batch * stride_batch + index_msa * stride_msa + index_head * stride_head
+            ).to(tl.int64)
+            # M/D packed as [batch*N_SEQ*H + msa*H + head] * SEQ_LEN (matches dq/dk_dv).
+            base_seq = (
+                (index_batch * N_SEQ * HEAD + index_msa * HEAD + index_head) * SEQ_LEN
+            ).to(tl.int64)
+
+            Q_ptrs = Q + base_qkv + offs_q[:, None] * stride_seq + offs_dim[None, :]
+            K_ptrs = K + base_qkv + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+            V_ptrs = V + base_qkv + offs_kv[:, None] * stride_seq + offs_dim[None, :]
+            dO_ptrs = dO + base_qkv + offs_q[:, None] * stride_seq + offs_dim[None, :]
+
+            res_mask_ptr = (
+                res_mask
+                + (index_batch * stride_mask_batch + index_msa * stride_mask_msa)
+                + offs_kv[None, :] * stride_mask_seq
+            )
+
+            if EVEN_Q & EVEN_KV:
+                m_block = tl.load(M + base_seq + offs_q)
+                Di = tl.load(D + base_seq + offs_q)
+                rm = tl.load(res_mask_ptr).broadcast_to((BLOCK_SIZE_Q, BLOCK_SIZE_KV))
+                if EVEN_DIM:
+                    Q_block = tl.load(Q_ptrs)
+                    K_block = tl.load(K_ptrs)
+                    V_block = tl.load(V_ptrs)
+                    dO_block = tl.load(dO_ptrs)
+                else:
+                    Q_block = tl.load(Q_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
+                    K_block = tl.load(K_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
+                    V_block = tl.load(V_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
+                    dO_block = tl.load(dO_ptrs, mask=offs_dim[None, :] < DIM, other=0.0)
+            else:
+                # `other=0.0` for M: combined with the explicit `-inf` OOB mask
+                # applied to QK below, this gives QK - m = -inf for OOB rows →
+                # P = exp2(-inf) = 0 → dS = 0. (Using other=inf here would
+                # propagate inf - inf = NaN.)
+                m_block = tl.load(M + base_seq + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+                Di = tl.load(D + base_seq + offs_q, mask=offs_q < SEQ_LEN, other=0.0)
+                rm = tl.load(res_mask_ptr, mask=mask_kv, other=float("-inf")).broadcast_to(
+                    (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
+                )
+                if EVEN_DIM:
+                    Q_block = tl.load(Q_ptrs, mask=offs_q[:, None] < SEQ_LEN, other=0.0)
+                    K_block = tl.load(K_ptrs, mask=offs_kv[:, None] < SEQ_LEN, other=0.0)
+                    V_block = tl.load(V_ptrs, mask=offs_kv[:, None] < SEQ_LEN, other=0.0)
+                    dO_block = tl.load(dO_ptrs, mask=offs_q[:, None] < SEQ_LEN, other=0.0)
+                else:
+                    Q_block = tl.load(
+                        Q_ptrs,
+                        mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                        other=0.0,
+                    )
+                    K_block = tl.load(
+                        K_ptrs,
+                        mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                        other=0.0,
+                    )
+                    V_block = tl.load(
+                        V_ptrs,
+                        mask=(offs_kv[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                        other=0.0,
+                    )
+                    dO_block = tl.load(
+                        dO_ptrs,
+                        mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM),
+                        other=0.0,
+                    )
+
+            Q_scaled = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
+            QK_block = tl.dot(Q_scaled, tl.trans(K_block)) + pb + rm
+            if not EVEN_KV:
+                QK_block += tl.where(mask_kv, 0, float("-inf"))
+            if not EVEN_Q:
+                QK_block += tl.where(mask_q, 0, float("-inf"))
+
+            # m_block = +inf for fully-masked rows → P = exp2(-inf) = 0 → dS = 0.
+            P_block = tl.math.exp2((QK_block - m_block[:, None]) * inv_ln2)
+            dP_block = tl.dot(dO_block, tl.trans(V_block)).to(tl.float32)
+            dS_block = P_block * (dP_block - Di[:, None])
+
+            db_block += dS_block
+
+        if EVEN_Q & EVEN_KV:
+            tl.store(d_pair_bias_block_ptr, db_block)
+        else:
+            tl.store(d_pair_bias_block_ptr, db_block, mask=tile_mask)
 
     @persistent_autotune(configs=_ATTN_BWD_DK_DV_CONFIGS, key=["SEQ_LEN", "DIM"])
     @triton.heuristics(
@@ -923,6 +1089,41 @@ class _EvoformerAttention(torch.autograd.Function):
             dQ=dQ,
             dK=dK,
             dV=dV,
+            M=M,
+            D=D_diag,
+            stride_batch=Q.stride(0),
+            stride_msa=Q.stride(1),
+            stride_head=Q.stride(2),
+            stride_seq=Q.stride(3),
+            stride_pair_bias_batch=pair_bias.stride(0),
+            stride_pair_bias_head=pair_bias.stride(2),
+            stride_pair_bias_seq1=pair_bias.stride(3),
+            stride_pair_bias_seq2=pair_bias.stride(4),
+            stride_mask_batch=res_mask.stride(0),
+            stride_mask_msa=res_mask.stride(1),
+            stride_mask_seq=res_mask.stride(4),
+            HEAD=HEAD,
+            N_SEQ=N_SEQ,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_DIM=BLOCK_DIM,
+            DIM=ctx.DIM,
+        )
+
+        def bwd_db_grid(args):
+            return (
+                triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
+                triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_KV"]),
+                BATCH_SIZE * HEAD,
+            )
+
+        _attn_bwd_db[bwd_db_grid](
+            Q=Q,
+            K=K,
+            V=V,
+            res_mask=res_mask,
+            pair_bias=pair_bias,
+            softmax_scale=ctx.softmax_scale,
+            dO=dO,
             d_pair_bias=d_pair_bias,
             M=M,
             D=D_diag,

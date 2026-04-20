@@ -186,6 +186,7 @@ def build_dataloaders(
         "interface_distance",
         "mmcif_dir",
         "max_templates",
+        "max_template_date",
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 

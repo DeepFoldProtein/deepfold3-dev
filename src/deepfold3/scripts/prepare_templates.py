@@ -141,9 +141,10 @@ def _process_monomer(
 @click.option(
     "--mmcif-cache",
     default=None,
-    type=click.Path(exists=True, path_type=Path),
-    help="JSON metadata cache from ``deepfold3 scan-mmcif``. Required to apply "
-    "release-date filtering. Provides ``{pdb_id: {released, ...}}``.",
+    type=click.Path(path_type=Path),
+    help="JSON metadata cache from ``deepfold3 scan-mmcif`` mapping "
+    "``{pdb_id: {released, ...}}``. Defaults to ``{data_dir}/mmcif_meta.json`` "
+    "if present; pass an explicit path to override.",
 )
 @click.option(
     "--max-template-date",
@@ -204,14 +205,23 @@ def prepare_templates(
         logger.error("No records found in %s", data_dir)
         return
 
-    # Build the {uppercase_pdb_id → release_date} map.
+    if mmcif_cache is None:
+        mmcif_cache = data_dir / "mmcif_meta.json"
+
     release_dates: dict[str, str] | None = None
-    if mmcif_cache is not None:
+    if mmcif_cache.exists():
         import json as _json
 
         cache = _json.loads(mmcif_cache.read_text())
         release_dates = {k.upper(): v["released"] for k, v in cache.items() if v.get("released")}
         logger.info("Loaded %d release dates from %s", len(release_dates), mmcif_cache)
+    else:
+        logger.warning(
+            "mmcif-cache %s not found; templates will be written with "
+            "release_date=None and get filtered out at training time. Run "
+            "``deepfold3 scan-mmcif`` first.",
+            mmcif_cache,
+        )
 
     if monomer:
         _run_monomer(

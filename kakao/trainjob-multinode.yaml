@@ -95,8 +95,6 @@ spec:
       - PYTHONUNBUFFERED
       - "-x"
       - OMP_NUM_THREADS
-      - "-x"
-      - TORCH_DISTRIBUTED_DEBUG
       - bash
       - "-lc"
       - |
@@ -154,11 +152,11 @@ spec:
           --config configs/initial.yaml \
           --output ${RUN_DIR} \
           --ccd /data/components.cif.gz \
+          --ccd-cache /data/ccd_cache.json \
           --mmcif-dir /data/pdb/divided \
           --wandb ${WANDB_PROJECT} \
           --wandb-entity ${WANDB_ENTITY} \
           --override wandb_run_name=${RUN_NAME} \
-          --override seed=99 \
           --override epoch_size=100000 \
           ${EXTRA_ARGS}
     env:
@@ -203,10 +201,6 @@ spec:
         value: "20000"
       - name: PYTHONUNBUFFERED
         value: "1"
-      - name: TORCH_DISTRIBUTED_DEBUG
-        # DETAIL logs per-iteration forward/backward/comm timings. Noisy in
-        # production — enable only for perf investigation runs.
-        value: "DETAIL"
       - name: OMP_NUM_THREADS
         # 12 CPUs per GPU (= per rank): 4 DataLoader workers × OMP=3 threads.
         # Trainer procs are CUDA-bound so their thread budget is headroom.

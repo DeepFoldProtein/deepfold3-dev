@@ -76,9 +76,12 @@ def _scan_one(args: tuple[str, str]) -> tuple[str, dict | None]:
 )
 @click.option(
     "--output",
-    required=True,
+    default=None,
     type=click.Path(path_type=Path),
-    help="Path to write the JSON metadata cache.",
+    help="Path to write the JSON metadata cache. Defaults to "
+    "``{data_dir}/mmcif_meta.json`` (the conventional location consumed by "
+    "``prepare-templates`` and ``enrich-manifest``); required when "
+    "``--ids-file`` is used instead of ``--data-dir``.",
 )
 @click.option(
     "--data-dir",
@@ -101,7 +104,7 @@ def _scan_one(args: tuple[str, str]) -> tuple[str, dict | None]:
 )
 def scan_mmcif(
     mmcif_dir: Path,
-    output: Path,
+    output: Path | None,
     data_dir: Path | None,
     ids_file: Path | None,
     workers: int,
@@ -117,6 +120,12 @@ def scan_mmcif(
     if data_dir is not None and ids_file is not None:
         click.echo("Error: --data-dir and --ids-file are mutually exclusive.", err=True)
         sys.exit(1)
+
+    if output is None:
+        if data_dir is None:
+            click.echo("Error: --output is required when --ids-file is used.", err=True)
+            sys.exit(1)
+        output = data_dir / "mmcif_meta.json"
 
     if data_dir is not None:
         from deepfold3.data.prepare.manifest import load_manifest

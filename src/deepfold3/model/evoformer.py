@@ -43,6 +43,7 @@ from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfi
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
+from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 from deepfold3.model.template_embedding import TemplateEmbedding
 
 _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
@@ -66,6 +67,8 @@ class EvoformerBlock(nn.Module):
         num_msa_heads: int = 8,
         num_pair_heads: int = 4,
         outer_product_hidden: int = 32,
+        msa_dropout: float = 0.15,
+        pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
     ):
         super().__init__()
@@ -79,6 +82,8 @@ class EvoformerBlock(nn.Module):
         self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
         self.msa_transition = make_transition_block(c_msa, config=optim)
+        self.msa_dropout = msa_dropout
+        self.pair_dropout = pair_dropout
 
     def forward(
         self,
@@ -87,16 +92,14 @@ class EvoformerBlock(nn.Module):
         msa_mask: torch.Tensor,  # [B?, S, N]
         pair_mask: torch.Tensor,  # [B?, N, N]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Update pair from MSA
-        pair = pair + self.outer_product(msa, msa_mask)
-        # Update MSA from pair
-        msa = msa + self.row_attn(msa, msa_mask, pair)
+        p_pair, p_msa, training = self.pair_dropout, self.msa_dropout, self.training
+        pair = dropout_add_rowwise(pair, self.outer_product(msa, msa_mask), p_pair, training)
+        msa = dropout_add_rowwise(msa, self.row_attn(msa, msa_mask, pair), p_msa, training)
         msa = msa + self.msa_transition(msa)
-        # Update pair
-        pair = pair + self.tri_mul_out(pair, pair_mask)
-        pair = pair + self.tri_mul_in(pair, pair_mask)
-        pair = pair + self.pair_attn_row(pair, pair_mask)
-        pair = pair + self.pair_attn_col(pair, pair_mask)
+        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p_pair, training)
+        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p_pair, training)
+        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p_pair, training)
+        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p_pair, training)
         pair = pair + self.pair_transition(pair)
         return msa, pair
 
@@ -118,6 +121,7 @@ class PairFormerBlock(nn.Module):
         num_single_heads: int = 16,
         single_key_dim: int = 384,
         single_value_dim: int = 384,
+        pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
     ):
         super().__init__()
@@ -137,6 +141,7 @@ class PairFormerBlock(nn.Module):
             optim=optim,
         )
         self.single_transition = make_transition_block(c_single, config=optim)
+        self.pair_dropout = pair_dropout
 
     def forward(
         self,
@@ -145,11 +150,11 @@ class PairFormerBlock(nn.Module):
         pair_mask: torch.Tensor,  # [B?, N, N]
         seq_mask: torch.Tensor,  # [B?, N]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Pair updates
-        pair = pair + self.tri_mul_out(pair, pair_mask)
-        pair = pair + self.tri_mul_in(pair, pair_mask)
-        pair = pair + self.pair_attn_row(pair, pair_mask)
-        pair = pair + self.pair_attn_col(pair, pair_mask)
+        p, training = self.pair_dropout, self.training
+        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training)
+        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training)
+        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training)
+        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training)
         pair = pair + self.pair_transition(pair)
         # Single update: pair → logits, then single attention
         pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
@@ -245,6 +250,8 @@ class Evoformer(nn.Module):
                     num_msa_heads=cfg.msa_attention.num_head,
                     num_pair_heads=cfg.pair_attention.num_head,
                     outer_product_hidden=cfg.outer_product_num_channel,
+                    msa_dropout=cfg.msa_dropout,
+                    pair_dropout=cfg.pair_dropout,
                     optim=optim,
                 )
                 for _ in range(cfg.num_layer)
@@ -261,6 +268,7 @@ class Evoformer(nn.Module):
                     num_single_heads=pf_cfg.single_attention_num_head,
                     single_key_dim=pf_cfg.single_key_dim,
                     single_value_dim=pf_cfg.single_value_dim,
+                    pair_dropout=pf_cfg.pair_dropout,
                     optim=optim,
                 )
                 for _ in range(pf_cfg.num_layer)

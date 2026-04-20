@@ -1030,3 +1030,30 @@ def test_determinism_forward_and_backward():
         assert torch.equal(dKi, dK0), f"dK not deterministic at iter {i}"
         assert torch.equal(dVi, dV0), f"dV not deterministic at iter {i}"
         assert torch.equal(dPi, dP0), f"d_pair_bias not deterministic at iter {i}"
+
+
+def test_d_pair_bias_determinism_large_nseq():
+    """Bitwise-equal d_pair_bias across 20 iters with N_seq=16, N_res=250
+    (uneven-tile path, high N_SEQ writer count on each output tile).
+    """
+    B, N_seq, N_res, H, D = 1, 16, 250, 4, 32
+    dtype = torch.bfloat16
+    seed = 99
+    Q, K, V, res_mask, pair_bias = _make_inputs(B, N_seq, N_res, H, D, dtype, seed, requires_grad=True)
+
+    torch.manual_seed(seed + 11)
+    dO = torch.randn((B, N_seq, N_res, H, D), device="cuda", dtype=dtype) * 0.1
+
+    out0 = _EvoformerAttention.apply(Q, K, V, res_mask, pair_bias, False)
+    dQ0, dK0, dV0, dP0 = torch.autograd.grad(out0, [Q, K, V, pair_bias], grad_outputs=dO)
+    torch.cuda.synchronize()
+
+    for i in range(1, 20):
+        outi = _EvoformerAttention.apply(Q, K, V, res_mask, pair_bias, False)
+        dQi, dKi, dVi, dPi = torch.autograd.grad(outi, [Q, K, V, pair_bias], grad_outputs=dO)
+        torch.cuda.synchronize()
+        assert torch.equal(outi, out0), f"forward not deterministic at iter {i}"
+        assert torch.equal(dQi, dQ0), f"dQ not deterministic at iter {i}"
+        assert torch.equal(dKi, dK0), f"dK not deterministic at iter {i}"
+        assert torch.equal(dVi, dV0), f"dV not deterministic at iter {i}"
+        assert torch.equal(dPi, dP0), f"d_pair_bias not deterministic at iter {i}"
