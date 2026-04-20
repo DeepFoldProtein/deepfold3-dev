@@ -171,6 +171,7 @@ def build_dataloaders(
         interface_crop_weight=model_cfg.data.interface_crop_weight,
         interface_distance=model_cfg.data.interface_distance,
         max_chains=model_cfg.data.max_chains,
+        ccd_cache_path=cfg.ccd_cache_path or None,
     )
 
     # Keys accepted by OF3Dataset (subset of ds_kwargs).

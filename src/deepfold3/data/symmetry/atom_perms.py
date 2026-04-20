@@ -168,7 +168,7 @@ def compute_ligand_token_swap_pairs(
     only slot ``M=0``), so ligand symmetries become **inter-token** swaps.
     For every ligand chain we look up its CCD residue name, fetch the
     automorphism group from ``ligand_perm_cache`` (the JSON dict produced
-    by ``deepfold3 build-ligand-cache``), extract the involution pairs
+    by ``deepfold3 build-ccd-cache --automorphisms``), extract the involution pairs
     from each automorphism, and map them back to current token indices
     via ``token['residue_index']`` — which the tokenizer sets to the
     local-within-ligand atom index, so the mapping survives cropping.

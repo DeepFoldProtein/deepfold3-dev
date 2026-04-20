@@ -122,6 +122,7 @@ def training_step(
             diffusion_chunk_size=chunk_size_arg,
             backward_fn=backward_fn,
             loss_cfg=loss_cfg_arg,
+            compute_confidence=cfg.alpha_confidence > 0,
         )
 
     # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice

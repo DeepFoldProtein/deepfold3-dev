@@ -25,7 +25,7 @@ from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncode
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.precision import upcast_fp32 as _upcast_fp32
-from deepfold3.model.primitives import LinearNoBias, af3_linear_init_
+from deepfold3.model.primitives import LinearNoBias, af3_linear_init_, chunked_linear_init_
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -247,7 +247,8 @@ class DiffusionTransformerBlock(nn.Module):
         nn.init.zeros_(self.ffn_zero_cond.weight)
         nn.init.constant_(self.ffn_zero_cond.bias, -2.0)
 
-        # Fused FFN kernels (optional)
+        # Fused FFN kernels (optional). Stateless — read parent's ffn_linear1
+        # weight at call time (single source of truth; no sync).
         self._fused_ada_ln_linear = None
         self._fused_swiglu = None
         if optim is not None and optim.use_fused_ada_transition:
@@ -257,29 +258,11 @@ class DiffusionTransformerBlock(nn.Module):
 
                 self._fused_ada_ln_linear = FusedAdaLayerNormLinear(c, num_int * 2)
                 self._fused_swiglu = FusedSwiGLU()
-                self._sync_ffn_to_fused()
             except ImportError:
                 pass
 
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load state dict then sync to fused FFN parameters if present."""
-        if self._fused_ada_ln_linear is not None and strict:
-            # Relax strict if incoming state_dict lacks fused keys (they are derived).
-            if not any(k.startswith(("_fused_ada_ln_linear.", "_fused_swiglu.")) for k in state_dict):
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        if self._fused_ada_ln_linear is not None:
-            self._sync_ffn_to_fused()
-        return result
-
-    def _sync_ffn_to_fused(self):
-        """Copy ffn_linear1 weights to fused AdaLN+Linear."""
-        if self._fused_ada_ln_linear is not None:
-            with torch.no_grad():
-                self._fused_ada_ln_linear.linear_weight.data.copy_(self.ffn_linear1.weight.data.T)
 
     def _compute(
         self,
@@ -328,7 +311,8 @@ class DiffusionTransformerBlock(nn.Module):
         bias = self.ffn_cond_bias(cn)
 
         if self._fused_ada_ln_linear is not None and x.is_cuda:
-            h = self._fused_ada_ln_linear(x, scale, bias)
+            # Stateless fused AdaLN+Linear reads parent's ffn_linear1 weight.
+            h = self._fused_ada_ln_linear(x, scale, bias, self.ffn_linear1.weight.T)
             ff = self._fused_swiglu(h)
         else:
             xn = F.layer_norm(x, [C])
@@ -480,10 +464,13 @@ class DiffusionConditioningBlock(nn.Module):
     ):
         super().__init__()
         self.sigma_data = sigma_data
-        # Pair conditioning
+        # Pair conditioning: concat(pair_emb, rel_feat) → linear
+        # IntFold §5.4.2: init each concat slice with its own fan_in (not the
+        # sum) so Lecun stddev matches a per-feature linear + add.
         pair_in = c_pair_in + rel_feat_dim
         self.pair_cond_norm_w = nn.Parameter(torch.ones(pair_in))
         self.pair_cond_proj = LinearNoBias(pair_in, c_pair_out)
+        chunked_linear_init_(self.pair_cond_proj.weight, [c_pair_in, rel_feat_dim])
         self.pair_trans0 = make_transition_block(
             c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
         )
@@ -491,10 +478,11 @@ class DiffusionConditioningBlock(nn.Module):
             c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
         )
 
-        # Single conditioning: concat(single_embedding, target_feat)
+        # Single conditioning: concat(single_embedding, target_feat) → linear
         single_in = c_single_in + target_feat_dim  # 384 + 447 = 831
         self.single_cond_norm_w = nn.Parameter(torch.ones(single_in))
         self.single_cond_proj = LinearNoBias(single_in, c_single_out)
+        chunked_linear_init_(self.single_cond_proj.weight, [c_single_in, target_feat_dim])
 
         # Noise embedding conditioning (Fourier weights loaded from safetensors)
         self.register_buffer("fourier_weight", torch.zeros(fourier_dim))

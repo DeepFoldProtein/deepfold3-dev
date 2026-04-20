@@ -181,6 +181,14 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
     type=click.Path(exists=True),
     help="PDB mmCIF mirror directory. Enables template loading during training.",
 )
+@click.option(
+    "--ccd-cache",
+    "ccd_cache_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Path to unified CCD cache JSON (atoms + ref_pos + automorphisms). "
+    "Enables ligand atom-permutation loss. Build with `deepfold3 build-ccd-cache --automorphisms`.",
+)
 def train(
     data_dir: str | None,
     output: str,
@@ -202,6 +210,7 @@ def train(
     extra_datasets: tuple[str, ...],
     eval_cutoff_date: str | None,
     mmcif_dir: str | None,
+    ccd_cache_path: str | None,
 ) -> None:
     """Train DeepFold3 model."""
     from deepfold3.config_loader import load_config
@@ -284,6 +293,8 @@ def train(
         train_cfg.wandb_entity = wandb_entity
     if mmcif_dir is not None:
         train_cfg.mmcif_dir = mmcif_dir
+    if ccd_cache_path is not None:
+        train_cfg.ccd_cache_path = ccd_cache_path
     if eval_cutoff_date is not None:
         train_cfg.eval_cutoff_date = eval_cutoff_date
 

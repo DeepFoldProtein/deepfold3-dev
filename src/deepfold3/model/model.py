@@ -149,51 +149,18 @@ class DeepFold3(nn.Module):
         # Distogram head
         self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head)
 
-    def state_dict(self, *args, **kwargs):
-        """Return state dict without fused kernel parameters."""
-        markers = OptimConfig.FUSED_STATE_DICT_MARKERS
-        full = super().state_dict(*args, **kwargs)
-        return {k: v for k, v in full.items() if not any(m in k for m in markers)}
-
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load state dict and sync any fused kernel parameters."""
-        # Fused kernel params are derived — relax strict if none appear in the incoming dict.
-        markers = OptimConfig.FUSED_STATE_DICT_MARKERS
-        if strict:
-            has_fused = any(any(m in k for m in markers) for k in state_dict)
-            if not has_fused:
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        self._sync_fused_kernels()
-        return result
+        """Load state dict.
 
-    def _sync_fused_kernels(self):
-        """Sync all fused kernel parameters from their base module weights.
-
-        Fused Triton modules hold copies of weights from their base (unfused)
-        counterparts. When the top-level model.load_state_dict() loads weights,
-        only the base params are updated — fused copies become stale. This
-        method walks all modules and re-syncs every fused copy.
+        All fused Triton wrapper modules are stateless after the 2026-04-20
+        refactor — they read the parent module's parameters at call time and
+        own none themselves. Old checkpoints may still contain keys under
+        those names (`_ln_linear.*`, `_fused_pair_bias.*`, etc.); filter them
+        out so strict-mode loading still works for the legacy weights.
         """
-        for mod in self.modules():
-            # TriangleMul: fused gate (LN+packed GEMM), dual GEMM, center proj (LN+Linear)
-            if hasattr(mod, "_fused_gate") and mod._fused_gate is not None:
-                mod._sync_to_fused_gate()
-            if hasattr(mod, "_fused_dual_gemm") and mod._fused_dual_gemm is not None:
-                mod._sync_dual_gemm()
-            if hasattr(mod, "_fused_center_proj") and mod._fused_center_proj is not None:
-                mod._sync_center_proj()
-            # AdaTransitionBlock: fused AdaLN+Linear
-            if hasattr(mod, "_fused_ada_ln_linear") and mod._fused_ada_ln_linear is not None:
-                mod._sync_ffn_to_fused()
-            # FusedTransitionBlock: fused LN+Linear
-            if hasattr(mod, "_sync_to_fused") and hasattr(mod, "_ln_linear") and mod._ln_linear is not None:
-                mod._sync_to_fused()
-            # GridSelfAttention: fused LN+transpose, fused pair bias (LN+proj+permute)
-            if hasattr(mod, "_ln_transpose") and mod._ln_transpose is not None:
-                mod._sync_ln_transpose()
-            if hasattr(mod, "_fused_pair_bias") and mod._fused_pair_bias is not None:
-                mod._sync_pair_bias()
+        markers = OptimConfig.FUSED_STATE_DICT_MARKERS
+        filtered = {k: v for k, v in state_dict.items() if not any(m in k for m in markers)}
+        return super().load_state_dict(filtered, strict=strict, assign=assign)
 
     def run_evoformer(
         self,
@@ -378,14 +345,17 @@ class DeepFold3(nn.Module):
         diffusion_chunk_size: int = 0,
         backward_fn=None,
         loss_cfg=None,
+        compute_confidence: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
         Encapsulates the full training pipeline:
 
         1. Evoformer trunk with recycling (gradient only on last cycle).
-        2. Single-step diffusion training (augment GT, add noise, denoise).
-        3. Mini-rollout (no gradient, reduced steps/samples).
+        2. Mini-rollout (no gradient, reduced steps/samples) — runs before
+           diffusion so the chain/ligand permutation in the diffusion MSE
+           can read ``mini_rollout_pos`` from ``pred``.
+        3. Single-step diffusion training (augment GT, add noise, denoise).
         4. Confidence head on mini-rollout positions.
         5. Distogram head.
 
@@ -448,7 +418,34 @@ class DeepFold3(nn.Module):
         pred["single"] = embeddings["single"]
         pred["pair"] = embeddings["pair"]
 
-        # --- 2. Diffusion training step ---
+        # --- 2. Mini-rollout (no gradient) ---
+        # Runs before diffusion so the chunked diffusion MSE can read
+        # ``mini_rollout_pos`` for chain/ligand permutation (AF3 §4.3).
+        # eval() + detach inputs is defence-in-depth against any submodule
+        # that tracks grad through leaves under no_grad.
+        with torch.no_grad():
+            diff_cfg = self.diffusion_head.cfg
+            orig_steps, orig_samples = diff_cfg.steps, diff_cfg.num_samples
+            diff_cfg.steps = mini_rollout_steps
+            diff_cfg.num_samples = mini_rollout_samples
+            was_training = self.diffusion_head.training
+            self.diffusion_head.eval()
+            try:
+                mini_embeddings = {k: v.detach() for k, v in embeddings.items()}
+                mini_result = self.diffusion_head.sample(
+                    embeddings=mini_embeddings,
+                    seq_mask=seq_mask,
+                    rel_feat=rel_feat.detach(),
+                    **{k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in ref_kwargs.items()},
+                )
+            finally:
+                diff_cfg.steps, diff_cfg.num_samples = orig_steps, orig_samples
+                if was_training:
+                    self.diffusion_head.train()
+
+        pred["mini_rollout_pos"] = mini_result["atom_positions"].detach()
+
+        # --- 3. Diffusion training step ---
         chunked = (
             diffusion_chunk_size > 0
             and backward_fn is not None
@@ -501,11 +498,13 @@ class DeepFold3(nn.Module):
                 #   noise_levels: [B, S_chunk]
                 chunk_loss = pair_real.new_zeros(())
                 chunk_components: dict[str, torch.Tensor] = {}
+                mini_pos_batched = pred["mini_rollout_pos"]  # [B, S_mini, N, M, 3]
                 for b in range(B_pair):
                     chunk_pred_b = {
                         "denoised": denoised_c[b],
                         "gt_augmented": gt_aug_c[b],
                         "noise_levels": noise_levels_c[b],
+                        "mini_rollout_pos": mini_pos_batched[b],
                     }
                     features_b = {
                         k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
@@ -545,53 +544,48 @@ class DeepFold3(nn.Module):
             pred["gt_augmented"] = gt_aug
             pred["noise_levels"] = noise_levels
 
-        # --- 3. Mini-rollout (no gradient) ---
-        with torch.no_grad():
-            diff_cfg = self.diffusion_head.cfg
-            orig_steps, orig_samples = diff_cfg.steps, diff_cfg.num_samples
-            diff_cfg.steps = mini_rollout_steps
-            diff_cfg.num_samples = mini_rollout_samples
-            try:
-                mini_result = self.diffusion_head.sample(
-                    embeddings=embeddings, seq_mask=seq_mask, rel_feat=rel_feat, **ref_kwargs
-                )
-            finally:
-                diff_cfg.steps, diff_cfg.num_samples = orig_steps, orig_samples
-
-        pred["mini_rollout_pos"] = mini_result["atom_positions"].detach()
-
         # --- 4. Confidence head ---
-        # AF3 §3.7: confidence head trains over fixed (detached) trunk
-        # outputs and the (already-detached) mini-rollout positions, so
-        # confidence-loss gradients update only confidence-head parameters.
-        # ConfidenceHead supports batched ``[B?, N, ...]`` inputs natively
-        # (PairFormer + projection ops are all batch-aware) — pass straight
-        # through whether ``B == 1`` or ``B > 1``.
-        conf_out = self.confidence_head(
-            pair=embeddings["pair"].detach(),
-            single=embeddings["single"].detach(),
-            pair_mask=pair_mask,
-            seq_mask=seq_mask,
-            target_feat=target_feat.detach(),
-            atom_positions=pred["mini_rollout_pos"],
-            rep_atom_index=features.get("token_to_rep_atom"),
-            return_pre_logits=fused_ce,
-        )
+        # ``compute_confidence`` gates only the confidence head forward so
+        # the caller can disable confidence supervision (e.g. warmup
+        # phase). Mini-rollout stays on to keep chain-perm deterministic.
+        # Skipping the head entirely — not just the loss — is required
+        # because a NaN/Inf in the confidence logits would contaminate
+        # ``total_loss`` even when multiplied by ``alpha_confidence=0``
+        # (``0 * NaN == NaN``). The flag must stay constant across a run
+        # so DDP ``static_graph=True`` sees an invariant reached-parameter
+        # set.
+        if compute_confidence:
+            # AF3 §3.7: confidence head trains over fixed (detached) trunk
+            # outputs and the (already-detached) mini-rollout positions, so
+            # confidence-loss gradients update only confidence-head parameters.
+            conf_out = self.confidence_head(
+                pair=embeddings["pair"].detach(),
+                single=embeddings["single"].detach(),
+                pair_mask=pair_mask,
+                seq_mask=seq_mask,
+                target_feat=target_feat.detach(),
+                atom_positions=pred["mini_rollout_pos"],
+                rep_atom_index=features.get("token_to_rep_atom"),
+                return_pre_logits=fused_ce,
+            )
 
-        pred["plddt"] = conf_out["plddt_logits"]
-        pred["exp_resolved"] = conf_out["exp_resolved_logits"]
+            pred["plddt"] = conf_out["plddt_logits"]
+            pred["exp_resolved"] = conf_out["exp_resolved_logits"]
 
+            if fused_ce:
+                pred["pae_features"] = conf_out["pae_features"]
+                pred["pde_features"] = conf_out["pde_features"]
+                pred["pae_weight"] = self.confidence_head.pae_logits.weight
+                pred["pde_weight"] = self.confidence_head.pde_half_logits.weight
+            else:
+                pred["pae"] = conf_out["pae_logits"]
+                pred["pde"] = conf_out["pde_logits"]
+
+        # --- 5. Distogram head (independent of mini-rollout) ---
         if fused_ce:
-            # Return pre-projection features + weight refs for chunked linear+CE
-            pred["pae_features"] = conf_out["pae_features"]
-            pred["pde_features"] = conf_out["pde_features"]
-            pred["pae_weight"] = self.confidence_head.pae_logits.weight
-            pred["pde_weight"] = self.confidence_head.pde_half_logits.weight
             pred["distogram_features"] = embeddings["pair"]
             pred["distogram_weight"] = self.distogram_head.half_logits.weight
         else:
-            pred["pae"] = conf_out["pae_logits"]
-            pred["pde"] = conf_out["pde_logits"]
             pred["distogram"] = self.distogram_head(embeddings["pair"])
 
         return pred

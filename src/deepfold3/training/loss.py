@@ -282,6 +282,36 @@ def smooth_lddt_loss(
 # ---------------------------------------------------------------------------
 
 
+def chain_perm_from_mini_rollout(
+    pred: dict[str, torch.Tensor],
+    features: dict[str, torch.Tensor],
+) -> dict[int, int] | None:
+    """AF3 §4.3 chain permutation from the mini-rollout structure.
+
+    The mini-rollout is a multi-step denoised prediction (``no_grad``) in
+    the same frame as the un-augmented GT, so a single chain assignment
+    computed here can be applied to every augmented GT sample consumed
+    by the diffusion MSE. Returns ``None`` when the inputs needed for
+    permutation aren't present (``mini_rollout_pos``, ``asym_id``,
+    ``entity_id``) — callers fall back to the legacy per-sample compute
+    on the noisy single-step denoised prediction.
+    """
+    mini_pos = pred.get("mini_rollout_pos")
+    asym_id = features.get("asym_id")
+    entity_id = features.get("entity_id")
+    gt_pos = features.get("atom_gt_positions")
+    atom_mask = features.get("atom_gt_mask")
+    if mini_pos is None or asym_id is None or entity_id is None or gt_pos is None or atom_mask is None:
+        return None
+
+    from deepfold3.data.symmetry.chain_perm import compute_chain_permutation_tokens
+
+    # mini-rollout is ``[S_mini, N, M, 3]`` — use the first sample.
+    return compute_chain_permutation_tokens(
+        mini_pos[0], gt_pos, atom_mask.bool(), asym_id, entity_id
+    )
+
+
 def diffusion_mse_loss(
     pred_pos: torch.Tensor,  # [S, N, M, 3]
     gt_pos: torch.Tensor,  # [S, N, M, 3] (augmented GT per sample)
@@ -296,6 +326,8 @@ def diffusion_mse_loss(
     ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 2] (token_a, token_b) ligand swaps
     asym_id: torch.Tensor | None = None,  # [N] int — per-token chain id
     entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
+    chain_assign: dict[int, int] | None = None,  # pre-computed pred→GT chain mapping
+    atom_perm_pred: torch.Tensor | None = None,  # [N, M, 3] — mini-rollout reference for atom/ligand swap decisions
     apply_rigid_align: bool = True,
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
@@ -343,23 +375,47 @@ def diffusion_mse_loss(
         )
 
         S = gt_pos.shape[0]
-        permuted_chunks: list[torch.Tensor] = []
         atom_mask_bool = atom_mask.bool()
-        for s in range(S):
-            chain_assign = compute_chain_permutation_tokens(pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id)
-            new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)
-            permuted_chunks.append(new_gt)
+        # AF3 §4.3: a single chain assignment (from the multi-step
+        # ``mini_rollout`` structure) is shared across all S augmented GT
+        # samples, because augmentation is SE(3) and preserves chain
+        # identity. Fall back to per-sample compute on the (noisy)
+        # single-step denoised ``pred_pos`` only when the caller didn't
+        # pre-compute an assignment — mainly legacy tests or inference
+        # paths without mini-rollout.
+        if chain_assign is not None:
+            permuted_chunks = [
+                apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)[0]
+                for s in range(S)
+            ]
+        else:
+            permuted_chunks = []
+            for s in range(S):
+                assign_s = compute_chain_permutation_tokens(
+                    pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id
+                )
+                new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, assign_s)
+                permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
+
+    # Atom / ligand permutation use ``mini_rollout_pos`` (AF3 §4.3:
+    # decisions come from the multi-step mini-rollout) when available,
+    # falling back to the per-sample single-step ``pred_pos`` only when
+    # the caller didn't stage a mini-rollout reference.
+    if atom_perm_pred is not None:
+        atom_ref = atom_perm_pred.unsqueeze(0).expand_as(pred_pos)
+    else:
+        atom_ref = pred_pos
 
     if atom_swap_pairs is not None and len(atom_swap_pairs) > 0:
         from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
 
-        gt_pos = apply_token_atom_permutation(pred_pos, gt_pos, atom_mask.bool(), atom_swap_pairs)
+        gt_pos = apply_token_atom_permutation(atom_ref, gt_pos, atom_mask.bool(), atom_swap_pairs)
 
     if ligand_swap_pairs is not None and len(ligand_swap_pairs) > 0:
         from deepfold3.data.symmetry.atom_perms import apply_ligand_token_swap
 
-        gt_pos = apply_ligand_token_swap(pred_pos, gt_pos, atom_mask.bool(), ligand_swap_pairs)
+        gt_pos = apply_ligand_token_swap(atom_ref, gt_pos, atom_mask.bool(), ligand_swap_pairs)
 
     mask = atom_mask.float()  # [N, M]
 
@@ -805,6 +861,8 @@ def diffusion_only_loss(
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
+            chain_assign=chain_perm_from_mini_rollout(pred, features),
+            atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
             apply_rigid_align=cfg.use_rigid_align,
         )
         components["diffusion_mse"] = l_mse.detach()
@@ -929,6 +987,8 @@ def training_loss(
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
+            chain_assign=chain_perm_from_mini_rollout(pred, features),
+            atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
             apply_rigid_align=cfg.use_rigid_align,
         )
         losses["diffusion_mse"] = l_mse

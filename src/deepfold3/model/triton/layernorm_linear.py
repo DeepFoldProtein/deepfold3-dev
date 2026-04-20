@@ -10,8 +10,6 @@ Triton configs are unavailable for the given shape.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -535,7 +533,13 @@ class LayernormLinearFunction(torch.autograd.Function):
 
 
 class FusedLayerNormLinear(nn.Module):
-    """Fused LayerNorm + Linear module (drop-in for LayerNorm -> LinearNoBias sequence).
+    """Fused LayerNorm + Linear kernel — STATELESS.
+
+    Holds no parameters; callers pass LN scale/offset and the linear weight
+    (stored as [K, N] for the Triton kernel) at call time. This avoids the
+    duplicate-parameter + sync pattern that would otherwise split gradients
+    between parent and fused copies and cause training to be lost on
+    checkpoint reload.
 
     Args:
         in_features: Input/normalized dimension (K).
@@ -549,39 +553,38 @@ class FusedLayerNormLinear(nn.Module):
         self.out_features = out_features
         self.has_linear_bias = has_linear_bias
 
-        # LayerNorm parameters (weight=scale, bias=offset)
-        self.weight = nn.Parameter(torch.ones(in_features))
-        self.bias = nn.Parameter(torch.zeros(in_features))
-
-        # Linear parameters (stored as [K, N] for Triton kernel)
-        self.linear_weight = nn.Parameter(torch.empty(in_features, out_features))
-        self.linear_bias = nn.Parameter(torch.empty(out_features)) if has_linear_bias else None
-
-        self._reset_linear_parameters()
-
-    def _reset_linear_parameters(self):
-        temp = torch.empty(self.out_features, self.in_features)
-        nn.init.kaiming_uniform_(temp, a=math.sqrt(5))
-        with torch.no_grad():
-            self.linear_weight.data.copy_(temp.T)
-        if self.has_linear_bias:
-            fan_in = self.in_features
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.linear_bias, -bound, bound)
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        X: torch.Tensor,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        linear_weight: torch.Tensor,
+        linear_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            X: Input tensor with last dim == in_features.
+            ln_weight: [in_features] LN scale (from parent's norm.weight).
+            ln_bias: [in_features] LN offset (from parent's norm.bias).
+            linear_weight: [in_features, out_features] transposed linear weight
+                (for standard nn.Linear weight [out_features, in_features],
+                pass `.T`).
+            linear_bias: [out_features] optional linear bias.
+        """
+        if linear_bias is not None and not self.has_linear_bias:
+            raise ValueError("linear_bias provided but module configured with has_linear_bias=False")
         if not HAS_TRITON or not X.is_cuda:
             return F.linear(
-                F.layer_norm(X, (self.in_features,), self.weight, self.bias),
-                self.linear_weight.T,
-                self.linear_bias,
+                F.layer_norm(X, (self.in_features,), ln_weight, ln_bias),
+                linear_weight.T,
+                linear_bias,
             )
         return LayernormLinearFunction.apply(
             X,
-            self.linear_weight,
-            self.linear_bias,
-            self.weight,
-            self.bias,
+            linear_weight,
+            linear_bias,
+            ln_weight,
+            ln_bias,
             True,
             self.has_linear_bias,
         )

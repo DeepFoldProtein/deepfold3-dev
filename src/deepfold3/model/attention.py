@@ -84,7 +84,6 @@ class GridSelfAttention(nn.Module):
                 from deepfold3.model.triton.fused_pair_bias import FusedPairBias
 
                 self._fused_pair_bias = FusedPairBias(c, num_heads)
-                self._sync_pair_bias()
             except ImportError:
                 pass
         if optim is not None and optim.use_fused_ln_transpose and transpose:
@@ -92,7 +91,6 @@ class GridSelfAttention(nn.Module):
                 from deepfold3.model.triton.layernorm_transpose import FusedLayerNormTranspose
 
                 self._ln_transpose = FusedLayerNormTranspose(c, do_transpose=True)
-                self._sync_ln_transpose()
             except ImportError:
                 pass
         if self._evo_attn is None and optim is not None and optim.use_torch_compile:
@@ -162,34 +160,6 @@ class GridSelfAttention(nn.Module):
         g = torch.sigmoid(self.to_g(z_flat))
         return self.out_proj(out * g)
 
-    def _sync_pair_bias(self):
-        """Copy norm + pair_bias weights to fused pair bias module."""
-        if self._fused_pair_bias is not None:
-            with torch.no_grad():
-                self._fused_pair_bias.ln_weight.data.copy_(self.norm.weight.data)
-                self._fused_pair_bias.ln_bias.data.copy_(self.norm.bias.data)
-                self._fused_pair_bias.proj_weight.data.copy_(self.pair_bias.weight.data)
-
-    def _sync_ln_transpose(self):
-        """Copy norm weights to the fused LN+transpose module."""
-        if self._ln_transpose is not None:
-            with torch.no_grad():
-                self._ln_transpose.weight.data.copy_(self.norm.weight.data)
-                self._ln_transpose.bias.data.copy_(self.norm.bias.data)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        fused_prefixes = ("_ln_transpose.", "_fused_pair_bias.")
-        has_fused = self._ln_transpose is not None or self._fused_pair_bias is not None
-        if has_fused and strict:
-            if not any(k.startswith(p) for k in state_dict for p in fused_prefixes):
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        if self._fused_pair_bias is not None:
-            self._sync_pair_bias()
-        if self._ln_transpose is not None:
-            self._sync_ln_transpose()
-        return result
-
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -212,7 +182,9 @@ class GridSelfAttention(nn.Module):
         _defer_transpose = self.transpose and self._evo_attn is not None and z.is_cuda
 
         if self._fused_pair_bias is not None and z.is_cuda:
-            pb = self._fused_pair_bias(z)  # [B, H, N, N] — fused LN+proj+permute
+            pb = self._fused_pair_bias(
+                z, self.norm.weight, self.norm.bias, self.pair_bias.weight
+            )  # [B, H, N, N]
             z = self.norm(z)
             if self.transpose and not _defer_transpose:
                 z = z.permute(0, 2, 1, 3)
@@ -220,7 +192,7 @@ class GridSelfAttention(nn.Module):
         elif self._ln_transpose is not None and z.is_cuda:
             z_normed = self.norm(z)
             pb = self.pair_bias(z_normed).permute(0, 3, 1, 2)
-            z = self._ln_transpose(z)  # [B, N2, N1, C] — fused LN + transpose
+            z = self._ln_transpose(z, self.norm.weight, self.norm.bias)
             mask = mask.permute(0, 2, 1)
         else:
             z = self.norm(z)

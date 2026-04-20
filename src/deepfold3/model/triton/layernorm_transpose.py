@@ -267,7 +267,7 @@ class LayerNormTransposeFunction(torch.autograd.Function):
 
 
 class FusedLayerNormTranspose(nn.Module):
-    """Fused LayerNorm + optional dim transpose.
+    """Fused LayerNorm + optional dim transpose — stateless.
 
     Replaces:
         out = F.layer_norm(x, [C], weight, bias)
@@ -276,6 +276,9 @@ class FusedLayerNormTranspose(nn.Module):
 
     Input must be 4D: [B, N1, N2, C]. When do_transpose=True, output is
     [B, N2, N1, C]. LN is always over the last dimension C.
+
+    The parent passes ``self.norm.weight/bias`` at call time so LN shares
+    a single parameter source with the QKV path.
 
     Args:
         normalized_shape: Size of the last dimension (C).
@@ -288,24 +291,29 @@ class FusedLayerNormTranspose(nn.Module):
         self.normalized_shape = normalized_shape
         self.do_transpose = do_transpose
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
             x: [B, N1, N2, C] — must be 4D with batch dim.
+            weight: [C] LN scale (from parent's self.norm.weight).
+            bias: [C] LN shift (from parent's self.norm.bias).
         Returns:
             [B, N2, N1, C] if do_transpose else [B, N1, N2, C].
         """
         if not HAS_TRITON or not x.is_cuda:
-            out = F.layer_norm(x, (self.normalized_shape,), self.weight, self.bias, self.eps)
+            out = F.layer_norm(x, (self.normalized_shape,), weight, bias, self.eps)
             if self.do_transpose:
                 out = out.permute(0, 2, 1, 3).contiguous()
             return out
 
         B, N1, N2, C = x.shape
-        return LayerNormTransposeFunction.apply(x, self.weight, self.bias, N1, N2, self.eps, self.do_transpose)
+        return LayerNormTransposeFunction.apply(x, weight, bias, N1, N2, self.eps, self.do_transpose)
 
     def extra_repr(self):
         return f"normalized_shape={self.normalized_shape}, do_transpose={self.do_transpose}, eps={self.eps}"

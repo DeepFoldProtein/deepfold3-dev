@@ -466,18 +466,34 @@ class WrappedOptimizer:
                 grad_norms_per_rank = grad_norm.view(1)
             grad_finite_per_rank = torch.isfinite(grad_norms_per_rank)
             if not bool(grad_finite_per_rank.all().item()):
-                self.optimizer.zero_grad(set_to_none=True)
-                bad_ranks = (~grad_finite_per_rank).nonzero(as_tuple=False).flatten().tolist()
-                per_rank = ", ".join(f"rank{r}={grad_norms_per_rank[r].item():.3e}" for r in bad_ranks)
-                rank_zero_warn(f"Step {attempted_step}: NaN/Inf in grads (ranks={bad_ranks}, {per_rank}), skipping")
-                if self.dist.rank in bad_ranks and self._window_record_ids:
-                    logger.warning(
-                        f"Step {attempted_step}: rank {self.dist.rank} NaN/Inf grad window "
-                        f"record_ids={self._window_record_ids}"
+                return self._skip_for_bad_grad(
+                    state,
+                    attempted_step,
+                    grad_norm,
+                    grad_norms_per_rank,
+                    (~grad_finite_per_rank).nonzero(as_tuple=False).flatten().tolist(),
+                    warn_prefix="NaN/Inf in grads",
+                    record_prefix="NaN/Inf grad window",
+                )
+
+            # Per-rank outlier guard: clipping a pre-clip norm ~1e8 to
+            # ``grad_clip_norm`` yields a near-random direction (scale factor
+            # ~1e-7) that contributes nothing meaningful and accumulates
+            # magnitude drift across many steps. Drop the whole step instead.
+            skip_threshold = self.cfg.grad_norm_skip_threshold
+            if skip_threshold > 0:
+                outlier_per_rank = grad_norms_per_rank > skip_threshold
+                if bool(outlier_per_rank.any().item()):
+                    bad_ranks = outlier_per_rank.nonzero(as_tuple=False).flatten().tolist()
+                    return self._skip_for_bad_grad(
+                        state,
+                        attempted_step,
+                        grad_norm,
+                        grad_norms_per_rank,
+                        bad_ranks,
+                        warn_prefix=f"grad outlier exceeded skip_threshold={skip_threshold:.3e}",
+                        record_prefix="grad outlier window",
                     )
-                self._window_record_ids.clear()
-                self._account_skip(state, attempted_step, reason="grad")
-                return StepResult(advanced=False, was_nan=True, reason="grad", grad_norm=grad_norm, nan_ranks=bad_ranks)
 
             # Surface grad-norm spikes that stay below the NaN/Inf skip
             # trigger — gives per-rank record_ids for examples driving the
@@ -504,6 +520,29 @@ class WrappedOptimizer:
             state.effective_step += 1
             state.consecutive_nan_skips = 0
             return StepResult(advanced=True, was_nan=False, reason=None, grad_norm=grad_norm, nan_ranks=[])
+
+    def _skip_for_bad_grad(
+        self,
+        state: TrainState,
+        attempted_step: int,
+        grad_norm: torch.Tensor,
+        grad_norms_per_rank: torch.Tensor,
+        bad_ranks: list[int],
+        *,
+        warn_prefix: str,
+        record_prefix: str,
+    ) -> StepResult:
+        self.optimizer.zero_grad(set_to_none=True)
+        per_rank = ", ".join(f"rank{r}={grad_norms_per_rank[r].item():.3e}" for r in bad_ranks)
+        rank_zero_warn(f"Step {attempted_step}: {warn_prefix} (ranks={bad_ranks}, {per_rank}), skipping")
+        if self.dist.rank in bad_ranks and self._window_record_ids:
+            logger.warning(
+                f"Step {attempted_step}: rank {self.dist.rank} {record_prefix} "
+                f"record_ids={self._window_record_ids}"
+            )
+        self._window_record_ids.clear()
+        self._account_skip(state, attempted_step, reason="grad")
+        return StepResult(advanced=False, was_nan=True, reason="grad", grad_norm=grad_norm, nan_ranks=bad_ranks)
 
     def _account_skip(self, state: TrainState, attempted_step: int, *, reason: Literal["loss", "grad"]) -> None:
         """Bump the consecutive-skip counter and raise if it exceeds the limit.

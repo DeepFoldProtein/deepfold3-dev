@@ -106,10 +106,11 @@ if HAS_TRITON:
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block = QK_block - m_ij[:, None]
 
-            P_block = tl.math.exp(QK_block)
+            inv_ln2: tl.constexpr = 1.4426950408889634  # 1/ln(2) — exp2 idiom (trifast/protenix)
+            P_block = tl.math.exp2(QK_block * inv_ln2)
             l_ij = tl.sum(P_block, 1)
 
-            alpha = tl.math.exp(m_i - m_ij)
+            alpha = tl.math.exp2((m_i - m_ij) * inv_ln2)
             l_i = l_i * alpha + l_ij
 
             P_block = P_block.to(V_block.dtype)
@@ -287,8 +288,18 @@ if HAS_TRITON:
             SEQ_LEN,
         )
 
-        m_i += tl.math.log(l_i)
-        O_block = O_block / l_i[:, None]
+        # Fully-masked row handling (sentinel pattern, matches trifast/Tri Dao
+        # flash-attn). A row whose attention keys are ALL mask=-1e9 has m_i
+        # dominated by that mask value after the loop. In fp32, ULP near -1e9
+        # is ~128 >> log(N) (~6), so backward's P = exp2((QK - LSE) * inv_ln2)
+        # silently computes exp2(0) = 1 instead of 1/N, giving an exact N×
+        # gradient amplification. Fix: store LSE = +inf as sentinel. In backward,
+        # QK - (+inf) = -inf, exp2(-inf) = 0 naturally — no explicit sentinel
+        # check needed, all gradient contributions collapse to 0.
+        row_is_masked = m_i < -1e8  # any valid QK sits far above this
+        l_i_safe = tl.where(row_is_masked, 1.0, l_i)
+        m_i = tl.where(row_is_masked, float("inf"), m_i + tl.math.log(l_i_safe))
+        O_block = tl.where(row_is_masked[:, None], 0.0, O_block / l_i_safe[:, None])
         O_block = O_block.to(O.type.element_ty)
         m_ptrs = M + index_batch_msa_head * SEQ_LEN + offs_q
 
@@ -443,6 +454,9 @@ if HAS_TRITON:
                     other=0.0,
                 )
 
+        # Fully-masked rows: forward stores LSE = +inf sentinel. Natural math
+        # handles the rest — QK - (+inf) = -inf → exp2(-inf) = 0 → P = 0 →
+        # dQ/dK/dV/d_pair_bias contributions vanish. No explicit check needed.
         M_block = M_block[:, None]
         offs_kv = tl.arange(0, BLOCK_SIZE_KV)
         pair_bias_block_ptr = (
@@ -507,7 +521,9 @@ if HAS_TRITON:
             if not EVEN_KV:
                 QK_block += tl.where((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, 0, float("-inf"))
 
-            P_block = tl.math.exp(QK_block - M_block)
+            inv_ln2: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+            # M_block = +inf for fully-masked rows → P = exp2(-inf) = 0 naturally.
+            P_block = tl.math.exp2((QK_block - M_block) * inv_ln2)
             dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
             dS_block = P_block * (dP_block - Di[:, None])
 
@@ -696,7 +712,10 @@ if HAS_TRITON:
             if not (EVEN_Q & EVEN_KV):
                 QK_T_block += tl.where((offs_kv[:, None] < SEQ_LEN) & (offs_q[None, :] < SEQ_LEN), 0, float("-inf"))
 
-            P_T_block = tl.math.exp(QK_T_block - m[None, :])
+            inv_ln2: tl.constexpr = 1.4426950408889634  # 1/ln(2)
+            # m = +inf for fully-masked rows → P_T = exp2(-inf) = 0 naturally,
+            # so dV/dK contributions from masked rows are 0.
+            P_T_block = tl.math.exp2((QK_T_block - m[None, :]) * inv_ln2)
             dV_block += tl.dot(P_T_block.to(K_block.dtype), dO_block)
 
             dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)

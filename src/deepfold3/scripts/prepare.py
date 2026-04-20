@@ -588,13 +588,26 @@ def fetch_ccd(output: str) -> None:
     is_flag=True,
     help="Generate ETKDGv3 ref_pos via RDKit from CCD SMILES (AF3 §2.8). Requires RDKit.",
 )
-@click.option("--workers", default=1, type=int, help="Parallel workers for ref_pos generation.")
-def build_ccd_cache(components_cif: str, output: str, ref_pos: bool, workers: int) -> None:
-    """Build a CCD cache for structure validation and ref_pos.
+@click.option(
+    "--automorphisms",
+    is_flag=True,
+    help="Enumerate heavy-atom graph automorphisms via RDKit for the ligand "
+    "atom-permutation loss (AF3 §4.2). Requires RDKit.",
+)
+@click.option(
+    "--workers",
+    default=1,
+    type=int,
+    help="Parallel workers for ref_pos / automorphism generation.",
+)
+def build_ccd_cache(components_cif: str, output: str, ref_pos: bool, automorphisms: bool, workers: int) -> None:
+    """Build the unified CCD cache.
 
-    Reads the full components.cif and writes a JSON cache with atom names,
-    leaving atoms, and optionally ETKDGv3-generated reference positions.
-    Used with ``deepfold3 prepare --ccd-cache``.
+    Reads the full ``components.cif`` and writes one JSON with atom names,
+    leaving atoms, and — when the corresponding flag is set — ETKDGv3
+    reference positions and/or RDKit automorphism groups. Consumed by
+    ``deepfold3 prepare --ccd-cache`` (structure validation + ref_pos)
+    and the training dataloader (automorphisms for ligand atom perm).
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -603,7 +616,13 @@ def build_ccd_cache(components_cif: str, output: str, ref_pos: bool, workers: in
     )
     from deepfold3.data.ccd import build_atom_name_cache
 
-    n = build_atom_name_cache(components_cif, output, ref_pos=ref_pos, workers=workers)
+    n = build_atom_name_cache(
+        components_cif,
+        output,
+        ref_pos=ref_pos,
+        automorphisms=automorphisms,
+        workers=workers,
+    )
     click.echo(f"Wrote {n} CCD entries to {output}")
 
 

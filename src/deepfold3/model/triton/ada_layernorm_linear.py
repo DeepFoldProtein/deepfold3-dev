@@ -19,8 +19,6 @@ Triton configs are unavailable.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -456,7 +454,7 @@ class AdaLayerNormLinearFunction(torch.autograd.Function):
 
 
 class FusedAdaLayerNormLinear(nn.Module):
-    """Fused AdaLN + Linear module.
+    """Fused AdaLN + Linear kernel — STATELESS.
 
     Replaces the pattern:
         xn = F.layer_norm(x, [K])
@@ -464,6 +462,9 @@ class FusedAdaLayerNormLinear(nn.Module):
         out = F.linear(xn, W.T)
 
     where scale/bias come from external conditioning (per-element, not learnable).
+
+    Holds no parameters; callers pass the linear weight (stored as [K, N] for
+    the Triton kernel) at call time.
 
     Args:
         in_features: Input/normalized dimension (K).
@@ -475,22 +476,20 @@ class FusedAdaLayerNormLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Linear parameters stored as [K, N] for Triton kernel
-        self.linear_weight = nn.Parameter(torch.empty(in_features, out_features))
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        temp = torch.empty(self.out_features, self.in_features)
-        nn.init.kaiming_uniform_(temp, a=math.sqrt(5))
-        with torch.no_grad():
-            self.linear_weight.data.copy_(temp.T)
-
-    def forward(self, x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor,
+        linear_weight: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
             x: Input tensor [..., K].
             scale: Conditioning scale [..., K].
             bias: Conditioning bias [..., K].
+            linear_weight: [in_features, out_features] transposed linear
+                weight (for standard nn.Linear weight [out, in], pass `.T`).
 
         Returns:
             Output tensor [..., N].
@@ -498,8 +497,8 @@ class FusedAdaLayerNormLinear(nn.Module):
         if not HAS_TRITON or not x.is_cuda:
             xn = F.layer_norm(x, (self.in_features,))
             xn = scale * xn + bias
-            return F.linear(xn, self.linear_weight.T)
-        return AdaLayerNormLinearFunction.apply(x, self.linear_weight, scale, bias)
+            return F.linear(xn, linear_weight.T)
+        return AdaLayerNormLinearFunction.apply(x, linear_weight, scale, bias)
 
     def extra_repr(self):
         return f"in_features={self.in_features}, out_features={self.out_features}"

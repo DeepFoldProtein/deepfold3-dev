@@ -31,6 +31,7 @@ Key dimension facts from AF3 weight file:
 
 from __future__ import annotations
 
+import math
 from functools import partial as _partial
 
 import torch
@@ -41,7 +42,7 @@ from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAtt
 from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LayerNorm, LinearNoBias
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
 from deepfold3.model.template_embedding import TemplateEmbedding
 
 _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
@@ -214,6 +215,26 @@ class Evoformer(nn.Module):
 
         # Single activations from target feat (447-dim input)
         self.single_activations = LinearNoBias(_TARGET_FEAT_DIM, c_single)
+
+        # Variance-matched init for sum-fusion sites (from-scratch training).
+        # Default af3_linear_init_ gives ``stddev(W) = sqrt(1/fan_in)``, which at
+        # init produces per-stream output magnitudes that vary by orders of
+        # magnitude across heterogeneous streams (e.g. fan_in=1 bond indicator
+        # vs. fan_in=447 target_feat). For sum-fusion we want each stream to
+        # contribute ~ 1/sqrt(K) at init.
+        #
+        # Pair init: K=4 (left, right, position, bond); prev=0, templates optional.
+        _pair_target = 0.5  # 1 / sqrt(4)
+        sum_fusion_init_(self.left_single.weight, _pair_target, "dense")
+        sum_fusion_init_(self.right_single.weight, _pair_target, "dense")
+        sum_fusion_init_(self.position_activations.weight, _pair_target, "one_hot")
+        sum_fusion_init_(self.bond_embedding.weight, _pair_target, "one_hot")
+        # MSA init: K=2 (msa_activations, extra_msa_target_feat broadcast).
+        _msa_target = 1.0 / math.sqrt(2)
+        sum_fusion_init_(self.msa_activations.weight, _msa_target, "dense")
+        sum_fusion_init_(self.extra_msa_target_feat.weight, _msa_target, "dense")
+        # Single init (K=1 active at step 0: only single_activations; prev=0) —
+        # already matches default init, no override.
 
         # MSA stack
         self.msa_stack = nn.ModuleList(

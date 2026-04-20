@@ -3,10 +3,8 @@
 Maintains shadow copies of model parameters, updated each optimizer step.
 Swap in EMA weights for evaluation, then restore originals.
 
-Fused kernel parameters (names containing ``_fused_gate.``,
-``_fused_ada_ln_linear.``, ``_fused_swiglu.``, ``_ln_linear.``, ``_swiglu.``)
-are excluded — they are derived from base weights and re-synced after
-``apply()``/``restore()``.
+Legacy fused-kernel parameter names are filtered out of the shadow dict so
+old EMA state_dicts still load cleanly.
 """
 
 from __future__ import annotations
@@ -19,12 +17,6 @@ from deepfold3.model.config import OptimConfig
 
 def _is_fused(name: str) -> bool:
     return any(m in name for m in OptimConfig.FUSED_STATE_DICT_MARKERS)
-
-
-def _sync_fused(model: nn.Module) -> None:
-    """Re-sync any fused kernel parameters from their base weights."""
-    if hasattr(model, "_sync_fused_kernels"):
-        model._sync_fused_kernels()
 
 
 class EMA:
@@ -92,7 +84,6 @@ class EMA:
 
         Call ``restore()`` after evaluation to put original weights back.
         Uses pointer swapping (zero-copy, zero-allocation).
-        After swapping, fused kernels are re-synced from the new base weights.
 
         Args:
             model: Model whose parameters will be replaced.
@@ -101,12 +92,9 @@ class EMA:
             if name in self.shadow:
                 self.shadow[name], param.data = param.data, self.shadow[name]
         self._invalidate_cache()
-        _sync_fused(model)
 
     def restore(self, model: nn.Module) -> None:
         """Restore original model parameters after ``apply()``.
-
-        Swaps the shadow and model weights back, then re-syncs fused kernels.
 
         Args:
             model: Model whose parameters will be restored.
@@ -115,7 +103,6 @@ class EMA:
             if name in self.shadow:
                 self.shadow[name], param.data = param.data, self.shadow[name]
         self._invalidate_cache()
-        _sync_fused(model)
 
     def state_dict(self) -> dict:
         """Returns serializable EMA state."""

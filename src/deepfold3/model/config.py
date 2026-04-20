@@ -228,9 +228,9 @@ class OptimConfig:
     # No effect on inference (only applied when grad is enabled).
     use_gradient_checkpointing: bool = False
 
-    # Substrings that identify derived fused-kernel parameters in state dicts.
-    # These keys are excluded from checkpoints (they are re-synced from base
-    # weights on load) and from EMA shadow copies.
+    # Legacy fused-kernel parameter substrings. Current fused wrappers are
+    # stateless (no owned parameters), but older checkpoints may contain
+    # these keys; they are filtered out of state-dict loads and EMA shadow.
     FUSED_STATE_DICT_MARKERS: tuple[str, ...] = (
         "_fused_gate.",
         "_fused_center_proj.",
@@ -430,6 +430,12 @@ class TrainingConfig:
     # 0 disables. Useful for identifying examples that drive grad spikes
     # but stay below the NaN/Inf skip trigger.
     grad_norm_log_threshold: float = 0.0
+    # If ANY rank's pre-clip grad-norm exceeds this value, skip the whole
+    # optimizer step (per-rank outlier guard). Clipping to ``grad_clip_norm``
+    # from a huge pre-clip norm produces a near-random direction that
+    # degrades update quality and feeds magnitude drift; dropping the step
+    # is cleaner than applying garbage. 0 disables.
+    grad_norm_skip_threshold: float = 0.0
 
     # EMA
     ema_decay: float = 0.999
@@ -578,6 +584,10 @@ class TrainingConfig:
 
     # Templates
     mmcif_dir: str = ""  # PDB mmCIF mirror path; non-empty enables template loading
+
+    # Unified CCD cache (atoms + ref_pos + automorphisms) on the shared PVC.
+    # Non-empty enables ligand atom-permutation loss via ``load_ligand_automorphisms``.
+    ccd_cache_path: str = ""
 
     # Distillation dataset (optional, legacy — prefer extra_datasets)
     distillation_data_dir: str = ""  # empty = disabled

@@ -424,21 +424,32 @@ def build_atom_name_cache(
     output_path: str | Path,
     *,
     ref_pos: bool = False,
+    automorphisms: bool = False,
     workers: int = 1,
 ) -> int:
-    """Build a JSON cache mapping CCD code → atom info.
+    """Build a unified CCD cache mapping CCD code → atom info.
 
     Reads the full ``components.cif`` (or ``.cif.gz``) and extracts per-component:
     - ``atoms``: list of valid heavy-atom names
     - ``leaving``: list of heavy-atom names with ``pdbx_leaving_atom_flag = Y``
     - ``ref_pos`` (optional): ETKDGv3-generated 3D coordinates ``[[x,y,z], ...]``
       for each heavy atom (AF3 §2.8). Requires RDKit.
+    - ``automorphisms`` (optional): RDKit heavy-atom graph automorphism group
+      as a list of permutations ``[[perm_0_idx, perm_1_idx, ...], ...]``. The
+      first permutation is always identity. Feeds the training-time ligand
+      atom-permutation loss (AF3 §4.2: "up to 1000 permutations via RDKit").
+
+    The three optional sections share a single JSON file so training needs
+    exactly one cache on the shared PVC — no per-dataset sidecar files.
 
     Args:
         components_path: Path to ``components.cif`` or ``components.cif.gz``.
         output_path: Where to write the JSON cache.
         ref_pos: If True, generate ETKDGv3 conformers via RDKit for ref_pos.
-        workers: Number of parallel workers for ref_pos generation.
+        automorphisms: If True, enumerate heavy-atom graph automorphisms via
+            RDKit ``GetSubstructMatches`` (maxMatches=1024) per CCD code.
+        workers: Number of parallel workers for ref_pos / automorphism
+            generation.
 
     Returns:
         Number of CCD entries written.
@@ -544,6 +555,62 @@ def build_atom_name_cache(
             if len(failed_codes) > 50:
                 log.warning("  ... and %d more", len(failed_codes) - 50)
 
+    # Generate RDKit heavy-atom automorphism groups from the fully parsed
+    # CCD blocks. Needs bonds + atoms + elements, so we walk the same doc
+    # again and build a ``CcdMolecule`` per block before handing it to the
+    # RDKit enumeration. Works in parallel because ``compute_ligand_auto
+    # morphisms`` is a pure function of ``CcdMolecule``.
+    if automorphisms:
+        log.info("Computing heavy-atom automorphisms for %d CCD entries (workers=%d)...", len(cache), workers)
+
+        mol_items: list[tuple[str, dict]] = []
+        for block in doc:
+            code = block.name
+            if code not in cache:
+                continue
+            mol_dict = _serialise_ccd_block_for_mol(block)
+            if mol_dict is None:
+                continue
+            mol_items.append((code, mol_dict))
+
+        n_with_sym = 0
+        n_failed = 0
+        n_total = len(mol_items)
+
+        def _handle(code: str, perms: list[list[int]]) -> None:
+            nonlocal n_with_sym, n_failed
+            if not perms:
+                n_failed += 1
+                return
+            if len(perms) > 1:
+                n_with_sym += 1
+            cache[code]["automorphisms"] = perms
+
+        if workers <= 1:
+            for i, (code, mol_dict) in enumerate(mol_items, 1):
+                _, perms = _compute_automorphisms_for_serialised(code, mol_dict)
+                _handle(code, perms)
+                if i % 2000 == 0:
+                    log.info("  automorphisms: %d/%d done (sym=%d failed=%d)", i, n_total, n_with_sym, n_failed)
+        else:
+            from concurrent.futures import ProcessPoolExecutor
+
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                done = 0
+                for code, perms in executor.map(_compute_automorphisms_for_serialised_star, mol_items, chunksize=32):
+                    _handle(code, perms)
+                    done += 1
+                    if done % 2000 == 0:
+                        log.info("  automorphisms: %d/%d done (sym=%d failed=%d)", done, n_total, n_with_sym, n_failed)
+
+        log.info(
+            "Automorphisms: %d/%d entries, %d with non-trivial symmetry (>1 perm), %d failed",
+            n_total - n_failed,
+            n_total,
+            n_with_sym,
+            n_failed,
+        )
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
@@ -553,10 +620,103 @@ def build_atom_name_cache(
     return len(cache)
 
 
+def _serialise_ccd_block_for_mol(block) -> dict | None:
+    """Dump the heavy-atom subset of a gemmi CCD block into a pickleable dict.
+
+    The dict is what :func:`_compute_automorphisms_for_serialised` consumes
+    on worker processes — gemmi objects don't survive a ``ProcessPoolExecutor``
+    pickle round-trip, so we flatten to Python primitives here on the main
+    process.
+    """
+    atom_table = block.find(
+        [
+            "_chem_comp_atom.atom_id",
+            "_chem_comp_atom.type_symbol",
+            "_chem_comp_atom.charge",
+        ]
+    )
+    atom_names: list[str] = []
+    elements: list[str] = []
+    charges: list[float] = []
+    name_to_idx: dict[str, int] = {}
+    for row in atom_table:
+        elem = row[1].strip().strip('"')
+        if elem.upper() == "H":
+            continue
+        name = row[0].strip().strip('"')
+        name_to_idx[name] = len(atom_names)
+        atom_names.append(name)
+        elements.append(elem)
+        try:
+            charges.append(float(row[2]))
+        except (ValueError, TypeError):
+            charges.append(0.0)
+    if not atom_names:
+        return None
+
+    bond_table = block.find(
+        [
+            "_chem_comp_bond.atom_id_1",
+            "_chem_comp_bond.atom_id_2",
+            "_chem_comp_bond.value_order",
+        ]
+    )
+    bonds: list[tuple[int, int, int]] = []
+    for row in bond_table:
+        a = row[0].strip().strip('"')
+        b = row[1].strip().strip('"')
+        order_str = row[2].strip().strip('"').upper() if len(row) > 2 else "SING"
+        if a not in name_to_idx or b not in name_to_idx:
+            continue
+        order = _BOND_ORDER.get(order_str, 1)
+        bonds.append((name_to_idx[a], name_to_idx[b], order))
+
+    return {
+        "atom_names": atom_names,
+        "elements": elements,
+        "charges": charges,
+        "bonds": bonds,
+    }
+
+
+def _compute_automorphisms_for_serialised(code: str, mol_dict: dict) -> tuple[str, list[list[int]]]:
+    """Build a ``CcdMolecule`` stub and run the RDKit automorphism pass.
+
+    Runs inside ``ProcessPoolExecutor`` workers, so it must not close over
+    gemmi objects. Returns JSON-ready ``[[int, ...], ...]`` (empty list
+    signals "no automorphisms available" — caller decides whether that's
+    a failure or a degenerate result).
+    """
+    from deepfold3.data.symmetry.ligand_perms import compute_ligand_automorphisms
+
+    positions = np.zeros((len(mol_dict["atom_names"]), 3), dtype=np.float32)
+    mol = CcdMolecule(
+        atom_names=list(mol_dict["atom_names"]),
+        positions=positions,
+        elements=list(mol_dict["elements"]),
+        charges=list(mol_dict["charges"]),
+        bonds=[tuple(b) for b in mol_dict["bonds"]],
+        res_name=code,
+    )
+    try:
+        perms = compute_ligand_automorphisms(mol)
+    except Exception:
+        return code, []
+    return code, [list(int(i) for i in p) for p in perms]
+
+
+def _compute_automorphisms_for_serialised_star(item: tuple[str, dict]) -> tuple[str, list[list[int]]]:
+    return _compute_automorphisms_for_serialised(item[0], item[1])
+
+
 def load_ccd_cache(
     path: str | Path,
 ) -> tuple[dict[str, set[str]], dict[str, np.ndarray], dict[str, set[str]]]:
-    """Load all CCD cache data in a single JSON parse.
+    """Load atom-name / ref_pos / leaving sections of the unified CCD cache.
+
+    The cache may also carry an ``automorphisms`` section — callers that
+    need it should use :func:`load_ligand_automorphisms` to avoid
+    re-parsing.
 
     Returns:
         (atom_names, ref_pos, leaving_atoms) — three dicts keyed by CCD code.
@@ -581,6 +741,34 @@ def load_ccd_cache(
                 leaving[k] = set(v["leaving"])
 
     return atom_names, ref_pos, leaving
+
+
+def load_ligand_automorphisms(path: str | Path) -> dict[str, list[list[int]]]:
+    """Extract the ``automorphisms`` subsection of the unified CCD cache.
+
+    Returns ``{ccd_code: [[perm], ...]}`` ready for
+    :func:`deepfold3.data.symmetry.ligand_perms.prime_automorphism_memo`.
+    Entries without an ``automorphisms`` field are omitted. Returns an
+    empty dict if the file doesn't exist or is the legacy list-of-names
+    format (no per-entry dict).
+    """
+    import json
+
+    path = Path(path)
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+
+    out: dict[str, list[list[int]]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        perms = v.get("automorphisms")
+        if not perms:
+            continue
+        out[k] = [[int(i) for i in p] for p in perms]
+    return out
 
 
 def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:

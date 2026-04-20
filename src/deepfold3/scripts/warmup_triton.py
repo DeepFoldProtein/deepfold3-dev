@@ -42,7 +42,6 @@ so warmup must be re-run once per distinct GPU model.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Iterable
@@ -53,6 +52,7 @@ import torch
 
 from deepfold3.model.bucket import BUCKET_SIZES
 from deepfold3.model.config import ModelConfig
+from deepfold3.scripts import cli
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class WarmupShapes:
 
 
 def _load_configs(config_path: str | None) -> tuple[ModelConfig, int]:
-    """Load a ``ModelConfig`` and ``diffusion_chunk_size`` from JSON.
+    """Load a ``ModelConfig`` and ``diffusion_chunk_size`` from JSON or YAML.
 
     Returns ``(ModelConfig, chunk_size)`` with defaults when no config is given.
     """
@@ -117,8 +117,9 @@ def _load_configs(config_path: str | None) -> tuple[ModelConfig, int]:
     chunk_size = 16  # TrainingConfig default
     if not config_path:
         return mcfg, chunk_size
-    with open(config_path) as f:
-        overrides = json.load(f)
+    from deepfold3.config_loader import load_config
+
+    overrides = load_config(config_path)
     model_overrides = overrides.get("model", {})
     if model_overrides:
         from deepfold3.scripts.train import _apply_overrides
@@ -313,14 +314,14 @@ def warmup_buckets(
     logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
 
 
-@click.command(name="warmup-triton")
+@cli.command(name="warmup-triton")
 @click.option(
     "--config",
     "config_path",
     type=click.Path(exists=True, dir_okay=False),
     default=None,
     help=(
-        "JSON config file in the same format as ``deepfold3 train --config``. "
+        "JSON or YAML config file in the same format as ``deepfold3 train --config``. "
         "Channel dims and transition factors are read from the ``model`` section; "
         "defaults are used when omitted."
     ),

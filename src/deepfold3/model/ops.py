@@ -126,24 +126,20 @@ class _TriangleMulBase(nn.Module):
                 from deepfold3.model.triton.fused_gated_dual_gemm import FusedGatedDualGEMM
 
                 self._fused_dual_gemm = FusedGatedDualGEMM(c_z, c_z * 2)
-                self._sync_dual_gemm()
             except ImportError:
                 pass
             if self._fused_dual_gemm is None:
-                # Level 1: LN + packed GEMM + sigmoid postprocess
                 try:
                     from deepfold3.model.triton.triangle_mul_gate import FusedTriangleMulGate
 
                     self._fused_gate = FusedTriangleMulGate(c_z)
-                    self._sync_to_fused_gate()
                 except ImportError:
                     pass
-            # Level 2: Fused LN+Linear for post-einsum norm_center + out_proj
+            # Level 2: Fused LN+Linear for post-einsum norm_center + out_proj.
             try:
                 from deepfold3.model.triton.layernorm_linear import FusedLayerNormLinear
 
                 self._fused_center_proj = FusedLayerNormLinear(c_z, c_z, has_linear_bias=False)
-                self._sync_center_proj()
             except ImportError:
                 pass
 
@@ -155,62 +151,28 @@ class _TriangleMulBase(nn.Module):
             # graph mishandles nested Triton kernel launches (SymNodeVariable error).
             self._compute = torch.compile(self._compute)
 
-    def _sync_dual_gemm(self):
-        """Copy proj/gate weights to the fused dual GEMM module."""
-        if self._fused_dual_gemm is not None:
-            with torch.no_grad():
-                self._fused_dual_gemm.w_gate.data.copy_(self.gate.weight.data)
-                self._fused_dual_gemm.w_proj.data.copy_(self.proj.weight.data)
-
-    def _sync_to_fused_gate(self):
-        """Copy norm/proj/gate/out_gate weights to FusedTriangleMulGate."""
-        if self._fused_gate is not None:
-            with torch.no_grad():
-                self._fused_gate.norm_left.weight.data.copy_(self.norm_left.weight.data)
-                self._fused_gate.norm_left.bias.data.copy_(self.norm_left.bias.data)
-                self._fused_gate.proj.weight.data.copy_(self.proj.weight.data)
-                self._fused_gate.gate.weight.data.copy_(self.gate.weight.data)
-                self._fused_gate.out_gate.weight.data.copy_(self.out_gate.weight.data)
-                self._fused_gate._sync_to_fused()
-
-    def _sync_center_proj(self):
-        """Copy norm_center/out_proj weights to fused LN+Linear."""
-        if self._fused_center_proj is not None:
-            with torch.no_grad():
-                self._fused_center_proj.weight.data.copy_(self.norm_center.weight.data)
-                self._fused_center_proj.bias.data.copy_(self.norm_center.bias.data)
-                self._fused_center_proj.linear_weight.data.copy_(self.out_proj.weight.data.T)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load state dict then sync to fused parameters if present."""
-        fused_prefixes = ("_fused_gate.", "_fused_center_proj.", "_fused_dual_gemm.")
-        has_fused = any(
-            getattr(self, attr) is not None for attr in ("_fused_gate", "_fused_center_proj", "_fused_dual_gemm")
-        )
-        if has_fused and strict:
-            if not any(k.startswith(p) for k in state_dict for p in fused_prefixes):
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        # Each _sync method guards on `is not None` internally
-        self._sync_dual_gemm()
-        self._sync_to_fused_gate()
-        self._sync_center_proj()
-        return result
-
     def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if self._fused_dual_gemm is not None and z.is_cuda:
-            # Level 3: Fused dual GEMM (cuEQ pattern) — two GEMMs share input
-            # tile loads, sigmoid + multiply fused in GEMM epilogue.
+            # Level 3: dual GEMM (cuEQ) — sigmoid + multiply fused in GEMM epilogue.
             z0 = self.norm_left(z)
-            gated_proj = self._fused_dual_gemm(z0)  # sigmoid(z0@Wg.T) * (z0@Wp.T)
+            gated_proj = self._fused_dual_gemm(
+                z0, w_gate=self.gate.weight, w_proj=self.proj.weight
+            )  # sigmoid(z0@Wg.T) * (z0@Wp.T)
             out_gate = torch.sigmoid(self.out_gate(z0))
             del z0  # free normalized input (400 MB at N=1280)
             a = gated_proj[..., 0::2]
             b = gated_proj[..., 1::2]
             del gated_proj  # free dual GEMM output (800 MB) — a, b are stride-2 views
         elif self._fused_gate is not None and z.is_cuda:
-            # Level 1: LN + packed GEMM + sigmoid postprocess
-            a, b, out_gate = self._fused_gate(z)
+            # Level 1: LN + packed GEMM + sigmoid postprocess.
+            a, b, out_gate = self._fused_gate(
+                z,
+                self.norm_left.weight,
+                self.norm_left.bias,
+                self.proj.weight,
+                self.gate.weight,
+                self.out_gate.weight,
+            )
         else:
             z0 = self.norm_left(z)
             proj = self.proj(z0)
@@ -230,7 +192,12 @@ class _TriangleMulBase(nn.Module):
         act = _TRIANGLE_MATMUL[self._equation](a, b)
         del a, b  # free masked projections before output gating
         if self._fused_center_proj is not None and act.is_cuda:
-            act = self._fused_center_proj(act)
+            act = self._fused_center_proj(
+                act,
+                self.norm_center.weight,
+                self.norm_center.bias,
+                self.out_proj.weight.T,
+            )
         else:
             act = self.norm_center(act)
             act = self.out_proj(act)

@@ -348,13 +348,14 @@ class FusedPairBiasFunction(torch.autograd.Function):
 class FusedPairBias(nn.Module):
     """Fused LN + Linear + permute for GridSelfAttention pair bias.
 
+    Stateless: the parent passes ``self.norm.weight/bias`` and
+    ``self.pair_bias.weight`` at call time so LN shares one parameter
+    source with the QKV path.
+
     Drop-in replacement for:
         z_normed = self.norm(z)                  # LayerNorm [B, N, N, C]
         pb = self.pair_bias(z_normed)            # LinearNoBias [B, N, N, H]
-        pb = pb.permute(0, 3, 1, 2)             # → [B, H, N, N]
-
-    Supports both training (autograd with PyTorch backward) and inference
-    (fully fused kernel with optional mask).
+        pb = pb.permute(0, 3, 1, 2)              # → [B, H, N, N]
 
     Args:
         c: Pair channel dimension (128).
@@ -368,38 +369,44 @@ class FusedPairBias(nn.Module):
         self.num_heads = num_heads
         self.eps = eps
 
-        self.ln_weight = nn.Parameter(torch.ones(c))
-        self.ln_bias = nn.Parameter(torch.zeros(c))
-        self.proj_weight = nn.Parameter(torch.empty(num_heads, c))
-        nn.init.kaiming_uniform_(self.proj_weight)
-
-    def forward(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        z: torch.Tensor,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor,
+        proj_weight: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             z: [B, N, N, C] pair activations (pre-LN).
+            ln_weight: [C] LN scale (from parent's self.norm.weight).
+            ln_bias: [C] LN shift (from parent's self.norm.bias).
+            proj_weight: [H, C] pair bias projection weight
+                (from parent's self.pair_bias.weight).
             mask: [B, N] optional mask. Applied as output + (1-mask)*(-1e9).
 
         Returns:
             [B, H, N, N] pair bias ready for attention.
         """
         if not HAS_TRITON or not z.is_cuda:
-            z_normed = F.layer_norm(z, (self.c,), self.ln_weight, self.ln_bias, self.eps)
-            pb = F.linear(z_normed, self.proj_weight).permute(0, 3, 1, 2)
+            z_normed = F.layer_norm(z, (self.c,), ln_weight, ln_bias, self.eps)
+            pb = F.linear(z_normed, proj_weight).permute(0, 3, 1, 2)
             if mask is not None:
                 pb = pb + (1.0 - mask[:, None, None, :].float()) * (-1e9)
             return pb
 
         if z.requires_grad:
-            pb = FusedPairBiasFunction.apply(z, self.ln_weight, self.ln_bias, self.proj_weight, self.eps)
+            pb = FusedPairBiasFunction.apply(z, ln_weight, ln_bias, proj_weight, self.eps)
             if mask is not None:
                 pb = pb + (1.0 - mask[:, None, None, :].float()) * (-1e9)
             return pb
 
         out, _, _, _, _ = fused_pair_bias_forward(
             z,
-            self.ln_weight,
-            self.ln_bias,
-            self.proj_weight,
+            ln_weight,
+            ln_bias,
+            proj_weight,
             proj_bias=None,
             mask=mask,
             eps=self.eps,

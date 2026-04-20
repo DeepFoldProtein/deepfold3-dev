@@ -6,6 +6,7 @@ InferenceInput:  builds features directly from a sequence string (no mmCIF neede
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import zipfile
@@ -133,6 +134,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         max_chains: int = 0,
         sampling_rows: list | None = None,
         name: str = "",
+        ccd_cache_path: str | Path | None = None,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -169,20 +171,36 @@ class TrainingDataset(torch.utils.data.Dataset):
             interface_weight=interface_crop_weight,
             interface_distance=interface_distance,
         )
-        # Optional ligand symmetry cache (built once per data dir via
-        # ``deepfold3 build-ligand-cache``). Loaded lazily into memory and
-        # passed to the featurizer so the loss can apply ligand atom
-        # permutations during training.
-        ligand_cache_path = self.data_dir / "ligand_symmetry.json"
+        # Ligand automorphism cache for the training-time atom permutation
+        # loss (AF3 §4.2). When ``ccd_cache_path`` is supplied (e.g.
+        # ``/data/ccd_cache.json`` on the shared PVC), pull the
+        # ``automorphisms`` subsection of the unified CCD cache. Otherwise
+        # fall back to the per-dataset ``ligand_symmetry.json`` sidecar
+        # for backwards compatibility. When neither is available the
+        # featurizer runs with ``ligand_perm_cache=None`` and ligand
+        # symmetry is simply disabled.
         ligand_perm_cache: dict | None = None
-        if ligand_cache_path.exists():
-            import json as _json
+        if ccd_cache_path is not None:
+            from deepfold3.data.ccd import load_ligand_automorphisms
 
             try:
-                ligand_perm_cache = _json.loads(ligand_cache_path.read_text())
-                logger.info("Loaded ligand symmetry cache: %d CCDs", len(ligand_perm_cache))
+                ligand_perm_cache = load_ligand_automorphisms(ccd_cache_path)
+                logger.info(
+                    "Loaded %d ligand automorphism entries from %s",
+                    len(ligand_perm_cache),
+                    ccd_cache_path,
+                )
             except Exception:
-                logger.warning("Failed to load %s; ligand symmetry disabled", ligand_cache_path)
+                logger.warning("Failed to load %s; ligand symmetry disabled", ccd_cache_path)
+        else:
+            sidecar = self.data_dir / "ligand_symmetry.json"
+            if sidecar.exists():
+                try:
+                    with open(sidecar) as f:
+                        ligand_perm_cache = json.load(f)
+                    logger.info("Loaded ligand symmetry cache: %d CCDs (%s)", len(ligand_perm_cache), sidecar)
+                except Exception:
+                    logger.warning("Failed to load %s; ligand symmetry disabled", sidecar)
         self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs, ligand_perm_cache=ligand_perm_cache)
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker

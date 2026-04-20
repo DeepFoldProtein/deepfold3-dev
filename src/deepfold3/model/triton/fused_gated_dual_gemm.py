@@ -510,7 +510,7 @@ def fused_gated_dual_gemm(
 
 
 class FusedGatedDualGEMM(nn.Module):
-    """Fused sigmoid-gated dual GEMM module.
+    """Fused sigmoid-gated dual GEMM kernel — STATELESS.
 
     Drop-in replacement for the triangle-multiply pre-einsum pattern:
         proj = proj_linear(x)
@@ -520,46 +520,50 @@ class FusedGatedDualGEMM(nn.Module):
     Uses a single Triton kernel that shares the input tile load across
     both GEMMs and fuses the sigmoid + multiply into the epilogue.
 
+    Holds no parameters; callers pass w_gate and w_proj (and optional biases)
+    at call time. Weights must be shaped [out_features, in_features] in
+    standard nn.Linear convention.
+
     Args:
         in_features: Input dimension (K = c_z in triangle multiply).
         out_features: Output dimension (N = 2 * c_z for proj/gate).
-        bias: If True, adds learnable bias vectors to both GEMMs.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
-        self.w_gate = nn.Parameter(torch.empty(out_features, in_features))
-        self.w_proj = nn.Parameter(torch.empty(out_features, in_features))
-
-        if bias:
-            self.b_gate = nn.Parameter(torch.zeros(out_features))
-            self.b_proj = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.register_parameter("b_gate", None)
-            self.register_parameter("b_proj", None)
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        nn.init.kaiming_uniform_(self.w_gate)
-        nn.init.kaiming_uniform_(self.w_proj)
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        w_gate: torch.Tensor,
+        w_proj: torch.Tensor,
+        b_gate: torch.Tensor | None = None,
+        b_proj: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [*, in_features] input.
+            w_gate: [out_features, in_features] gate weight (standard nn.Linear shape).
+            w_proj: [out_features, in_features] projection weight.
+            b_gate: [out_features] optional gate bias.
+            b_proj: [out_features] optional projection bias.
+            mask: optional per-row mask broadcast as mask[..., None] in epilogue.
+        """
         if not HAS_TRITON or not x.is_cuda:
-            gate = x @ self.w_gate.T
-            proj = x @ self.w_proj.T
-            if self.b_gate is not None:
-                gate = gate + self.b_gate
-            if self.b_proj is not None:
-                proj = proj + self.b_proj
+            gate = x @ w_gate.T
+            proj = x @ w_proj.T
+            if b_gate is not None:
+                gate = gate + b_gate
+            if b_proj is not None:
+                proj = proj + b_proj
             out = torch.sigmoid(gate) * proj
             if mask is not None:
                 out = out * mask.unsqueeze(-1)
             return out
-        return fused_gated_dual_gemm(x, self.w_gate, self.w_proj, b_gate=self.b_gate, b_proj=self.b_proj, mask=mask)
+        return fused_gated_dual_gemm(x, w_gate, w_proj, b_gate=b_gate, b_proj=b_proj, mask=mask)
 
     def extra_repr(self):
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.b_gate is not None}"
+        return f"in_features={self.in_features}, out_features={self.out_features}"

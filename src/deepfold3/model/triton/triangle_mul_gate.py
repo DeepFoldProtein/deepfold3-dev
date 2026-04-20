@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     import triton
@@ -214,12 +215,12 @@ class TriMulPostProcessFunction(torch.autograd.Function):
 
 
 class FusedTriangleMulGate(nn.Module):
-    """Fused pre-einsum processing for TriangleMul.
+    """Fused pre-einsum processing for TriangleMul — STATELESS.
 
     Replaces:
         z0 = LN(z)
-        proj = proj_linear(z0)       # [*, 2K]
-        gate = sigmoid(gate_linear(z0))  # [*, 2K]
+        proj = proj_linear(z0)            # [*, 2K]
+        gate = sigmoid(gate_linear(z0))   # [*, 2K]
         out_gate = sigmoid(out_gate_linear(z0))  # [*, K]
         proj = proj * gate
         a = proj[..., 0::2]
@@ -229,6 +230,11 @@ class FusedTriangleMulGate(nn.Module):
         combined = FusedLayerNormLinear(z)   # [*, 5K]
         a, b, out_gate = TriMulPostProcess(combined, K)
 
+    Holds no parameters; the caller (`_TriangleMulBase`) owns the weights and
+    passes them at call time. The fused path packs the three linear weights
+    into one [K, 5K] tensor via `torch.cat` — differentiable end-to-end, so
+    gradients flow back into proj/gate/out_gate correctly.
+
     Args:
         c_z: Pair channel dimension.
     """
@@ -237,75 +243,47 @@ class FusedTriangleMulGate(nn.Module):
         super().__init__()
         self.c_z = c_z
 
+        # Stateless leaf.
         if HAS_ALL:
             self._ln_linear = FusedLayerNormLinear(c_z, 5 * c_z, has_linear_bias=False)
         else:
             self._ln_linear = None
 
-        # Standard modules for weight compatibility
-        self.norm_left = nn.LayerNorm(c_z)
-        self.proj = nn.Linear(c_z, c_z * 2, bias=False)
-        self.gate = nn.Linear(c_z, c_z * 2, bias=False)
-        self.out_gate = nn.Linear(c_z, c_z, bias=False)
-
-        if HAS_ALL:
-            self._sync_to_fused()
-
-    def _sync_to_fused(self):
-        """Pack proj, gate, out_gate weights into fused LN+Linear."""
-        if self._ln_linear is None:
-            return
-        with torch.no_grad():
-            self._ln_linear.weight.data.copy_(self.norm_left.weight.data)
-            self._ln_linear.bias.data.copy_(self.norm_left.bias.data)
-            # Pack [proj(2K) | gate(2K) | out_gate(K)] = 5K output features
-            # linear_weight is [K, 5K] for Triton
-            packed = torch.cat([self.proj.weight.T, self.gate.weight.T, self.out_gate.weight.T], dim=1)
-            self._ln_linear.linear_weight.data.copy_(packed)
-
-    def _sync_from_fused(self):
-        """Unpack fused weights back to standard modules."""
-        if self._ln_linear is None:
-            return
-        K = self.c_z
-        with torch.no_grad():
-            self.norm_left.weight.data.copy_(self._ln_linear.weight.data)
-            self.norm_left.bias.data.copy_(self._ln_linear.bias.data)
-            packed = self._ln_linear.linear_weight.data
-            self.proj.weight.data.copy_(packed[:, : 2 * K].T)
-            self.gate.weight.data.copy_(packed[:, 2 * K : 4 * K].T)
-            self.out_gate.weight.data.copy_(packed[:, 4 * K :].T)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        if HAS_ALL and strict:
-            fused_prefixes = ("_ln_linear.",)
-            own_keys = {k for k in self.state_dict() if any(k.startswith(p) for p in fused_prefixes)}
-            missing_fused = own_keys - set(state_dict)
-            if missing_fused:
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        if HAS_ALL:
-            self._sync_to_fused()
-        return result
-
-    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        z: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_bias: torch.Tensor,
+        proj_weight: torch.Tensor,
+        gate_weight: torch.Tensor,
+        out_gate_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             z: Input tensor [..., c_z].
+            norm_weight: [c_z] LN scale.
+            norm_bias: [c_z] LN offset.
+            proj_weight: [2*c_z, c_z] projection weight (standard nn.Linear shape).
+            gate_weight: [2*c_z, c_z] gate weight.
+            out_gate_weight: [c_z, c_z] out-gate weight.
 
         Returns:
             (a, b, out_gate) each [..., c_z].
         """
         if HAS_ALL and z.is_cuda and self._ln_linear is not None:
-            combined = self._ln_linear(z)  # [..., 5K]
+            # Pack [proj.T | gate.T | out_gate.T] as [K, 5K] in one fresh
+            # tensor. torch.cat is differentiable — autograd routes grads back
+            # into the three separate weights.
+            packed = torch.cat([proj_weight.T, gate_weight.T, out_gate_weight.T], dim=1)
+            combined = self._ln_linear(z, norm_weight, norm_bias, packed)  # [..., 5K]
             a, b, out_gate = TriMulPostProcessFunction.apply(combined, self.c_z)
             return a, b, out_gate
 
-        # Fallback
-        z0 = self.norm_left(z)
-        proj = self.proj(z0)
-        gate = torch.sigmoid(self.gate(z0))
-        out_gate = torch.sigmoid(self.out_gate(z0))
+        # Fallback (CPU or Triton unavailable). Construct functional LN + linear ops.
+        z0 = F.layer_norm(z, (self.c_z,), norm_weight, norm_bias)
+        proj = F.linear(z0, proj_weight)
+        gate = torch.sigmoid(F.linear(z0, gate_weight))
+        out_gate = torch.sigmoid(F.linear(z0, out_gate_weight))
         proj = proj * gate
         a = proj[..., 0::2]
         b = proj[..., 1::2]

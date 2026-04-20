@@ -43,6 +43,11 @@ class FusedAdaTransitionBlock(nn.Module):
 
     Falls back to unfused ops when Triton is unavailable or input is on CPU.
 
+    This module owns the standard weights (linear1, linear2, cond_*, etc.);
+    the fused AdaLN+Linear path reads linear1.weight at call time (transposed
+    on the fly; autograd tracks the transpose). No duplicate parameters, no
+    sync.
+
     Args:
         channels: Input/output dimension.
         cond_dim: Conditioning dimension.
@@ -54,6 +59,7 @@ class FusedAdaTransitionBlock(nn.Module):
         self.channels = channels
         num_intermediate = channels * num_intermediate_factor
 
+        # Stateless leaves — hold no params.
         if HAS_TRITON:
             self._ada_ln_linear = FusedAdaLayerNormLinear(channels, num_intermediate * 2)
             self._swiglu = FusedSwiGLU()
@@ -61,8 +67,7 @@ class FusedAdaTransitionBlock(nn.Module):
             self._ada_ln_linear = None
             self._swiglu = None
 
-        # Standard modules for weight compatibility and fallback
-        # AF3: single_cond_scale/bias use initializer='zeros', linear1='relu', linear2='zeros'
+        # AF3: single_cond_scale/bias use initializer='zeros', linear1='relu', linear2='zeros'.
         self.norm = nn.LayerNorm(channels, elementwise_affine=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, channels)
@@ -78,34 +83,6 @@ class FusedAdaTransitionBlock(nn.Module):
         nn.init.constant_(self.zero_cond.bias, -2.0)
         self._act = SwiGLU()
 
-        if HAS_TRITON:
-            self._sync_to_fused()
-
-    def _sync_to_fused(self):
-        """Copy weights from standard modules to fused kernel parameters."""
-        if self._ada_ln_linear is not None:
-            with torch.no_grad():
-                self._ada_ln_linear.linear_weight.data.copy_(self.linear1.weight.data.T)
-
-    def _sync_from_fused(self):
-        """Copy weights from fused kernel parameters back to standard modules."""
-        if self._ada_ln_linear is not None:
-            with torch.no_grad():
-                self.linear1.weight.data.copy_(self._ada_ln_linear.linear_weight.data.T)
-
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        """Load state dict then sync to fused parameters."""
-        if HAS_TRITON and strict:
-            fused_prefixes = ("_ada_ln_linear.", "_swiglu.")
-            own_keys = {k for k in self.state_dict() if any(k.startswith(p) for p in fused_prefixes)}
-            missing_fused = own_keys - set(state_dict)
-            if missing_fused:
-                strict = False
-        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
-        if HAS_TRITON:
-            self._sync_to_fused()
-        return result
-
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # Conditioning pre-computation (lightweight, stays in PyTorch)
         c = F.layer_norm(cond, [cond.shape[-1]]) * self.cond_norm_weight
@@ -114,7 +91,7 @@ class FusedAdaTransitionBlock(nn.Module):
 
         if HAS_TRITON and x.is_cuda and self._ada_ln_linear is not None:
             # Fused path: AdaLN+Linear -> SwiGLU -> Linear
-            h = self._ada_ln_linear(x, scale, bias)
+            h = self._ada_ln_linear(x, scale, bias, self.linear1.weight.T)
             h = self._swiglu(h)
             out = self.linear2(h)
         else:

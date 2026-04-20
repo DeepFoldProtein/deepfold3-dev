@@ -34,12 +34,19 @@ class Cropper:
         spatial_weight: float = 0.4,
         interface_weight: float = 0.4,
         interface_distance: float = 15.0,
+        min_resolved: int = 4,
+        max_attempts: int = 8,
     ):
         self.max_neighborhood = max_neighborhood
         self.contiguous_weight = contiguous_weight
         self.spatial_weight = spatial_weight
         self.interface_weight = interface_weight
         self.interface_distance = interface_distance
+        # IntFold §5.4.3: crops must contain ≥min_resolved residues so Kabsch
+        # alignment in the loss is well-posed. Retry up to max_attempts times
+        # with fresh RNG streams if a candidate crop falls short.
+        self.min_resolved = min_resolved
+        self.max_attempts = max_attempts
 
     def crop(
         self,
@@ -85,27 +92,47 @@ class Cropper:
 
         rng = random.Random(seed)
 
-        if chain_id is not None:
-            selected = self._contiguous_crop(tokens, max_tokens, max_atoms, chain_id, rng)
-        elif anchor is not None:
-            kind, a, b = anchor
-            if kind == "chain":
-                selected = self._contiguous_crop(tokens, max_tokens, max_atoms, a, rng)
-            elif kind == "interface":
-                selected = self._interface_spatial_crop(tokens, max_tokens, max_atoms, rng, anchor_chains=(a, b))
-            else:
-                selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
-        else:
-            # Weighted random choice among three strategies (no anchor)
-            r = rng.random()
-            if r < self.contiguous_weight:
-                selected = self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
-            elif r < self.contiguous_weight + self.interface_weight:
-                selected = self._interface_spatial_crop(tokens, max_tokens, max_atoms, rng)
-            else:
-                selected = self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+        # Per-token resolved = any atom [atom_idx, atom_idx+atom_num) has
+        # is_present=True. Computed via prefix-sum on the atom mask so the
+        # per-attempt check is a cheap indexed diff.
+        atom_present = data.structure.atoms["is_present"].astype(np.int32)
+        present_prefix = np.concatenate([[0], np.cumsum(atom_present)])
+        tok_start = tokens["atom_idx"].astype(np.int64)
+        tok_end = tok_start + tokens["atom_num"].astype(np.int64)
+        token_resolved = (present_prefix[tok_end] - present_prefix[tok_start]) > 0
+        total_resolved = int(token_resolved.sum())
+        attempts = self.max_attempts if total_resolved >= self.min_resolved else 1
 
-        return self._reindex(data, selected)
+        cand = None
+        for attempt in range(attempts):
+            attempt_rng = random.Random(rng.random()) if attempt > 0 else rng
+
+            if chain_id is not None:
+                cand = self._contiguous_crop(tokens, max_tokens, max_atoms, chain_id, attempt_rng)
+            elif anchor is not None:
+                kind, a, b = anchor
+                if kind == "chain":
+                    cand = self._contiguous_crop(tokens, max_tokens, max_atoms, a, attempt_rng)
+                elif kind == "interface":
+                    cand = self._interface_spatial_crop(tokens, max_tokens, max_atoms, attempt_rng, anchor_chains=(a, b))
+                else:
+                    cand = self._spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
+            else:
+                r = attempt_rng.random()
+                if r < self.contiguous_weight:
+                    cand = self._contiguous_crop(tokens, max_tokens, max_atoms, None, attempt_rng)
+                elif r < self.contiguous_weight + self.interface_weight:
+                    cand = self._interface_spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
+                else:
+                    cand = self._spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
+
+            if int(token_resolved[cand].sum()) >= self.min_resolved:
+                break
+
+        # ``cand`` holds either a crop that cleared ``min_resolved`` or the
+        # last-attempt fallback (used when ``total_resolved < min_resolved``,
+        # or when no attempt cleared the bar).
+        return self._reindex(data, cand)
 
     # ------------------------------------------------------------------
     # Contiguous cropping
