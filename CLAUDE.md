@@ -62,9 +62,9 @@ deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8 --max-templates 4 --workers 16
-deepfold3 scan-mmcif --mmcif-dir ~/deepfold3/pdb/divided --data-dir /data/training --output mmcif_meta.json --workers 32
+deepfold3 scan-mmcif --mmcif-dir ~/deepfold3/pdb/divided --data-dir /data/training --workers 32
 deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
-deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx --mmcif-cache mmcif_meta.json
+deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx --mmcif-cache data/mmcif_meta.json
 deepfold3 drop-obsolete --data-dir /data/training
 deepfold3 drop-obsolete --data-dir /data/training --delete-files
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
@@ -219,20 +219,22 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 ```
 1. Evoformer trunk (random 1–max_recycles recycles, gradient on last only)
 2. Diffusion training step (noise sampling + single denoise, with gradient)
-3. Mini-rollout (20-step denoise, no gradient → predicted positions for confidence)
-4. Confidence head (on mini-rollout positions, gradient flows)
-5. Distogram head (cross-entropy on distance bins)
+3. Mini-rollout (20-step denoise, no gradient → predicted positions for confidence / chain-perm)
+4. Confidence head (on mini-rollout positions; gated on `alpha_confidence > 0`, skipped entirely in stages 1–3)
+5. Distogram head (cross-entropy on distance bins; all samples incl. distillation)
 ```
 
 ### Loss Weights (AF3 §5.3)
 
 | Loss | Weight | Notes |
 |------|--------|-------|
-| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted; mol-type reweight: DNA/RNA 5×, ligand 10× |
+| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted; mol-type reweight: DNA/RNA 5×, ligand 10×. All samples incl. distillation. |
 | Bond violation | `alpha_diffusion × alpha_bond` (0) | MSE on bond distances vs CCD ideal; enable for stage 2 |
-| Distogram | `alpha_distogram` (0.03) | 64-bin cross-entropy |
-| pLDDT, PDE, exp_resolved | `alpha_confidence` (1e-4) | Per-atom/pair confidence; gated on resolution ∈ [0.1, 4.0] |
-| PAE | `alpha_confidence × alpha_pae` (0) | Disabled in stage 1; set alpha_pae=1.0 for finetuning |
+| Distogram | `alpha_distogram` (0.03) | 64-bin cross-entropy. All samples incl. distillation (AF3 §5.2 Table 6). |
+| pLDDT, PDE, exp_resolved | `alpha_confidence` (0 in stages 1–3, 1e-4 in FT3) | PDB-only (distillation skipped, AF3 §4.3); gated on resolution ∈ [0.1, 4.0]. Head forward disabled entirely when α=0. |
+| PAE | `alpha_confidence × alpha_pae` (0 until FT3) | Set `alpha_pae=1.0` only in finetune3 (confidence-only stage) |
+
+Confidence head forward is gated on `alpha_confidence > 0` ([model.py:557](src/deepfold3/model/model.py#L557)) — skipped entirely when disabled to avoid `0 × NaN = NaN` contamination of the total loss. Mini-rollout still runs (needed for chain permutation determinism). Distogram loss lives above the `is_distillation` early-return in `training_loss` so distillation samples contribute distogram gradient.
 
 ### Token Masks (Loss Control)
 

@@ -1021,12 +1021,6 @@ def training_loss(
             losses["bond"] = l_bond
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
 
-    # --- Distillation: skip distogram + confidence losses ---
-    is_distillation = features.get("is_distillation")
-    if is_distillation is not None and is_distillation.item():
-        losses["total"] = total
-        return total, losses
-
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]
     if rep_idx is not None:
@@ -1035,7 +1029,9 @@ def training_loss(
     else:
         gt_rep = gt_pos[:, 1, :]  # fallback to CA
 
-    # --- Distogram loss ---
+    # --- Distogram loss (all samples, incl. distillation) ---
+    # AF3 §5.2 Table 6: "Train structure and distogram" = True for stages 1–3
+    # regardless of sample origin. Only confidence losses are PDB-only (§4.3).
     if cfg.alpha_distogram > 0:
         if "distogram_features" in pred:
             from deepfold3.training.fused_loss import distogram_loss_fused
@@ -1054,6 +1050,12 @@ def training_loss(
         if l_disto is not None:
             losses["distogram"] = l_disto
             total = total + cfg.alpha_distogram * l_disto
+
+    # --- Distillation: skip confidence losses (AF3 §4.3: PDB-only, res-gated) ---
+    is_distillation = features.get("is_distillation")
+    if is_distillation is not None and is_distillation.item():
+        losses["total"] = total
+        return total, losses
 
     # --- Confidence losses ---
     # Resolution gating uses a tensor multiply (not a Python branch) so the

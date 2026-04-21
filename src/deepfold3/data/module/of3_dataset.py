@@ -324,7 +324,8 @@ class OF3Dataset(torch.utils.data.Dataset):
         max_tokens: Maximum tokens per sample after cropping.
         max_atoms: Maximum atoms per sample after cropping.
         max_msa_seqs: Maximum MSA sequences to keep.
-        is_distillation: Mark samples as distillation (disables confidence loss).
+        is_distillation: Mark samples as distillation (disables confidence loss;
+            diffusion + distogram still trained).
         mmcif_dir: PDB mmCIF mirror for template extraction (optional).
         max_templates: Maximum templates per sample (AF3 §2.4).
         max_template_date: Hard cutoff on template release date (ISO YYYY-MM-DD).

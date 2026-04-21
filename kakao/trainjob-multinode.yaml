@@ -1,4 +1,4 @@
-# DeepFold3 multi-node training — 8 nodes × 8 B200 (= 64 ranks) on Kakao Cloud.
+# DeepFold3 multi-node training — 16 nodes × 8 B200 (= 128 ranks) on Kakao Cloud.
 #
 # Topology assumptions:
 #   * deepspeed-llm TrainingRuntime (OpenMPI launcher + IB sidecar image)
@@ -35,18 +35,18 @@ spec:
     kind: TrainingRuntime
     name: deepspeed-llm
   trainer:
-    # numProcPerNode=1 → MPI launches ONE agent per node (8 total). Each agent
+    # numProcPerNode=1 → MPI launches ONE agent per node (16 total). Each agent
     # then runs torchrun --nproc-per-node=8 to fan out the 8 GPU workers in-proc.
-    # Benefits over -np 64 direct: native --redirects/--tee per-rank logs, no
+    # Benefits over -np 128 direct: native --redirects/--tee per-rank logs, no
     # per-rank PATH/env propagation issues, matches runs/notes byte-for-byte.
-    numNodes: 8
+    numNodes: 16
     numProcPerNode: 1
     command:
       - mpirun
       - "--hostfile"
       - /etc/mpi/hostfile
       - "-np"
-      - "8"                             # one torchrun agent per node
+      - "16"                            # one torchrun agent per node
       - "--bind-to"
       - "none"
       - "-x"
@@ -100,7 +100,36 @@ spec:
       - |
         set -euo pipefail
 
-        NODE_RANK=${OMPI_COMM_WORLD_RANK}
+        # Kill any leftover python workers from a previous mpirun attempt.
+        # Worker pods are persistent (sshd stays up across launcher restarts),
+        # so when the launcher crashes and k8s restarts it, the orphaned
+        # bash→torchrun→python subtree on each worker may keep running — its
+        # SIGHUP from the dropped SSH session doesn't always reach the Python
+        # children. Those live stragglers hold GPU memory and make the next
+        # set_device(i) fail with cudaErrorDevicesUnavailable.
+        #
+        # Pattern `python[0-9]` matches the venv interpreter (python3 / python3.11)
+        # but NOT this bash's own cmdline — bash's heredoc contains the literal
+        # string "python[0-9]" which the regex never matches (no digit after
+        # "python" in the script text). This avoids pkill-suicide that killed
+        # rank 15's bash in df3-20260421-014213.
+        pkill -9 -f '\.venv/bin/python[0-9]' || true
+        sleep 5
+
+        # Prefix every diagnostic line with [NR=N] so the launcher log (which
+        # interleaves output from all 16 MPI ranks) can be filtered per node
+        # via `grep '\[NR=1\]'`. We want to identify which specific physical
+        # GPU (UUID + PCIe bus-id) is bound at local_rank=6 on the failing pod
+        # — `cudaErrorDevicesUnavailable` keeps hitting that slot regardless
+        # of which pod is scheduled there.
+        NR=${OMPI_COMM_WORLD_RANK}
+        {
+          echo "POD=$(hostname) K8S_NODE=${NODE_NAME:-unknown}"
+          nvidia-smi --query-gpu=index,uuid,pci.bus_id,compute_mode --format=csv || true
+          nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv || true
+        } 2>&1 | sed "s/^/[NR=${NR}] /"
+
+        NODE_RANK=${NR}
         MASTER_ADDR=${JOBSET_NAME}-launcher-0-0.${JOBSET_NAME}
         MASTER_PORT=29500
 
@@ -141,7 +170,7 @@ spec:
         # us per-rank stdout.log files under ${LOG_DIR}/attempt_*/<rank>/ which
         # is what the inf-grad investigation flow expects.
         exec torchrun \
-          --nnodes=8 \
+          --nnodes=16 \
           --nproc-per-node=8 \
           --node-rank=${NODE_RANK} \
           --master-addr=${MASTER_ADDR} \
@@ -242,6 +271,13 @@ spec:
         valueFrom:
           fieldRef:
             fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+      # Physical K8s node name via downward API. Pod hostname only identifies
+      # the JobSet slot (node-0-N); NODE_NAME points to the underlying host so
+      # we can pinpoint which specific physical B200 has a stuck/faulty GPU.
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
     resourcesPerNode:
       requests:
         cpu: "96"                       # 12 CPU × 8 GPU
@@ -264,6 +300,21 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
+        # Exclude physical K8s node host-10-0-1-5 — its GPU at bus DC:00.0
+        # (UUID GPU-a776b8c8-7efb-26ef-5724-a82d072d1c64) reproducibly fails
+        # cudaErrorDevicesUnavailable at torch.cuda.set_device(6) across two
+        # back-to-back trainjobs landing on it via different pod roles
+        # (df3-20260421-015303/015733). Notebook SA can't cordon cluster-scoped
+        # nodes, so we blacklist at the pod level instead.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        - host-10-0-1-5
         containers:
           - name: node
             volumeMounts:
@@ -294,6 +345,16 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
+        # See launcher block above for the reason this host is excluded.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        - host-10-0-1-5
         containers:
           - name: node
             volumeMounts:

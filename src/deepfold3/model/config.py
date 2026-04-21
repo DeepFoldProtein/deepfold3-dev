@@ -341,7 +341,8 @@ class DatasetConfig:
         data_dir: Path to data directory (structures/ + msa/).
         weight: Sampling probability relative to primary dataset (1.0).
         strategy: ``"weighted"`` (cluster-balanced) or ``"uniform"``.
-        is_distillation: If True, disables confidence/distogram losses.
+        is_distillation: If True, disables confidence losses (PDB-only per AF3 §4.3).
+            Diffusion and distogram losses still apply.
         format: ``"df3"`` (default) or ``"of3"`` (OpenFold 3 preprocessed).
         cutoff_date: ISO date filter. For training datasets: records released
             AFTER this date are excluded. For eval datasets: only records

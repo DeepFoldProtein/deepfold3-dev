@@ -8,7 +8,7 @@ training:
 
   alpha_diffusion: 4.0
   alpha_distogram: 0.03
-  alpha_confidence: 1.0e-4
+  alpha_confidence: 0.0
   alpha_pae: 0.0
   alpha_bond: 1.0
   alpha_smooth_lddt: 1.0

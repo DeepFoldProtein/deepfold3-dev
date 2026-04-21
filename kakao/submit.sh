@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DeepFold3 multi-node training submitter (8 nodes × 8 B200 = 64 ranks).
+# DeepFold3 multi-node training submitter (16 nodes × 8 B200 = 128 ranks).
 #
 # Usage:
 #   bash kakao/submit.sh                                  # auto: df3-YYYYMMDD-HHMMSS
@@ -51,7 +51,7 @@ cat <<EOF
 │   trainjob name : ${JOB_NAME}
 │   wandb         : ${WANDB_ENTITY}/${WANDB_PROJECT}
 │   extra args    : ${EXTRA_ARGS:-<none>}
-│   nodes × gpus  : 8 × 8 = 64 ranks
+│   nodes × gpus  : 16 × 8 = 128 ranks
 ╰────────────────────────────────────────────────────────────╯
 EOF
 
