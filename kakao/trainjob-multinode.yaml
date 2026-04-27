@@ -1,4 +1,4 @@
-# DeepFold3 multi-node training — 16 nodes × 8 B200 (= 128 ranks) on Kakao Cloud.
+# DeepFold3 multi-node training — 8 nodes × 8 B200 (= 64 ranks) on Kakao Cloud.
 #
 # Topology assumptions:
 #   * deepspeed-llm TrainingRuntime (OpenMPI launcher + IB sidecar image)
@@ -35,18 +35,14 @@ spec:
     kind: TrainingRuntime
     name: deepspeed-llm
   trainer:
-    # numProcPerNode=1 → MPI launches ONE agent per node (16 total). Each agent
-    # then runs torchrun --nproc-per-node=8 to fan out the 8 GPU workers in-proc.
-    # Benefits over -np 128 direct: native --redirects/--tee per-rank logs, no
-    # per-rank PATH/env propagation issues, matches runs/notes byte-for-byte.
-    numNodes: 16
+    numNodes: __N_NODES__
     numProcPerNode: 1
     command:
       - mpirun
       - "--hostfile"
       - /etc/mpi/hostfile
       - "-np"
-      - "16"                            # one torchrun agent per node
+      - "__N_NODES__"
       - "--bind-to"
       - "none"
       - "-x"
@@ -170,7 +166,7 @@ spec:
         # us per-rank stdout.log files under ${LOG_DIR}/attempt_*/<rank>/ which
         # is what the inf-grad investigation flow expects.
         exec torchrun \
-          --nnodes=16 \
+          --nnodes=__N_NODES__ \
           --nproc-per-node=8 \
           --node-rank=${NODE_RANK} \
           --master-addr=${MASTER_ADDR} \
@@ -300,21 +296,6 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
-        # Exclude physical K8s node host-10-0-1-5 — its GPU at bus DC:00.0
-        # (UUID GPU-a776b8c8-7efb-26ef-5724-a82d072d1c64) reproducibly fails
-        # cudaErrorDevicesUnavailable at torch.cuda.set_device(6) across two
-        # back-to-back trainjobs landing on it via different pod roles
-        # (df3-20260421-015303/015733). Notebook SA can't cordon cluster-scoped
-        # nodes, so we blacklist at the pod level instead.
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-                - matchExpressions:
-                    - key: kubernetes.io/hostname
-                      operator: NotIn
-                      values:
-                        - host-10-0-1-5
         containers:
           - name: node
             volumeMounts:
@@ -345,16 +326,6 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
-        # See launcher block above for the reason this host is excluded.
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-                - matchExpressions:
-                    - key: kubernetes.io/hostname
-                      operator: NotIn
-                      values:
-                        - host-10-0-1-5
         containers:
           - name: node
             volumeMounts:

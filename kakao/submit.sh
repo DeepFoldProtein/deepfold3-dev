@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DeepFold3 multi-node training submitter (16 nodes × 8 B200 = 128 ranks).
+# DeepFold3 multi-node training submitter (8 nodes × 8 B200 = 64 ranks).
 #
 # Usage:
 #   bash kakao/submit.sh                                  # auto: df3-YYYYMMDD-HHMMSS
@@ -36,6 +36,7 @@ EXTRA_ARGS="${*:-}"
 
 WANDB_PROJECT="${WANDB_PROJECT:-deepfold3-stage0}"
 WANDB_ENTITY="${WANDB_ENTITY:-DeepFoldProtein}"
+N_NODES="${N_NODES:-8}"
 
 # k8s names must be DNS-1123 (lowercase alphanumerics + hyphens).
 JOB_NAME="$(printf '%s' "${RUN_NAME}" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-' | cut -c1-52)"
@@ -51,7 +52,7 @@ cat <<EOF
 │   trainjob name : ${JOB_NAME}
 │   wandb         : ${WANDB_ENTITY}/${WANDB_PROJECT}
 │   extra args    : ${EXTRA_ARGS:-<none>}
-│   nodes × gpus  : 16 × 8 = 128 ranks
+│   nodes × gpus  : ${N_NODES} × 8 = $((N_NODES * 8)) ranks
 ╰────────────────────────────────────────────────────────────╯
 EOF
 
@@ -64,6 +65,7 @@ sed \
     -e "s|__WANDB_PROJECT__|${WANDB_PROJECT}|g" \
     -e "s|__WANDB_ENTITY__|${WANDB_ENTITY}|g" \
     -e "s|__EXTRA_ARGS__|${EXTRA_ARGS}|g" \
+    -e "s|__N_NODES__|${N_NODES}|g" \
     "${YAML}" \
     | ${KUBECTL} apply -f -
 
