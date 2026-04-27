@@ -316,7 +316,9 @@ class TestPaeLoss:
         """When pred == gt the frame-aligned error is 0 for all pairs.
 
         With uniform-random logits, the loss should match
-        ``-log_softmax[..., 0].mean()`` exactly.
+        ``-log_softmax[..., 0].mean()`` exactly. Disable the 25° co-linearity
+        filter (``angle_threshold=0``) so randomly-generated frames don't
+        get dropped from the supervision.
         """
         torch.manual_seed(0)
         n = 16
@@ -328,7 +330,16 @@ class TestPaeLoss:
         logits = torch.randn(1, n, n, num_bins, requires_grad=True)
         pae_mask = torch.ones(n, n)
 
-        loss = pae_loss(logits, pred_rep, pred_frames, rep, frames, pae_mask, num_bins=num_bins)
+        loss = pae_loss(
+            logits,
+            pred_rep,
+            pred_frames,
+            rep,
+            frames,
+            pae_mask,
+            num_bins=num_bins,
+            angle_threshold=0.0,
+        )
 
         log_probs = torch.nn.functional.log_softmax(logits.detach().float(), dim=-1)
         expected = -log_probs[..., 0].mean()

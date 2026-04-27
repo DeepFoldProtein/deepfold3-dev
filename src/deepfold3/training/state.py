@@ -10,6 +10,7 @@ without reaching into a god-object.
 
 from __future__ import annotations
 
+import os
 import random
 from dataclasses import dataclass, field
 
@@ -48,12 +49,16 @@ class TrainState:
     last_num_recycles: int = 0
 
 
-def seed_everything(seed: int, rank: int) -> None:
+def seed_everything(seed: int, rank: int, *, deterministic: bool = False) -> None:
     """Set seeds for reproducibility, offset by rank.
 
     Offsetting by rank gives each rank an independent RNG stream while
     keeping the run as a whole deterministic with respect to the
     user-supplied seed.
+
+    When ``deterministic=True``, also force torch/cuDNN to pick
+    deterministic algorithms. This trades throughput for bit-exact
+    reproducibility.
     """
     effective = seed + rank
     random.seed(effective)
@@ -61,3 +66,10 @@ def seed_everything(seed: int, rank: int) -> None:
     torch.manual_seed(effective)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(effective)
+    if deterministic:
+        # cuBLAS workspace must be configured before the first CUDA op;
+        # skip silently if the user already set it.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False

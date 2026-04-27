@@ -1,0 +1,79 @@
+{
+  "params": {
+    "B": "1",
+    "N_seq": "2",
+    "N_res": "384",
+    "H": "8",
+    "D": "32",
+    "dtype": "torch.bfloat16",
+    "seed": "42",
+    "note": "first half rows stddev=1, second half stddev=5"
+  },
+  "fwd": {
+    "max_abs_ref": 21.716381072998047,
+    "abs_err_max": 0.6795973777770996,
+    "abs_err_mean": 0.011485672555863857,
+    "rel_err_max": 635.5517578125,
+    "rel_err_p99": 0.2079409807920456,
+    "rel_err_mean": 0.027964988723397255,
+    "fail_frac": 0.0469004325568676,
+    "is_finite": true,
+    "atol_eff": 0.02171638107299805,
+    "rtol": 0.01,
+    "n_significant_elements": 196607
+  },
+  "bwd": {
+    "dQ": {
+      "max_abs_ref": 9.761092185974121,
+      "abs_err_max": 0.3180348873138428,
+      "abs_err_mean": 0.0038148164749145508,
+      "rel_err_max": 988.8427734375,
+      "rel_err_p99": 7.046097278594971,
+      "rel_err_mean": 0.4857007563114166,
+      "fail_frac": 0.0006205241079442203,
+      "is_finite": true,
+      "atol_eff": 0.048805460929870606,
+      "rtol": 0.05,
+      "n_significant_elements": 172652
+    },
+    "dK": {
+      "max_abs_ref": 8.319180488586426,
+      "abs_err_max": 0.8886055946350098,
+      "abs_err_mean": 0.006072278134524822,
+      "rel_err_max": 367.30230712890625,
+      "rel_err_p99": 0.7076648473739624,
+      "rel_err_mean": 0.07655694335699081,
+      "fail_frac": 0.0142822265625,
+      "is_finite": true,
+      "atol_eff": 0.04159590244293213,
+      "rtol": 0.05,
+      "n_significant_elements": 185492
+    },
+    "dV": {
+      "max_abs_ref": 1.189771294593811,
+      "abs_err_max": 0.1042565107345581,
+      "abs_err_mean": 0.0017747541423887014,
+      "rel_err_max": 988.7770385742188,
+      "rel_err_p99": 0.656116247177124,
+      "rel_err_mean": 0.08635247498750687,
+      "fail_frac": 0.0387064628303051,
+      "is_finite": true,
+      "atol_eff": 0.005948856472969055,
+      "rtol": 0.05,
+      "n_significant_elements": 193829
+    },
+    "d_pair_bias": {
+      "max_abs_ref": 3.3979763984680176,
+      "abs_err_max": 0.12059211730957031,
+      "abs_err_mean": 4.286806870368309e-05,
+      "rel_err_max": 817.5155029296875,
+      "rel_err_p99": 0.11150265485048294,
+      "rel_err_mean": 0.019891291856765747,
+      "fail_frac": 0.00011105007433798164,
+      "is_finite": true,
+      "atol_eff": 0.016989881992340087,
+      "rtol": 0.02,
+      "n_significant_elements": 334603
+    }
+  }
+}

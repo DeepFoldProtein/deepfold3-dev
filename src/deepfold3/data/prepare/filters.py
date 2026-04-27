@@ -176,9 +176,7 @@ def count_tight_clashes(structure: Structure, dist: float = 0.8) -> int:
     if not mask.any():
         return 0
 
-    coords = np.column_stack(
-        [atoms["x"][mask], atoms["y"][mask], atoms["z"][mask]]
-    ).astype(np.float64)
+    coords = np.column_stack([atoms["x"][mask], atoms["y"][mask], atoms["z"][mask]]).astype(np.float64)
     # Map filtered indices back to original atom indices so we can
     # dedupe directly-bonded pairs from ``structure.bonds``.
     orig_idx = np.flatnonzero(mask)
@@ -431,9 +429,7 @@ def filter_structure(
         elif not filter_unknown(structure, ci):
             reasons[ci.chain_name] = "all residues unknown"
             ci.valid = False
-        elif cfg.max_unk_fraction is not None and not filter_unknown_fraction(
-            structure, ci, cfg.max_unk_fraction
-        ):
+        elif cfg.max_unk_fraction is not None and not filter_unknown_fraction(structure, ci, cfg.max_unk_fraction):
             frac = _unk_fraction(structure, ci)
             reasons[ci.chain_name] = f"UNK fraction {frac:.2f} > {cfg.max_unk_fraction:.2f}"
             ci.valid = False
@@ -459,8 +455,7 @@ def filter_structure(
             for ci in record.chains:
                 if ci.valid:
                     reasons[ci.chain_name] = (
-                        f"record tight-clash {n_tight} > max {cfg.max_tight_clashes} "
-                        f"(< {cfg.tight_clash_dist:.2f} Å)"
+                        f"record tight-clash {n_tight} > max {cfg.max_tight_clashes} (< {cfg.tight_clash_dist:.2f} Å)"
                     )
                     ci.valid = False
 

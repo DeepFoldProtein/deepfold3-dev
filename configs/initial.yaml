@@ -25,12 +25,12 @@ training:
 
   max_tokens: 384
   max_atoms: 4096
-  max_msa_seqs: 512
+  max_msa_seqs: 1024
   max_recycles: 3
 
   batch_size_per_rank: 2
   diffusion_batch_size: 48
-  diffusion_chunk_size: 16
+  diffusion_chunk_size: 8
   mini_rollout_steps: 20
   mini_rollout_samples: 1
 

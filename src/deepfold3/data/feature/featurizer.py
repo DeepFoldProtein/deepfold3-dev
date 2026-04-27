@@ -39,6 +39,7 @@ class Featurizer:
         max_msa_seqs: int = const.MAX_MSA_ROWS,
         max_templates: int = 4,
         ligand_perm_cache: dict[str, list[list[int]]] | None = None,
+        include_polymer_backbone_bonds: bool = False,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
@@ -48,6 +49,12 @@ class Featurizer:
         # alongside ``atom_swap_pairs`` so the diffusion loss can apply
         # ligand-atom permutations as well.
         self.ligand_perm_cache = ligand_perm_cache
+        # Bond-loss scope. AF3 §5.3 / OpenFold-3 restrict ``L_bond`` to
+        # polymer–ligand token bonds; the Protenix-style extended set (all
+        # polymer backbone bonds + ligand intra-bonds) is preserved behind
+        # this flag for experimentation but is off by default because it
+        # double-counts against the diffusion MSE on shared atom pairs.
+        self.include_polymer_backbone_bonds = include_polymer_backbone_bonds
 
     def process(
         self,
@@ -451,9 +458,18 @@ class Featurizer:
             ligand_swap_pairs = compute_ligand_token_swap_pairs(data.structure, tokens, self.ligand_perm_cache)
             result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
-            # Bond features for bond violation loss (Protenix-style: observed GT distances)
+            # Bond features for bond violation loss (AF3 §5.3: polymer–ligand
+            # token bonds only by default; extended Protenix-style set
+            # gated behind ``include_polymer_backbone_bonds``).
             bond_feats = self._build_bond_features(
-                tokens, data.structure.atoms, atom_gt_positions, atom_gt_mask, data.bonds, N, M
+                tokens,
+                data.structure.atoms,
+                atom_gt_positions,
+                atom_gt_mask,
+                data.bonds,
+                N,
+                M,
+                include_polymer_backbone=self.include_polymer_backbone_bonds,
             )
             result.update(bond_feats)
 
@@ -750,10 +766,17 @@ class Featurizer:
         token_bonds: np.ndarray,  # TOKEN_BOND_DTYPE from Tokenized
         N: int,
         M: int,
+        include_polymer_backbone: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Build bond pair features for bond violation loss.
+        """Build bond pair features for bond violation loss (AF3 §5.3, Eq. 5).
 
-        Collects three types of bonds:
+        AF3 §5.3 and OpenFold-3 restrict ``L_bond`` to polymer–ligand token
+        bonds. When ``include_polymer_backbone`` is False (default) that
+        scope is applied: only ``Tokenized.bonds`` entries where one side
+        is polymer and the other is ligand are emitted.
+
+        When ``include_polymer_backbone`` is True the legacy Protenix-style
+        extended set is emitted — preserved for experimentation:
 
         1. **Intra-residue backbone** (polymer):
            - Protein: N-CA (atoms 0-1), CA-C (atoms 1-2) within each token.
@@ -763,8 +786,7 @@ class Featurizer:
         2. **Inter-residue peptide/phosphodiester**:
            - Protein: C[i] (atom 2) → N[i+1] (atom 0).
            - RNA/DNA: O3'[i] → P[i+1] (looked up by name).
-        3. **Ligand-ligand bonds**: from ``Tokenized.bonds`` (token-level,
-           atom index 0 for each single-atom ligand token).
+        3. **All token bonds** (polymer–ligand and ligand–ligand).
 
         Uses **observed GT distances** as targets (Protenix approach), not
         CCD ideal distances. Only includes bonds where both atoms are
@@ -778,8 +800,9 @@ class Featurizer:
         """
         bonds: list[tuple[int, int, int, int]] = []  # (t1, a1, t2, a2)
 
-        # Per-token cache of atom-name → local atom index (only for nucleic
-        # tokens, to avoid the overhead for protein-only complexes).
+        # Per-token cache of atom-name → local atom index (only used by the
+        # legacy polymer-backbone path; keeps the default AF3 path free of
+        # per-token name-lookup overhead on protein-only complexes).
         nucleic_name_map: dict[int, dict[str, int]] = {}
 
         def _nucleic_atom_map(tok_idx: int) -> dict[str, int]:
@@ -802,60 +825,72 @@ class Featurizer:
             ("C3'", "O3'"),
         )
 
-        # --- 1. Intra-residue backbone bonds ---
-        # Protein: N(0)-CA(1), CA(1)-C(2)
-        # RNA/DNA: P-O5', O5'-C5', C5'-C4', C4'-C3', C3'-O3' (by atom name;
-        # 5'-terminal nucleotides lack the phosphate group so P may be
-        # missing — those bonds are silently skipped).
-        for i in range(N):
-            mt = int(tokens[i]["mol_type"])
-            if mt == const.MOL_PROTEIN:
-                # N-CA bond (atoms 0-1)
-                bonds.append((i, 0, i, 1))
-                # CA-C bond (atoms 1-2)
-                bonds.append((i, 1, i, 2))
-            elif mt in (const.MOL_RNA, const.MOL_DNA):
-                amap = _nucleic_atom_map(i)
-                for a_name, b_name in _NUC_INTRA_BONDS:
-                    a_idx = amap.get(a_name)
-                    b_idx = amap.get(b_name)
-                    if a_idx is None or b_idx is None:
-                        continue
-                    bonds.append((i, a_idx, i, b_idx))
+        if include_polymer_backbone:
+            # --- 1. Intra-residue backbone bonds ---
+            # Protein: N(0)-CA(1), CA(1)-C(2)
+            # RNA/DNA: P-O5', O5'-C5', C5'-C4', C4'-C3', C3'-O3' (by atom name;
+            # 5'-terminal nucleotides lack the phosphate group so P may be
+            # missing — those bonds are silently skipped).
+            for i in range(N):
+                mt = int(tokens[i]["mol_type"])
+                if mt == const.MOL_PROTEIN:
+                    # N-CA bond (atoms 0-1)
+                    bonds.append((i, 0, i, 1))
+                    # CA-C bond (atoms 1-2)
+                    bonds.append((i, 1, i, 2))
+                elif mt in (const.MOL_RNA, const.MOL_DNA):
+                    amap = _nucleic_atom_map(i)
+                    for a_name, b_name in _NUC_INTRA_BONDS:
+                        a_idx = amap.get(a_name)
+                        b_idx = amap.get(b_name)
+                        if a_idx is None or b_idx is None:
+                            continue
+                        bonds.append((i, a_idx, i, b_idx))
 
-        # --- 2. Inter-residue backbone bonds ---
-        for i in range(N - 1):
-            mt_i = int(tokens[i]["mol_type"])
-            mt_j = int(tokens[i + 1]["mol_type"])
-            chain_i = int(tokens[i]["asym_id"])
-            chain_j = int(tokens[i + 1]["asym_id"])
+            # --- 2. Inter-residue backbone bonds ---
+            for i in range(N - 1):
+                mt_i = int(tokens[i]["mol_type"])
+                mt_j = int(tokens[i + 1]["mol_type"])
+                chain_i = int(tokens[i]["asym_id"])
+                chain_j = int(tokens[i + 1]["asym_id"])
 
-            # Must be same chain and both polymer
-            if chain_i != chain_j:
-                continue
-            if mt_i == const.MOL_NONPOLYMER or mt_j == const.MOL_NONPOLYMER:
-                continue
+                # Must be same chain and both polymer
+                if chain_i != chain_j:
+                    continue
+                if mt_i == const.MOL_NONPOLYMER or mt_j == const.MOL_NONPOLYMER:
+                    continue
 
-            if mt_i == const.MOL_PROTEIN and mt_j == const.MOL_PROTEIN:
-                # C[i] (atom 2) → N[i+1] (atom 0)
-                bonds.append((i, 2, i + 1, 0))
-            elif mt_i in (const.MOL_RNA, const.MOL_DNA) and mt_j in (const.MOL_RNA, const.MOL_DNA):
-                # O3'[i] → P[i+1] (phosphodiester linkage). Either atom
-                # may be missing at chain termini or when the residue
-                # lacks the phosphate group — skip those cases.
-                amap_i = _nucleic_atom_map(i)
-                amap_j = _nucleic_atom_map(i + 1)
-                o3_idx = amap_i.get("O3'")
-                p_idx = amap_j.get("P")
-                if o3_idx is not None and p_idx is not None:
-                    bonds.append((i, o3_idx, i + 1, p_idx))
+                if mt_i == const.MOL_PROTEIN and mt_j == const.MOL_PROTEIN:
+                    # C[i] (atom 2) → N[i+1] (atom 0)
+                    bonds.append((i, 2, i + 1, 0))
+                elif mt_i in (const.MOL_RNA, const.MOL_DNA) and mt_j in (const.MOL_RNA, const.MOL_DNA):
+                    # O3'[i] → P[i+1] (phosphodiester linkage). Either atom
+                    # may be missing at chain termini or when the residue
+                    # lacks the phosphate group — skip those cases.
+                    amap_i = _nucleic_atom_map(i)
+                    amap_j = _nucleic_atom_map(i + 1)
+                    o3_idx = amap_i.get("O3'")
+                    p_idx = amap_j.get("P")
+                    if o3_idx is not None and p_idx is not None:
+                        bonds.append((i, o3_idx, i + 1, p_idx))
 
-        # --- 3. Token bonds (cross-entity + ligand intra-bonds) ---
+        # --- 3. Token bonds ---
+        # Default (AF3 §5.3): polymer–ligand only. Extended path keeps all
+        # token bonds (polymer–ligand + ligand–ligand) to match the legacy
+        # Protenix behaviour.
+        mol_types = tokens["mol_type"].astype(np.int64)
         for bond in token_bonds:
             t1, t2 = int(bond["token_1"]), int(bond["token_2"])
             a1, a2 = int(bond["atom_1"]), int(bond["atom_2"])
-            if 0 <= t1 < N and 0 <= t2 < N and a1 < M and a2 < M:
-                bonds.append((t1, a1, t2, a2))
+            if not (0 <= t1 < N and 0 <= t2 < N and a1 < M and a2 < M):
+                continue
+            if not include_polymer_backbone:
+                is_polymer_1 = mol_types[t1] != const.MOL_NONPOLYMER
+                is_polymer_2 = mol_types[t2] != const.MOL_NONPOLYMER
+                if is_polymer_1 == is_polymer_2:
+                    # Skip polymer–polymer and ligand–ligand token bonds.
+                    continue
+            bonds.append((t1, a1, t2, a2))
 
         if not bonds:
             return {

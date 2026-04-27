@@ -114,7 +114,9 @@ class Cropper:
                 if kind == "chain":
                     cand = self._contiguous_crop(tokens, max_tokens, max_atoms, a, attempt_rng)
                 elif kind == "interface":
-                    cand = self._interface_spatial_crop(tokens, max_tokens, max_atoms, attempt_rng, anchor_chains=(a, b))
+                    cand = self._interface_spatial_crop(
+                        tokens, max_tokens, max_atoms, attempt_rng, anchor_chains=(a, b)
+                    )
                 else:
                     cand = self._spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
             else:

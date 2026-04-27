@@ -632,13 +632,9 @@ if HAS_TRITON:
         inv_ln2: tl.constexpr = 1.4426950408889634  # 1/ln(2)
 
         for index_msa in range(0, N_SEQ):
-            base_qkv = (
-                index_batch * stride_batch + index_msa * stride_msa + index_head * stride_head
-            ).to(tl.int64)
+            base_qkv = (index_batch * stride_batch + index_msa * stride_msa + index_head * stride_head).to(tl.int64)
             # M/D packed as [batch*N_SEQ*H + msa*H + head] * SEQ_LEN (matches dq/dk_dv).
-            base_seq = (
-                (index_batch * N_SEQ * HEAD + index_msa * HEAD + index_head) * SEQ_LEN
-            ).to(tl.int64)
+            base_seq = ((index_batch * N_SEQ * HEAD + index_msa * HEAD + index_head) * SEQ_LEN).to(tl.int64)
 
             Q_ptrs = Q + base_qkv + offs_q[:, None] * stride_seq + offs_dim[None, :]
             K_ptrs = K + base_qkv + offs_kv[:, None] * stride_seq + offs_dim[None, :]

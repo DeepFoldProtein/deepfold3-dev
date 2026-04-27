@@ -43,8 +43,8 @@ from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfi
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
-from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 from deepfold3.model.template_embedding import TemplateEmbedding
+from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 
 _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -84,6 +84,7 @@ class EvoformerBlock(nn.Module):
         self.msa_transition = make_transition_block(c_msa, config=optim)
         self.msa_dropout = msa_dropout
         self.pair_dropout = pair_dropout
+        self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
 
     def forward(
         self,
@@ -93,13 +94,14 @@ class EvoformerBlock(nn.Module):
         pair_mask: torch.Tensor,  # [B?, N, N]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         p_pair, p_msa, training = self.pair_dropout, self.msa_dropout, self.training
-        pair = dropout_add_rowwise(pair, self.outer_product(msa, msa_mask), p_pair, training)
-        msa = dropout_add_rowwise(msa, self.row_attn(msa, msa_mask, pair), p_msa, training)
+        use_fused = self.use_fused_dropout
+        pair = pair + self.outer_product(msa, msa_mask)
+        msa = dropout_add_rowwise(msa, self.row_attn(msa, msa_mask, pair), p_msa, training, use_fused)
         msa = msa + self.msa_transition(msa)
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p_pair, training)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p_pair, training)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p_pair, training)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p_pair, training)
+        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
         pair = pair + self.pair_transition(pair)
         return msa, pair
 
@@ -142,6 +144,7 @@ class PairFormerBlock(nn.Module):
         )
         self.single_transition = make_transition_block(c_single, config=optim)
         self.pair_dropout = pair_dropout
+        self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
 
     def forward(
         self,
@@ -151,10 +154,11 @@ class PairFormerBlock(nn.Module):
         seq_mask: torch.Tensor,  # [B?, N]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         p, training = self.pair_dropout, self.training
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training)
+        use_fused = self.use_fused_dropout
+        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
         pair = pair + self.pair_transition(pair)
         # Single update: pair → logits, then single attention
         pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]

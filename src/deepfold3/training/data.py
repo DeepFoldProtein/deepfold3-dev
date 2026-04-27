@@ -16,9 +16,12 @@ anchor). This closes the AF3 §2.5.1 loop. See
 from __future__ import annotations
 
 import logging
+import random
 from functools import partial
 from pathlib import Path
 
+import numpy as np
+import torch
 from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
 
 from deepfold3.data.module.collate import collate_fn
@@ -28,6 +31,7 @@ from deepfold3.training.distributed import DistInfo
 
 logger = logging.getLogger(__name__)
 
+
 # Bucket-padded collation keeps Triton kernel input shapes (and the
 # persistent autotune cache keys) deterministic across microsteps. For
 # distributed training we ALSO force ``fixed_bucket_n=cfg.max_tokens`` so
@@ -36,6 +40,26 @@ logger = logging.getLogger(__name__)
 # longest crop stalls every per-step collective (the 58 s multi-node tax).
 def _make_bucket_collate(max_tokens: int):
     return partial(collate_fn, bucket_pad=True, fixed_bucket_n=max_tokens)
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Per-worker RNG init.
+
+    ``torch.initial_seed()`` already derives a unique 64-bit seed per
+    worker from the DataLoader's base ``generator`` seed; this just
+    propagates the low 32 bits to ``random`` and ``numpy`` so all RNG
+    sources a dataset/cropper might use are seeded consistently.
+    """
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _make_loader_generator(base_seed: int, rank: int) -> torch.Generator:
+    """Seed a ``torch.Generator`` that drives DataLoader worker seeds."""
+    g = torch.Generator()
+    g.manual_seed(base_seed + rank)
+    return g
 
 
 def _apply_cutoff(records: list, cutoff: str, *, keep_after: bool) -> list:
@@ -329,6 +353,8 @@ def build_dataloaders(
         drop_last=cfg.drop_last,
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+        worker_init_fn=_seed_worker,
+        generator=_make_loader_generator(cfg.seed, dist.rank),
     )
 
     eval_dl: DataLoader | None = None
@@ -365,6 +391,8 @@ def build_dataloaders(
             pin_memory=cfg.pin_memory,
             persistent_workers=cfg.eval_num_workers > 0,
             prefetch_factor=cfg.prefetch_factor if cfg.eval_num_workers > 0 else None,
+            worker_init_fn=_seed_worker,
+            generator=_make_loader_generator(cfg.seed, dist.rank),
         )
 
     return train_dl, eval_dl

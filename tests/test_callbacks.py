@@ -113,9 +113,8 @@ def test_ema_callback_updates_on_step_end():
     callback.on_step_end(trainer, result)
     post = ema.shadow["weight"]
 
-    # Warm-start decay: ``min(0.5, (1+num_updates)/(10+num_updates))`` — on
-    # the first update ``num_updates=1`` so decay = min(0.5, 2/11) = 2/11.
-    decay = min(0.5, 2 / 11)
+    # Constant decay (matches OF3 ``ExponentialMovingAverage``).
+    decay = 0.5
     expected = decay * pre + (1 - decay) * model.weight
     torch.testing.assert_close(post, expected)
 

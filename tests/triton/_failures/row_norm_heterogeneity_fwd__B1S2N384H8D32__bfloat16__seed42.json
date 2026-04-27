@@ -1,0 +1,26 @@
+{
+  "test_name": "row_norm_heterogeneity_fwd",
+  "params": {
+    "B": "1",
+    "N_seq": "2",
+    "N_res": "384",
+    "H": "8",
+    "D": "32",
+    "dtype": "torch.bfloat16",
+    "seed": "42",
+    "note": "first half rows stddev=1, second half stddev=5"
+  },
+  "metrics": {
+    "max_abs_ref": 21.716381072998047,
+    "abs_err_max": 0.6795973777770996,
+    "abs_err_mean": 0.011485672555863857,
+    "rel_err_max": 635.5517578125,
+    "rel_err_p99": 0.2079409807920456,
+    "rel_err_mean": 0.027964988723397255,
+    "fail_frac": 0.0469004325568676,
+    "is_finite": true,
+    "atol_eff": 0.02171638107299805,
+    "rtol": 0.01,
+    "n_significant_elements": 196607
+  }
+}

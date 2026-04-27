@@ -11,6 +11,7 @@ to avoid Python-level loops and unnecessary GPU synchronization.
 
 from __future__ import annotations
 
+import math
 from contextlib import nullcontext
 
 import torch
@@ -307,9 +308,7 @@ def chain_perm_from_mini_rollout(
     from deepfold3.data.symmetry.chain_perm import compute_chain_permutation_tokens
 
     # mini-rollout is ``[S_mini, N, M, 3]`` — use the first sample.
-    return compute_chain_permutation_tokens(
-        mini_pos[0], gt_pos, atom_mask.bool(), asym_id, entity_id
-    )
+    return compute_chain_permutation_tokens(mini_pos[0], gt_pos, atom_mask.bool(), asym_id, entity_id)
 
 
 def diffusion_mse_loss(
@@ -385,15 +384,12 @@ def diffusion_mse_loss(
         # paths without mini-rollout.
         if chain_assign is not None:
             permuted_chunks = [
-                apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)[0]
-                for s in range(S)
+                apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)[0] for s in range(S)
             ]
         else:
             permuted_chunks = []
             for s in range(S):
-                assign_s = compute_chain_permutation_tokens(
-                    pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id
-                )
+                assign_s = compute_chain_permutation_tokens(pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id)
                 new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, assign_s)
                 permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
@@ -445,13 +441,18 @@ def diffusion_mse_loss(
         gt_pos = gt_flat.reshape_as(pred_pos)
 
     weight_mask = weight_2d.unsqueeze(-1)  # [N, M, 1]
-    n_weighted = weight_mask.sum().clamp(min=1)
+    # AF3 §5.3 eq. 3 / OF3 ``mse_loss`` / Protenix ``MSELoss``: divide by
+    # *atom count* (not sum-of-weights) so the absolute scale tracks the
+    # number of supervised atoms; the mol-type and region weights only
+    # reweight the numerator. The leading 1/3 averages over the three
+    # spatial coordinates.
+    n_atoms = mask.sum().clamp(min=1)
 
     # Per-sample EDM weight [S]
     w = (noise_levels**2 + sigma_data**2) / (noise_levels * sigma_data) ** 2
 
     # Vectorized MSE: [S, N, M, 3] → [S]
-    mse_per_sample = ((pred_pos - gt_pos) ** 2 * weight_mask.unsqueeze(0)).sum(dim=(-3, -2, -1)) / n_weighted
+    mse_per_sample = ((pred_pos - gt_pos) ** 2 * weight_mask.unsqueeze(0)).sum(dim=(-3, -2, -1)) / (3.0 * n_atoms)
     return (w * mse_per_sample).mean()
 
 
@@ -494,8 +495,18 @@ def plddt_loss(
     gt_pos: torch.Tensor,  # [N, M, 3]
     atom_mask: torch.Tensor,  # [N, M]
     num_bins: int = 50,
+    mol_type: torch.Tensor | None = None,  # [N] int (0=prot, 1=DNA, 2=RNA, 3=lig)
+    rep_idx: torch.Tensor | None = None,  # [N] int — rep atom slot in [0, M)
 ) -> torch.Tensor:
     """Per-atom pLDDT cross-entropy loss.
+
+    AF3 §4.3.1 / OF3 ``all_atom_plddt_loss``: when ``mol_type`` and
+    ``rep_idx`` are provided, the LDDT target is computed against
+    representative atoms only (CA for protein, C1' for nucleic), with
+    inclusion radius depending on j's molecule type — 15 Å for
+    protein-rep j, 30 Å for nucleic-rep j; ligands contribute no j atoms.
+    Without those features (legacy/test code paths), falls back to a flat
+    30 Å radius over all atom pairs.
 
     Vectorized: computes per-atom LDDT for all S samples at once.
     """
@@ -506,7 +517,7 @@ def plddt_loss(
     n_atoms = flat_mask.sum().clamp(min=1)
 
     # Compute per-atom LDDT for all samples at once [S, N, M]
-    lddt_all = _compute_per_atom_lddt_batched(pred_pos, gt_pos, atom_mask)
+    lddt_all = _compute_per_atom_lddt_batched(pred_pos, gt_pos, atom_mask, mol_type=mol_type, rep_idx=rep_idx)
     target = (lddt_all * num_bins).clamp(0, num_bins - 1).long()  # [S, N, M]
 
     log_probs = F.log_softmax(logits_r.float(), dim=-1)  # fp32 for stability
@@ -583,6 +594,29 @@ def express_coordinates_in_frame(
     return result.to(out_dtype)
 
 
+def _frame_angle_mask(
+    frames: torch.Tensor,  # [..., N, 3, 3] — (a, b, c) atom positions
+    angle_threshold: float = 25.0,  # degrees
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Per-token frame validity from co-linearity threshold.
+
+    AF3 §4.3.2 / OF3 ``get_token_frame_atoms``: a frame is invalid when
+    ∠(a, b, c) is within ``angle_threshold`` of 0° or 180°. Returns a
+    bool mask of shape ``[..., N]`` that is ``True`` when the frame is
+    well-conditioned (angle ∈ ``(threshold, 180 − threshold)``).
+    """
+    a = frames[..., 0, :]
+    b = frames[..., 1, :]
+    c = frames[..., 2, :]
+    u = a - b
+    v = c - b
+    cos_angle = (u * v).sum(dim=-1) / (u.norm(dim=-1).clamp(min=eps) * v.norm(dim=-1).clamp(min=eps))
+    cos_max = math.cos(math.radians(angle_threshold))
+    cos_min = math.cos(math.radians(180.0 - angle_threshold))
+    return (cos_angle < cos_max) & (cos_angle > cos_min)
+
+
 def pae_loss(
     logits: torch.Tensor,  # [S, N, N, num_bins]
     pred_rep: torch.Tensor,  # [S, N, 3] representative atoms
@@ -592,6 +626,7 @@ def pae_loss(
     pae_mask: torch.Tensor,  # [N, N] float — frames_mask[i] & pair_mask[i, j]
     num_bins: int = 64,
     max_error_bin: float = 31.0,
+    angle_threshold: float = 25.0,
 ) -> torch.Tensor:
     """Frame-aligned predicted aligned error (PAE) cross-entropy loss.
 
@@ -601,11 +636,11 @@ def pae_loss(
     ``num_bins`` bins over ``[0, max_error_bin]`` (last bin is catch-all),
     and computes cross-entropy against the predicted bin logits.
 
-    ``pae_mask`` is a float mask gating which (i, j) pairs contribute. The
-    caller is expected to AND ``frames_mask[i]`` with ``pair_mask[i, j]``
-    so frameless rows (ligands, single-atom entities) drop out. Frame
-    validity on the target token ``j`` is intentionally not enforced —
-    frameless-j can still be aligned *into* a valid-i frame.
+    Frames whose ∠(a, b, c) lies within ``angle_threshold`` of co-linearity
+    are dropped per-sample (separately on pred and GT), matching OF3
+    ``pae_loss``'s ``angle_threshold=25`` filter — co-linear frames have
+    ill-defined orientation and would otherwise inject noise into the
+    alignment-error supervision.
     """
     S = logits.shape[0]
 
@@ -616,12 +651,19 @@ def pae_loss(
     bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=logits.device)
     target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
 
-    n_valid = pae_mask.sum().clamp(min=1)
+    pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold).float()  # [S, N]
+    gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).float()  # [N]
+    # Gate is on the i-axis (frame-providing token); j is unrestricted.
+    mask_s = pae_mask.unsqueeze(0) * pred_angle_ok.unsqueeze(-1) * gt_angle_ok.unsqueeze(0).unsqueeze(-1)  # [S, N, N]
+
     log_probs = F.log_softmax(logits.float(), dim=-1)
     nll = -log_probs.gather(-1, target.unsqueeze(-1)).squeeze(-1)  # [S, N, N]
-    # Reduce over samples first so the mask multiply is done on an
-    # [N, N] tensor instead of [S, N, N].
-    return (nll.sum(0) * pae_mask).sum() / (n_valid * S)
+    # Per-sample mean (OF3 convention: divide by per-sample valid count,
+    # then average across samples) so samples with sparse valid frames
+    # don't get over-weighted by global normalisation.
+    nll_per_sample = (nll * mask_s).sum(dim=(-1, -2))  # [S]
+    n_valid_per_sample = mask_s.sum(dim=(-1, -2)).clamp(min=1)  # [S]
+    return (nll_per_sample / n_valid_per_sample).mean()
 
 
 def pde_loss(
@@ -739,37 +781,98 @@ def _compute_per_atom_lddt_batched(
     atom_mask: torch.Tensor,  # [N, M]
     cutoffs: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0),
     inclusion_radius: float = 30.0,
+    mol_type: torch.Tensor | None = None,  # [N] int (0=prot, 1=DNA, 2=RNA, 3=lig)
+    rep_idx: torch.Tensor | None = None,  # [N] int — rep atom slot in [0, M)
+    inclusion_radius_protein: float = 15.0,
+    inclusion_radius_nucleotide: float = 30.0,
 ) -> torch.Tensor:
     """Compute per-atom LDDT score in [0, 1], batched over S.
+
+    With ``mol_type`` and ``rep_idx``, applies AF3 §4.3.1 conventions:
+    j-axis restricted to representative atoms of standard polymer tokens
+    (CA for protein, C1' for nucleic); inclusion radius is 15 Å for
+    protein-rep j and 30 Å for nucleic-rep j; ligand tokens contribute
+    no j atoms. Without those features, falls back to a flat
+    ``inclusion_radius`` over all pairs.
 
     Returns [S, N, M] LDDT scores.
     """
     S = pred_pos.shape[0]
-    flat_mask = atom_mask.reshape(-1).bool()
-    A = flat_mask.sum()
-    result = torch.zeros(S, *atom_mask.shape, device=pred_pos.device, dtype=pred_pos.dtype)
-    if A < 2:
+    N, M = atom_mask.shape
+    result = torch.zeros(S, N, M, device=pred_pos.device, dtype=pred_pos.dtype)
+
+    i_mask = atom_mask.reshape(-1).bool()  # [N*M]
+    if i_mask.sum() < 1:
         return result
 
-    gt_flat = gt_pos.reshape(-1, 3)[flat_mask]  # [A, 3]
-    gt_dist = torch.cdist(gt_flat, gt_flat)  # [A, A]
-    pair_mask = (gt_dist < inclusion_radius) & (gt_dist > 1e-3)
-    n_pairs = pair_mask.sum(dim=-1).clamp(min=1)  # [A]
+    if mol_type is None or rep_idx is None:
+        # Legacy / fallback: flat radius, all-vs-all over resolved atoms.
+        gt_flat = gt_pos.reshape(-1, 3)[i_mask]  # [A, 3]
+        gt_dist = torch.cdist(gt_flat, gt_flat)  # [A, A]
+        pair_mask = (gt_dist < inclusion_radius) & (gt_dist > 1e-3)
+        n_pairs = pair_mask.sum(dim=-1).clamp(min=1)  # [A]
 
-    pred_flat = pred_pos.reshape(S, -1, 3)[:, flat_mask]  # [S, A, 3]
-    pred_dist = torch.cdist(pred_flat, pred_flat)  # [S, A, A]
-    dist_diff = (pred_dist - gt_dist.unsqueeze(0)).abs()
+        pred_flat = pred_pos.reshape(S, -1, 3)[:, i_mask]  # [S, A, 3]
+        pred_dist = torch.cdist(pred_flat, pred_flat)  # [S, A, A]
+        dist_diff = (pred_dist - gt_dist.unsqueeze(0)).abs()
 
-    # Per-atom scoring (hard threshold): [S, A]
-    scores = pred_pos.new_zeros(S, A)
+        scores = pred_pos.new_zeros(S, gt_flat.shape[0])
+        for c in cutoffs:
+            scores = scores + ((dist_diff < c).float() * pair_mask).sum(dim=-1) / n_pairs
+        scores = scores / len(cutoffs)
+
+        full = torch.zeros(S, atom_mask.numel(), device=pred_pos.device, dtype=pred_pos.dtype)
+        full[:, i_mask] = scores
+        return full.reshape(S, N, M)
+
+    # OF3-style: per-pair-type radius, j restricted to rep atoms of
+    # standard polymer tokens (protein/nucleic; ligands skipped).
+    is_prot_tok = mol_type == 0  # MOL_PROTEIN
+    is_nuc_tok = (mol_type == 1) | (mol_type == 2)  # MOL_DNA + MOL_RNA
+    rep_clamped = rep_idx.clamp(min=0, max=M - 1)
+    arange_M = torch.arange(M, device=atom_mask.device)
+    is_rep_atom = (
+        (arange_M.unsqueeze(0) == rep_clamped.unsqueeze(-1))
+        & (rep_idx.unsqueeze(-1) >= 0)
+        & (rep_idx.unsqueeze(-1) < M)
+    )  # [N, M]
+
+    is_prot_atom_j = is_prot_tok.unsqueeze(-1) & is_rep_atom & atom_mask.bool()  # [N, M]
+    is_nuc_atom_j = is_nuc_tok.unsqueeze(-1) & is_rep_atom & atom_mask.bool()  # [N, M]
+    j_mask = (is_prot_atom_j | is_nuc_atom_j).reshape(-1)  # [N*M]
+
+    if j_mask.sum() < 1:
+        return result
+
+    gt_flat = gt_pos.reshape(-1, 3)
+    gt_flat_i = gt_flat[i_mask]  # [Ai, 3]
+    gt_flat_j = gt_flat[j_mask]  # [Aj, 3]
+    gt_dist = torch.cdist(gt_flat_i, gt_flat_j)  # [Ai, Aj]
+
+    is_prot_j_flat = is_prot_atom_j.reshape(-1)[j_mask]  # [Aj] bool
+    radius_j = torch.where(
+        is_prot_j_flat,
+        gt_dist.new_full((), inclusion_radius_protein),
+        gt_dist.new_full((), inclusion_radius_nucleotide),
+    )  # [Aj]
+
+    pair_mask = (gt_dist < radius_j.unsqueeze(0)) & (gt_dist > 1e-3)  # [Ai, Aj]
+    n_pairs = pair_mask.sum(dim=-1).clamp(min=1)  # [Ai]
+
+    pred_flat = pred_pos.reshape(S, -1, 3)
+    pred_flat_i = pred_flat[:, i_mask]  # [S, Ai, 3]
+    pred_flat_j = pred_flat[:, j_mask]  # [S, Aj, 3]
+    pred_dist = torch.cdist(pred_flat_i, pred_flat_j)  # [S, Ai, Aj]
+    dist_diff = (pred_dist - gt_dist.unsqueeze(0)).abs()  # [S, Ai, Aj]
+
+    scores = pred_pos.new_zeros(S, gt_flat_i.shape[0])
     for c in cutoffs:
         scores = scores + ((dist_diff < c).float() * pair_mask).sum(dim=-1) / n_pairs
     scores = scores / len(cutoffs)
 
-    # Scatter back to [S, N*M]
     full = torch.zeros(S, atom_mask.numel(), device=pred_pos.device, dtype=pred_pos.dtype)
-    full[:, flat_mask] = scores
-    return full.reshape(S, *atom_mask.shape)
+    full[:, i_mask] = scores
+    return full.reshape(S, N, M)
 
 
 # Backward compat alias
@@ -1074,7 +1177,14 @@ def training_loss(
         mini_pos = pred.get("mini_rollout_pos")  # [1, N, M, 3]
         if mini_pos is not None:
             if "plddt" in pred:
-                l_plddt = plddt_loss(pred["plddt"], mini_pos, gt_pos, atom_mask)
+                l_plddt = plddt_loss(
+                    pred["plddt"],
+                    mini_pos,
+                    gt_pos,
+                    atom_mask,
+                    mol_type=features.get("mol_type"),
+                    rep_idx=rep_idx,
+                )
                 losses["plddt"] = l_plddt
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_plddt
 

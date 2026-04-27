@@ -128,9 +128,7 @@ def _dump_failure(name: str, params: dict, metrics: dict) -> None:
         pass
 
 
-def _assert_pass(
-    name: str, params: dict, metrics: dict, fail_frac_limit: float = FAIL_FRAC_LIMIT
-) -> None:
+def _assert_pass(name: str, params: dict, metrics: dict, fail_frac_limit: float = FAIL_FRAC_LIMIT) -> None:
     try:
         assert metrics["is_finite"], f"{name}: non-finite output; {metrics}"
         assert metrics["fail_frac"] <= fail_frac_limit, (
@@ -263,9 +261,7 @@ class TestFusedAdaLayerNormLinear:
         xn = F.layer_norm(xr, (K,))
         xn = sr * xn + br
         out_r = F.linear(xn, Wr.T)
-        dx_r, ds_r, db_r, dW_r = torch.autograd.grad(
-            out_r, [xr, sr, br, Wr], grad_outputs=dO.float()
-        )
+        dx_r, ds_r, db_r, dW_r = torch.autograd.grad(out_r, [xr, sr, br, Wr], grad_outputs=dO.float())
         torch.cuda.synchronize()
 
         atol_f, rtol_f = FWD_POLICY[dtype]
@@ -374,9 +370,7 @@ class TestFusedTriangleMulGate:
         a_r = proj[..., 0::2]
         b_r = proj[..., 1::2]
         loss_r = (a_r * dA.float()).sum() + (b_r * dB.float()).sum() + (og_r * dOG.float()).sum()
-        dz_r, dnw_r, dnb_r, dpw_r, dgw_r, dow_r = torch.autograd.grad(
-            loss_r, [zr, nwr, nbr, pwr, gwr, owr]
-        )
+        dz_r, dnw_r, dnb_r, dpw_r, dgw_r, dow_r = torch.autograd.grad(loss_r, [zr, nwr, nbr, pwr, gwr, owr])
         torch.cuda.synchronize()
 
         atol_f, rtol_f = FWD_POLICY[dtype]
@@ -474,9 +468,7 @@ class TestFusedPairBias:
         lnbr = ln_b.detach().float().requires_grad_(True)
         pwr = p_w.detach().float().requires_grad_(True)
         out_r = F.linear(F.layer_norm(zr, (C,), lnwr, lnbr), pwr).permute(0, 3, 1, 2)
-        dz_r, dlnw_r, dlnb_r, dpw_r = torch.autograd.grad(
-            out_r, [zr, lnwr, lnbr, pwr], grad_outputs=dO.float()
-        )
+        dz_r, dlnw_r, dlnb_r, dpw_r = torch.autograd.grad(out_r, [zr, lnwr, lnbr, pwr], grad_outputs=dO.float())
         torch.cuda.synchronize()
 
         atol_f, rtol_f = FWD_POLICY[dtype]
@@ -530,9 +522,7 @@ def test_fused_ada_transition_no_duplicate_params():
 
     blk = FusedAdaTransitionBlock(channels=128, cond_dim=64, num_intermediate_factor=2).cuda()
     keys = _weight_keys(blk)
-    forbidden = {
-        k for k in keys if k.startswith("_ada_ln_linear.") or k.startswith("_swiglu.")
-    }
+    forbidden = {k for k in keys if k.startswith("_ada_ln_linear.") or k.startswith("_swiglu.")}
     assert not forbidden, f"unexpected duplicate-param keys in FusedAdaTransitionBlock: {forbidden}"
 
 
@@ -580,11 +570,7 @@ def test_fused_ada_transition_save_load_cycle():
     from deepfold3.model.triton.fused_ada_transition import FusedAdaTransitionBlock
 
     torch.manual_seed(0)
-    blk = (
-        FusedAdaTransitionBlock(channels=128, cond_dim=64, num_intermediate_factor=2)
-        .cuda()
-        .to(torch.bfloat16)
-    )
+    blk = FusedAdaTransitionBlock(channels=128, cond_dim=64, num_intermediate_factor=2).cuda().to(torch.bfloat16)
     opt = torch.optim.SGD(blk.parameters(), lr=1e-2)
 
     for step in range(3):
@@ -604,11 +590,7 @@ def test_fused_ada_transition_save_load_cycle():
         out_trained = blk(x, cond).clone()
 
     sd = blk.state_dict()
-    blk2 = (
-        FusedAdaTransitionBlock(channels=128, cond_dim=64, num_intermediate_factor=2)
-        .cuda()
-        .to(torch.bfloat16)
-    )
+    blk2 = FusedAdaTransitionBlock(channels=128, cond_dim=64, num_intermediate_factor=2).cuda().to(torch.bfloat16)
     blk2.load_state_dict(sd)
     blk2.eval()
     with torch.no_grad():

@@ -148,13 +148,7 @@ def _render_text(info: dict) -> str:
     lines.append(f"chains={info['num_chains']} interfaces={info['num_interfaces']}")
 
     arts = info["artifacts"]
-    lines.append(
-        "artifacts: "
-        + ", ".join(
-            f"{k}={'OK' if v['exists'] else 'MISSING'}"
-            for k, v in arts.items()
-        )
-    )
+    lines.append("artifacts: " + ", ".join(f"{k}={'OK' if v['exists'] else 'MISSING'}" for k, v in arts.items()))
     if "structure" in info:
         s = info["structure"]
         if "error" in s:

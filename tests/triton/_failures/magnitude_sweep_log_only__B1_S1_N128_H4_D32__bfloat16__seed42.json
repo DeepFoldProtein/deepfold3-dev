@@ -1,0 +1,21 @@
+{
+  "test_name": "magnitude_sweep_log_only",
+  "params": {
+    "B": "1",
+    "N_seq": "1",
+    "N_res": "128",
+    "H": "4",
+    "D": "32",
+    "dtype": "torch.bfloat16",
+    "seed": "42",
+    "sigma": "1000.0"
+  },
+  "metrics": {
+    "abs_err_max": 4120.0,
+    "abs_err_mean": 2.1946468353271484,
+    "rel_err_max": 58.070064544677734,
+    "rel_err_mean": 0.007317797746509314,
+    "max_abs_ref": 3792.0,
+    "is_finite": true
+  }
+}

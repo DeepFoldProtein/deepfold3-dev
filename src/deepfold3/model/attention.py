@@ -182,9 +182,7 @@ class GridSelfAttention(nn.Module):
         _defer_transpose = self.transpose and self._evo_attn is not None and z.is_cuda
 
         if self._fused_pair_bias is not None and z.is_cuda:
-            pb = self._fused_pair_bias(
-                z, self.norm.weight, self.norm.bias, self.pair_bias.weight
-            )  # [B, H, N, N]
+            pb = self._fused_pair_bias(z, self.norm.weight, self.norm.bias, self.pair_bias.weight)  # [B, H, N, N]
             z = self.norm(z)
             if self.transpose and not _defer_transpose:
                 z = z.permute(0, 2, 1, 3)

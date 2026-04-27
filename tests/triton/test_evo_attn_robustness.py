@@ -820,6 +820,381 @@ def test_learned_pair_bias_pattern():
         _assert_pass(f"learned_pair_bias_bwd/{n}", {**params, "grad": n}, m)
 
 
+# ----------------------------------------------------------------------------
+# Category 5b: Realistic non-Gaussian input distributions
+# Real training activations are NOT iid Gaussian: dropout leaves sparse
+# zeros, clustered tokens produce bimodal rows, one-sided-heavy tails appear
+# after SwiGLU/ReLU routes, padded batches mix wildly different row norms,
+# and whole-slot masks exercise the zero-sentinel path. Fail budget 1% to
+# match the heavy-tail policy (§5).
+# ----------------------------------------------------------------------------
+
+
+def _run_qkv_dist_stress(test_name: str, qkv_sampler, seed: int = 42, extra_params: dict | None = None) -> None:
+    """Shared fwd+bwd check for custom Q/K/V samplers.
+
+    ``qkv_sampler(shape) -> fp32 tensor on cuda``. Each tensor is rescaled
+    to unit stddev (post-LN-realistic scale) so only the distribution SHAPE
+    differs from the iid-Gaussian baseline. Pair bias / mask / dO standard.
+    """
+    B, N_seq, N_res, H, D = 1, 2, 384, 8, 32
+    dtype = torch.bfloat16
+    torch.manual_seed(seed)
+
+    shape = (B, N_seq, N_res, H, D)
+    Q = _unit_stddev_rescale(qkv_sampler(shape)).to(dtype).contiguous()
+    K = _unit_stddev_rescale(qkv_sampler(shape)).to(dtype).contiguous()
+    V = _unit_stddev_rescale(qkv_sampler(shape)).to(dtype).contiguous()
+    Q = Q.detach().requires_grad_(True)
+    K = K.detach().requires_grad_(True)
+    V = V.detach().requires_grad_(True)
+
+    res_mask = torch.zeros((B, N_seq, 1, 1, N_res), device="cuda", dtype=torch.float32)
+    pair_bias = torch.randn((B, 1, H, N_res, N_res), device="cuda", dtype=torch.float32).contiguous()
+    pair_bias = pair_bias.detach().requires_grad_(True)
+
+    torch.manual_seed(seed + 13)
+    dO = torch.randn((B, N_seq, N_res, H, D), device="cuda", dtype=dtype) * 0.1
+
+    fused_out, ref_out = _fused_and_ref_forward(Q, K, V, res_mask, pair_bias)
+    atol_f, rtol_f = FWD_POLICY[dtype]
+    m_fwd = error_metrics(fused_out, ref_out, atol_f, rtol_f)
+
+    kg, rg = _backward_pair(Q, K, V, res_mask, pair_bias, dO)
+    atol_q, rtol_q = BWD_QKV_POLICY[dtype]
+    atol_b, rtol_b = BWD_BIAS_POLICY[dtype]
+    names = ("dQ", "dK", "dV", "d_pair_bias")
+    pols = ((atol_q, rtol_q), (atol_q, rtol_q), (atol_q, rtol_q), (atol_b, rtol_b))
+    m_bwd = {n: error_metrics(k, r, *p) for n, k, r, p in zip(names, kg, rg, pols, strict=True)}
+
+    params = {
+        "B": B,
+        "N_seq": N_seq,
+        "N_res": N_res,
+        "H": H,
+        "D": D,
+        "dtype": dtype,
+        "seed": seed,
+        **(extra_params or {}),
+    }
+    try:
+        _FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        (_FAILURE_DIR / f"{test_name}.json").write_text(
+            json.dumps(
+                {"params": {k: str(v) for k, v in params.items()}, "fwd": m_fwd, "bwd": m_bwd},
+                indent=2,
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+    _assert_pass(f"{test_name}_fwd", params, m_fwd, fail_frac_limit=1e-2)
+    for n, m in m_bwd.items():
+        _assert_pass(f"{test_name}_bwd/{n}", {**params, "grad": n}, m, fail_frac_limit=1e-2)
+
+
+@pytest.mark.parametrize("sparsity", [0.3, 0.5, 0.7])
+def test_sparse_qkv(sparsity):
+    """Post-dropout-like sparsity: randn × Bernoulli(1-p). Fraction ``sparsity``
+    of entries are zero. Stresses bf16 handling of underflow-prone entries
+    and softmax numerator sparsity."""
+
+    def sampler(shape):
+        g = torch.randn(shape, device="cuda", dtype=torch.float32)
+        keep = (torch.rand(shape, device="cuda") >= sparsity).float()
+        return g * keep
+
+    _run_qkv_dist_stress(
+        f"sparse_qkv_s{sparsity}",
+        sampler,
+        extra_params={"sparsity": sparsity, "dist": "normal_x_bernoulli"},
+    )
+
+
+@pytest.mark.parametrize("sep", [2.0, 5.0])
+def test_bimodal_qkv(sep):
+    """Two-cluster activations: 50% ~ N(-sep/2, 1), 50% ~ N(+sep/2, 1).
+    Post-LN unit-stddev rescale preserves the bimodal shape. Stresses
+    softmax behavior when Q/K/V samples cluster into two attractor modes."""
+
+    def sampler(shape):
+        x = torch.randn(shape, device="cuda", dtype=torch.float32)
+        sign = (torch.rand(shape, device="cuda") < 0.5).float() * 2.0 - 1.0
+        return x + sign * (sep / 2.0)
+
+    _run_qkv_dist_stress(
+        f"bimodal_qkv_sep{sep}",
+        sampler,
+        extra_params={"separation": sep, "dist": "bimodal_normal"},
+    )
+
+
+@pytest.mark.parametrize("dist", ["exponential", "lognormal"])
+def test_skewed_qkv(dist):
+    """One-sided-heavy-tail Q/K/V (post-SwiGLU / post-ReLU-like routes).
+    Exponential(λ=1) or LogNormal(μ=0, σ=1), unit-stddev rescaled."""
+
+    def sampler(shape):
+        if dist == "exponential":
+            return torch.empty(shape, device="cuda", dtype=torch.float32).exponential_()
+        return torch.empty(shape, device="cuda", dtype=torch.float32).log_normal_(mean=0.0, std=1.0)
+
+    _run_qkv_dist_stress(
+        f"skewed_qkv_{dist}",
+        sampler,
+        extra_params={"dist": dist},
+    )
+
+
+@pytest.mark.parametrize("sparsity", [0.3, 0.5, 0.7])
+@pytest.mark.parametrize("df", [3.0, 5.0])
+def test_sparse_heavy_tail_qkv(sparsity, df):
+    """Spike-at-0 + heavy tail: Bernoulli(1-sparsity) × Student-t(df). The
+    surviving entries carry a heavy tail while the rest are exactly 0 —
+    the joint failure mode ``test_sparse_qkv`` (Gaussian survivors) and
+    ``test_heavy_tailed_inputs`` (no spike) each miss. Exercises bf16
+    underflow at the same time as a handful of outlier rows that
+    dominate the softmax."""
+    chi2 = torch.distributions.Chi2(df)
+    normal = torch.distributions.Normal(0.0, 1.0)
+
+    def sampler(shape):
+        # Student-t = Normal / sqrt(Chi2(df) / df), sampled iid.
+        z = normal.sample(shape).to(device="cuda", dtype=torch.float32)
+        c = chi2.sample(shape).to(device="cuda", dtype=torch.float32)
+        t = z / torch.sqrt(c / df)
+        keep = (torch.rand(shape, device="cuda") >= sparsity).float()
+        return t * keep
+
+    _run_qkv_dist_stress(
+        f"sparse_heavy_tail_qkv_s{sparsity}_df{df}",
+        sampler,
+        extra_params={"sparsity": sparsity, "df": df, "dist": "bernoulli_x_student_t"},
+    )
+
+
+def test_shared_ln_qkv_source():
+    """Q/K/V as three affine projections of one LN-normalized source.
+
+    Real GridSelfAttention computes ``Q = LN(x) W_q, K = LN(x) W_k,
+    V = LN(x) W_v``. All three share an input, so Q/K are strongly
+    correlated — softmax(Q K^T) concentrates along the diagonal even
+    at random init. iid-Gaussian Q/K/V (all other tests here) cannot
+    produce this attention pattern, so the kernel's online-softmax
+    renormalization, the LSE tail, and the backward d_pair_bias
+    accumulation were previously only tested under the "flat"
+    attention regime."""
+    B, N_seq, N_res, H, D = 1, 2, 384, 8, 32
+    E = 256  # channel dim feeding the Q/K/V projections
+    dtype = torch.bfloat16
+    seed = 42
+    torch.manual_seed(seed)
+
+    # Base activation + three independent projections. Using a single
+    # LN source is the whole point — the test is about Q/K correlation.
+    x = torch.randn((B, N_seq, N_res, E), device="cuda", dtype=torch.float32)
+    ln = torch.nn.LayerNorm(E, elementwise_affine=True).cuda().float()
+    with torch.no_grad():
+        ln.weight.normal_(mean=1.0, std=0.1)
+        ln.bias.zero_()
+    xn = ln(x)
+
+    # Small init so post-projection stddev matches the ~1 that other
+    # tests rescale to (H*D fan-in = 256, so std ~ 1/sqrt(256) keeps
+    # per-head activations near unit variance).
+    fan_in = E
+    w_scale = (1.0 / fan_in) ** 0.5
+
+    def project(seed_offset: int) -> torch.Tensor:
+        gen = torch.Generator(device="cuda").manual_seed(seed + seed_offset)
+        W = torch.randn((E, H * D), generator=gen, device="cuda", dtype=torch.float32) * w_scale
+        y = xn @ W  # (B, N_seq, N_res, H*D)
+        return y.view(B, N_seq, N_res, H, D)
+
+    Q = project(1).to(dtype).contiguous().detach().requires_grad_(True)
+    K = project(2).to(dtype).contiguous().detach().requires_grad_(True)
+    V = project(3).to(dtype).contiguous().detach().requires_grad_(True)
+
+    res_mask = torch.zeros((B, N_seq, 1, 1, N_res), device="cuda", dtype=torch.float32)
+    pair_bias = torch.randn((B, 1, H, N_res, N_res), device="cuda", dtype=torch.float32).contiguous()
+    pair_bias = pair_bias.detach().requires_grad_(True)
+
+    torch.manual_seed(seed + 17)
+    dO = torch.randn((B, N_seq, N_res, H, D), device="cuda", dtype=dtype) * 0.1
+
+    fused_out, ref_out = _fused_and_ref_forward(Q, K, V, res_mask, pair_bias)
+    atol_f, rtol_f = FWD_POLICY[dtype]
+    m_fwd = error_metrics(fused_out, ref_out, atol_f, rtol_f)
+
+    kg, rg = _backward_pair(Q, K, V, res_mask, pair_bias, dO)
+    atol_q, rtol_q = BWD_QKV_POLICY[dtype]
+    atol_b, rtol_b = BWD_BIAS_POLICY[dtype]
+    names = ("dQ", "dK", "dV", "d_pair_bias")
+    pols = ((atol_q, rtol_q), (atol_q, rtol_q), (atol_q, rtol_q), (atol_b, rtol_b))
+    m_bwd = {n: error_metrics(k, r, *p) for n, k, r, p in zip(names, kg, rg, pols, strict=True)}
+
+    params = {
+        "B": B,
+        "N_seq": N_seq,
+        "N_res": N_res,
+        "H": H,
+        "D": D,
+        "E": E,
+        "dtype": dtype,
+        "seed": seed,
+        "note": "Q/K/V from shared LN source (correlated)",
+    }
+    try:
+        _FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        (_FAILURE_DIR / "shared_ln_qkv_source.json").write_text(
+            json.dumps(
+                {"params": {k: str(v) for k, v in params.items()}, "fwd": m_fwd, "bwd": m_bwd},
+                indent=2,
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+    _assert_pass("shared_ln_qkv_fwd", params, m_fwd, fail_frac_limit=1e-2)
+    for n, m in m_bwd.items():
+        _assert_pass(f"shared_ln_qkv_bwd/{n}", {**params, "grad": n}, m, fail_frac_limit=1e-2)
+
+
+def test_all_masked_batch_slot():
+    """Fully-masked (B, N_seq) slot: no valid keys anywhere. Sentinel contract
+    says that slot's output is exactly 0 (see ``reference_evo_attention``).
+    ``test_near_zero_mask`` keeps 2 valid keys; this is the 0-valid-key edge
+    and exercises reduction-across-empty paths the other tests never touch."""
+    B, N_seq, N_res, H, D = 2, 2, 128, 4, 32
+    dtype = torch.bfloat16
+    seed = 42
+    Q, K, V, _, pair_bias = _make_inputs(B, N_seq, N_res, H, D, dtype, seed, requires_grad=True)
+
+    res_mask = torch.zeros((B, N_seq, 1, 1, N_res), device="cuda", dtype=torch.float32)
+    # Fully mask (batch=0, n_seq=0); mild sparsity elsewhere for contrast.
+    res_mask[0, 0] = -1e9
+    res_mask[0, 1, ..., ::4] = -1e9
+
+    torch.manual_seed(seed + 41)
+    dO = torch.randn((B, N_seq, N_res, H, D), device="cuda", dtype=dtype) * 0.1
+
+    fused_out, ref_out = _fused_and_ref_forward(Q, K, V, res_mask, pair_bias)
+    atol_f, rtol_f = FWD_POLICY[dtype]
+    m_fwd = error_metrics(fused_out, ref_out, atol_f, rtol_f)
+
+    # Sentinel contract: fully-masked slot must be exactly 0 (not NaN, not
+    # leaked mean-of-values). This is stricter than the generic fail_frac gate.
+    masked_slice = fused_out[0, 0]
+    assert torch.isfinite(fused_out).all(), "non-finite output in masked-slot test"
+    assert masked_slice.abs().max().item() == 0.0, (
+        f"all-masked slot should be 0, got max={masked_slice.abs().max().item():.3e}"
+    )
+
+    kg, rg = _backward_pair(Q, K, V, res_mask, pair_bias, dO)
+    atol_q, rtol_q = BWD_QKV_POLICY[dtype]
+    atol_b, rtol_b = BWD_BIAS_POLICY[dtype]
+    names = ("dQ", "dK", "dV", "d_pair_bias")
+    pols = ((atol_q, rtol_q), (atol_q, rtol_q), (atol_q, rtol_q), (atol_b, rtol_b))
+    m_bwd = {n: error_metrics(k, r, *p) for n, k, r, p in zip(names, kg, rg, pols, strict=True)}
+
+    params = {
+        "B": B,
+        "N_seq": N_seq,
+        "N_res": N_res,
+        "H": H,
+        "D": D,
+        "dtype": dtype,
+        "seed": seed,
+        "note": "one (B, N_seq) slot fully masked",
+    }
+    try:
+        _FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        (_FAILURE_DIR / "all_masked_batch_slot.json").write_text(
+            json.dumps(
+                {"params": {k: str(v) for k, v in params.items()}, "fwd": m_fwd, "bwd": m_bwd},
+                indent=2,
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+    _assert_pass("all_masked_batch_slot_fwd", params, m_fwd, fail_frac_limit=1e-2)
+    for n, m in m_bwd.items():
+        _assert_pass(f"all_masked_batch_slot_bwd/{n}", {**params, "grad": n}, m, fail_frac_limit=1e-2)
+
+
+def test_row_norm_heterogeneity():
+    """Mixed-magnitude rows: first half of tokens have stddev 1, second half
+    stddev 5. Emulates batches with padding mixed into live tokens or where
+    some rows have strongly-learned activations. Checks that high-norm rows
+    don't systematically dominate softmax / d_pair_bias accumulation beyond
+    the reference."""
+    B, N_seq, N_res, H, D = 1, 2, 384, 8, 32
+    dtype = torch.bfloat16
+    seed = 42
+    torch.manual_seed(seed)
+
+    shape = (B, N_seq, N_res, H, D)
+    row_scale = torch.ones(N_res, device="cuda", dtype=torch.float32)
+    row_scale[N_res // 2 :] = 5.0
+    row_scale = row_scale.view(1, 1, N_res, 1, 1)
+
+    def mk(offset: int) -> torch.Tensor:
+        torch.manual_seed(seed + offset)
+        return (torch.randn(shape, device="cuda", dtype=torch.float32) * row_scale).to(dtype).contiguous()
+
+    Q = mk(0).detach().requires_grad_(True)
+    K = mk(1).detach().requires_grad_(True)
+    V = mk(2).detach().requires_grad_(True)
+
+    res_mask = torch.zeros((B, N_seq, 1, 1, N_res), device="cuda", dtype=torch.float32)
+    pair_bias = torch.randn((B, 1, H, N_res, N_res), device="cuda", dtype=torch.float32).contiguous()
+    pair_bias = pair_bias.detach().requires_grad_(True)
+
+    torch.manual_seed(seed + 53)
+    dO = torch.randn((B, N_seq, N_res, H, D), device="cuda", dtype=dtype) * 0.1
+
+    fused_out, ref_out = _fused_and_ref_forward(Q, K, V, res_mask, pair_bias)
+    atol_f, rtol_f = FWD_POLICY[dtype]
+    m_fwd = error_metrics(fused_out, ref_out, atol_f, rtol_f)
+
+    kg, rg = _backward_pair(Q, K, V, res_mask, pair_bias, dO)
+    atol_q, rtol_q = BWD_QKV_POLICY[dtype]
+    atol_b, rtol_b = BWD_BIAS_POLICY[dtype]
+    names = ("dQ", "dK", "dV", "d_pair_bias")
+    pols = ((atol_q, rtol_q), (atol_q, rtol_q), (atol_q, rtol_q), (atol_b, rtol_b))
+    m_bwd = {n: error_metrics(k, r, *p) for n, k, r, p in zip(names, kg, rg, pols, strict=True)}
+
+    params = {
+        "B": B,
+        "N_seq": N_seq,
+        "N_res": N_res,
+        "H": H,
+        "D": D,
+        "dtype": dtype,
+        "seed": seed,
+        "note": "first half rows stddev=1, second half stddev=5",
+    }
+    try:
+        _FAILURE_DIR.mkdir(parents=True, exist_ok=True)
+        (_FAILURE_DIR / "row_norm_heterogeneity.json").write_text(
+            json.dumps(
+                {"params": {k: str(v) for k, v in params.items()}, "fwd": m_fwd, "bwd": m_bwd},
+                indent=2,
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+    _assert_pass("row_norm_heterogeneity_fwd", params, m_fwd, fail_frac_limit=1e-2)
+    for n, m in m_bwd.items():
+        _assert_pass(f"row_norm_heterogeneity_bwd/{n}", {**params, "grad": n}, m, fail_frac_limit=1e-2)
+
+
 def test_near_zero_mask():
     """All but 2 positions masked out. Per spec §5: rtol x5 relaxation."""
     B, N_seq, N_res, H, D = 1, 1, 128, 4, 32
@@ -990,7 +1365,8 @@ def test_known_failure_replay():
                     "ref_grad_max_abs": {n: float(r.abs().max().item()) for n, r in zip(names, rg, strict=True)},
                     "bwd_metrics": m_bwd,
                 },
-                indent=2, default=str,
+                indent=2,
+                default=str,
             )
         )
     except Exception:

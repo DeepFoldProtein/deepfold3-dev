@@ -14,7 +14,6 @@ pipeline.
 from __future__ import annotations
 
 import logging
-import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path

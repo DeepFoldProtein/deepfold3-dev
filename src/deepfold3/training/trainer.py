@@ -143,7 +143,7 @@ class Trainer:
 
     def _seed_everything(self) -> None:
         """Seed all RNGs with a per-rank offset."""
-        seed_everything(self.cfg.seed, self.dist.rank)
+        seed_everything(self.cfg.seed, self.dist.rank, deterministic=self.cfg.deterministic)
 
     # ------------------------------------------------------------------
     # Model and optimizer setup

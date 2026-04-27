@@ -199,6 +199,7 @@ class TemplatePairFormerBlock(nn.Module):
         self.pair_attn_col = GridSelfAttention(num_channels, num_heads=num_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(num_channels, num_intermediate_factor, config=optim)
         self.pair_dropout = pair_dropout
+        self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
 
     def forward(self, pair: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
         """Forward pass through one template PairFormer block.
@@ -211,10 +212,11 @@ class TemplatePairFormerBlock(nn.Module):
             Updated pair activations [N, N, num_channels].
         """
         p, training = self.pair_dropout, self.training
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training)
+        use_fused = self.use_fused_dropout
+        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
         pair = pair + self.pair_transition(pair)
         return pair
 

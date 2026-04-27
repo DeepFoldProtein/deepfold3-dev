@@ -1,0 +1,26 @@
+{
+  "test_name": "single_tensor_large",
+  "params": {
+    "B": "1",
+    "N_seq": "1",
+    "N_res": "128",
+    "H": "4",
+    "D": "32",
+    "dtype": "torch.bfloat16",
+    "seed": "42",
+    "target": "V"
+  },
+  "metrics": {
+    "max_abs_ref": 35.2403564453125,
+    "abs_err_max": 0.08371543884277344,
+    "abs_err_mean": 0.01135981548577547,
+    "rel_err_max": 10.493387222290039,
+    "rel_err_p99": 0.07462646812200546,
+    "rel_err_mean": 0.008104454725980759,
+    "fail_frac": 6.103515625e-05,
+    "is_finite": true,
+    "atol_eff": 0.0352403564453125,
+    "rtol": 0.01,
+    "n_significant_elements": 16384
+  }
+}

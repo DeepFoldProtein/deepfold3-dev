@@ -215,12 +215,17 @@ def pae_loss_fused(
     max_error_bin: float = 31.0,
     num_bins: int = 64,
     chunk_n: int = 32,
+    angle_threshold: float = 25.0,
 ) -> torch.Tensor:
     """Frame-aligned PAE CE loss with chunked linear (no symmetrization).
 
     Frame-alignment math is delegated to
     :func:`deepfold3.training.loss.express_coordinates_in_frame`; only the
     logits projection and cross-entropy are fused via chunked linear.
+
+    The 25° co-linearity filter (AF3 §4.3.2 / OF3 ``pae_loss``) is applied
+    per-sample on both pred and GT frames so degenerate-frame rows don't
+    contribute to the supervision.
 
     Args:
         features: Post-LN pair features ``[S, N, N, H]`` (pre-projection).
@@ -232,7 +237,7 @@ def pae_loss_fused(
         pae_mask: Float mask ``[N, N]`` already AND-combining frames-mask
             and pair-mask (built once by the caller).
     """
-    from deepfold3.training.loss import express_coordinates_in_frame
+    from deepfold3.training.loss import _frame_angle_mask, express_coordinates_in_frame
 
     pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
     gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
@@ -241,7 +246,9 @@ def pae_loss_fused(
     bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=features.device)
     target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
 
-    mask_s = pae_mask.unsqueeze(0).expand(features.shape[0], -1, -1)
+    pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold).to(pae_mask.dtype)
+    gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).to(pae_mask.dtype)
+    mask_s = pae_mask.unsqueeze(0) * pred_angle_ok.unsqueeze(-1) * gt_angle_ok.unsqueeze(0).unsqueeze(-1)  # [S, N, N]
 
     return chunked_linear_cross_entropy(
         features,

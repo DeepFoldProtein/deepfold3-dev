@@ -17,6 +17,7 @@ API:
 Both functions fall back to unfused PyTorch when Triton is unavailable, when
 ``training=False``, or when ``p_drop == 0``.
 """
+
 from __future__ import annotations
 
 import torch
@@ -195,6 +196,7 @@ def dropout_add_rowwise(
     x: torch.Tensor,
     p_drop: float,
     training: bool,
+    use_fused: bool = True,
 ) -> torch.Tensor:
     """Fused row-wise dropout + residual add.
 
@@ -202,10 +204,13 @@ def dropout_add_rowwise(
     ``[..., N_row, N_col, C]`` or MSA activations ``[..., S, N, C]``, entire
     rows share the same drop decision — applied AFTER the update but BEFORE
     the residual add, in one fused pass.
+
+    Set ``use_fused=False`` to force the unfused PyTorch fallback (A/B
+    diagnostics). Wired from ``OptimConfig.use_fused_dropout_add``.
     """
     if not training or p_drop == 0.0:
         return residual + x
-    if _HAS_TRITON and x.is_cuda:
+    if _HAS_TRITON and x.is_cuda and use_fused:
         return _FusedDropoutAdd.apply(residual, x, p_drop, True)
     return _unfused_dropout_add(residual, x, p_drop, share_dim=-3)
 
@@ -215,15 +220,19 @@ def dropout_add_columnwise(
     x: torch.Tensor,
     p_drop: float,
     training: bool,
+    use_fused: bool = True,
 ) -> torch.Tensor:
     """Fused column-wise dropout + residual add.
 
     Mask is shared along dim ``-2`` (column axis). Used for residual updates
     whose pattern is the transpose of the row-wise case (e.g. ending
     triangle attention).
+
+    Set ``use_fused=False`` to force the unfused PyTorch fallback (A/B
+    diagnostics). Wired from ``OptimConfig.use_fused_dropout_add``.
     """
     if not training or p_drop == 0.0:
         return residual + x
-    if _HAS_TRITON and x.is_cuda:
+    if _HAS_TRITON and x.is_cuda and use_fused:
         return _FusedDropoutAdd.apply(residual, x, p_drop, False)
     return _unfused_dropout_add(residual, x, p_drop, share_dim=-2)

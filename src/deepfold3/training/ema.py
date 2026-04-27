@@ -1,10 +1,14 @@
 """Exponential Moving Average for model parameters.
 
-Maintains shadow copies of model parameters, updated each optimizer step.
-Swap in EMA weights for evaluation, then restore originals.
+Constant-decay EMA over `requires_grad` parameters (matches OF3
+``ExponentialMovingAverage`` semantics — no warm-start). Buffers are not
+tracked: every DF3 buffer is a constant initialised once (Fourier
+weights, ref-atom tables) or a derived shadow re-synced from params
+(fused/tiled kernels), so EMAing them is a no-op or actively wrong.
 
-Legacy fused-kernel parameter names are filtered out of the shadow dict so
-old EMA state_dicts still load cleanly.
+Legacy fused-kernel parameter names are filtered out of the shadow dict
+so old EMA state_dicts still load cleanly and so the EMA update doesn't
+double-decay against the base params they shadow.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ class EMA:
     """Exponential moving average of model parameters.
 
     Attributes:
-        decay: Target EMA decay factor.
+        decay: Constant EMA decay factor.
         num_updates: Number of update calls so far.
         shadow: Shadow copies of trainable parameters (excludes fused kernels).
     """
@@ -65,19 +69,17 @@ class EMA:
     def update(self, model: nn.Module) -> None:
         """Update shadow parameters with current model parameters.
 
-        Uses warm-start decay: ``min(decay, (1 + n) / (10 + n))``.
+        Constant decay (no warm-start), matches OF3 convention.
 
         Args:
             model: Model with updated parameters.
         """
         self.num_updates += 1
-        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
-
         if self._cached_model_id != id(model):
             self._rebuild_foreach_lists(model)
 
         with torch.no_grad():
-            torch._foreach_lerp_(self._shadow_list, self._param_list, 1.0 - decay)
+            torch._foreach_lerp_(self._shadow_list, self._param_list, 1.0 - self.decay)
 
     def apply(self, model: nn.Module) -> None:
         """Swap model parameters with EMA shadow parameters in-place.

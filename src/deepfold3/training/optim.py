@@ -537,8 +537,7 @@ class WrappedOptimizer:
         rank_zero_warn(f"Step {attempted_step}: {warn_prefix} (ranks={bad_ranks}, {per_rank}), skipping")
         if self.dist.rank in bad_ranks and self._window_record_ids:
             logger.warning(
-                f"Step {attempted_step}: rank {self.dist.rank} {record_prefix} "
-                f"record_ids={self._window_record_ids}"
+                f"Step {attempted_step}: rank {self.dist.rank} {record_prefix} record_ids={self._window_record_ids}"
             )
         self._window_record_ids.clear()
         self._account_skip(state, attempted_step, reason="grad")

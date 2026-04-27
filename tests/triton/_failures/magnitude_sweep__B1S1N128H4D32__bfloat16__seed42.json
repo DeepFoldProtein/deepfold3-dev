@@ -1,0 +1,26 @@
+{
+  "test_name": "magnitude_sweep",
+  "params": {
+    "B": "1",
+    "N_seq": "1",
+    "N_res": "128",
+    "H": "4",
+    "D": "32",
+    "dtype": "torch.bfloat16",
+    "seed": "42",
+    "sigma": "10.0"
+  },
+  "metrics": {
+    "max_abs_ref": 31.889989852905273,
+    "abs_err_max": 0.15845108032226562,
+    "abs_err_mean": 0.012961650267243385,
+    "rel_err_max": 21.531864166259766,
+    "rel_err_p99": 0.16025012731552124,
+    "rel_err_mean": 0.01558120921254158,
+    "fail_frac": 0.00799560546875,
+    "is_finite": true,
+    "atol_eff": 0.031889989852905275,
+    "rtol": 0.01,
+    "n_significant_elements": 16384
+  }
+}

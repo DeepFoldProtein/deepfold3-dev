@@ -1,4 +1,5 @@
 """Unit tests for fused dropout+add (row-wise and column-wise)."""
+
 from __future__ import annotations
 
 import pytest
@@ -249,7 +250,7 @@ def test_backward_mask_matches_forward_mask_on_same_seed(rowwise):
     # Backward mask (grad_x > 0 → kept).
     bwd_keep = (grad_x.abs() > 1e-6).float()
     # Where x is non-zero, fwd and bwd should agree.
-    agree_where_x_nonzero = (x_val.abs() > 1e-6)
+    agree_where_x_nonzero = x_val.abs() > 1e-6
     assert torch.equal(fwd_keep[agree_where_x_nonzero], bwd_keep[agree_where_x_nonzero])
 
 
@@ -302,9 +303,7 @@ def test_expected_output_preserves_mean(rowwise, p):
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "shape", [(1, 17, 17, 24), (1, 1, 128, 64), (3, 384, 384, 128)]
-)
+@pytest.mark.parametrize("shape", [(1, 17, 17, 24), (1, 1, 128, 64), (3, 384, 384, 128)])
 @pytest.mark.parametrize("rowwise", [True, False])
 def test_odd_shapes(shape, rowwise):
     torch.manual_seed(7)

@@ -574,9 +574,7 @@ def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
     # first_conformer() collapses microheterogeneity (multiple residues sharing
     # the same seqid) to a single residue so struct_seq stays aligned 1:1 with
     # seqres and with the residue lookup used downstream.
-    struct_seq = "".join(
-        _one_letter(gemmi.find_tabulated_residue(res.name)) for res in polymer.first_conformer()
-    )
+    struct_seq = "".join(_one_letter(gemmi.find_tabulated_residue(res.name)) for res in polymer.first_conformer())
 
     entity = st.get_entity_of(polymer)
     if entity is None or not entity.full_sequence:
@@ -593,8 +591,7 @@ def _build_polymer_lookup(chain, max_atoms: int) -> dict[int, tuple[int, np.ndar
     microheterogeneity sites.
     """
     return {
-        idx: _extract_residue_features(res, max_atoms)
-        for idx, res in enumerate(chain.get_polymer().first_conformer())
+        idx: _extract_residue_features(res, max_atoms) for idx, res in enumerate(chain.get_polymer().first_conformer())
     }
 
 

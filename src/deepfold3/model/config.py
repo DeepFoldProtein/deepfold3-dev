@@ -213,6 +213,11 @@ class OptimConfig:
     use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
+    # dropout_add fuses per-batch row/column-wise dropout with a residual add and
+    # samples the mask on the fly via tl.rand (see model/triton/dropout_add.py).
+    # Default True preserves current behavior (Triton always active on CUDA);
+    # set False to force the unfused PyTorch fallback for A/B diagnostics.
+    use_fused_dropout_add: bool = True
     use_torch_compile: bool = False
     # Tiled linear: chunk pair transitions along dim=-2, recompute during backward
     # Saves ~67% of pair transition activation memory at cost of ~2x FLOPs for those layers.
@@ -398,6 +403,10 @@ class TrainingConfig:
         static_graph: DDP ``static_graph`` flag.
         max_steps: Total effective training steps.
         seed: Base random seed (offset by rank for DDP).
+        deterministic: If True, force deterministic algorithms
+            (``torch.use_deterministic_algorithms(True)``,
+            ``cudnn.deterministic = True``, ``cudnn.benchmark = False``)
+            for bit-exact reproducibility. Incurs a significant perf cost.
         checkpoint_interval: Save a checkpoint every N effective steps.
         eval_interval: Run evaluation every N effective steps.
         log_interval: Log metrics every N effective steps.
@@ -541,6 +550,7 @@ class TrainingConfig:
     # Run control
     max_steps: int = 200000
     seed: int = 42
+    deterministic: bool = False  # enable torch.use_deterministic_algorithms + cudnn.deterministic
     checkpoint_interval: int = 1000
     eval_interval: int = 5000
     log_interval: int = 50  # in optimizer steps (after grad accumulation)
@@ -636,12 +646,6 @@ class DistogramConfig:
     num_bins: int = 64
     first_break: float = 2.3125
     last_break: float = 21.6875
-    # Insert a LayerNorm before ``half_logits``. Off by default — AF3
-    # / Protenix / Boltz / OpenFold-3 all feed raw pair into a bare
-    # linear here. Turn on to decouple distogram logit magnitude from
-    # ``‖z‖``; useful as an alternative / complement to
-    # ``alpha_pair_reg``. Mirrors the ``pae_logits_ln`` / ``pde_logits_ln``
-    # pattern already used in ``ConfidenceHead``.
     use_half_logits_ln: bool = False
 
 

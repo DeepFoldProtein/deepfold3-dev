@@ -136,6 +136,13 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
 @click.option("--max-tokens", default=None, type=int, help="Override max tokens per crop.")
 @click.option("--grad-accum", default=None, type=int, help="Override gradient accumulation steps.")
 @click.option("--seed", default=None, type=int, help="Override random seed.")
+@click.option(
+    "--deterministic",
+    is_flag=True,
+    default=False,
+    help="Force deterministic algorithms (torch.use_deterministic_algorithms + cudnn.deterministic). "
+    "Reproducible but slower; sets CUBLAS_WORKSPACE_CONFIG if unset.",
+)
 @click.option("--dtype", default=None, type=click.Choice(["bf16", "fp32", "fp16"]), help="Override precision.")
 @click.option("--wandb", "wandb_project", default=None, help="WandB project name (enables tracking).")
 @click.option("--wandb-entity", default=None, help="WandB team/org entity (default: personal workspace).")
@@ -200,6 +207,7 @@ def train(
     max_tokens: int | None,
     grad_accum: int | None,
     seed: int | None,
+    deterministic: bool,
     dtype: str | None,
     wandb_project: str | None,
     wandb_entity: str | None,
@@ -284,6 +292,8 @@ def train(
         train_cfg.accumulate_grad_batches = grad_accum
     if seed is not None:
         train_cfg.seed = seed
+    if deterministic:
+        train_cfg.deterministic = True
     if dtype is not None:
         train_cfg.dtype = dtype
     if wandb_project is not None:
