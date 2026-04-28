@@ -126,6 +126,18 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         # SF.step() raises if not in train mode. Eval/checkpoint save flip it
         # via ``optimizer_eval_mode`` and restore on exit.
         optimizer.train()
+        # SF maintains its own averaged sequence ``x`` (the inference target,
+        # surfaced at eval / checkpoint via ``optimizer_eval_mode``). Running
+        # EMA on top averages ``y`` (the gradient point) into a *different*
+        # iterate that competes with ``x`` for the eval/inference role and
+        # doubles per-param memory for averaging. Disable EMA explicitly via
+        # ``ema_decay: 0`` (configs/schedule_free.yaml does this).
+        if cfg.ema_decay > 0:
+            rank_zero_warn(
+                f"optimizer_type='schedule_free' with ema_decay={cfg.ema_decay} > 0: "
+                "EMA(y) will replace SF's x at eval, defeating the purpose of SF's averaging. "
+                "Set ema_decay=0 unless you're deliberately A/B-testing the two averages."
+            )
         rank_zero_info(
             f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, weight_decay={cfg.weight_decay} "
             f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"

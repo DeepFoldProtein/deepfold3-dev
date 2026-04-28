@@ -9,7 +9,15 @@ base: initial.yaml
 # happens in ~2/(1−β₂) = 40 steps. Paper recommends T_warmup ≥ that
 # time; 1000 steps gives a generous margin and matches the warmup we
 # already validated for AdamW.
+#
+# ema_decay: 0 disables EMA. SF maintains its own averaged sequence ``x``
+# (the inference target, surfaced via optimizer.eval_mode() at eval and
+# checkpoint save). Running EMA on top would have it average ``y`` (the
+# gradient point), giving a *different* averaged iterate that competes
+# with ``x`` and adds memory. Disable to let SF be the single source of
+# averaging truth.
 training:
   optimizer_type: schedule_free
   lr: 0.0018
   warmup_steps: 1000
+  ema_decay: 0.0
