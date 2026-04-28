@@ -23,6 +23,7 @@ import torch.nn as nn
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.training.ema import EMA
 from deepfold3.training.rank_zero import rank_zero_info
+from deepfold3.training.schedule_free import optimizer_eval_mode
 from deepfold3.training.scheduler import AF3LRScheduler
 from deepfold3.training.state import TrainState
 
@@ -87,20 +88,29 @@ class CheckpointManager:
 
         Keys match the pre-refactor format exactly so existing
         checkpoints remain loadable by this module.
+
+        For Schedule-Free optimizers, ``optimizer_eval_mode`` flips live
+        params from ``y`` (gradient point) to ``x`` (inference target)
+        for the duration of the save so ``model.state_dict()`` captures
+        the inference weights — matching the published library's
+        contract ("the optimizer should be placed in eval mode when
+        storing checkpoints"). Restored to ``y`` on context exit. No-op
+        for plain AdamW.
         """
-        blob: dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "global_step": state.global_step,
-            "effective_step": state.effective_step,
-            "best_eval_loss": state.best_eval_loss,
-            "model_cfg": model_cfg,
-            "train_cfg": train_cfg,
-        }
-        if ema is not None:
-            blob["ema"] = ema.state_dict()
-        torch.save(blob, path)
+        with optimizer_eval_mode(optimizer):
+            blob: dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "global_step": state.global_step,
+                "effective_step": state.effective_step,
+                "best_eval_loss": state.best_eval_loss,
+                "model_cfg": model_cfg,
+                "train_cfg": train_cfg,
+            }
+            if ema is not None:
+                blob["ema"] = ema.state_dict()
+            torch.save(blob, path)
         logger.info(f"Saved checkpoint to {path}")
 
         if self.max_checkpoints > 0:
@@ -147,6 +157,15 @@ class CheckpointManager:
 
         if "optimizer" in ckpt and not train_cfg.skip_load_optimizer:
             optimizer.load_state_dict(ckpt["optimizer"])
+        # Schedule-Free was saved with ``train_mode=False`` (live param =
+        # x) so ``load_state_dict`` restored the same. Lerp ``p ← y`` from
+        # ``(x, z)`` so training resumes at the same gradient point as
+        # just before the save. ``eval_mode`` is the SF marker — plain
+        # AdamW lacks both ``.train()`` and ``.eval_mode``. Calling
+        # ``train()`` while already in train mode is a no-op (idempotent),
+        # so a checkpoint pre-dating the eval-on-save behavior is handled.
+        if hasattr(optimizer, "eval_mode"):
+            optimizer.train()
         if "scheduler" in ckpt and not train_cfg.skip_load_scheduler:
             scheduler.load_state_dict(ckpt["scheduler"])
         if "ema" in ckpt and ema is not None:

@@ -24,6 +24,7 @@ from deepfold3.model.config import TrainingConfig
 from deepfold3.training.collective_guard import collective_guard
 from deepfold3.training.distributed import DistInfo
 from deepfold3.training.rank_zero import rank_zero_critical, rank_zero_info, rank_zero_warn
+from deepfold3.training.schedule_free import AdamWScheduleFree
 from deepfold3.training.state import TrainState
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,33 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
+    n_decay = sum(p.numel() for p in decay_params) / 1e6
+    n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
+
+    if cfg.optimizer_type == "schedule_free":
+        # SF manages its own warmup-then-flat schedule; ``finetune_scheduler``
+        # is bypassed via an identity ``LambdaLR`` in :func:`build_scheduler`.
+        optimizer = AdamWScheduleFree(
+            param_groups,
+            lr=cfg.lr,
+            betas=cfg.betas,
+            eps=cfg.eps,
+            warmup_steps=cfg.warmup_steps,
+        )
+        # SF.step() raises if not in train mode. Eval/checkpoint save flip it
+        # via ``optimizer_eval_mode`` and restore on exit.
+        optimizer.train()
+        rank_zero_info(
+            f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, weight_decay={cfg.weight_decay} "
+            f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
+        )
+        return optimizer
+
+    if cfg.optimizer_type != "adamw":
+        raise ValueError(
+            f"optimizer_type must be 'adamw' or 'schedule_free', got {cfg.optimizer_type!r}"
+        )
+
     # Fused AdamW on CUDA: single kernel launch per param group,
     # ~1.3-1.5x faster than the foreach implementation at our scale.
     use_fused_adam = torch.cuda.is_available()
@@ -119,8 +147,6 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         eps=cfg.eps,
         fused=use_fused_adam,
     )
-    n_decay = sum(p.numel() for p in decay_params) / 1e6
-    n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
     rank_zero_info(
         f"AdamW: fused={use_fused_adam}, weight_decay={cfg.weight_decay} "
         f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"

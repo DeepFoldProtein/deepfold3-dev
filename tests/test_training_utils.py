@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from deepfold3.model.config import TrainingConfig
 from deepfold3.training.ema import EMA
-from deepfold3.training.scheduler import AF3LRScheduler
+from deepfold3.training.scheduler import AF3LRScheduler, WSDSScheduler, build_scheduler
 
 
 def _simple_model():
@@ -172,3 +172,346 @@ class TestAF3LRScheduler:
             scheduler.step()
         lr_after_first_decay = scheduler.get_last_lr()[0]
         assert abs(lr_after_first_decay - 0.5e-3) < 1e-9, f"Expected 0.5e-3, got {lr_after_first_decay}"
+
+
+# ---------------------------------------------------------------------------
+# WSDSScheduler tests
+# ---------------------------------------------------------------------------
+
+
+class TestWSDSScheduler:
+    def _make_scheduler(self, *, warmup=5, windows=None, min_ratio=0.01, lr=1e-3):
+        model = _simple_model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        cfg = TrainingConfig(
+            lr=lr,
+            warmup_steps=warmup,
+            wsds_decay_windows=windows or [],
+            wsds_min_lr_ratio=min_ratio,
+        )
+        scheduler = WSDSScheduler(optimizer, cfg)
+        return optimizer, scheduler
+
+    def _step_to(self, optimizer, scheduler, target_step: int) -> float:
+        """Drive the optimizer to ``target_step`` and return current LR."""
+        # scheduler.last_epoch is the last completed step. We step until it
+        # equals target_step.
+        while scheduler.last_epoch < target_step:
+            optimizer.step()
+            scheduler.step()
+        return scheduler.get_last_lr()[0]
+
+    def test_warmup_then_stable(self):
+        optimizer, scheduler = self._make_scheduler(warmup=10, windows=[[100, 110]], lr=1e-3)
+        # Mid warmup
+        lr5 = self._step_to(optimizer, scheduler, 5)
+        assert abs(lr5 - 5e-4) < 1e-9
+        # End of warmup → stable
+        lr10 = self._step_to(optimizer, scheduler, 10)
+        assert abs(lr10 - 1e-3) < 1e-9
+        # Stable phase before decay window
+        lr50 = self._step_to(optimizer, scheduler, 50)
+        assert abs(lr50 - 1e-3) < 1e-9
+
+    def test_decay_endpoints(self):
+        # Window [100, 110), 10 steps
+        optimizer, scheduler = self._make_scheduler(
+            warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3
+        )
+        lr_start = self._step_to(optimizer, scheduler, 100)  # s=0 → max_lr
+        assert abs(lr_start - 1e-3) < 1e-9, f"At s=0 lr should be max: {lr_start}"
+        lr_end = self._step_to(optimizer, scheduler, 109)  # s=9, L=10
+        # 1/lr = 0.9*10 + 0.1 = 9.1 → lr ≈ 1e-3 / 9.1 ≈ 1.0989e-4
+        assert abs(lr_end - 1e-3 / 9.1) < 1e-7, f"Near-end lr: {lr_end}"
+
+    def test_resume_after_decay(self):
+        optimizer, scheduler = self._make_scheduler(
+            warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3
+        )
+        # Step 110: past the decay window → back to max_lr (no rollback)
+        lr110 = self._step_to(optimizer, scheduler, 110)
+        assert abs(lr110 - 1e-3) < 1e-9, f"Post-decay should resume at max_lr: {lr110}"
+
+    def test_multiple_windows(self):
+        optimizer, scheduler = self._make_scheduler(
+            warmup=5, windows=[[100, 110], [200, 210]], min_ratio=0.5, lr=1e-3
+        )
+        # Stable between the two windows
+        lr150 = self._step_to(optimizer, scheduler, 150)
+        assert abs(lr150 - 1e-3) < 1e-9
+        # Mid-decay of second window: s=5, L=10, u=0.5
+        # 1/lr_mult = 0.5/0.5 + 0.5 = 1.5 → lr = 1e-3 / 1.5
+        lr205 = self._step_to(optimizer, scheduler, 205)
+        assert abs(lr205 - 1e-3 / 1.5) < 1e-9, f"Mid-decay of 2nd window: {lr205}"
+
+    def test_inverse_proportional_form(self):
+        # 1/lr should be linear-in-step within a decay window
+        optimizer, scheduler = self._make_scheduler(
+            warmup=0, windows=[[0, 100]], min_ratio=0.01, lr=1.0
+        )
+        # collect LR at steps 0, 25, 50, 75 → 1/lr should be linear
+        lrs = []
+        for step in (0, 25, 50, 75):
+            lrs.append(self._step_to(optimizer, scheduler, step))
+        inv_lrs = [1.0 / lr for lr in lrs]
+        # diffs of 1/lr should be (approximately) constant
+        diffs = [inv_lrs[i + 1] - inv_lrs[i] for i in range(len(inv_lrs) - 1)]
+        for i in range(1, len(diffs)):
+            assert abs(diffs[i] - diffs[0]) < 1e-9, f"Inverse-LR not linear: {diffs}"
+
+    def test_overlapping_windows_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="overlap"):
+            self._make_scheduler(windows=[[100, 200], [150, 250]])
+
+    def test_invalid_window_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="must be > start"):
+            self._make_scheduler(windows=[[200, 100]])  # end < start
+
+    def test_invalid_ratio_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="min_lr_ratio"):
+            self._make_scheduler(windows=[[100, 200]], min_ratio=1.5)
+
+    def test_build_scheduler_dispatches_wsds(self):
+        model = _simple_model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        cfg = TrainingConfig(
+            lr=1e-3,
+            finetune_scheduler="wsds",
+            warmup_steps=5,
+            wsds_decay_windows=[[100, 110]],
+            wsds_min_lr_ratio=0.1,
+        )
+        sched = build_scheduler(optimizer, cfg)
+        assert isinstance(sched, WSDSScheduler)
+
+    def test_build_scheduler_unknown_name_rejected(self):
+        import pytest
+
+        model = _simple_model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        cfg = TrainingConfig(lr=1e-3, finetune_scheduler="bogus")
+        with pytest.raises(ValueError, match="finetune_scheduler"):
+            build_scheduler(optimizer, cfg)
+
+
+# ---------------------------------------------------------------------------
+# AdamWScheduleFree tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdamWScheduleFree:
+    def _build(self, *, lr=1e-3, warmup=0, weight_decay=0.0, betas=(0.9, 0.999)):
+        from deepfold3.training.schedule_free import AdamWScheduleFree
+
+        model = _simple_model()
+        optimizer = AdamWScheduleFree(
+            model.parameters(),
+            lr=lr,
+            betas=betas,
+            warmup_steps=warmup,
+            weight_decay=weight_decay,
+        )
+        return model, optimizer
+
+    @staticmethod
+    def _set_grads(model, value=0.1):
+        for p in model.parameters():
+            p.grad = torch.full_like(p, value)
+
+    def test_step_requires_train_mode(self):
+        import pytest
+
+        _, optimizer = self._build()
+        # Default group['train_mode'] is False in __init__.
+        with pytest.raises(RuntimeError, match="train mode"):
+            optimizer.step()
+
+    def test_train_eval_swap_round_trip(self):
+        model, optimizer = self._build(lr=1e-2, warmup=0)
+        optimizer.train()
+        # Two steps: first step has ckp1 = 1.0 (= 1/(k+1) with weight_lr_power
+        # giving constant weight) so x = z = y degenerately; second step gives
+        # ckp1 = 0.5 and a non-trivial average.
+        for _ in range(2):
+            self._set_grads(model)
+            optimizer.step()
+
+        # Snapshot y at this iterate (live param after step).
+        y_snapshot = [p.detach().clone() for p in model.parameters()]
+
+        optimizer.eval()
+        # Now p should equal x for each param. After 2 steps, x ≠ y.
+        x_snapshot = [p.detach().clone() for p in model.parameters()]
+        any_differ = any(not torch.allclose(x, y) for x, y in zip(x_snapshot, y_snapshot, strict=True))
+        assert any_differ, "x should differ from y after multiple steps"
+
+        optimizer.train()
+        # Now back to y — must match the pre-eval snapshot bit-exactly (lerp is
+        # invertible: train→eval→train is the identity on p).
+        for p, y in zip(model.parameters(), y_snapshot, strict=True):
+            assert torch.allclose(p, y, atol=1e-6), "train→eval→train should restore y"
+
+    def test_extract_x_matches_eval_swap(self):
+        model, optimizer = self._build(lr=1e-2)
+        optimizer.train()
+        self._set_grads(model)
+        optimizer.step()
+
+        # Materialize x via the helper (no live mutation).
+        x_helper = [optimizer.extract_x(p).detach().clone() for p in model.parameters()]
+        # Live snapshot of y (extract_x must not have changed live params).
+        y_after_helper = [p.detach().clone() for p in model.parameters()]
+
+        # Now compare against eval-then-read.
+        optimizer.eval()
+        for p, x_h in zip(model.parameters(), x_helper, strict=True):
+            assert torch.allclose(p, x_h, atol=1e-6)
+        optimizer.train()
+
+        # Confirm extract_x was non-destructive.
+        for p, y in zip(model.parameters(), y_after_helper, strict=True):
+            assert torch.allclose(p, y, atol=1e-6)
+
+    def test_state_dict_roundtrip_resume(self):
+        # Two parallel runs: one continues straight, the other saves+loads
+        # mid-way. Final params must agree.
+        model_a, opt_a = self._build(lr=1e-2)
+        model_b, opt_b = self._build(lr=1e-2)
+        # Sync init weights so the two runs start identically.
+        with torch.no_grad():
+            for pa, pb in zip(model_a.parameters(), model_b.parameters(), strict=True):
+                pb.copy_(pa)
+        opt_a.train()
+        opt_b.train()
+
+        for _ in range(5):
+            self._set_grads(model_a, value=0.1)
+            self._set_grads(model_b, value=0.1)
+            opt_a.step()
+            opt_b.step()
+
+        # Save B inside eval mode (matches CheckpointManager.save behavior).
+        opt_b.eval()
+        b_state = opt_b.state_dict()
+        b_model_state = {k: v.detach().clone() for k, v in model_b.state_dict().items()}
+        opt_b.train()
+
+        # Fresh model_c + opt_c reconstructed from B's saved state.
+        from deepfold3.training.schedule_free import AdamWScheduleFree
+
+        model_c = _simple_model()
+        # Random init — overwrite with saved x (= what was in model_b at eval-save).
+        model_c.load_state_dict(b_model_state)
+        opt_c = AdamWScheduleFree(model_c.parameters(), lr=1e-2)
+        opt_c.load_state_dict(b_state)
+        opt_c.train()  # lerp p ← y
+
+        # Continue 5 more steps for both A and C.
+        for _ in range(5):
+            self._set_grads(model_a, value=0.1)
+            self._set_grads(model_c, value=0.1)
+            opt_a.step()
+            opt_c.step()
+
+        for pa, pc in zip(model_a.parameters(), model_c.parameters(), strict=True):
+            assert torch.allclose(pa, pc, atol=1e-5), "save+load round-trip diverged"
+
+    def test_warmup_lr_curve(self):
+        # Paper Algorithm 1 line 8: γ_t = γ · √(1−β₂^t) · min(1, t/T_warm).
+        # Use β₂ = 0.0 so the bias correction term is identically 1 for
+        # t≥1 and we can verify the warmup factor in isolation. With β₂=0
+        # the second moment is just g² (no momentum) — fine for testing.
+        model, optimizer = self._build(lr=1e-2, warmup=5, betas=(0.9, 0.0))
+        optimizer.train()
+        observed = []
+        for _ in range(8):
+            self._set_grads(model)
+            optimizer.step()
+            observed.append(optimizer.param_groups[0]["scheduled_lr"])
+        expected_warmup = [(i + 1) / 5 * 1e-2 for i in range(5)]
+        for got, exp in zip(observed[:5], expected_warmup, strict=True):
+            assert abs(got - exp) < 1e-12, f"warmup lr curve: got {got}, expected {exp}"
+        # Steps 5+: flat at lr.
+        for got in observed[5:]:
+            assert abs(got - 1e-2) < 1e-12
+
+    def test_lr_includes_bias_correction(self):
+        # γ_t / γ at step t with sched = 1.0 must equal √(1 − β₂^t).
+        model, optimizer = self._build(lr=1.0, warmup=0, betas=(0.9, 0.95))
+        optimizer.train()
+        for t in range(1, 10):
+            self._set_grads(model)
+            optimizer.step()
+            expected = (1 - 0.95**t) ** 0.5
+            got = optimizer.param_groups[0]["scheduled_lr"]
+            assert abs(got - expected) < 1e-12, f"step {t}: got {got}, expected {expected}"
+
+    def test_skip_step_does_not_advance_iterates(self):
+        model, optimizer = self._build(lr=1e-2)
+        optimizer.train()
+        # One real step to materialize state (z, exp_avg_sq, k=1).
+        self._set_grads(model)
+        optimizer.step()
+        z_before = [optimizer.state[p]["z"].detach().clone() for p in model.parameters()]
+        v_before = [optimizer.state[p]["exp_avg_sq"].detach().clone() for p in model.parameters()]
+        k_before = optimizer.param_groups[0]["k"]
+
+        # Simulate WrappedOptimizer skip path: zero grads, do NOT call step.
+        for p in model.parameters():
+            p.grad = None
+
+        # State must be unchanged.
+        for p, z in zip(model.parameters(), z_before, strict=True):
+            assert torch.equal(optimizer.state[p]["z"], z)
+        for p, v in zip(model.parameters(), v_before, strict=True):
+            assert torch.equal(optimizer.state[p]["exp_avg_sq"], v)
+        assert optimizer.param_groups[0]["k"] == k_before
+
+    def test_build_optimizer_dispatches_schedule_free(self):
+        from deepfold3.training.optim import build_optimizer
+        from deepfold3.training.schedule_free import AdamWScheduleFree
+
+        model = _simple_model()
+        cfg = TrainingConfig(lr=1e-3, optimizer_type="schedule_free", warmup_steps=10)
+        optimizer = build_optimizer(model, cfg)
+        assert isinstance(optimizer, AdamWScheduleFree)
+        # build_optimizer must leave SF in train mode (step() requires it).
+        assert optimizer.param_groups[0]["train_mode"] is True
+
+    def test_identity_scheduler_for_schedule_free(self):
+        from torch.optim.lr_scheduler import LambdaLR
+
+        from deepfold3.training.scheduler import build_scheduler
+
+        model = _simple_model()
+        cfg = TrainingConfig(lr=1e-3, optimizer_type="schedule_free", warmup_steps=10)
+        # Use a real SF optimizer so the scheduler can attach.
+        from deepfold3.training.optim import build_optimizer
+
+        optimizer = build_optimizer(model, cfg)
+        sched = build_scheduler(optimizer, cfg)
+        assert isinstance(sched, LambdaLR)
+        # Identity multiplier: lr unchanged across many .step() calls.
+        before = optimizer.param_groups[0]["lr"]
+        for _ in range(20):
+            sched.step()
+        assert abs(optimizer.param_groups[0]["lr"] - before) < 1e-12
+
+    def test_optimizer_eval_mode_noop_for_adamw(self):
+        # The free helper must be safe to call on plain AdamW (no eval/train methods).
+        from deepfold3.training.schedule_free import optimizer_eval_mode
+
+        model = _simple_model()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        snapshot = [p.detach().clone() for p in model.parameters()]
+        with optimizer_eval_mode(optimizer):
+            for p, s in zip(model.parameters(), snapshot, strict=True):
+                assert torch.equal(p, s)
+        for p, s in zip(model.parameters(), snapshot, strict=True):
+            assert torch.equal(p, s)

@@ -420,6 +420,10 @@ class TrainingConfig:
     weight_decay: float = 0.0
     betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-8
+    # "adamw" = torch.optim.AdamW + ``finetune_scheduler`` LambdaLR.
+    # "schedule_free" = AdamWScheduleFree (Defazio et al. 2024); ``finetune_scheduler``
+    # is ignored — SF manages its own warmup-then-flat schedule via ``warmup_steps``.
+    optimizer_type: str = "adamw"
 
     # LR schedule (AF3-style: warmup, plateau, step decay)
     warmup_steps: int = 1000
@@ -567,9 +571,23 @@ class TrainingConfig:
 
     # Multi-stage training (use --override or JSON config to set these per stage)
     train_confidence_only: bool = False  # freeze trunk, only train confidence head
-    finetune_scheduler: str = "af3"  # "af3" or "cosine"
+    finetune_scheduler: str = "af3"  # "af3", "cosine", or "wsds"
     cosine_min_lr_ratio: float = 0.1  # min LR = lr * ratio (for cosine scheduler)
     cosine_max_steps: int = 20000  # total steps for cosine annealing
+
+    # Warmup-Stable-Decay-Simplified (WSD-S) — continual-pretraining schedule
+    # with multiple [decay_start, decay_end] checkpoints. After warmup the LR
+    # holds at ``lr`` (stable phase), then within each [start, end) window
+    # decays inverse-proportionally from ``lr`` → ``lr * wsds_min_lr_ratio``.
+    # After ``end`` the LR jumps back to ``lr`` (no rollback). See
+    # https://arxiv.org/abs/2410.05192 (Hägele et al., 2024) for the
+    # river-valley justification and the 8–12% decay-fraction guidance.
+    #
+    # Example ``configs/initial.yaml``:
+    #   wsds_decay_windows: [[9000, 10000], [18000, 20000]]
+    #   wsds_min_lr_ratio: 0.01
+    wsds_decay_windows: list[list[int]] = field(default_factory=list)
+    wsds_min_lr_ratio: float = 0.01
 
     # Checkpoint loading
     load_strict: bool = True  # strict state_dict loading

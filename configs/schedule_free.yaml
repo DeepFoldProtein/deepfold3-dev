@@ -1,0 +1,15 @@
+base: initial.yaml
+
+# Schedule-Free AdamW (Defazio et al. 2024, "The Road Less Scheduled").
+# γ_t = γ · √(1 − β₂^t) · min(1, t/T_warmup)
+# No external decay schedule — finetune_scheduler is ignored under this
+# optimizer (build_scheduler returns an identity LambdaLR).
+#
+# β₂=0.95 (inherited from initial.yaml) — bias-correction stabilization
+# happens in ~2/(1−β₂) = 40 steps. Paper recommends T_warmup ≥ that
+# time; 1000 steps gives a generous margin and matches the warmup we
+# already validated for AdamW.
+training:
+  optimizer_type: schedule_free
+  lr: 0.0018
+  warmup_steps: 1000

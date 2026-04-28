@@ -354,12 +354,21 @@ class Trainer:
             eval_dl,
             self.cfg,
             self.model_cfg,
+            optimizer=self.optimizer,
             device=self.dist.device,
             log_microsteps=self.cfg.log_microsteps,
         )
         if self.dist.is_main:
             logger.info(f"Eval at step {self.state.effective_step}: {eval_metrics}")
-            self.trackers.log(eval_metrics, step=self.state.effective_step)
+            # Inject ``train/step`` so wandb's ``step_metric="train/step"``
+            # places eval points on the correct x-axis. Without it, an eval
+            # fired before any train-step log call (e.g. eval_before on
+            # resume) is charted at the wandb internal step (=0 for a fresh
+            # run) instead of ``effective_step``.
+            self.trackers.log(
+                {**eval_metrics, "train/step": self.state.effective_step},
+                step=self.state.effective_step,
+            )
             eval_total = eval_metrics.get("eval/total", float("inf"))
             if eval_total < self.state.best_eval_loss:
                 self.state.best_eval_loss = eval_total
