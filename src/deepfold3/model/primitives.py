@@ -116,15 +116,60 @@ class LinearNoBias(nn.Linear):
         af3_linear_init_(self.weight, initializer)
 
 
-class LayerNorm(nn.LayerNorm):
-    """nn.LayerNorm wrapper.
+def layer_norm(
+    x: torch.Tensor,
+    normalized_shape: int | tuple[int, ...] | list[int],
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """LayerNorm in fp32 with bf16 passthrough.
 
-    AF3 always uses create_scale=True, create_offset=True (the default), so
-    this is simply a named alias that makes the intent explicit.
+    Upcasts the input (and any affine weight/bias) to fp32, runs the
+    normalisation, then casts back to the input dtype. The surrounding
+    compute stays in bf16; only the LN-internal mean/variance/rsqrt and
+    affine multiply are fp32.
+
+    No ``autocast`` context manager — PyTorch's autocast policy keeps
+    ``F.layer_norm`` in fp32 already, and a context-manager scope inside a
+    callable that may be re-invoked under
+    ``torch.utils.checkpoint(use_reentrant=False)`` causes saved-tensor
+    hook divergence (see ``tiled_linear`` module docstring).
+    """
+    orig_dtype = x.dtype
+    x32 = x.float()
+    w32 = weight.float() if weight is not None else None
+    b32 = bias.float() if bias is not None else None
+    out = F.layer_norm(x32, normalized_shape, w32, b32, eps)
+    return out.to(orig_dtype)
+
+
+class LayerNorm(nn.LayerNorm):
+    """LayerNorm that always runs forward in fp32.
+
+    Subclass of ``nn.LayerNorm`` — accepts ``elementwise_affine`` and
+    ``bias`` like the base class. AF3 trunk LNs use the default
+    ``elementwise_affine=True``; AdaLN-zero patterns pass
+    ``elementwise_affine=False`` for a parameter-free LN.
     """
 
-    def __init__(self, normalized_shape: int | tuple[int, ...]):
-        super().__init__(normalized_shape, elementwise_affine=True)
+    def __init__(
+        self,
+        normalized_shape: int | tuple[int, ...],
+        *,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+    ):
+        super().__init__(
+            normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
 
 
 class AdaLayerNorm(nn.Module):
@@ -144,8 +189,8 @@ class AdaLayerNorm(nn.Module):
 
     def __init__(self, dim: int, cond_dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.cond_norm = nn.LayerNorm(cond_dim, elementwise_affine=False, bias=False)
+        self.norm = LayerNorm(dim, elementwise_affine=False)
+        self.cond_norm = LayerNorm(cond_dim, elementwise_affine=False, bias=False)
         # weight-only LN (create_offset=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, dim)
@@ -156,7 +201,7 @@ class AdaLayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         x = self.norm(x)
-        c = F.layer_norm(cond, [cond.shape[-1]]) * self.cond_norm_weight
+        c = layer_norm(cond, [cond.shape[-1]]) * self.cond_norm_weight
         scale = torch.sigmoid(self.cond_scale(c))
         bias = self.cond_bias(c)
         return scale * x + bias
@@ -218,7 +263,7 @@ class AdaTransitionBlock(nn.Module):
         super().__init__()
         num_intermediate = channels * num_intermediate_factor
         # AdaLN parts (no offset on base norm, no offset on cond_norm)
-        self.norm = nn.LayerNorm(channels, elementwise_affine=False)
+        self.norm = LayerNorm(channels, elementwise_affine=False)
         self.cond_norm_weight = nn.Parameter(torch.ones(cond_dim))
         self.cond_scale = nn.Linear(cond_dim, channels)
         self.cond_bias = LinearNoBias(cond_dim, channels, initializer="zeros")
@@ -243,8 +288,8 @@ class AdaTransitionBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         # AdaLN
-        xn = F.layer_norm(x, [x.shape[-1]])
-        c = F.layer_norm(cond, [cond.shape[-1]]) * self.cond_norm_weight
+        xn = layer_norm(x, [x.shape[-1]])
+        c = layer_norm(cond, [cond.shape[-1]]) * self.cond_norm_weight
         scale = torch.sigmoid(self.cond_scale(c))
         bias = self.cond_bias(c)
         xn = scale * xn + bias

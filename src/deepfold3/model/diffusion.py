@@ -25,7 +25,7 @@ from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncode
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.precision import upcast_fp32 as _upcast_fp32
-from deepfold3.model.primitives import LinearNoBias, af3_linear_init_, chunked_linear_init_
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, chunked_linear_init_, layer_norm
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -210,7 +210,7 @@ class DiffusionTransformerBlock(nn.Module):
 
         # Self-attention with AdaLN-zero
         # Conditioning inputs are c_single_cond-dimensional, outputs are c-dimensional
-        self.attn_norm = nn.LayerNorm(c, elementwise_affine=False)
+        self.attn_norm = LayerNorm(c, elementwise_affine=False)
         self.attn_cond_norm_w = nn.Parameter(torch.ones(c_single_cond))
         # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
         self.attn_cond_scale = nn.Linear(c_single_cond, c)
@@ -229,7 +229,7 @@ class DiffusionTransformerBlock(nn.Module):
         self.zero_cond = nn.Linear(c_single_cond, c)
 
         # FFN with AdaLN-zero
-        self.ffn_norm = nn.LayerNorm(c, elementwise_affine=False)
+        self.ffn_norm = LayerNorm(c, elementwise_affine=False)
         self.ffn_cond_norm_w = nn.Parameter(torch.ones(c_single_cond))
         # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
         self.ffn_cond_scale = nn.Linear(c_single_cond, c)
@@ -278,8 +278,8 @@ class DiffusionTransformerBlock(nn.Module):
         Dv = self.val_dim_per_head
 
         # AdaLN-zero self-attention
-        xn = F.layer_norm(x, [C])
-        cn = F.layer_norm(single_cond, [Cs]) * self.attn_cond_norm_w
+        xn = layer_norm(x, [C])
+        cn = layer_norm(single_cond, [Cs]) * self.attn_cond_norm_w
         scale = torch.sigmoid(self.attn_cond_scale(cn))
         bias = self.attn_cond_bias(cn)
         xn = scale * xn + bias
@@ -306,7 +306,7 @@ class DiffusionTransformerBlock(nn.Module):
         x = x + gate * out
 
         # AdaLN-zero FFN
-        cn = F.layer_norm(single_cond, [Cs]) * self.ffn_cond_norm_w
+        cn = layer_norm(single_cond, [Cs]) * self.ffn_cond_norm_w
         scale = torch.sigmoid(self.ffn_cond_scale(cn))
         bias = self.ffn_cond_bias(cn)
 
@@ -315,7 +315,7 @@ class DiffusionTransformerBlock(nn.Module):
             h = self._fused_ada_ln_linear(x, scale, bias, self.ffn_linear1.weight.T)
             ff = self._fused_swiglu(h)
         else:
-            xn = F.layer_norm(x, [C])
+            xn = layer_norm(x, [C])
             xn = scale * xn + bias
             a, b = self.ffn_linear1(xn).chunk(2, dim=-1)
             ff = F.silu(a) * b
@@ -411,7 +411,7 @@ class DiffusionTransformer(nn.Module):
         num_super = self.num_blocks // sbs
 
         # Compute pair norm once (pair_cond is constant across super-blocks)
-        pair_norm = F.layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+        pair_norm = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
 
         for super_idx in range(num_super):
             # Per-super-block pair logit projection
@@ -427,7 +427,7 @@ class DiffusionTransformer(nn.Module):
                 pl = pair_logits_all[..., start:end, :, :]  # [..., H, N, N]
                 act = self.layers[i](act, mask, single_cond, pl)
 
-        act = F.layer_norm(act, [act.shape[-1]]) * self.output_norm_w
+        act = layer_norm(act, [act.shape[-1]]) * self.output_norm_w
         return act
 
 
@@ -529,14 +529,14 @@ class DiffusionConditioningBlock(nn.Module):
         """
         # Pair cond
         pair_in = torch.cat([pair_emb, rel_feat], dim=-1)
-        pair_norm = F.layer_norm(pair_in, [pair_in.shape[-1]]) * self.pair_cond_norm_w
+        pair_norm = layer_norm(pair_in, [pair_in.shape[-1]]) * self.pair_cond_norm_w
         pair_cond = self.pair_cond_proj(pair_norm)
         pair_cond = pair_cond + self.pair_trans0(pair_cond)
         pair_cond = pair_cond + self.pair_trans1(pair_cond)
 
         # Single cond (without noise)
         single_in = torch.cat([single_emb, target_feat], dim=-1)
-        single_norm = F.layer_norm(single_in, [single_in.shape[-1]]) * self.single_cond_norm_w
+        single_norm = layer_norm(single_in, [single_in.shape[-1]]) * self.single_cond_norm_w
         single_cond_pre_noise = self.single_cond_proj(single_norm)
         return single_cond_pre_noise, pair_cond
 
@@ -550,7 +550,7 @@ class DiffusionConditioningBlock(nn.Module):
         while noise_emb.dim() < single_cond_pre_noise.dim():
             noise_emb = noise_emb.unsqueeze(-2)
         noise_expanded = noise_emb.expand(*single_cond_pre_noise.shape[:-1], -1)
-        noise_norm = F.layer_norm(noise_expanded, [noise_emb.shape[-1]]) * self.noise_emb_norm_w
+        noise_norm = layer_norm(noise_expanded, [noise_emb.shape[-1]]) * self.noise_emb_norm_w
         single_cond = single_cond_pre_noise + self.noise_emb_proj(noise_norm)
         single_cond = single_cond + self.single_trans0(single_cond)
         single_cond = single_cond + self.single_trans1(single_cond)
@@ -734,7 +734,7 @@ class DiffusionHead(nn.Module):
         act = enc.token_act.float()
 
         # Add trunk single conditioning to token activations
-        sc_norm = F.layer_norm(single_cond, [single_cond.shape[-1]]) * self.single_cond_emb_norm_w
+        sc_norm = layer_norm(single_cond, [single_cond.shape[-1]]) * self.single_cond_emb_norm_w
         act = act + self.single_cond_embedding_projection(sc_norm)
 
         # Main transformer (already batch-aware)

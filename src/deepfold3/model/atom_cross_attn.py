@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold3.model.primitives import LinearNoBias, af3_linear_init_
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, layer_norm
 
 
 @dataclasses.dataclass
@@ -521,8 +521,8 @@ class AtomCrossAttTransformer(nn.Module):
             nn.init.constant_(b["zero_cond"].bias, -2.0)
 
         # Shared norms (parameter-free, elementwise_affine=False)
-        self.attn_norms = nn.ModuleList([nn.LayerNorm(c, elementwise_affine=False) for _ in range(num_blocks)])
-        self.ffn_norms = nn.ModuleList([nn.LayerNorm(c, elementwise_affine=False) for _ in range(num_blocks)])
+        self.attn_norms = nn.ModuleList([LayerNorm(c, elementwise_affine=False) for _ in range(num_blocks)])
+        self.ffn_norms = nn.ModuleList([LayerNorm(c, elementwise_affine=False) for _ in range(num_blocks)])
 
         # q-side AdaLN conditioning
         # AF3: single_cond_scale and single_cond_bias use initializer='zeros'
@@ -583,7 +583,7 @@ class AtomCrossAttTransformer(nn.Module):
         # Pre-compute pair logits for all blocks (scale-only LN). Permute the
         # ``num_blocks * H`` axis to the front so block ``i`` can be sliced
         # cheaply on the leading dim. ``...`` carries any leading batch dims.
-        pair_normed = F.layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+        pair_normed = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
         pair_logits = self.pair_logits_proj(pair_normed)  # [..., S, Q, K, nb*H]
         # Move (nb*H) to the front to slice per block. ``movedim`` is
         # batch-friendly (handles any leading dims).
@@ -598,12 +598,12 @@ class AtomCrossAttTransformer(nn.Module):
 
             # --- q-side AdaLN ---
             xn_q = self.attn_norms[i](queries_act)  # [..., S, Q, c]
-            cn_q = F.layer_norm(queries_single_cond, [C]) * self.attn_cond_w[i]
+            cn_q = layer_norm(queries_single_cond, [C]) * self.attn_cond_w[i]
             xn_q = torch.sigmoid(self.attn_cond_scale[i](cn_q)) * xn_q + self.attn_cond_bias[i](cn_q)
 
             # --- k-side AdaLN ---
-            xn_k = F.layer_norm(keys_act, [C])  # [..., S, K, c]
-            cn_k = F.layer_norm(keys_single_cond, [C]) * self.k_cond_w[i]
+            xn_k = layer_norm(keys_act, [C])  # [..., S, K, c]
+            cn_k = layer_norm(keys_single_cond, [C]) * self.k_cond_w[i]
             xn_k = torch.sigmoid(self.k_cond_scale[i](cn_k)) * xn_k + self.k_cond_bias[i](cn_k)
 
             # --- Cross-attention. Reshape last 3 dims (S, Q, c) to (S, Q, H, D),
@@ -639,7 +639,7 @@ class AtomCrossAttTransformer(nn.Module):
 
             # --- FFN on queries only ---
             xn = self.ffn_norms[i](queries_act)
-            cn = F.layer_norm(queries_single_cond, [C]) * self.ffn_cond_w[i]
+            cn = layer_norm(queries_single_cond, [C]) * self.ffn_cond_w[i]
             xn = torch.sigmoid(self.ffn_cond_scale[i](cn)) * xn + self.ffn_cond_bias[i](cn)
             ff = ffn["linear1"](xn)
             a, b = ff.chunk(2, dim=-1)
@@ -872,7 +872,7 @@ class AtomEncoder(nn.Module):
             ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars
         )  # [B?, N, M, c]
 
-        ts_norm = F.layer_norm(trunk_single, [trunk_single.shape[-1]]) * self.lnorm_trunk_single_w
+        ts_norm = layer_norm(trunk_single, [trunk_single.shape[-1]]) * self.lnorm_trunk_single_w
         ts_proj = self.embed_trunk_single(ts_norm)  # [B?, N, c]
         atom_single = atom_single + ts_proj.unsqueeze(-2)
 
@@ -886,7 +886,7 @@ class AtomEncoder(nn.Module):
         offsets_valid = subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)
 
         # --- Trunk pair contribution ---
-        tp_norm = F.layer_norm(trunk_pair, [trunk_pair.shape[-1]]) * self.lnorm_trunk_pair_w
+        tp_norm = layer_norm(trunk_pair, [trunk_pair.shape[-1]]) * self.lnorm_trunk_pair_w
         tp_proj = self.embed_trunk_pair(tp_norm)  # [B?, N, N, cp]
         pair_idx = subsets.token_for_query.unsqueeze(-1) * N + subsets.token_for_key.unsqueeze(-2)
         pair_valid = subsets.ta_to_q_mask.unsqueeze(-1) & subsets.q_to_k_mask.unsqueeze(-2)
@@ -1049,7 +1049,7 @@ class AtomDecoder(nn.Module):
         queries_act = queries_act * enc.queries_mask.unsqueeze(-1)
 
         # Normalize and project to 3D position updates
-        queries_act = F.layer_norm(queries_act, [c]) * self.atom_norm_w
+        queries_act = layer_norm(queries_act, [c]) * self.atom_norm_w
         pos_update_q = self.pos_update(queries_act)  # [S, Q, 3]
 
         # Scatter back to token-atoms [N, M, 3]
