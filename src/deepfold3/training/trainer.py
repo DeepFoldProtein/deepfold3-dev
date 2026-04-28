@@ -601,7 +601,11 @@ class Trainer:
                         # Eval / checkpoint / logging time is intentionally excluded so the
                         # displayed rate/ETA reflect pure training throughput.
                         dt = compute_time_window / max(self.cfg.log_interval, 1)
-                        lr = self.optimizer.param_groups[0]["lr"]
+                        # Schedule-Free folds warmup + bias-correction into ``scheduled_lr``;
+                        # ``lr`` stays at the configured peak. Prefer the scheduled value so
+                        # the log/WandB curve reflects what's actually applied.
+                        g = self.optimizer.param_groups[0]
+                        lr = g.get("scheduled_lr", g["lr"])
 
                         # Throughput (global token sum from all ranks via all-reduce).
                         # Same compute-time denominator as ``dt`` for a consistent picture.
