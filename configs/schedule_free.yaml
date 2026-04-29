@@ -21,3 +21,10 @@ training:
   lr: 0.0018
   warmup_steps: 1000
   ema_decay: 0.0
+
+  # Trust the clip: per-rank magnitude skip disabled. max_norm=10 always
+  # runs and bounds the optimizer-visible gradient; NaN/Inf gate is
+  # separate. SF's iterate averaging dilutes residual direction-noise
+  # from clipped spikes.
+  grad_norm_skip_threshold: 0.0
+  grad_norm_log_threshold: 1000.0
