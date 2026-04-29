@@ -15,6 +15,29 @@ def _simple_model():
     return nn.Linear(4, 2)
 
 
+def _make_records(n: int):
+    """Minimal valid Records for sampler tests — single-chain, integer cluster."""
+    from deepfold3.data.types import ChainInfo, Record
+
+    return [
+        Record(
+            id=f"id_{i}",
+            chains=[
+                ChainInfo(
+                    chain_id=0,
+                    chain_name="A",
+                    mol_type=0,  # protein
+                    cluster_id=i % 5,  # int cluster_id triggers WeightedClusterSampler path
+                    msa_id=i,
+                    num_residues=64,
+                ),
+            ],
+            interfaces=[],
+        )
+        for i in range(n)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # EMA tests
 # ---------------------------------------------------------------------------
@@ -692,6 +715,113 @@ class TestCheckpointResume:
         )
         assert new_state.effective_step == 1300
         assert new_state.epoch == 1300 // 391  # == 3
+
+    def test_sampler_iter_position_round_trip(self, tmp_path):
+        """Sampler ``sample_idx`` is captured + restored, so resume yields the tail.
+
+        The end-to-end check: yield N samples, snapshot, build a fresh
+        sampler with the same seed/epoch, ``load_state_dict``, then
+        yield the rest — total sequence must equal a single uncut iter.
+        """
+        from deepfold3.data.sample.weighted import WeightedClusterSampler
+        records = _make_records(30)
+        sampler_a = WeightedClusterSampler(
+            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_a.set_epoch(2)
+
+        full = list(iter(sampler_a))  # consume entire epoch
+        assert len(full) == 20
+
+        # Re-run, stop midway, save state, hand off to a fresh sampler.
+        sampler_b = WeightedClusterSampler(
+            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_b.set_epoch(2)
+        prefix = []
+        for i, idx in enumerate(iter(sampler_b)):
+            prefix.append(idx)
+            if i + 1 == 7:  # stop after 7 samples
+                break
+        snap = sampler_b.state_dict()
+        assert snap["sample_idx"] == 7
+
+        sampler_c = WeightedClusterSampler(
+            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_c.load_state_dict(snap)
+        # Trainer always calls set_epoch before iter — must be a no-op
+        # when epoch matches the loaded value.
+        sampler_c.set_epoch(snap["epoch"])
+        tail = list(iter(sampler_c))
+
+        assert prefix + tail == full
+        assert sampler_c.sample_idx == 20  # exhausted
+
+    def test_sampler_set_epoch_resets_idx_only_on_change(self, tmp_path):
+        """``set_epoch(e)`` resets ``sample_idx`` only when ``e`` changes."""
+        from deepfold3.data.sample.weighted import WeightedClusterSampler
+        records = _make_records(20)
+        sampler = WeightedClusterSampler(
+            records=records, epoch_size=10, num_replicas=1, rank=0, seed=1
+        )
+        sampler.set_epoch(5)
+        sampler.sample_idx = 4  # simulate having yielded 4 samples
+        sampler.set_epoch(5)  # same epoch — must NOT reset
+        assert sampler.sample_idx == 4
+        sampler.set_epoch(6)  # new epoch — resets
+        assert sampler.sample_idx == 0
+
+    def test_full_round_trip_through_checkpoint_manager(self, tmp_path):
+        """End-to-end: sampler state goes through CheckpointManager save/load."""
+        from deepfold3.data.sample.weighted import WeightedClusterSampler
+        from deepfold3.training.state import TrainState
+        records = _make_records(30)
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
+        sampler = WeightedClusterSampler(
+            records=records, epoch_size=20, num_replicas=1, rank=0, seed=11
+        )
+        sampler.set_epoch(2)
+        # Consume 6 of 20.
+        it = iter(sampler)
+        for _ in range(6):
+            next(it)
+        assert sampler.sample_idx == 6
+
+        path = tmp_path / "ckpt.pt"
+        ckpt_mgr.save(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=state,
+            model_cfg=model_cfg,
+            train_cfg=cfg,
+            dist_info=dist_info,
+            train_sampler=sampler,
+        )
+
+        # Fresh sampler, same construction args, restore via the manager.
+        sampler2 = WeightedClusterSampler(
+            records=records, epoch_size=20, num_replicas=1, rank=0, seed=11
+        )
+        new_state = TrainState()
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+            train_sampler=sampler2,
+        )
+        assert sampler2.epoch == 2
+        assert sampler2.sample_idx == 6
 
     def test_sf_invariant_violation_raises(self, tmp_path):
         """Loading an SF blob whose optimizer state has train_mode=True must error."""

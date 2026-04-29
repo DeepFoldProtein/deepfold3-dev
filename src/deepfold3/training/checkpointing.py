@@ -146,6 +146,7 @@ class CheckpointManager:
         model_cfg: ModelConfig,
         train_cfg: TrainingConfig,
         dist_info: DistInfo,
+        train_sampler: object | None = None,
     ) -> None:
         """Save the checkpoint blob + rotate old files.
 
@@ -182,6 +183,12 @@ class CheckpointManager:
                 blob["ema"] = ema.state_dict()
             if scaler is not None and scaler.is_enabled():
                 blob["scaler"] = scaler.state_dict()
+            # Sampler state: per-rank, captured at save time (rank 0
+            # records its own position; other ranks may be at a slightly
+            # different index due to DataLoader prefetch, but they all
+            # work from the same shard so resume re-shards uniformly).
+            if train_sampler is not None and hasattr(train_sampler, "state_dict"):
+                blob["sampler"] = train_sampler.state_dict()
             torch.save(blob, path)
         logger.info(f"Saved checkpoint to {path}")
 
@@ -216,6 +223,7 @@ class CheckpointManager:
         train_cfg: TrainingConfig,
         dist_info: DistInfo,
         steps_per_epoch: int | None = None,
+        train_sampler: object | None = None,
     ) -> None:
         """Resume training state from ``path``, mutating the live objects in place.
 
@@ -287,7 +295,21 @@ class CheckpointManager:
         if my_rng is not None:
             _restore_rng_state_local(my_rng)
 
-        rank_zero_info(f"Resumed from {path} at step {state.effective_step} (epoch={state.epoch})")
+        # Sampler state: same epoch + within-epoch index across ranks
+        # (each rank yields its own shard of the same RNG-derived index
+        # list, so identical sample_idx is the right resume target).
+        if (
+            train_sampler is not None
+            and "sampler" in ckpt
+            and hasattr(train_sampler, "load_state_dict")
+        ):
+            train_sampler.load_state_dict(ckpt["sampler"])
+
+        sampler_idx = getattr(train_sampler, "sample_idx", None) if train_sampler is not None else None
+        suffix = f", epoch={state.epoch}"
+        if sampler_idx is not None:
+            suffix += f", sample_idx={sampler_idx}"
+        rank_zero_info(f"Resumed from {path} at step {state.effective_step}{suffix}")
 
     # ----- discovery -----
 

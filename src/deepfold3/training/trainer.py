@@ -133,6 +133,7 @@ class Trainer:
         self.callbacks: CallbackHub = CallbackHub()
         self.dist: DistInfo | None = None
         self.state = TrainState()
+        self._train_sampler: object | None = None
 
     # ------------------------------------------------------------------
     # Distributed setup
@@ -409,6 +410,7 @@ class Trainer:
             model_cfg=self.model_cfg,
             train_cfg=self.cfg,
             dist_info=self.dist,
+            train_sampler=self._train_sampler,
         )
 
     @staticmethod
@@ -437,6 +439,7 @@ class Trainer:
             train_cfg=self.cfg,
             dist_info=self.dist,
             steps_per_epoch=steps_per_epoch,
+            train_sampler=self._train_sampler,
         )
 
     # ------------------------------------------------------------------
@@ -459,6 +462,11 @@ class Trainer:
         self._init_trackers()
 
         train_dl, eval_dl = self._init_dataloaders()
+        # Stash the train sampler so the checkpoint manager can persist
+        # its within-epoch position (only one sampler per run; capturing
+        # it once here avoids re-deriving from ``train_dl.sampler`` at
+        # every save site).
+        self._train_sampler = train_dl.sampler
         output_dir = Path(self.cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -250,6 +250,12 @@ class WeightedClusterSampler(Sampler[int]):
         self.rank = rank
         self.seed = seed
         self.epoch = 0
+        # Within-epoch position. Advanced once per yielded index. Reset
+        # by ``set_epoch`` only when the epoch number actually changes,
+        # so a resumed sampler whose state was loaded after construction
+        # is not clobbered by the trainer's ``set_epoch(state.epoch)``
+        # at the top of the loop.
+        self.sample_idx = 0
 
         self.rows, self.weights = build_sampling_rows(
             records,
@@ -264,13 +270,44 @@ class WeightedClusterSampler(Sampler[int]):
         rng = np.random.default_rng(self.seed + self.epoch)
         indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
         shard = indices[self.rank :: self.num_replicas]
-        yield from shard.tolist()
+        for i in range(self.sample_idx, len(shard)):
+            self.sample_idx = i + 1
+            yield int(shard[i])
+        # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
+        # state_dict captured after the iterator drained reads as
+        # "epoch fully consumed". ``set_epoch`` resets it on the next
+        # outer-loop tick.
 
     def __len__(self) -> int:
         return self.epoch_size // self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
+        if epoch != self.epoch:
+            self.sample_idx = 0
         self.epoch = epoch
+
+    def state_dict(self) -> dict:
+        """Snapshot for checkpoint resume.
+
+        Captures epoch + within-epoch position so the iterator can
+        fast-forward past indices that were already trained on. Saving
+        ``seed`` makes resume catch the same-seed mismatch loud.
+        """
+        return {"epoch": self.epoch, "sample_idx": self.sample_idx, "seed": self.seed}
+
+    def load_state_dict(self, state: dict) -> None:
+        if "seed" in state and state["seed"] != self.seed:
+            # Seed change is allowed (different runs, different shuffles)
+            # but signal it so a silent divergence isn't surprising later.
+            import warnings
+
+            warnings.warn(
+                f"WeightedClusterSampler resume with seed={self.seed} but ckpt sampler had "
+                f"seed={state['seed']}; sample sequence will diverge.",
+                stacklevel=2,
+            )
+        self.epoch = state["epoch"]
+        self.sample_idx = state.get("sample_idx", 0)
 
 
 class WeightedEvalSampler(Sampler[int]):
