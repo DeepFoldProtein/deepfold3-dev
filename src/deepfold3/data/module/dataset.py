@@ -135,6 +135,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         sampling_rows: list | None = None,
         name: str = "",
         ccd_cache_path: str | Path | None = None,
+        exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -163,6 +164,12 @@ class TrainingDataset(torch.utils.data.Dataset):
                 if dropped:
                     self._dropped_chains_cache[r.id] = dropped
         self.is_distillation = is_distillation
+        # Per-dataset exclusion: tokens whose mol_type is in this list are
+        # synthesised into a ``MASK_LOSS_WEIGHT`` channel (1.0 elsewhere,
+        # 0.0 on excluded mol_types) at ``__getitem__`` time. The token mask
+        # rides through cropping and featurisation; the loss orchestrator
+        # picks it up automatically.
+        self.exclude_loss_mol_types = tuple(int(m) for m in (exclude_loss_mol_types or ()))
         self.tokenizer = Tokenizer()
         self.cropper = Cropper(
             max_neighborhood=max_neighborhood,
@@ -314,6 +321,22 @@ class TrainingDataset(torch.utils.data.Dataset):
             mp = mask_path(self.data_dir / "masks", record.id)
             if mp.exists():
                 tokenized = tokenized.with_mask(TokenMask.load(str(mp)))
+
+        # Synthesize the per-token loss-weight channel from mol_type when the
+        # dataset config marks any mol_types for exclusion (e.g. PATCHR
+        # ligands). Must run before cropping so the channel is sliced
+        # alongside the rest of the token state.
+        if self.exclude_loss_mol_types:
+            from deepfold3.data.masking import MASK_LOSS_WEIGHT
+
+            arr = TokenMask.loss_weight_excluding_mol_types(tokenized.tokens, self.exclude_loss_mol_types)
+            existing = tokenized.token_mask
+            if existing is None:
+                tokenized = tokenized.with_mask(TokenMask({MASK_LOSS_WEIGHT: arr}))
+            else:
+                channels = dict(existing.channels)
+                channels[MASK_LOSS_WEIGHT] = arr
+                tokenized = tokenized.with_mask(TokenMask(channels))
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         feats = self.featurizer.process(

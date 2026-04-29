@@ -15,6 +15,7 @@ import numpy as np
 # Reserved channel names — use these constants to avoid stringly-typed coupling.
 MASK_FIXED = "fixed"
 MASK_REGION = "region"
+MASK_LOSS_WEIGHT = "loss_weight"
 
 
 @dataclass
@@ -29,6 +30,13 @@ class TokenMask:
             (e.g. PATCHR ATLAS distillation). Intermediate values allowed.
         ``"region"`` (int16): Semantic region label ID
             (0 = unset, 1+ = application-defined, e.g. CDR-H1/H2/H3).
+        ``"loss_weight"`` (float32): Per-token multiplicative loss weight.
+            1.0 = full supervision, 0.0 = excluded from all per-atom and
+            per-pair losses. Used to drop unreliable supervision (e.g.
+            PATCHR-inpainted ligand atoms) while keeping the affected
+            tokens in the model input. Typically synthesised by the
+            dataset from ``DatasetConfig.exclude_loss_mol_types`` instead
+            of being precomputed.
     """
 
     channels: dict[str, np.ndarray]
@@ -133,3 +141,27 @@ class TokenMask:
                     fixed[i] = fixed_lookup[key]
 
         return fixed
+
+    @staticmethod
+    def loss_weight_excluding_mol_types(
+        tokens: np.ndarray,
+        exclude: tuple[int, ...] | list[int],
+    ) -> np.ndarray:
+        """Build a ``"loss_weight"`` channel that zeros tokens whose ``mol_type`` is in *exclude*.
+
+        Returns a float32 array of shape ``[N_tokens]`` with 0.0 on every
+        token whose ``mol_type`` matches any value in *exclude* and 1.0
+        elsewhere. ``exclude=()`` returns an all-ones array.
+
+        Used by datasets that mark some mol_types as "do not supervise"
+        (e.g. PATCHR ligands when their poses are inpainted).
+        """
+        N = len(tokens)
+        out = np.ones(N, dtype=np.float32)
+        if not exclude:
+            return out
+        exclude_set = {int(m) for m in exclude}
+        for i in range(N):
+            if int(tokens[i]["mol_type"]) in exclude_set:
+                out[i] = 0.0
+        return out

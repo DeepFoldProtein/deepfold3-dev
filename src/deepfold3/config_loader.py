@@ -107,6 +107,13 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
             raise ValueError(f"datasets[{i}]: invalid strategy '{strategy}', must be one of {valid_strategies}")
         if fmt not in valid_formats:
             raise ValueError(f"datasets[{i}]: invalid format '{fmt}', must be one of {valid_formats}")
+        excl_raw = entry.get("exclude_loss_mol_types", []) or []
+        if not isinstance(excl_raw, list):
+            raise ValueError(f"datasets[{i}]: exclude_loss_mol_types must be a list of integers")
+        try:
+            excl = [int(x) for x in excl_raw]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"datasets[{i}]: exclude_loss_mol_types must contain integers ({exc})") from exc
         result.append(
             {
                 "name": entry["name"],
@@ -116,6 +123,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "is_distillation": bool(entry.get("is_distillation", False)),
                 "format": fmt,
                 "cutoff_date": str(entry.get("cutoff_date", "")),
+                "exclude_loss_mol_types": excl,
             }
         )
     return result

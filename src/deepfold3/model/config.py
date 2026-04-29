@@ -352,6 +352,13 @@ class DatasetConfig:
         cutoff_date: ISO date filter. For training datasets: records released
             AFTER this date are excluded. For eval datasets: only records
             released AFTER this date are included.
+        exclude_loss_mol_types: List of integer ``mol_type`` values whose tokens
+            should be **dropped from all per-atom and per-pair losses** while
+            still appearing in the model input. The dataset synthesises a
+            ``MASK_LOSS_WEIGHT`` token-mask channel from the tokenized
+            ``mol_type`` array (1.0 elsewhere, 0.0 on excluded mol_types).
+            Default empty = no exclusion. Common use: PATCHR distillation
+            sets ``[3]`` (``MOL_NONPOLYMER``) to drop inpainted ligand poses.
     """
 
     name: str = ""
@@ -361,6 +368,7 @@ class DatasetConfig:
     is_distillation: bool = False
     format: str = "df3"
     cutoff_date: str = ""
+    exclude_loss_mol_types: list[int] = field(default_factory=list)
 
 
 @dataclass

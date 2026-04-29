@@ -71,6 +71,7 @@ DIM0_KEYS = {
     "atom_gt_mask",
     "mask_fixed",
     "mask_region",
+    "mask_loss_weight",
 }
 
 # Features where dims 0 and 1 = N, N

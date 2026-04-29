@@ -54,7 +54,10 @@ def _build_one(args: tuple) -> str | None:
     inp = Input(structure=structure, paired_msa={}, unpaired_msa={})
     tokenized = tokenizer.tokenize(inp)
 
-    # Build the fixed mask
+    # Build the fixed mask (per-residue inpainting confidence from the JSON).
+    # Per-token loss exclusion (e.g. dropping ligand atoms from supervision)
+    # is handled at training-data load time via
+    # ``DatasetConfig.exclude_loss_mol_types`` — no need to precompute it here.
     fixed = TokenMask.fixed_from_patchr(
         json_path,
         tokenized.tokens,

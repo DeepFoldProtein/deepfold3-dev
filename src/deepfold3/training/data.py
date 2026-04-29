@@ -245,6 +245,7 @@ def build_dataloaders(
                 of3_dir=Path(spec.data_dir),
                 is_distillation=spec.is_distillation,
                 name=spec.name,
+                exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
                 **of3_kwargs,
             )
         else:
@@ -253,6 +254,7 @@ def build_dataloaders(
                 data_dir=Path(spec.data_dir),
                 is_distillation=spec.is_distillation,
                 name=spec.name,
+                exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
                 **ds_kwargs,
             )
         return ds, recs

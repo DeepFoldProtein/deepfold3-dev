@@ -159,6 +159,7 @@ class TestNormalizeDatasets:
                 "strategy": "uniform",
                 "is_distillation": True,
                 "format": "of3",
+                "exclude_loss_mol_types": [3],
             }
         ]
         result = normalize_datasets(raw)
@@ -171,6 +172,7 @@ class TestNormalizeDatasets:
                 "is_distillation": True,
                 "format": "of3",
                 "cutoff_date": "",
+                "exclude_loss_mol_types": [3],
             }
         ]
 
@@ -222,6 +224,7 @@ class TestLoadConfig:
                 "is_distillation": False,
                 "format": "df3",
                 "cutoff_date": "",
+                "exclude_loss_mol_types": [],
             }
         ]
 

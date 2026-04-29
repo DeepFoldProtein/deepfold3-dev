@@ -17,7 +17,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from deepfold3.data.masking import MASK_FIXED, MASK_REGION
+from deepfold3.data.masking import MASK_FIXED, MASK_LOSS_WEIGHT, MASK_REGION
 from deepfold3.model.config import TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -943,6 +943,17 @@ def diffusion_only_loss(
     if region_label is not None and cfg.region_loss_weights:
         region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
 
+    # Per-token loss-weight mask (1.0 keep, 0.0 drop). Set per-dataset via
+    # ``DatasetConfig.exclude_loss_mol_types`` (e.g. PATCHR ligands carry 0.0
+    # here). Equivalent to multiplying the per-atom ``atom_mask`` by the
+    # broadcast token-level mask, which lets the existing loss functions
+    # use it transparently — no signature changes needed.
+    loss_weight_mask = features.get(f"mask_{MASK_LOSS_WEIGHT}")
+    if loss_weight_mask is not None and bool((loss_weight_mask < 1.0).any()) is False:
+        loss_weight_mask = None
+    if loss_weight_mask is not None:
+        atom_mask = atom_mask * loss_weight_mask.unsqueeze(-1)
+
     denoised = pred["denoised"]
     gt_aug = pred["gt_augmented"]
     noise_levels = pred["noise_levels"]
@@ -1038,6 +1049,23 @@ def training_loss(
     if region_label is not None and cfg.region_loss_weights:
         region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
 
+    # Per-token loss-weight mask (set per-dataset via
+    # ``DatasetConfig.exclude_loss_mol_types``; e.g. PATCHR drops ligand tokens).
+    # Drops the masked tokens from per-atom / per-pair losses by zeroing out
+    # the corresponding entries of ``atom_mask`` and ``seq_mask`` before
+    # passing them to the loss functions. ``pair_reg`` / ``single_reg``
+    # regularisers keep the originals so excluded tokens' activation
+    # magnitudes stay bounded.
+    loss_weight_mask = features.get(f"mask_{MASK_LOSS_WEIGHT}")
+    if loss_weight_mask is not None and bool((loss_weight_mask < 1.0).any()) is False:
+        loss_weight_mask = None
+    if loss_weight_mask is not None:
+        loss_atom_mask = atom_mask * loss_weight_mask.unsqueeze(-1)
+        loss_seq_mask = seq_mask & (loss_weight_mask >= 0.5)
+    else:
+        loss_atom_mask = atom_mask
+        loss_seq_mask = seq_mask
+
     # --- Single-representation magnitude regularization ---
     # ``alpha_{single,pair}_reg is None`` disables entirely; 0.0 is
     # observation-only (compute under no_grad and log); >0 adds
@@ -1080,7 +1108,7 @@ def training_loss(
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
-            atom_mask,
+            loss_atom_mask,
             noise_levels,
             mol_type=features.get("mol_type"),
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
@@ -1100,7 +1128,7 @@ def training_loss(
             l_lddt = smooth_lddt_loss(
                 denoised,
                 gt_pos,
-                atom_mask,
+                loss_atom_mask,
                 cutoffs=cfg.lddt_cutoffs,
                 inclusion_radius=cfg.lddt_inclusion_radius,
                 nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
@@ -1143,11 +1171,11 @@ def training_loss(
                 pred["distogram_features"],
                 pred["distogram_weight"],
                 gt_rep,
-                seq_mask,
+                loss_seq_mask,
                 chunk_n=cfg.fused_ce_chunk_n,
             )
         elif "distogram" in pred:
-            l_disto = distogram_loss(pred["distogram"], gt_rep, seq_mask)
+            l_disto = distogram_loss(pred["distogram"], gt_rep, loss_seq_mask)
         else:
             l_disto = None
         if l_disto is not None:
@@ -1181,7 +1209,7 @@ def training_loss(
                     pred["plddt"],
                     mini_pos,
                     gt_pos,
-                    atom_mask,
+                    loss_atom_mask,
                     mol_type=features.get("mol_type"),
                     rep_idx=rep_idx,
                 )
@@ -1201,13 +1229,13 @@ def training_loss(
                     pred["pde_weight"],
                     mini_rep,
                     gt_rep,
-                    seq_mask,
+                    loss_seq_mask,
                     chunk_n=cfg.fused_ce_chunk_n,
                 )
                 losses["pde"] = l_pde
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
             elif "pde" in pred:
-                l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, seq_mask)
+                l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, loss_seq_mask)
                 losses["pde"] = l_pde
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
 
@@ -1217,10 +1245,16 @@ def training_loss(
                 # (=GT resolved mmCIF mask) is the binary target.
                 ref_mask = features.get("ref_mask")
                 if ref_mask is None:
-                    ref_mask = atom_mask  # fall back to GT mask if ref_mask absent
+                    ref_mask = loss_atom_mask  # fall back to GT mask if ref_mask absent
+                else:
+                    # Apply ligand-loss exclusion to the supervision domain
+                    # (ref_mask) as well, otherwise excluded ligand atoms still
+                    # enter the reduction denominator.
+                    if loss_weight_mask is not None:
+                        ref_mask = ref_mask * loss_weight_mask.unsqueeze(-1)
                 l_resolved = exp_resolved_loss(
                     pred["exp_resolved"],
-                    atom_mask,
+                    loss_atom_mask,
                     valid_mask=ref_mask,
                     fixed_mask=fixed_mask,
                 )
@@ -1241,7 +1275,12 @@ def training_loss(
 
                     pair_mask_feat = features.get("pair_mask")
                     if pair_mask_feat is None:
-                        pair_mask_feat = seq_mask.unsqueeze(1) & seq_mask.unsqueeze(0)
+                        pair_mask_feat = loss_seq_mask.unsqueeze(1) & loss_seq_mask.unsqueeze(0)
+                    elif loss_weight_mask is not None:
+                        # AND-in the per-token exclusion mask so PAE doesn't
+                        # supervise pairs involving an excluded token.
+                        keep = loss_weight_mask >= 0.5
+                        pair_mask_feat = pair_mask_feat.bool() & keep.unsqueeze(1) & keep.unsqueeze(0)
                     pae_mask = (frames_mask.bool().unsqueeze(-1) & pair_mask_feat.bool()).float()
 
                     if "pae_features" in pred:

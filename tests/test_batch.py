@@ -112,6 +112,33 @@ class TestCollation:
         assert batch["ref_mask"][0, 100:, :].sum() == 0
         assert batch["ref_mask"][1, 50:, :].sum() == 0
 
+    def test_bucket_pad_mask_loss_weight_kept_in_lockstep(self):
+        """``mask_loss_weight`` (per-token) must be padded along N so it
+        stays aligned with ``atom_gt_mask`` after bucketing. Regression for
+        the diffusion-loss shape mismatch in df3-20260429-skip5k-v2."""
+        from deepfold3.model.bucket import next_bucket
+
+        feat_a = _make_features(192, seed=0)
+        feat_a["atom_gt_positions"] = torch.zeros(192, 24, 3)
+        feat_a["atom_gt_mask"] = torch.ones(192, 24, dtype=torch.bool)
+        feat_a["mask_loss_weight"] = torch.ones(192, dtype=torch.float32)
+
+        feat_b = _make_features(50, seed=1)
+        feat_b["atom_gt_positions"] = torch.zeros(50, 24, 3)
+        feat_b["atom_gt_mask"] = torch.ones(50, 24, dtype=torch.bool)
+        feat_b["mask_loss_weight"] = torch.ones(50, dtype=torch.float32)
+
+        batch = collate_fn([feat_a, feat_b], bucket_pad=True)
+        expected_n = next_bucket(192)
+        assert batch["atom_gt_mask"].shape[1] == expected_n
+        assert batch["mask_loss_weight"].shape == (2, expected_n)
+        # Padded slots are 0 (excluded from loss — matches seq_mask=0 there).
+        assert batch["mask_loss_weight"][0, 192:].sum() == 0
+        assert batch["mask_loss_weight"][1, 50:].sum() == 0
+        # Real slots are unchanged.
+        assert batch["mask_loss_weight"][0, :192].min() == 1.0
+        assert batch["mask_loss_weight"][1, :50].min() == 1.0
+
     def test_bucket_pad_off_by_default(self):
         """Without bucket_pad, behaviour is unchanged from the legacy collate."""
         feats = [_make_features(100, seed=0)]

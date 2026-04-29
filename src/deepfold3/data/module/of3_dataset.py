@@ -352,6 +352,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         max_templates: int = 4,
         max_template_date: str | None = None,
         name: str = "",
+        exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs.
@@ -365,6 +366,8 @@ class OF3Dataset(torch.utils.data.Dataset):
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
         self.max_templates = max_templates
         self.max_template_date = max_template_date
+        # See ``TrainingDataset.exclude_loss_mol_types`` for semantics.
+        self.exclude_loss_mol_types = tuple(int(m) for m in (exclude_loss_mol_types or ()))
 
         self.tokenizer = Tokenizer()
         self.cropper = Cropper(
@@ -417,8 +420,13 @@ class OF3Dataset(torch.utils.data.Dataset):
         # 4. Build Input (monomer: no paired MSA)
         inp = Input.from_msa(structure, unpaired_msa)
 
-        # 5. Tokenize -> crop -> featurize
+        # 5. Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
+        if self.exclude_loss_mol_types:
+            from deepfold3.data.masking import MASK_LOSS_WEIGHT, TokenMask
+
+            arr = TokenMask.loss_weight_excluding_mol_types(tokenized.tokens, self.exclude_loss_mol_types)
+            tokenized = tokenized.with_mask(TokenMask({MASK_LOSS_WEIGHT: arr}))
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
         feats = self.featurizer.process(
             tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain

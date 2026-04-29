@@ -110,6 +110,7 @@ datasets:
     is_distillation: false
     format: df3
     cutoff_date: "2021-09-30"
+    exclude_loss_mol_types: [] # Exclude ligands
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
