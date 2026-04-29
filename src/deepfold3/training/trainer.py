@@ -420,14 +420,17 @@ class Trainer:
     def _load_checkpoint(self, path: Path) -> None:
         """Load checkpoint via :class:`CheckpointManager`.
 
-        Computes ``steps_per_epoch`` so old checkpoints (no ``epoch``
-        key) can derive a sampler-epoch from ``effective_step`` — the
-        sampler RNG keys on it, so we want to land in the right basin
-        even when resuming from a pre-epoch-persistence ckpt.
+        Computes ``steps_per_epoch`` and ``samples_per_step_per_rank``
+        so old checkpoints (no ``epoch`` / ``sampler`` keys) can derive
+        a sampler-epoch + within-epoch position from ``effective_step``
+        — the sampler RNG keys on epoch, so we want to land in the
+        right basin and skip records already trained on, even when
+        resuming from a pre-sampler-persistence ckpt.
         """
         cfg = self.cfg
         effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
         steps_per_epoch = max(1, cfg.epoch_size // max(1, effective_batch_size)) if cfg.epoch_size > 0 else 0
+        samples_per_step_per_rank = cfg.batch_size_per_rank * cfg.accumulate_grad_batches
         self.ckpt_manager.load(
             path,
             model=self.model,
@@ -440,6 +443,7 @@ class Trainer:
             dist_info=self.dist,
             steps_per_epoch=steps_per_epoch,
             train_sampler=self._train_sampler,
+            samples_per_step_per_rank=samples_per_step_per_rank,
         )
 
     # ------------------------------------------------------------------

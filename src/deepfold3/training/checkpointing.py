@@ -2,9 +2,13 @@
 
 On-disk format adds (over the pre-refactor blob): ``epoch``,
 ``rng_states`` (one entry per DDP rank; gathered on save, scattered
-on load), and ``scaler``. Older checkpoints missing these keys load
-through fallbacks (epoch derived from ``effective_step``; RNGs left
-at the seeds set by :func:`seed_everything`; scaler at default).
+on load), ``scaler``, and ``sampler``. Older checkpoints missing
+these keys load through fallbacks: epoch derived from
+``effective_step``; sampler ``sample_idx`` fast-forwarded from
+``(effective_step % steps_per_epoch) * samples_per_step_per_rank``;
+RNGs left at the seeds set by :func:`seed_everything`; scaler at
+default. Each fallback emits a rank-zero warning so the divergence
+from a step-exact resume is visible in the log.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import torch.nn as nn
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
-from deepfold3.training.rank_zero import rank_zero_info
+from deepfold3.training.rank_zero import rank_zero_info, rank_zero_warn
 from deepfold3.training.schedule_free import optimizer_eval_mode
 from deepfold3.training.scheduler import AF3LRScheduler
 from deepfold3.training.state import TrainState
@@ -84,10 +88,13 @@ def _gather_rng_states(dist_info: DistInfo) -> list[dict]:
 
 
 def _restore_rng_state_local(state: dict) -> None:
-    torch.set_rng_state(state["torch_cpu"])
+    # scatter_object_list / all_gather_object pickle-roundtrip strips the
+    # ByteTensor subclass, leaving a plain uint8 tensor. set_rng_state
+    # rejects that with "RNG state must be a torch.ByteTensor"; cast back.
+    torch.set_rng_state(state["torch_cpu"].cpu().byte())
     cuda_state = state.get("torch_cuda")
     if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(cuda_state)
+        torch.cuda.set_rng_state(cuda_state.cpu().byte())
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
 
@@ -224,6 +231,7 @@ class CheckpointManager:
         dist_info: DistInfo,
         steps_per_epoch: int | None = None,
         train_sampler: object | None = None,
+        samples_per_step_per_rank: int = 1,
     ) -> None:
         """Resume training state from ``path``, mutating the live objects in place.
 
@@ -233,9 +241,18 @@ class CheckpointManager:
 
         If the checkpoint includes per-rank ``rng_states``, each rank's
         slot is scattered back to it; otherwise RNGs are left at the
-        seed values set by :func:`seed_everything` (current behavior).
-        Same for ``scaler`` and ``epoch``: missing keys fall back to
-        defaults / derivation from ``effective_step``.
+        seed values set by :func:`seed_everything`. Same for ``scaler``
+        and ``epoch``: missing keys fall back to defaults / derivation
+        from ``effective_step``.
+
+        ``samples_per_step_per_rank`` (= ``batch_size_per_rank ×
+        accumulate_grad_batches``) is used only when the checkpoint has
+        no ``sampler`` key: the manager fast-forwards
+        :class:`WeightedClusterSampler`'s ``sample_idx`` to
+        ``(effective_step % steps_per_epoch) × samples_per_step_per_rank``
+        so resume skips records already trained — at the cost of a
+        differing RNG trajectory (dropout / EDM noise / shuffle).
+        Each missing-key fallback logs a rank-zero warning.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
@@ -272,8 +289,14 @@ class CheckpointManager:
             scheduler.load_state_dict(ckpt["scheduler"])
         if "ema" in ckpt and ema is not None:
             ema.load_state_dict(ckpt["ema"])
-        if "scaler" in ckpt and scaler is not None and scaler.is_enabled():
-            scaler.load_state_dict(ckpt["scaler"])
+        if scaler is not None and scaler.is_enabled():
+            if "scaler" in ckpt:
+                scaler.load_state_dict(ckpt["scaler"])
+            else:
+                rank_zero_warn(
+                    f"Checkpoint {path} has no 'scaler' state; using default GradScaler "
+                    "(scale will be re-estimated, may cause skipped steps early on)."
+                )
 
         if not train_cfg.skip_load_step:
             state.global_step = ckpt.get("global_step", 0)
@@ -285,11 +308,22 @@ class CheckpointManager:
                 # opt-step count so the sampler RNG resumes near where
                 # it would have been (off by at most one boundary).
                 state.epoch = state.effective_step // steps_per_epoch
+                rank_zero_info(
+                    f"Checkpoint {path} has no 'epoch' key; derived "
+                    f"epoch={state.epoch} = effective_step={state.effective_step} "
+                    f"// steps_per_epoch={steps_per_epoch}."
+                )
         state.best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
 
         # Scatter per-rank RNG states (rank 0 holds the list; everyone
         # else receives ``None`` and skips). Missing in old ckpts → rank
         # 0 broadcasts ``None`` and seed_everything's state stands.
+        if "rng_states" not in ckpt:
+            rank_zero_warn(
+                f"Checkpoint {path} has no 'rng_states'; per-rank RNG (CPU/CUDA "
+                "torch, python, numpy) stays at seed_everything values. DataLoader "
+                "shuffle / dropout / EDM noise trajectory will diverge from save point."
+            )
         rng_all = ckpt.get("rng_states") if dist_info.is_main else None
         my_rng = _scatter_rng_states(dist_info, rng_all)
         if my_rng is not None:
@@ -304,6 +338,32 @@ class CheckpointManager:
             and hasattr(train_sampler, "load_state_dict")
         ):
             train_sampler.load_state_dict(ckpt["sampler"])
+        elif (
+            train_sampler is not None
+            and steps_per_epoch
+            and steps_per_epoch > 0
+            and hasattr(train_sampler, "set_epoch")
+            and hasattr(train_sampler, "sample_idx")
+        ):
+            # Old checkpoint: derive within-epoch position from
+            # effective_step. Set ``epoch`` first so the trainer's
+            # subsequent ``set_epoch(state.epoch)`` is a no-op and
+            # doesn't reset ``sample_idx`` back to 0. The fast-forward
+            # skips records already trained on; the RNG trajectory
+            # (shuffle/dropout/noise) still diverges from the original
+            # run, so this is "approximate resume" — louder warning.
+            step_in_epoch = state.effective_step % steps_per_epoch
+            sample_idx_est = step_in_epoch * samples_per_step_per_rank
+            train_sampler.epoch = state.epoch
+            train_sampler.sample_idx = sample_idx_est
+            rank_zero_warn(
+                f"Checkpoint {path} has no 'sampler' state; fast-forwarding "
+                f"{type(train_sampler).__name__} to epoch={state.epoch}, "
+                f"sample_idx={sample_idx_est} "
+                f"(= ({state.effective_step} % {steps_per_epoch}) × "
+                f"{samples_per_step_per_rank}). RNG trajectory will differ "
+                "from the original run."
+            )
 
         sampler_idx = getattr(train_sampler, "sample_idx", None) if train_sampler is not None else None
         suffix = f", epoch={state.epoch}"
