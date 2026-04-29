@@ -9,45 +9,45 @@ Optimizations are toggled via `OptimConfig` — each can be independently enable
 
 ### Winners (enabled by `--optim recommended`)
 
-| Optimization | Speedup (fwd) | Memory Savings | Where Used | Count |
-|---|---|---|---|---|
-| **Triton EvoAttention (Grid)** | **2.9-3.3x** | **3.4-4.6x** | EvoformerBlock + PairFormerBlock pair attention | 104 attn |
-| **Triton FusedPairBias** | **+25-30%** on top of evo | tl.dot GEMM (5-10x vs scalar loop) | GridSelfAttention pair bias | 104 attn |
-| **Combined evo+pair_bias** | **3.7-4.6x** | **3.4-4.6x** | GridSelfAttention (row + col) | 104 attn |
-| **Triton FusedTriangleMul (L3)** | 1.24-1.32x | Symmetric memory (both directions) | TriangleMul outgoing + incoming | 96 modules |
-| **torch.compile (MSAAttention)** | 1.5-2.3x | 1.6-2.3x | EvoformerBlock (×4) | 4 modules |
-| **torch.compile (TriangleMul)** | 1.25-1.55x | ~1.0x | EvoformerBlock + PairFormerBlock | 104 modules |
-| **torch.compile (SingleAttention)** | 1.3-1.4x | ~1.0x | PairFormerBlock (×48) | 48 modules |
+| Optimization                        | Speedup (fwd)             | Memory Savings                     | Where Used                                      | Count       |
+| ----------------------------------- | ------------------------- | ---------------------------------- | ----------------------------------------------- | ----------- |
+| **Triton EvoAttention (Grid)**      | **2.9-3.3x**              | **3.4-4.6x**                       | EvoformerBlock + PairFormerBlock pair attention | 104 attn    |
+| **Triton FusedPairBias**            | **+25-30%** on top of evo | tl.dot GEMM (5-10x vs scalar loop) | GridSelfAttention pair bias                     | 104 attn    |
+| **Combined evo+pair_bias**          | **3.7-4.6x**              | **3.4-4.6x**                       | GridSelfAttention (row + col)                   | 104 attn    |
+| **Triton FusedTriangleMul (L3)**    | 1.24-1.32x                | Symmetric memory (both directions) | TriangleMul outgoing + incoming                 | 96 modules  |
+| **torch.compile (MSAAttention)**    | 1.5-2.3x                  | 1.6-2.3x                           | EvoformerBlock (×4)                             | 4 modules   |
+| **torch.compile (TriangleMul)**     | 1.25-1.55x                | ~1.0x                              | EvoformerBlock + PairFormerBlock                | 104 modules |
+| **torch.compile (SingleAttention)** | 1.3-1.4x                  | ~1.0x                              | PairFormerBlock (×48)                           | 48 modules  |
 
 ### Grid Column Attention (evo + pair bias)
 
-| N | pytorch | evo | evo+pb | Speedup | Mem reduction |
-|---|---|---|---|---|---|
-| 384 | 5.8ms / 2.8GB | 2.0ms / 0.9GB | **1.6ms / 1.0GB** | **3.7x / 2.9x** |
-| 512 | 13.3ms / 6.5GB | 4.3ms / 1.6GB | **3.2ms / 1.7GB** | **4.1x / 3.8x** |
+| N   | pytorch         | evo           | evo+pb            | Speedup         | Mem reduction |
+| --- | --------------- | ------------- | ----------------- | --------------- | ------------- |
+| 384 | 5.8ms / 2.8GB   | 2.0ms / 0.9GB | **1.6ms / 1.0GB** | **3.7x / 2.9x** |
+| 512 | 13.3ms / 6.5GB  | 4.3ms / 1.6GB | **3.2ms / 1.7GB** | **4.1x / 3.8x** |
 | 640 | 25.4ms / 12.3GB | 7.7ms / 2.5GB | **5.5ms / 2.6GB** | **4.6x / 4.7x** |
 
 ### Conditional winners (enabled by `--optim all`)
 
-| Optimization | Speedup | Condition |
-|---|---|---|
-| **Triton SwiGLU (pair, M=N²)** | 1.4-1.6x fwd, 1.9-2.1x full | Only at pair-transition scale (M=N²); single transitions too small |
-| **Triton FusedTransition (C=384)** | 1.2-1.3x full | Only beneficial at C≥256 and N≥1024; smaller shapes are slower |
-| **Triton LayerNormLinear (C=384)** | 1.1-1.2x full | Composited inside FusedTransitionBlock; marginal standalone |
-| **Triton FusedLNTranspose** | 1.7-2.3x fwd | Column attention LN+transpose; inference only |
+| Optimization                       | Speedup                     | Condition                                                          |
+| ---------------------------------- | --------------------------- | ------------------------------------------------------------------ |
+| **Triton SwiGLU (pair, M=N²)**     | 1.4-1.6x fwd, 1.9-2.1x full | Only at pair-transition scale (M=N²); single transitions too small |
+| **Triton FusedTransition (C=384)** | 1.2-1.3x full               | Only beneficial at C≥256 and N≥1024; smaller shapes are slower     |
+| **Triton LayerNormLinear (C=384)** | 1.1-1.2x full               | Composited inside FusedTransitionBlock; marginal standalone        |
+| **Triton FusedLNTranspose**        | 1.7-2.3x fwd                | Column attention LN+transpose; inference only                      |
 
 ### Not recommended (removed from config)
 
-| Optimization | Result | Reason |
-|---|---|---|
-| Triton EvoAttention (Single) | 0.87-1.03x (slower) | N=1 sequence dim → kernel overhead dominates; torch.compile is better |
-| torch.compile (LayerNorm) | 0.3x (3x slower) | Inductor overhead dominates tiny kernel |
-| torch.compile (LinearNoBias) | 0.3-0.5x (slower) | cuBLAS already optimal |
-| torch.compile (TransitionBlock) | 0.75-0.98x (slower) | Overhead > gain for most shapes |
-| torch.compile (AdaTransitionBlock) | 0.96-1.02x (neutral) | No meaningful benefit |
-| torch.compile (OuterProductMean) | 1.06-1.25x (marginal) | Minimal speedup, not worth compile cost |
-| Triton FusedTransition (C=64/128) | 0.8-1.0x (slower) | Shapes too small for Triton overhead |
-| Triton SwiGLU (single, M=N) | 0.5x (slower) | Kernel launch overhead dominates at tiny M; use only inside pair transitions |
+| Optimization                       | Result                | Reason                                                                       |
+| ---------------------------------- | --------------------- | ---------------------------------------------------------------------------- |
+| Triton EvoAttention (Single)       | 0.87-1.03x (slower)   | N=1 sequence dim → kernel overhead dominates; torch.compile is better        |
+| torch.compile (LayerNorm)          | 0.3x (3x slower)      | Inductor overhead dominates tiny kernel                                      |
+| torch.compile (LinearNoBias)       | 0.3-0.5x (slower)     | cuBLAS already optimal                                                       |
+| torch.compile (TransitionBlock)    | 0.75-0.98x (slower)   | Overhead > gain for most shapes                                              |
+| torch.compile (AdaTransitionBlock) | 0.96-1.02x (neutral)  | No meaningful benefit                                                        |
+| torch.compile (OuterProductMean)   | 1.06-1.25x (marginal) | Minimal speedup, not worth compile cost                                      |
+| Triton FusedTransition (C=64/128)  | 0.8-1.0x (slower)     | Shapes too small for Triton overhead                                         |
+| Triton SwiGLU (single, M=N)        | 0.5x (slower)         | Kernel launch overhead dominates at tiny M; use only inside pair transitions |
 
 ### Key Insight
 
@@ -68,18 +68,18 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 
 ## Available Backends
 
-| Backend | Module | Replaces | Source |
-| ------- | ------ | -------- | ------ |
-| Triton FusedEvoAttention | `_EvoformerAttention` | Flash-attention with pair bias | `triton/evo_attention.py` |
-| Triton FusedPairBias | `FusedPairBias` | LN + Linear + permute for pair bias (tl.dot GEMM) | `triton/fused_pair_bias.py` |
-| Triton FusedGatedDualGEMM | `FusedGatedDualGEMM` | Dual GEMM + sigmoid gate (TWO_INPUTS, mask, bias) | `triton/fused_gated_dual_gemm.py` |
-| Triton FusedTransitionBlock | `FusedTransitionBlock` | `TransitionBlock` (LN + Linear + SwiGLU + Linear) | `triton/fused_transition.py` |
-| Triton FusedLayerNormLinear | `FusedLayerNormLinear` | Fused LayerNorm + Linear | `triton/layernorm_linear.py` |
-| Triton FusedLayerNormTranspose | `FusedLayerNormTranspose` | LN + dim transpose (col attention) | `triton/layernorm_transpose.py` |
-| Triton FusedTriangleMulGate | `FusedTriangleMulGate` | LN + packed 3-projection GEMM + sigmoid | `triton/triangle_mul_gate.py` |
-| Persistent Autotune Cache | `CacheManager` | GPU-fingerprinted JSON cache for Triton configs | `triton/cache.py` |
-| TiledLinear | `TiledLinear` | Memory-efficient tiled recomputation for pair transitions | `tiled_linear.py` |
-| torch.compile | — | Wraps TriangleMul, MSAAttention, SingleAttention | PyTorch built-in |
+| Backend                        | Module                    | Replaces                                                  | Source                            |
+| ------------------------------ | ------------------------- | --------------------------------------------------------- | --------------------------------- |
+| Triton FusedEvoAttention       | `_EvoformerAttention`     | Flash-attention with pair bias                            | `triton/evo_attention.py`         |
+| Triton FusedPairBias           | `FusedPairBias`           | LN + Linear + permute for pair bias (tl.dot GEMM)         | `triton/fused_pair_bias.py`       |
+| Triton FusedGatedDualGEMM      | `FusedGatedDualGEMM`      | Dual GEMM + sigmoid gate (TWO_INPUTS, mask, bias)         | `triton/fused_gated_dual_gemm.py` |
+| Triton FusedTransitionBlock    | `FusedTransitionBlock`    | `TransitionBlock` (LN + Linear + SwiGLU + Linear)         | `triton/fused_transition.py`      |
+| Triton FusedLayerNormLinear    | `FusedLayerNormLinear`    | Fused LayerNorm + Linear                                  | `triton/layernorm_linear.py`      |
+| Triton FusedLayerNormTranspose | `FusedLayerNormTranspose` | LN + dim transpose (col attention)                        | `triton/layernorm_transpose.py`   |
+| Triton FusedTriangleMulGate    | `FusedTriangleMulGate`    | LN + packed 3-projection GEMM + sigmoid                   | `triton/triangle_mul_gate.py`     |
+| Persistent Autotune Cache      | `CacheManager`            | GPU-fingerprinted JSON cache for Triton configs           | `triton/cache.py`                 |
+| TiledLinear                    | `TiledLinear`             | Memory-efficient tiled recomputation for pair transitions | `tiled_linear.py`                 |
+| torch.compile                  | —                         | Wraps TriangleMul, MSAAttention, SingleAttention          | PyTorch built-in                  |
 
 ## Configuration
 
@@ -208,12 +208,12 @@ src/deepfold3/model/triton/
 sizes are picked by `triton.autotune` per (M, N, K) shape, with results persisted to disk
 and (on B200) seeded from the hardcoded `B200_PRETUNED` table at decorator-import time:
 
-| Kernel | Autotune key | Notes |
-|---|---|---|
-| `_attn_fwd`, `_attn_bwd_dq`, `_attn_bwd_dk_dv` (evo_attention) | `[SEQ_LEN, DIM]` | First-class autotune since the original commit |
-| `_fused_dual_gemm_fwd_kernel`, `_fused_dual_gemm_bwd_pregemm_kernel` | `[M, N, K]` | First-class autotune since the original commit |
-| `_second_forward_kernel`, `_first_backward_kernel` (layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Converted to persistent_autotune; previously used a hand-tuned `tuning.py` table that returned `None` (PyTorch fallback) for buckets ≤224 |
-| `_ada_second_forward_kernel`, `_ada_first_backward_kernel` (ada_layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Same conversion as above |
+| Kernel                                                                            | Autotune key              | Notes                                                                                                                                     |
+| --------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `_attn_fwd`, `_attn_bwd_dq`, `_attn_bwd_dk_dv` (evo_attention)                    | `[SEQ_LEN, DIM]`          | First-class autotune since the original commit                                                                                            |
+| `_fused_dual_gemm_fwd_kernel`, `_fused_dual_gemm_bwd_pregemm_kernel`              | `[M, N, K]`               | First-class autotune since the original commit                                                                                            |
+| `_second_forward_kernel`, `_first_backward_kernel` (layernorm_linear)             | `[M, N, K]` / `[M, K, N]` | Converted to persistent_autotune; previously used a hand-tuned `tuning.py` table that returned `None` (PyTorch fallback) for buckets ≤224 |
+| `_ada_second_forward_kernel`, `_ada_first_backward_kernel` (ada_layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Same conversion as above                                                                                                                  |
 
 The remaining elementwise kernels (`swiglu`, `triangle_mul_gate.{fwd,bwd}`,
 `layernorm_transpose`, `fused_pair_bias`) use a single shape-agnostic block-size
@@ -225,12 +225,12 @@ already optimal across all bucket sizes. There's no autotune surface for them.
 All GEMM-based Triton kernels support configurable precision via the `Precision` enum
 (adapted from NVIDIA cuEquivariance):
 
-| Mode | Value | Behavior |
-|------|-------|----------|
-| `DEFAULT` | 0 | Hardware default (fastest, least precise) |
-| `TF32` | 1 | Explicit TF32 rounding via `cvt_tf32_rn` (deterministic 19-bit mantissa) |
-| `TF32x3` | 2 | Triton's built-in tf32x3 accumulation (higher precision than TF32) |
-| `IEEE` | 3 | Full IEEE754 float32 (slowest, most precise) |
+| Mode      | Value | Behavior                                                                 |
+| --------- | ----- | ------------------------------------------------------------------------ |
+| `DEFAULT` | 0     | Hardware default (fastest, least precise)                                |
+| `TF32`    | 1     | Explicit TF32 rounding via `cvt_tf32_rn` (deterministic 19-bit mantissa) |
+| `TF32x3`  | 2     | Triton's built-in tf32x3 accumulation (higher precision than TF32)       |
+| `IEEE`    | 3     | Full IEEE754 float32 (slowest, most precise)                             |
 
 The `precision_dot(a, b, acc, PRECISION)` JIT helper dispatches `tl.dot` with the
 requested precision mode. The pair bias kernel defaults to `TF32x3` for best
@@ -273,6 +273,7 @@ deepfold3 warmup-triton --config configs/initial.json
 ```
 
 The script:
+
 1. Loads channel dimensions from the model config (falls back to defaults).
 2. Iterates over every bucket size in `bucket.BUCKET_SIZES ≤ 384`.
 3. For each bucket, drives `FusedLayerNormLinear`, `FusedAdaLayerNormLinear`,
@@ -463,7 +464,7 @@ Benchmark results are saved as JSON arrays in `benchmarks/results/`. Each entry:
 {
   "op_name": "GridSelfAttention",
   "provider": "triton",
-  "shape": {"N": 256, "C": 128, "H": 4},
+  "shape": { "N": 256, "C": 128, "H": 4 },
   "mode": "fwd",
   "time_ms": 0.123,
   "peak_memory_mb": 45.6,

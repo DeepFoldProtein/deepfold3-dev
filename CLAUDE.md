@@ -117,7 +117,7 @@ Input features (tokens + atoms)
 
 **Key dimensions**: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `num_recycles=10`, `diffusion_steps=200`, `num_samples=5`.
 
-**Atom representation**: Two layouts — *all-tokens* (one representative atom per token) and *all-token-atoms* `[N_tokens, max_atoms_per_token]` (all heavy atoms). Proteins/RNA/DNA use one token per residue; ligands use one token per atom.
+**Atom representation**: Two layouts — _all-tokens_ (one representative atom per token) and _all-token-atoms_ `[N_tokens, max_atoms_per_token]` (all heavy atoms). Proteins/RNA/DNA use one token per residue; ligands use one token per atom.
 
 ## Source Layout
 
@@ -171,7 +171,7 @@ src/deepfold3/
 │   └── confidences.py    # Confidence metric computation + save_confidences_json()
 ├── training/        # Training pipeline
 │   ├── loss.py           # smooth_lddt, diffusion_mse, bond, distogram, plddt, pae, pde, exp_resolved, training_loss
-│   ├── ema.py            # EMA with warm-start decay + fused kernel re-sync
+│   ├── ema.py            # EMA (constant decay, params-only; matches OF3 ExponentialMovingAverage)
 │   ├── scheduler.py      # AF3LRScheduler + CosineAnnealingScheduler
 │   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval, WandB)
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
@@ -197,16 +197,16 @@ scripts/                     # Shell scripts for database setup and GPU server
 
 ## Key Dependencies
 
-| Package | Purpose |
-| ------- | ------- |
-| `torch` | Core deep learning framework |
-| `gemmi` | mmCIF/PDB structure file parsing |
-| `rdkit` | Small molecule chemistry (ligand handling, symmetry) |
-| `pdbeccdutils` | CCD (Chemical Component Dictionary) utilities |
-| `safetensors` | Model weight serialization |
-| `zstandard` | Compression (model weights are `.zst`) |
-| `click` | CLI interface |
-| `numpy` | Numerical arrays / structured array storage |
+| Package        | Purpose                                              |
+| -------------- | ---------------------------------------------------- |
+| `torch`        | Core deep learning framework                         |
+| `gemmi`        | mmCIF/PDB structure file parsing                     |
+| `rdkit`        | Small molecule chemistry (ligand handling, symmetry) |
+| `pdbeccdutils` | CCD (Chemical Component Dictionary) utilities        |
+| `safetensors`  | Model weight serialization                           |
+| `zstandard`    | Compression (model weights are `.zst`)               |
+| `click`        | CLI interface                                        |
+| `numpy`        | Numerical arrays / structured array storage          |
 
 ## Training Pipeline
 
@@ -226,13 +226,13 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 
 ### Loss Weights (AF3 §5.3)
 
-| Loss | Weight | Notes |
-|------|--------|-------|
-| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0) | EDM-weighted; mol-type reweight: DNA/RNA 5×, ligand 10×. All samples incl. distillation. |
-| Bond violation | `alpha_diffusion × alpha_bond` (0) | MSE on bond distances vs CCD ideal; enable for stage 2 |
-| Distogram | `alpha_distogram` (0.03) | 64-bin cross-entropy. All samples incl. distillation (AF3 §5.2 Table 6). |
-| pLDDT, PDE, exp_resolved | `alpha_confidence` (0 in stages 1–3, 1e-4 in FT3) | PDB-only (distillation skipped, AF3 §4.3); gated on resolution ∈ [0.1, 4.0]. Head forward disabled entirely when α=0. |
-| PAE | `alpha_confidence × alpha_pae` (0 until FT3) | Set `alpha_pae=1.0` only in finetune3 (confidence-only stage) |
+| Loss                        | Weight                                            | Notes                                                                                                                 |
+| --------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Diffusion MSE + smooth LDDT | `alpha_diffusion` (4.0)                           | AF3 §5.3 eq. 3: `(1/3)·Σ‖Δ‖²·w·mask / Σ mask` (per-coord avg, atom-count denom). EDM-weighted; mol-type reweight: DNA/RNA 5×, ligand 10×. All samples incl. distillation. |
+| Bond violation              | `alpha_diffusion × alpha_bond` (0)                | MSE on bond distances vs CCD ideal; enable for stage 2                                                                |
+| Distogram                   | `alpha_distogram` (0.03)                          | 64-bin cross-entropy. All samples incl. distillation (AF3 §5.2 Table 6).                                              |
+| pLDDT, PDE, exp_resolved    | `alpha_confidence` (0 in stages 1–3, 1e-4 in FT3) | PDB-only (distillation skipped, AF3 §4.3); gated on resolution ∈ [0.1, 4.0]. Head forward disabled entirely when α=0. pLDDT j-axis restricted to representative atoms (CA / C1') with 15 Å (protein-rep j) / 30 Å (nucleic-rep j) radius (AF3 §4.3.1). |
+| PAE                         | `alpha_confidence × alpha_pae` (0 until FT3)      | Set `alpha_pae=1.0` only in finetune3 (confidence-only stage). Frames within 25° of co-linearity dropped per-sample on both pred and GT (AF3 §4.3.2). |
 
 Confidence head forward is gated on `alpha_confidence > 0` ([model.py:557](src/deepfold3/model/model.py#L557)) — skipped entirely when disabled to avoid `0 × NaN = NaN` contamination of the total loss. Mini-rollout still runs (needed for chain permutation determinism). Distogram loss lives above the `is_distillation` early-return in `training_loss` so distillation samples contribute distogram gradient.
 
@@ -240,10 +240,10 @@ Confidence head forward is gated on `alpha_confidence > 0` ([model.py:557](src/d
 
 Per-token mask channels stored in `data_dir/masks/{pdb_id}.npz`, loaded automatically by `TrainingDataset`. Managed via `TokenMask` (`data/masking.py`). Two reserved channels:
 
-| Channel | Dtype | Effect |
-|---------|-------|--------|
-| `"fixed"` | float32 `[N]` | 1.0 = experimental, 0.0 = model-generated. Scales `exp_resolved` loss target (soft CE). For PATCHR ATLAS distillation. |
-| `"region"` | int16 `[N]` | Region label (0=unset, 1+=CDR-H1/H2/H3 etc.). Applies per-token weight via `region_loss_weights` config to diffusion MSE loss. |
+| Channel    | Dtype         | Effect                                                                                                                         |
+| ---------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `"fixed"`  | float32 `[N]` | 1.0 = experimental, 0.0 = model-generated. Scales `exp_resolved` loss target (soft CE). For PATCHR ATLAS distillation.         |
+| `"region"` | int16 `[N]`   | Region label (0=unset, 1+=CDR-H1/H2/H3 etc.). Applies per-token weight via `region_loss_weights` config to diffusion MSE loss. |
 
 Generate PATCHR ATLAS masks from inpainting metadata JSON:
 

@@ -178,14 +178,14 @@ class TrainingConfig:
 
 **Stage presets** (applied via JSON config or CLI):
 
-| Config field | Stage 1 | Stage 2 | Stage 3 |
-|---|---|---|---|
-| `alpha_pae` | 0.0 | 0.0 | 1.0 |
-| `alpha_bond` | 0.0 | 1.0 | 0.0 |
-| `smooth_lddt_weight` | 1.0 | 0.0 | 0.0 |
-| `alpha_diffusion` | 4.0 | 4.0 | 0.0 |
-| `alpha_distogram` | 0.03 | 0.03 | 0.0 |
-| `train_confidence_only` | False | False | True |
+| Config field            | Stage 1 | Stage 2 | Stage 3 |
+| ----------------------- | ------- | ------- | ------- |
+| `alpha_pae`             | 0.0     | 0.0     | 1.0     |
+| `alpha_bond`            | 0.0     | 1.0     | 0.0     |
+| `smooth_lddt_weight`    | 1.0     | 0.0     | 0.0     |
+| `alpha_diffusion`       | 4.0     | 4.0     | 0.0     |
+| `alpha_distogram`       | 0.03    | 0.03    | 0.0     |
+| `train_confidence_only` | False   | False   | True    |
 
 ### 3.2 Confidence-only training (Stage 3)
 

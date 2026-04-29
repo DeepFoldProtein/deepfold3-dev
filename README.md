@@ -109,29 +109,36 @@ deepfold3 apply-clusters --help
 deepfold3 train --help
 ```
 
-| Command | Description |
-| ------- | ----------- |
-| `deepfold3 msa` | Search MSAs via MMseqs2 (server or local), with template hits |
-| `deepfold3 inference` | Run structure prediction from A3M or JSON input |
-| `deepfold3 convert` | Convert AF3 Haiku parameters to safetensors |
-| `deepfold3 plot` | Plot PAE/PDE/contact maps from confidences JSON |
-| `deepfold3 prepare` | Preprocess PDB mmCIF files into training data |
-| `deepfold3 cluster` | Cluster sequences with MMseqs2 (builds cluster file from training data) |
-| `deepfold3 apply-clusters` | Apply a cluster file to a manifest for cluster-balanced sampling |
-| `deepfold3 msa-batch` | Generate MSAs for all unique sequences in training data (local MMseqs2) |
-| `deepfold3 import-msa` | Import pre-existing A3M files (e.g. AFDB) into training data by sequence matching |
-| `deepfold3 train` | Train the model (single GPU or multi-GPU via torchrun) |
+| Command                    | Description                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| `deepfold3 msa`            | Search MSAs via MMseqs2 (server or local), with template hits                     |
+| `deepfold3 inference`      | Run structure prediction from A3M or JSON input                                   |
+| `deepfold3 convert`        | Convert AF3 Haiku parameters to safetensors                                       |
+| `deepfold3 plot`           | Plot PAE/PDE/contact maps from confidences JSON                                   |
+| `deepfold3 prepare`        | Preprocess PDB mmCIF files into training data                                     |
+| `deepfold3 cluster`        | Cluster sequences with MMseqs2 (builds cluster file from training data)           |
+| `deepfold3 apply-clusters` | Apply a cluster file to a manifest for cluster-balanced sampling                  |
+| `deepfold3 msa-batch`      | Generate MSAs for all unique sequences in training data (local MMseqs2)           |
+| `deepfold3 import-msa`     | Import pre-existing A3M files (e.g. AFDB) into training data by sequence matching |
+| `deepfold3 import-paired-msa`   | Import pre-existing paired MSA `.npz` files into training data                          |
+| `deepfold3 import-of3`     | Import OpenFold-3 distillation structures into training data                      |
+| `deepfold3 prepare-templates` | Discover multimer templates from per-chain MMseqs2 m8 hits (Hungarian pairing) |
+| `deepfold3 scan-mmcif`     | Build a parallel mmCIF metadata cache (resolution / method / release date)        |
+| `deepfold3 enrich-manifest` | Backfill structure-info fields on an existing manifest from idx/mmcif cache       |
+| `deepfold3 drop-obsolete`  | Drop manifest entries flagged obsolete in the wwPDB idx                           |
+| `deepfold3 warmup-triton`  | Pre-warm the persistent Triton autotune cache for the configured GPU              |
+| `deepfold3 train`          | Train the model (single GPU or multi-GPU via torchrun)                            |
 
 ## JSON Input Dialects
 
 DeepFold3 auto-detects and supports four JSON input formats:
 
-| Dialect | Key style | MSA | Templates | Auto-search |
-| ------- | --------- | --- | --------- | ----------- |
-| **`alphafold3`** | `protein`/`dna`/`rna`/`ligand` with `id` | inline or path | inline `templates` list | No |
-| **`alphafoldserver`** | `proteinChain`/`rnaSequence`/`dnaSequence`/`ion` | -- | -- | Yes (MMseqs2) |
-| **`protenix`** | `proteinChain`/`dnaSequence`/`rnaSequence` | `msa.precomputed_msa_dir` or path | `templatesPath` (.json/.hhr) | No |
-| **`deepfold3`** | Both AF3 and Protenix keys | All formats | All formats | No |
+| Dialect               | Key style                                        | MSA                               | Templates                    | Auto-search   |
+| --------------------- | ------------------------------------------------ | --------------------------------- | ---------------------------- | ------------- |
+| **`alphafold3`**      | `protein`/`dna`/`rna`/`ligand` with `id`         | inline or path                    | inline `templates` list      | No            |
+| **`alphafoldserver`** | `proteinChain`/`rnaSequence`/`dnaSequence`/`ion` | --                                | --                           | Yes (MMseqs2) |
+| **`protenix`**        | `proteinChain`/`dnaSequence`/`rnaSequence`       | `msa.precomputed_msa_dir` or path | `templatesPath` (.json/.hhr) | No            |
+| **`deepfold3`**       | Both AF3 and Protenix keys                       | All formats                       | All formats                  | No            |
 
 - **alphafold3** -- Faithful to `references/alphafold3`. Set `"dialect": "alphafold3"`.
 - **alphafoldserver** -- Faithful to AF3 server format. Set `"dialect": "alphafoldserver"`. MSAs and templates are searched automatically via ColabFold MMseqs2 server.
@@ -160,20 +167,20 @@ Key dimensions: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `diffus
 
 - [x] Sequence clustering (`deepfold3 cluster` via MMseqs2, or pre-computed wwPDB clusters via `deepfold3 apply-clusters`)
 - [x] MSA generation for training (`deepfold3 msa-batch` -- local MMseqs2 with GPU support, resume, batch splitting)
-- [ ] Training-time template pipeline (hmmsearch against PDB HMM profiles)
+- [x] Training-time template pipeline (`deepfold3 prepare-templates` -- multimer template discovery from per-chain MMseqs2 hits with Hungarian chain pairing; date-cutoff filter applied at sample time)
 
 ## Confidence Metrics
 
-| Metric | Shape | Description |
-| ------ | ----- | ----------- |
-| pLDDT | per-atom | Predicted local distance difference test (0-100) |
-| PAE | NxN | Predicted aligned error (Å) |
-| PDE | NxN | Predicted distance error (Å, symmetrised) |
-| pTM | scalar | Predicted TM-score |
-| ipTM | scalar | Interface predicted TM-score (multi-chain only) |
-| Ranking | scalar | 0.8 x ipTM + 0.2 x pTM |
-| gPDE | scalar | Global average PDE |
-| Contacts | NxN | P(distance < 8 Å) from distogram |
+| Metric   | Shape    | Description                                      |
+| -------- | -------- | ------------------------------------------------ |
+| pLDDT    | per-atom | Predicted local distance difference test (0-100) |
+| PAE      | NxN      | Predicted aligned error (Å)                      |
+| PDE      | NxN      | Predicted distance error (Å, symmetrised)        |
+| pTM      | scalar   | Predicted TM-score                               |
+| ipTM     | scalar   | Interface predicted TM-score (multi-chain only)  |
+| Ranking  | scalar   | 0.8 x ipTM + 0.2 x pTM                           |
+| gPDE     | scalar   | Global average PDE                               |
+| Contacts | NxN      | P(distance < 8 Å) from distogram                 |
 
 ## Development
 
@@ -208,26 +215,31 @@ src/deepfold3/
 |   +-- model.py        # DeepFold3 (top-level), DistogramHead
 |-- data/               # Data pipeline
 |   |-- msa/            # MMseqs2 MSA search (server API + local binary)
-|   |-- parse/          # mmcif.py, a3m.py, templates.py, hhr.py, json_input.py
+|   |-- parse/          # mmcif.py, a3m.py, templates.py, template_realign.py, hhr.py, json_input.py
 |   |-- tokenize/       # tokenizer.py (Input -> Tokenized)
 |   |-- crop/           # cropper.py (contiguous + spatial + interface-seeded)
-|   |-- sample/         # weighted.py (WeightedClusterSampler)
+|   |-- sample/         # weighted.py (per-(chain|interface) cluster sampler)
 |   |-- feature/        # featurizer.py, ref_atoms.py (CCD)
-|   |-- prepare/        # structure.py, filters.py, manifest.py, clustering.py
+|   |-- symmetry/       # chain / atom / ligand permutation alignment (AF3 §4.2 / §4.3)
+|   |-- prepare/        # structure.py, filters.py, manifest.py, clustering.py, template_search.py, materialize.py, entries_idx.py
 |   +-- module/         # dataset.py (TrainingDataset, InferenceInput), collate.py
 |-- training/           # Training pipeline
 |   |-- loss.py         # All loss functions (diffusion MSE, smooth LDDT, distogram, confidence)
-|   |-- ema.py          # Exponential Moving Average
-|   |-- scheduler.py    # AF3 LR scheduler (warmup -> plateau -> decay)
+|   |-- fused_loss.py   # Chunked-linear fused CE for distogram / PAE / PDE
+|   |-- ema.py          # Exponential Moving Average (constant decay, params-only)
+|   |-- scheduler.py    # AF3 LR scheduler (warmup -> plateau -> decay) + cosine
+|   |-- optim.py        # AdamW + WrappedOptimizer (NaN-skip + fp64 grad-norm)
+|   |-- state.py        # TrainState + seed_everything (deterministic mode)
+|   |-- data.py         # DataLoader assembly + worker RNG seeding
 |   +-- trainer.py      # DDP trainer (training loop, checkpointing, eval)
 |-- convert/af3.py      # Haiku -> PyTorch weight converter
 |-- io/                 # Output: mmCIF + confidences JSON
-+-- scripts/            # CLI: msa, inference, convert, plot, prepare, cluster, apply-clusters, train
++-- scripts/            # CLI: msa, inference, convert, plot, prepare, cluster, apply-clusters, msa-batch, import-msa, prepare-templates, scan-mmcif, enrich-manifest, drop-obsolete, warmup-triton, train
 ```
 
 ## References
 
-- Abramson, J. et al. "Accurate structure prediction of biomolecular interactions with AlphaFold 3." *Nature* (2024).
+- Abramson, J. et al. "Accurate structure prediction of biomolecular interactions with AlphaFold 3." _Nature_ (2024).
 - Data pipeline patterns adapted from [Boltz](https://github.com/jwohlwend/boltz) (MIT License).
 - Raw data processing patterns adapted from [Protenix](https://github.com/bytedance/Protenix) (Apache 2.0 License).
 

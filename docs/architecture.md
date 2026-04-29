@@ -55,33 +55,33 @@ Key constants (`model/model.py`):
 
 ### `primitives.py` -- Building Blocks
 
-| Class | Description |
-|---|---|
-| `LinearNoBias` | `nn.Linear(bias=False)` -- matches AF3's `hm.Linear` default (`use_bias=False`) |
-| `LayerNorm` | `nn.LayerNorm(elementwise_affine=True)` -- always has learnable scale+offset |
-| `AdaLayerNorm` | Adaptive LN: base LN (no learnable params) + conditioning -> sigmoid(scale) * x + bias |
-| `SwiGLU` | `swish(a) * b` where `[a, b] = linear(x).chunk(2)` |
-| `TransitionBlock` | LN -> SwiGLU feed-forward; `linear1: [c -> 2*c*factor]`, `linear2: [c*factor -> c]`; default factor=4 |
-| `AdaTransitionBlock` | AdaLN-zero conditioned FF for diffusion; `zero_cond` gate init at bias=-2; default factor=2 |
+| Class                | Description                                                                                           |
+| -------------------- | ----------------------------------------------------------------------------------------------------- |
+| `LinearNoBias`       | `nn.Linear(bias=False)` -- matches AF3's `hm.Linear` default (`use_bias=False`)                       |
+| `LayerNorm`          | `nn.LayerNorm(elementwise_affine=True)` -- always has learnable scale+offset                          |
+| `AdaLayerNorm`       | Adaptive LN: base LN (no learnable params) + conditioning -> sigmoid(scale) \* x + bias               |
+| `SwiGLU`             | `swish(a) * b` where `[a, b] = linear(x).chunk(2)`                                                    |
+| `TransitionBlock`    | LN -> SwiGLU feed-forward; `linear1: [c -> 2*c*factor]`, `linear2: [c*factor -> c]`; default factor=4 |
+| `AdaTransitionBlock` | AdaLN-zero conditioned FF for diffusion; `zero_cond` gate init at bias=-2; default factor=2           |
 
 ### `config.py` -- Configuration Hierarchy
 
 `ModelConfig` is the top-level config, containing nested dataclasses:
 
-| Config | Key Defaults |
-|---|---|
-| `ModelConfig` | `num_recycles=10` |
-| `EvoformerConfig` | `num_layer=4`, `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `num_msa=1024`, `max_relative_idx=32`, `max_relative_chain=2` |
-| `PairFormerConfig` | `num_layer=48`, `pair_channel=128`, `seq_channel=384`, `single_attention_num_head=16` |
-| `AtomCrossAttConfig` | `per_token_channels=768`, `per_atom_channels=128`, `per_atom_pair_channels=16`, `queries_subset_size=32`, `keys_subset_size=128` |
-| `AtomTransformerConfig` | `num_blocks=3`, `num_head=4`, `key_dim=128`, `value_dim=128` |
-| `DiffusionTransformerConfig` | `num_blocks=24`, `num_head=16`, `super_block_size=4`, `num_intermediate_factor=2` |
-| `DiffusionConfig` | `steps=200`, `num_samples=5`, `sigma_data=16.0`, `smin=0.0004`, `smax=160.0`, `noise_p=7.0`, `gamma_0=0.8`, `gamma_min=1.0`, `noise_scale=1.003`, `step_scale=1.5` |
-| `TemplateEmbeddingConfig` | `num_channels=64`, `pair_channel=128`, `dgram_num_bins=39`, `dgram_min_bin=3.25`, `dgram_max_bin=50.75`, `aatype_num_classes=31` |
-| `TemplatePairFormerConfig` | `num_layer=2`, `num_channels=64`, `num_heads=4`, `num_intermediate_factor=2` |
-| `ConfidenceConfig` | `num_layer=4`, `num_plddt_bins=50`, `num_distogram_bins=64`, `max_error_bin=31.0`, `max_atoms_per_token=24` |
-| `OptimConfig` | Fused kernel toggles; `FUSED_STATE_DICT_MARKERS` (tuple of key substrings for derived params) |
-| `DistogramConfig` | `num_bins=64`, `first_break=2.3125`, `last_break=21.6875` |
+| Config                       | Key Defaults                                                                                                                                                       |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ModelConfig`                | `num_recycles=10`                                                                                                                                                  |
+| `EvoformerConfig`            | `num_layer=4`, `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `num_msa=1024`, `max_relative_idx=32`, `max_relative_chain=2`                              |
+| `PairFormerConfig`           | `num_layer=48`, `pair_channel=128`, `seq_channel=384`, `single_attention_num_head=16`                                                                              |
+| `AtomCrossAttConfig`         | `per_token_channels=768`, `per_atom_channels=128`, `per_atom_pair_channels=16`, `queries_subset_size=32`, `keys_subset_size=128`                                   |
+| `AtomTransformerConfig`      | `num_blocks=3`, `num_head=4`, `key_dim=128`, `value_dim=128`                                                                                                       |
+| `DiffusionTransformerConfig` | `num_blocks=24`, `num_head=16`, `super_block_size=4`, `num_intermediate_factor=2`                                                                                  |
+| `DiffusionConfig`            | `steps=200`, `num_samples=5`, `sigma_data=16.0`, `smin=0.0004`, `smax=160.0`, `noise_p=7.0`, `gamma_0=0.8`, `gamma_min=1.0`, `noise_scale=1.003`, `step_scale=1.5` |
+| `TemplateEmbeddingConfig`    | `num_channels=64`, `pair_channel=128`, `dgram_num_bins=39`, `dgram_min_bin=3.25`, `dgram_max_bin=50.75`, `aatype_num_classes=31`                                   |
+| `TemplatePairFormerConfig`   | `num_layer=2`, `num_channels=64`, `num_heads=4`, `num_intermediate_factor=2`                                                                                       |
+| `ConfidenceConfig`           | `num_layer=4`, `num_plddt_bins=50`, `num_distogram_bins=64`, `max_error_bin=31.0`, `max_atoms_per_token=24`                                                        |
+| `OptimConfig`                | Fused kernel toggles; `FUSED_STATE_DICT_MARKERS` (tuple of key substrings for derived params)                                                                      |
+| `DistogramConfig`            | `num_bins=64`, `first_break=2.3125`, `last_break=21.6875`                                                                                                          |
 
 ### `embedders.py` -- Relative Encoding
 
@@ -307,7 +307,7 @@ Training infrastructure is in `src/deepfold3/training/`. See [training.md](train
 - **Loss**: Multi-component (diffusion MSE + smooth LDDT + distogram + confidence)
 - **DDP**: Native PyTorch `DistributedDataParallel` (no Lightning)
 - **Optimizer**: Adam with AF3-style LR schedule (warmup → plateau → step decay)
-- **EMA**: Exponential Moving Average with warm-start ramp
+- **EMA**: Exponential Moving Average with constant decay (params-only; buffers are init-time constants and not tracked)
 - **Config**: All hyperparameters in `TrainingConfig` dataclass — nothing hardcoded
 
 ## Fused Kernel Checkpoint Portability
@@ -315,8 +315,8 @@ Training infrastructure is in `src/deepfold3/training/`. See [training.md](train
 When fused Triton kernels are enabled (via `OptimConfig`), modules create derived parameter copies (e.g. `_fused_gate.*`, `_fused_ada_ln_linear.*`). These are **excluded** from checkpoints and EMA:
 
 - **`DeepFold3.state_dict()`** filters out keys matching `OptimConfig.FUSED_STATE_DICT_MARKERS`
-- **`DeepFold3.load_state_dict()`** relaxes `strict=True` when fused keys are absent, then calls `_sync_fused_kernels()` to rebuild derived params from base weights
-- **`EMA`** skips fused parameters during shadow initialization, and calls `_sync_fused_kernels()` after `apply()`/`restore()` to keep fused params consistent
+- **`DeepFold3.load_state_dict()`** relaxes `strict=True` when fused keys are absent; derived params are rebuilt from base weights at the next forward pass
+- **`EMA`** skips fused parameters during shadow initialization (they would double-decay against the base params they shadow)
 
 This ensures checkpoints are portable — the same `.pt` file loads correctly whether fused kernels are enabled or not. The marker list is defined once in `OptimConfig.FUSED_STATE_DICT_MARKERS`.
 

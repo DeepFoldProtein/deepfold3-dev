@@ -19,21 +19,21 @@ Organized reference from the AlphaFold 3 supplementary material (Abramson et al.
 
 **Protein databases (5):**
 
-| Database | Search tool | Max sequences |
-|----------|-------------|---------------|
-| UniRef90 | jackhmmer | 10,000 |
-| UniProt | jackhmmer | 50,000 |
-| Uniclust30 + BFD | HHBlits v3 | None |
-| Reduced BFD | jackhmmer | 5,000 |
-| MGnify | jackhmmer | 5,000 |
+| Database         | Search tool | Max sequences |
+| ---------------- | ----------- | ------------- |
+| UniRef90         | jackhmmer   | 10,000        |
+| UniProt          | jackhmmer   | 50,000        |
+| Uniclust30 + BFD | HHBlits v3  | None          |
+| Reduced BFD      | jackhmmer   | 5,000         |
+| MGnify           | jackhmmer   | 5,000         |
 
 **RNA databases (3):**
 
-| Database | Clustering tool | Search tool | Max sequences |
-|----------|----------------|-------------|---------------|
-| Rfam | mmseqs easy-cluster | nhmmer | 10,000 |
-| RNACentral | mmseqs easy-linclust | nhmmer | 10,000 |
-| Nucleotide collection | mmseqs easy-cluster | nhmmer | 10,000 |
+| Database              | Clustering tool      | Search tool | Max sequences |
+| --------------------- | -------------------- | ----------- | ------------- |
+| Rfam                  | mmseqs easy-cluster  | nhmmer      | 10,000        |
+| RNACentral            | mmseqs easy-linclust | nhmmer      | 10,000        |
+| Nucleotide collection | mmseqs easy-cluster  | nhmmer      | 10,000        |
 
 UniProt results kept separate for cross-chain pairing. All others stacked + deduplicated. During training, MSA subsampled: k = Uniform[1, n].
 
@@ -58,13 +58,13 @@ UniProt results kept separate for cross-chain pairing. All others stacked + dedu
 
 **5 datasets** (Table 3):
 
-| Name | Strategy | Weight |
-|------|----------|--------|
-| Weighted PDB | weighted | 0.5 |
-| Disordered protein PDB distillation | weighted | 0.02 |
-| Protein monomer distillation | uniform | 0.495 |
-| Short protein monomer distillation | uniform | 0.005 |
-| RNA distillation | uniform | 0.05 |
+| Name                                | Strategy | Weight |
+| ----------------------------------- | -------- | ------ |
+| Weighted PDB                        | weighted | 0.5    |
+| Disordered protein PDB distillation | weighted | 0.02   |
+| Protein monomer distillation        | uniform  | 0.495  |
+| Short protein monomer distillation  | uniform  | 0.005  |
+| RNA distillation                    | uniform  | 0.05   |
 
 (Transcription factor sets only during fine-tuning: negatives 0.011, positives 0.021)
 
@@ -78,13 +78,13 @@ Sample chains AND interfaces (chain pairs with min heavy atom separation < 5 Å)
 w ∝ (β_r / N_clust) × (α_prot × n_prot + α_nuc × n_nuc + α_ligand × n_ligand)
 ```
 
-| Parameter | Value |
-|-----------|-------|
-| β_chain | 0.5 |
-| β_interface | 1.0 |
-| α_prot | 3.0 |
-| α_nuc | 3.0 |
-| α_ligand | 1.0 |
+| Parameter   | Value |
+| ----------- | ----- |
+| β_chain     | 0.5   |
+| β_interface | 1.0   |
+| α_prot      | 3.0   |
+| α_nuc       | 3.0   |
+| α_ligand    | 1.0   |
 
 The selected chain/interface biases cropping to select crops near it.
 
@@ -100,12 +100,14 @@ The selected chain/interface biases cropping to select crops near it.
 ### §2.5.4 Filtering
 
 **Target-level:**
+
 - Released before 2021-09-30
 - Resolution ≤ 9 Å
 - Max 300 polymer chains (training), 1000 (evaluation)
 - Min 4 resolved residues per polymer chain
 
 **Bioassembly-level:**
+
 - Remove hydrogens
 - Remove all-unknown-residue polymer chains
 - Remove clashing chains (>30% of atoms within 1.7 Å of another chain; tie-break: higher clash %, then fewer atoms, then larger chain_id)
@@ -124,6 +126,7 @@ The selected chain/interface biases cropping to select crops near it.
 - Ligands → per-atom
 
 **Token centre atoms:**
+
 - Cα for standard amino acids
 - C1' for standard nucleotides
 - First (only) atom for per-atom tokens
@@ -132,11 +135,11 @@ The selected chain/interface biases cropping to select crops near it.
 
 Three strategies with dataset-specific weights:
 
-| Dataset | Contiguous | Spatial | Spatial interface |
-|---------|-----------|---------|-------------------|
-| Weighted PDB | 0.20 | 0.40 | 0.40 |
-| Disordered PDB | 0.20 | 0.40 | 0.40 |
-| Monomer distillation | 0.25 | 0.75 | 0.00 |
+| Dataset              | Contiguous | Spatial | Spatial interface |
+| -------------------- | ---------- | ------- | ----------------- |
+| Weighted PDB         | 0.20       | 0.40    | 0.40              |
+| Disordered PDB       | 0.20       | 0.40    | 0.40              |
+| Monomer distillation | 0.25       | 0.75    | 0.00              |
 
 - **Contiguous**: select contiguous sequences per chain (AlphaFold-Multimer Algorithm 1)
 - **Spatial**: random token centre atom as seed, expand by 3D proximity (AlphaFold-Multimer Algorithm 2)
@@ -148,18 +151,18 @@ For Weighted PDB / Disordered PDB: seed atom chosen from the selected chain/inte
 
 Key features:
 
-| Feature | Shape | Description |
-|---------|-------|-------------|
-| `token_bonds` | [N, N] | Polymer-ligand and ligand-ligand bonds; **bonds < 2.4 Å during training** |
-| `ref_pos` | [N_atom, 3] | Reference conformer with random rotation + translation |
-| `ref_element` | [N_atom, 128] | One-hot element up to atomic number 128 |
-| `ref_charge` | [N_atom] | Atom charge |
-| `ref_atom_name_chars` | [N_atom, 4, 64] | One-hot atom name (4 chars × 64 classes) |
-| `ref_space_uid` | [N_atom] | (chain_id, residue_index) → integer |
-| `msa` | [N_msa, N_token, 32] | One-hot MSA (32 classes) |
-| `profile` | [N_token, 32] | Residue type distribution in MSA |
-| `template_distogram` | [N_templ, N, N, 39] | Cβ distance histogram (38 bins, 3.25–50.75 Å) |
-| `template_unit_vector` | [N_templ, N, N, 3] | Cα displacement in local frame |
+| Feature                | Shape                | Description                                                               |
+| ---------------------- | -------------------- | ------------------------------------------------------------------------- |
+| `token_bonds`          | [N, N]               | Polymer-ligand and ligand-ligand bonds; **bonds < 2.4 Å during training** |
+| `ref_pos`              | [N_atom, 3]          | Reference conformer with random rotation + translation                    |
+| `ref_element`          | [N_atom, 128]        | One-hot element up to atomic number 128                                   |
+| `ref_charge`           | [N_atom]             | Atom charge                                                               |
+| `ref_atom_name_chars`  | [N_atom, 4, 64]      | One-hot atom name (4 chars × 64 classes)                                  |
+| `ref_space_uid`        | [N_atom]             | (chain_id, residue_index) → integer                                       |
+| `msa`                  | [N_msa, N_token, 32] | One-hot MSA (32 classes)                                                  |
+| `profile`              | [N_token, 32]        | Residue type distribution in MSA                                          |
+| `template_distogram`   | [N_templ, N, N, 39]  | Cβ distance histogram (38 bins, 3.25–50.75 Å)                             |
+| `template_unit_vector` | [N_templ, N, N, 3]   | Cα displacement in local frame                                            |
 
 ## §3.7.1 Diffusion Training
 
@@ -169,6 +172,7 @@ Key features:
 - **Noise schedule** (inference): t = σ_data × (s_max^(1/p) + t × (s_min^(1/p) − s_max^(1/p)))^p, s_max=160, s_min=4e-4, p=7, 200 steps
 
 **Loss (Eq. 6):**
+
 ```
 L_diffusion = (t² + σ_data²) / (t + σ_data)² × (L_MSE + α_bond × L_bond) + L_smooth_lddt
 ```
@@ -181,20 +185,20 @@ L_diffusion = (t² + σ_data²) / (t + σ_data)² × (L_MSE + α_bond × L_bond)
 
 ### §5.2 Training Stages
 
-| | Stage 1 | Fine-tune 1 | Fine-tune 2 | Fine-tune 3 |
-|---|---|---|---|---|
-| Crop size | 384 | 640 | 768 | 768 |
-| Init from | Random | Stage 1 | Fine-tune 1 | Fine-tune 2 |
-| Diffusion batch | 48 | 32 | 32 | 32 |
-| Bond loss weight | 0 | 1 | 1 | 1 |
-| Smooth LDDT | On | **Off** | On | N/A |
-| Train structure | Yes | Yes | Yes | No |
-| Train PAE | No | No | No | Yes |
-| Disorder PDB weight | 0.02 | 0.01 | 0.02 | 0.02 |
-| TF distillation | No | No | Yes | Yes |
-| Max chains | 20 | 20 | 20 | 50 |
-| Samples (M) | ~20 | ~1.5 | ~1.5 | ~1.8 |
-| Days (256 A100s) | ~10 | ~3 | ~5 | ~2 |
+|                     | Stage 1 | Fine-tune 1 | Fine-tune 2 | Fine-tune 3 |
+| ------------------- | ------- | ----------- | ----------- | ----------- |
+| Crop size           | 384     | 640         | 768         | 768         |
+| Init from           | Random  | Stage 1     | Fine-tune 1 | Fine-tune 2 |
+| Diffusion batch     | 48      | 32          | 32          | 32          |
+| Bond loss weight    | 0       | 1           | 1           | 1           |
+| Smooth LDDT         | On      | **Off**     | On          | N/A         |
+| Train structure     | Yes     | Yes         | Yes         | No          |
+| Train PAE           | No      | No          | No          | Yes         |
+| Disorder PDB weight | 0.02    | 0.01        | 0.02        | 0.02        |
+| TF distillation     | No      | No          | Yes         | Yes         |
+| Max chains          | 20      | 20          | 20          | 50          |
+| Samples (M)         | ~20     | ~1.5        | ~1.5        | ~1.8        |
+| Days (256 A100s)    | ~10     | ~3          | ~5          | ~2          |
 
 ### §5.3 Loss
 
@@ -202,27 +206,27 @@ L_diffusion = (t² + σ_data²) / (t + σ_data)² × (L_MSE + α_bond × L_bond)
 L = α_conf × (L_plddt + L_pde + L_resolved + α_pae × L_pae) + α_diff × L_diffusion + α_disto × L_distogram
 ```
 
-| Weight | Value |
-|--------|-------|
-| α_confidence | 1e-4 |
-| α_diffusion | 4.0 |
-| α_distogram | 3e-2 |
-| α_pae | 0 (stage 3: 1.0) |
+| Weight       | Value            |
+| ------------ | ---------------- |
+| α_confidence | 1e-4             |
+| α_diffusion  | 4.0              |
+| α_distogram  | 3e-2             |
+| α_pae        | 0 (stage 3: 1.0) |
 
 Confidence losses gated on resolution ∈ [0.1, 4.0] Å.
 
 ### §5.4 Optimization
 
-| Parameter | Value |
-|-----------|-------|
-| Optimizer | Adam |
-| β₁, β₂ | 0.9, 0.95 |
-| ε | 1e-8 |
-| Learning rate | 1.8e-3 |
-| Warmup | Linear, 1000 steps |
-| LR decay | ×0.95 every 50,000 steps |
-| Batch size | 256 |
-| Gradient clipping | L2 norm > 10 |
+| Parameter         | Value                    |
+| ----------------- | ------------------------ |
+| Optimizer         | Adam                     |
+| β₁, β₂            | 0.9, 0.95                |
+| ε                 | 1e-8                     |
+| Learning rate     | 1.8e-3                   |
+| Warmup            | Linear, 1000 steps       |
+| LR decay          | ×0.95 every 50,000 steps |
+| Batch size        | 256                      |
+| Gradient clipping | L2 norm > 10             |
 
 ### §5.5 Dropout
 

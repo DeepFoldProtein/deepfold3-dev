@@ -38,75 +38,75 @@ All intermediate representations use numpy structured arrays with explicit dtype
 
 ### `ATOM_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `x` | float32 | x coordinate (Å) |
-| `y` | float32 | y coordinate |
-| `z` | float32 | z coordinate |
-| `element` | int8 | Atomic number, clipped to [0, 127] |
-| `charge` | float16 | Formal charge |
-| `name` | S4 | Atom name (e.g. "CA", "C1'"), max 4 chars |
-| `is_present` | bool | Resolved in experimental structure |
-| `b_factor` | float32 | B-factor (experimental) or pLDDT (predicted) |
+| Field        | Type    | Description                                  |
+| ------------ | ------- | -------------------------------------------- |
+| `x`          | float32 | x coordinate (Å)                             |
+| `y`          | float32 | y coordinate                                 |
+| `z`          | float32 | z coordinate                                 |
+| `element`    | int8    | Atomic number, clipped to [0, 127]           |
+| `charge`     | float16 | Formal charge                                |
+| `name`       | S4      | Atom name (e.g. "CA", "C1'"), max 4 chars    |
+| `is_present` | bool    | Resolved in experimental structure           |
+| `b_factor`   | float32 | B-factor (experimental) or pLDDT (predicted) |
 
 ### `BOND_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `atom_1` | int32 | Global atom index |
-| `atom_2` | int32 | Global atom index |
-| `type` | int8 | Bond order: 1=single, 2=double, 3=triple, 4=aromatic |
+| Field    | Type  | Description                                          |
+| -------- | ----- | ---------------------------------------------------- |
+| `atom_1` | int32 | Global atom index                                    |
+| `atom_2` | int32 | Global atom index                                    |
+| `type`   | int8  | Bond order: 1=single, 2=double, 3=triple, 4=aromatic |
 
 ### `RESIDUE_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `name` | S5 | Residue name (3-letter code, e.g. "ALA", "DA") |
-| `res_type` | int16 | Index in `RES_TYPE_ORDER` (0-30) |
-| `mol_type` | int8 | `MOL_PROTEIN=0`, `MOL_DNA=1`, `MOL_RNA=2`, `MOL_NONPOLYMER=3` |
-| `res_id` | int32 | PDB sequence number |
-| `atom_idx` | int32 | Index of first atom in atoms array |
-| `atom_num` | int16 | Number of atoms |
-| `is_standard` | bool | Is a standard residue |
-| `is_present` | bool | Has resolved coordinates |
+| Field         | Type  | Description                                                   |
+| ------------- | ----- | ------------------------------------------------------------- |
+| `name`        | S5    | Residue name (3-letter code, e.g. "ALA", "DA")                |
+| `res_type`    | int16 | Index in `RES_TYPE_ORDER` (0-30)                              |
+| `mol_type`    | int8  | `MOL_PROTEIN=0`, `MOL_DNA=1`, `MOL_RNA=2`, `MOL_NONPOLYMER=3` |
+| `res_id`      | int32 | PDB sequence number                                           |
+| `atom_idx`    | int32 | Index of first atom in atoms array                            |
+| `atom_num`    | int16 | Number of atoms                                               |
+| `is_standard` | bool  | Is a standard residue                                         |
+| `is_present`  | bool  | Has resolved coordinates                                      |
 
 ### `CHAIN_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `name` | S4 | PDB chain ID |
-| `mol_type` | int8 | Molecule type |
+| Field       | Type  | Description                                 |
+| ----------- | ----- | ------------------------------------------- |
+| `name`      | S4    | PDB chain ID                                |
+| `mol_type`  | int8  | Molecule type                               |
 | `entity_id` | int32 | Entity group (same sequence -> same entity) |
-| `sym_id` | int32 | 0-based copy index within entity |
-| `asym_id` | int32 | Unique sequential chain index |
-| `res_idx` | int32 | Index of first residue |
-| `res_num` | int32 | Number of residues |
-| `atom_idx` | int32 | Index of first atom |
-| `atom_num` | int32 | Total atoms in chain |
+| `sym_id`    | int32 | 0-based copy index within entity            |
+| `asym_id`   | int32 | Unique sequential chain index               |
+| `res_idx`   | int32 | Index of first residue                      |
+| `res_num`   | int32 | Number of residues                          |
+| `atom_idx`  | int32 | Index of first atom                         |
+| `atom_num`  | int32 | Total atoms in chain                        |
 
 ### `TOKEN_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `token_idx` | int32 | Sequential token index |
-| `residue_index` | int32 | PDB residue number (polymer) or atom index (ligand) |
-| `res_type` | int16 | Index in `RES_TYPE_ORDER` |
-| `mol_type` | int8 | Molecule type |
-| `asym_id` | int32 | Chain ID |
-| `entity_id` | int32 | Entity ID |
-| `sym_id` | int32 | Symmetry ID |
-| `atom_idx` | int32 | Index in atoms array for this token's atoms |
-| `atom_num` | int16 | Number of atoms belonging to this token |
-| `center_x/y/z` | float32 | Representative atom coordinates (for spatial cropping) |
+| Field           | Type    | Description                                            |
+| --------------- | ------- | ------------------------------------------------------ |
+| `token_idx`     | int32   | Sequential token index                                 |
+| `residue_index` | int32   | PDB residue number (polymer) or atom index (ligand)    |
+| `res_type`      | int16   | Index in `RES_TYPE_ORDER`                              |
+| `mol_type`      | int8    | Molecule type                                          |
+| `asym_id`       | int32   | Chain ID                                               |
+| `entity_id`     | int32   | Entity ID                                              |
+| `sym_id`        | int32   | Symmetry ID                                            |
+| `atom_idx`      | int32   | Index in atoms array for this token's atoms            |
+| `atom_num`      | int16   | Number of atoms belonging to this token                |
+| `center_x/y/z`  | float32 | Representative atom coordinates (for spatial cropping) |
 
 ### `TOKEN_BOND_DTYPE`
 
-| Field | Type | Description |
-| ----- | ---- | ----------- |
-| `token_1` | int32 | Source token index |
-| `token_2` | int32 | Target token index |
-| `atom_1` | int16 | Atom index within token_1 |
-| `atom_2` | int16 | Atom index within token_2 |
+| Field     | Type  | Description               |
+| --------- | ----- | ------------------------- |
+| `token_1` | int32 | Source token index        |
+| `token_2` | int32 | Target token index        |
+| `atom_1`  | int16 | Atom index within token_1 |
+| `atom_2`  | int16 | Atom index within token_2 |
 
 Bonds include cross-entity bonds (disulfide, covalent, metal coordination) extracted from mmCIF `_struct_conn` and ligand intra-bonds from CCD. Backbone bonds are excluded (captured by sequence encoding).
 
@@ -336,7 +336,7 @@ The pairing algorithm relies on **MMseqs2's `pairaln` command**, which matches s
 7. RESULT2MSA: Convert to per-chain A3M files (msa-format-mode 5)
 ```
 
-Each chain gets its own paired A3M file. Row *i* in chain A's paired A3M and row *i* in chain B's paired A3M correspond to the same species. This is the cross-chain alignment.
+Each chain gets its own paired A3M file. Row _i_ in chain A's paired A3M and row _i_ in chain B's paired A3M correspond to the same species. This is the cross-chain alignment.
 
 For server mode (ColabFold API), the server runs `pairgreedy` or `paircomplete` modes internally and returns paired tar.gz alongside unpaired results.
 
@@ -422,17 +422,17 @@ The batch command identifies all multimer records (>1 valid protein chain), runs
 
 #### Comparison with Other Implementations
 
-| Aspect | DeepFold3 | OpenFold 3 | Protenix |
-|--------|-----------|------------|----------|
-| Pairing source | MMseqs2 `pairaln` (species-based) | Species-based alignment (custom) | Species-based alignment (custom) |
-| Storage | Separate paired/unpaired NPZ per chain | Single `MsaArrayCollection` (parsed/processed dicts) | Feature dict with `_all_seq` suffix |
-| Row layout | Paired (full-width) + unpaired (dense) | Query + paired + main (per-chain vstacked) | Paired (`_all_seq`) + unpaired (concatenated) |
-| Paired row count | `min(counts)` across chains, cap 8192 | `n_rows_paired_subsampled + 1` (includes query) | `prot_paired_num_alignments` (excludes query) |
-| Unpaired layout | Dense: row *i* has ALL chains' row *i* | Per-chain independent depth, padded | Padded to equal depth, then concat |
-| Partial pairing | Supported (missing chain = full gap row) | Configurable `min_chains_paired_partial` | All ≥2 chain species paired |
-| Subsampling | Global cap (`max_msa_seqs`) | Global `max_rows` split between paired/main | `max_size // 2` for paired, rest for unpaired |
-| Deduplication | Not explicit | Removes main rows present in paired | Removes unpaired rows present in paired |
-| Species sorting | MMseqs2 internal | Row-product ranking | Log-product ranking |
+| Aspect           | DeepFold3                                | OpenFold 3                                           | Protenix                                      |
+| ---------------- | ---------------------------------------- | ---------------------------------------------------- | --------------------------------------------- |
+| Pairing source   | MMseqs2 `pairaln` (species-based)        | Species-based alignment (custom)                     | Species-based alignment (custom)              |
+| Storage          | Separate paired/unpaired NPZ per chain   | Single `MsaArrayCollection` (parsed/processed dicts) | Feature dict with `_all_seq` suffix           |
+| Row layout       | Paired (full-width) + unpaired (dense)   | Query + paired + main (per-chain vstacked)           | Paired (`_all_seq`) + unpaired (concatenated) |
+| Paired row count | `min(counts)` across chains, cap 8192    | `n_rows_paired_subsampled + 1` (includes query)      | `prot_paired_num_alignments` (excludes query) |
+| Unpaired layout  | Dense: row _i_ has ALL chains' row _i_   | Per-chain independent depth, padded                  | Padded to equal depth, then concat            |
+| Partial pairing  | Supported (missing chain = full gap row) | Configurable `min_chains_paired_partial`             | All ≥2 chain species paired                   |
+| Subsampling      | Global cap (`max_msa_seqs`)              | Global `max_rows` split between paired/main          | `max_size // 2` for paired, rest for unpaired |
+| Deduplication    | Not explicit                             | Removes main rows present in paired                  | Removes unpaired rows present in paired       |
+| Species sorting  | MMseqs2 internal                         | Row-product ranking                                  | Log-product ranking                           |
 
 ## Parsing Stage
 
@@ -490,7 +490,7 @@ def fetch_pdb_mmcif(pdb_id, cache_dir=None, pdb_mmcif_dir=None) -> str:
 - Groups m8 hits across chains by template PDB ID; PDB IDs hitting ≥2 query chains are multimer template candidates
 - Uses `scipy.optimize.linear_sum_assignment` (Hungarian algorithm) for optimal query-to-template chain pairing
 - Self-hit exclusion: skips template PDB ID == training PDB ID
-- Offline preprocessing: `deepfold3 prepare-templates --data-dir ... --m8-dir ...` writes `{data_dir}/templates/{pdb_id}.json`
+- Offline preprocessing: `deepfold3 prepare-templates --data-dir ... --m8-dir ...` writes `{data_dir}/templates/{pdb_id}.json`. Auto-consumes `data/mmcif_meta.json` from `scan-mmcif` to populate `release_date` per hit (required for the training-time date cutoff to admit templates; without it every hit is dropped). Override with `--mmcif-cache <path>` or disable by pointing to a non-existent file.
 - Training-time: `TrainingDataset` loads template JSON index, reads mmCIF from PDB mirror, extracts `TemplateFeatures` via existing `_extract_from_index_pairs()`
 - Template augmentation: each sample randomly uses 0..max_templates (uniform), sampling from available hits
 - Per-chain dropout: for multimer templates, each chain alignment is independently kept with 50% probability (at least 1 chain always kept), creating partial multimer context during training
@@ -610,39 +610,39 @@ class Featurizer:
 
 N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 
-| Feature | Shape | Dtype | Description |
-| ------- | ----- | ----- | ----------- |
-| `res_type` | `[N]` | int64 | Token type (0-19=AA, 20=UNK, 21=gap, 22-25=RNA, 26-29=DNA, 30=N) |
-| `residue_index` | `[N]` | int64 | Residue number (1-based for polymer) |
-| `token_index` | `[N]` | int64 | Sequential token index (0-based) |
-| `asym_id` | `[N]` | int64 | Chain ID |
-| `entity_id` | `[N]` | int64 | Entity ID |
-| `sym_id` | `[N]` | int64 | Symmetry ID |
-| `mol_type` | `[N]` | int64 | Molecule type (0=protein, 1=DNA, 2=RNA, 3=non-polymer) |
-| `token_res_name` | `[N, 5]` | int8 | Residue name as ASCII bytes (e.g. "ALA", "PCG"), 0-padded |
-| `seq_mask` | `[N]` | bool | Valid token mask |
-| `pair_mask` | `[N, N]` | bool | `seq_mask[:, None] & seq_mask[None, :]` |
-| `frames_mask` | `[N]` | bool | True for polymer tokens with a complete rigid frame (protein/RNA/DNA, all three frame atoms present) |
-| `token_to_rep_atom` | `[N]` | int64 | Representative atom index: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand |
-| `frame_atom_index` | `[N, 3]` | int64 | Indices of the three atoms used to build each token's rigid frame: (N, CA, C) for proteins, (C1', C3', C4') for nucleic acids, zeros for ligand tokens (gated out by `frames_mask`). Used by the frame-aligned PAE loss (AF3 §4.3.2). |
-| `ref_pos` | `[N, M, 3]` | float32 | Reference atom positions (CCD ideal coords) |
-| `ref_mask` | `[N, M]` | bool | Valid atom mask |
-| `ref_element` | `[N, M]` | int64 | Atomic number (0-127 via `ELEMENT_TO_INT`) |
-| `ref_charge` | `[N, M]` | float32 | Formal charge |
-| `ref_atom_name_chars` | `[N, M, 4]` | int64 | Atom name encoding: `ord(c)-32` for each char of `name.ljust(4)[:4]` |
-| `ref_space_uid` | `[N, M]` | int64 | Reference space group ID: token_idx for polymer, first token of ligand residue for ligand atoms |
-| `msa` | `[S, N]` | int64 | MSA sequences: query row + paired rows + unpaired block-diagonal rows |
-| `msa_mask` | `[S, N]` | bool | MSA validity mask (cross-chain gaps are valid; only padding is False) |
-| `deletion_matrix` | `[S, N]` | int64 | Raw deletion counts (number of insertions before each match state) |
-| `profile` | `[N, 31]` | float32 | Per-position residue frequency (includes gap class at idx 21) |
-| `deletion_mean` | `[N]` | float32 | `mean(deletion_matrix, dim=0)` -- raw mean, arctan applied later in model |
-| `template_aatype` | `[T, N]` | int64 | Template residue types (same vocab as `res_type`) |
-| `template_pseudo_beta` | `[T, N, 3]` | float32 | Template CB positions (CA for GLY) |
-| `template_pseudo_beta_mask` | `[T, N]` | bool | Valid pseudo-beta mask |
-| `template_backbone_frame` | `[T, N, 3, 3]` | float32 | Template backbone frames (Gram-Schmidt from N/CA/C) |
-| `template_backbone_mask` | `[T, N]` | bool | Valid backbone frame mask |
-| `mask_fixed` | `[N]` | float32 | *(optional)* Token-level fixed mask: 1.0=experimental, 0.0=model-generated (e.g. PATCHR ATLAS). Scales `exp_resolved` loss target. |
-| `mask_region` | `[N]` | int16 | *(optional)* Region label (0=unset, 1+=app-defined, e.g. CDR-H1/H2/H3). Drives per-token `region_loss_weights` in diffusion MSE. |
+| Feature                     | Shape          | Dtype   | Description                                                                                                                                                                                                                           |
+| --------------------------- | -------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `res_type`                  | `[N]`          | int64   | Token type (0-19=AA, 20=UNK, 21=gap, 22-25=RNA, 26-29=DNA, 30=N)                                                                                                                                                                      |
+| `residue_index`             | `[N]`          | int64   | Residue number (1-based for polymer)                                                                                                                                                                                                  |
+| `token_index`               | `[N]`          | int64   | Sequential token index (0-based)                                                                                                                                                                                                      |
+| `asym_id`                   | `[N]`          | int64   | Chain ID                                                                                                                                                                                                                              |
+| `entity_id`                 | `[N]`          | int64   | Entity ID                                                                                                                                                                                                                             |
+| `sym_id`                    | `[N]`          | int64   | Symmetry ID                                                                                                                                                                                                                           |
+| `mol_type`                  | `[N]`          | int64   | Molecule type (0=protein, 1=DNA, 2=RNA, 3=non-polymer)                                                                                                                                                                                |
+| `token_res_name`            | `[N, 5]`       | int8    | Residue name as ASCII bytes (e.g. "ALA", "PCG"), 0-padded                                                                                                                                                                             |
+| `seq_mask`                  | `[N]`          | bool    | Valid token mask                                                                                                                                                                                                                      |
+| `pair_mask`                 | `[N, N]`       | bool    | `seq_mask[:, None] & seq_mask[None, :]`                                                                                                                                                                                               |
+| `frames_mask`               | `[N]`          | bool    | True for polymer tokens with a complete rigid frame (protein/RNA/DNA, all three frame atoms present)                                                                                                                                  |
+| `token_to_rep_atom`         | `[N]`          | int64   | Representative atom index: CB for protein (CA for GLY), C1' for nucleic, 0 for ligand                                                                                                                                                 |
+| `frame_atom_index`          | `[N, 3]`       | int64   | Indices of the three atoms used to build each token's rigid frame: (N, CA, C) for proteins, (C1', C3', C4') for nucleic acids, zeros for ligand tokens (gated out by `frames_mask`). Used by the frame-aligned PAE loss (AF3 §4.3.2). |
+| `ref_pos`                   | `[N, M, 3]`    | float32 | Reference atom positions (CCD ideal coords)                                                                                                                                                                                           |
+| `ref_mask`                  | `[N, M]`       | bool    | Valid atom mask                                                                                                                                                                                                                       |
+| `ref_element`               | `[N, M]`       | int64   | Atomic number (0-127 via `ELEMENT_TO_INT`)                                                                                                                                                                                            |
+| `ref_charge`                | `[N, M]`       | float32 | Formal charge                                                                                                                                                                                                                         |
+| `ref_atom_name_chars`       | `[N, M, 4]`    | int64   | Atom name encoding: `ord(c)-32` for each char of `name.ljust(4)[:4]`                                                                                                                                                                  |
+| `ref_space_uid`             | `[N, M]`       | int64   | Reference space group ID: token_idx for polymer, first token of ligand residue for ligand atoms                                                                                                                                       |
+| `msa`                       | `[S, N]`       | int64   | MSA sequences: query row + paired rows + unpaired block-diagonal rows                                                                                                                                                                 |
+| `msa_mask`                  | `[S, N]`       | bool    | MSA validity mask (cross-chain gaps are valid; only padding is False)                                                                                                                                                                 |
+| `deletion_matrix`           | `[S, N]`       | int64   | Raw deletion counts (number of insertions before each match state)                                                                                                                                                                    |
+| `profile`                   | `[N, 31]`      | float32 | Per-position residue frequency (includes gap class at idx 21)                                                                                                                                                                         |
+| `deletion_mean`             | `[N]`          | float32 | `mean(deletion_matrix, dim=0)` -- raw mean, arctan applied later in model                                                                                                                                                             |
+| `template_aatype`           | `[T, N]`       | int64   | Template residue types (same vocab as `res_type`)                                                                                                                                                                                     |
+| `template_pseudo_beta`      | `[T, N, 3]`    | float32 | Template CB positions (CA for GLY)                                                                                                                                                                                                    |
+| `template_pseudo_beta_mask` | `[T, N]`       | bool    | Valid pseudo-beta mask                                                                                                                                                                                                                |
+| `template_backbone_frame`   | `[T, N, 3, 3]` | float32 | Template backbone frames (Gram-Schmidt from N/CA/C)                                                                                                                                                                                   |
+| `template_backbone_mask`    | `[T, N]`       | bool    | Valid backbone frame mask                                                                                                                                                                                                             |
+| `mask_fixed`                | `[N]`          | float32 | _(optional)_ Token-level fixed mask: 1.0=experimental, 0.0=model-generated (e.g. PATCHR ATLAS). Scales `exp_resolved` loss target.                                                                                                    |
+| `mask_region`               | `[N]`          | int16   | _(optional)_ Region label (0=unset, 1+=app-defined, e.g. CDR-H1/H2/H3). Drives per-token `region_loss_weights` in diffusion MSE.                                                                                                      |
 
 ### Reference Atom Augmentation
 
@@ -728,14 +728,14 @@ def collate_fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
 **Residue type vocabulary** (`RES_TYPE_ORDER`, 31 classes):
 
-| Index | Type |
-| ----- | ---- |
-| 0-19 | 20 standard amino acids (ALA, ARG, ASN, ..., VAL) |
-| 20 | UNK (unknown protein) |
-| 21 | `-` (gap) |
-| 22-25 | RNA (A, G, C, U) |
-| 26-29 | DNA (DA, DG, DC, DT) |
-| 30 | N (unknown nucleic) |
+| Index | Type                                              |
+| ----- | ------------------------------------------------- |
+| 0-19  | 20 standard amino acids (ALA, ARG, ASN, ..., VAL) |
+| 20    | UNK (unknown protein)                             |
+| 21    | `-` (gap)                                         |
+| 22-25 | RNA (A, G, C, U)                                  |
+| 26-29 | DNA (DA, DG, DC, DT)                              |
+| 30    | N (unknown nucleic)                               |
 
 **MSA vocabulary** (`MSA_VOCAB_SIZE = 32`): Same indices as `RES_TYPE_ORDER` for overlapping types. Ambiguous amino acid codes mapped to nearest standard (e.g., B->ASP, Z->GLU, U->CYS).
 
@@ -777,16 +777,16 @@ Two-level filtering controlled by `StructureFilterConfig`:
 
 **Structure-level** (`filter_structure_metadata`) — reject entire structures (cheap, metadata only):
 
-| Filter | CLI flag | Default |
-|--------|----------|---------|
-| max_resolution | `--max-resolution` | disabled |
-| min_resolution | `--min-resolution` | disabled |
-| allowed_methods | `--methods` | disabled |
-| max_release_date | `--max-date` | disabled |
-| min_release_date | `--min-date` | disabled |
-| max_chains | `--max-chains` | 300 |
-| max_total_residues | `--max-total-residues` | 16384 |
-| min_polymer_chains | `--min-polymer-chains` | 1 |
+| Filter             | CLI flag               | Default  |
+| ------------------ | ---------------------- | -------- |
+| max_resolution     | `--max-resolution`     | disabled |
+| min_resolution     | `--min-resolution`     | disabled |
+| allowed_methods    | `--methods`            | disabled |
+| max_release_date   | `--max-date`           | disabled |
+| min_release_date   | `--min-date`           | disabled |
+| max_chains         | `--max-chains`         | 300      |
+| max_total_residues | `--max-total-residues` | 16384    |
+| min_polymer_chains | `--min-polymer-chains` | 1        |
 
 **Chain-level** (`filter_structure`) — mark individual chains as `valid=False`:
 
@@ -821,6 +821,7 @@ Two import commands share the same materialize machinery (parallel A3M parse →
 - `deepfold3 import-paired-msa --data-dir <dir> --paired-dir <complex_dir> --workers N` — per-complex paired MSAs (record-specific)
 
 Both:
+
 1. Try a direct filename lookup `{src}/{msa_id}.a3m` first (free for files already named by msa hash)
 2. Fall back to a content-hash index built from the source dir (slow, only used if filenames don't match)
 3. Parse A3M in place by default; pass `--keep-a3m` to also copy the source A3M alongside the NPZ
@@ -866,10 +867,10 @@ Use the helpers in `data/paths.py` (`structure_path`, `mask_path`, `template_pat
 
 `deepfold3 enrich-manifest` fills `structure_info` (`resolution`, `method`, `deposited`, `released`) on every record. Two complementary sources, both optional but at least one required:
 
-- `--idx <entries.idx>` — fast TSV pass over the wwPDB ``entries.idx`` derived-data file. Fills ``resolution`` (X-ray entries only), ``method``, and ``deposited``. Does **not** carry release dates.
-- `--mmcif-cache <cache.json>` — JSON metadata cache produced by `deepfold3 scan-mmcif`. Fills ``released`` (= the earliest ``_pdbx_audit_revision_history.revision_date``, matching AlphaFold 3's template date-cutoff convention) and any other field still blank.
+- `--idx <entries.idx>` — fast TSV pass over the wwPDB `entries.idx` derived-data file. Fills `resolution` (X-ray entries only), `method`, and `deposited`. Does **not** carry release dates.
+- `--mmcif-cache <cache.json>` — JSON metadata cache produced by `deepfold3 scan-mmcif`. Fills `released` (= the earliest `_pdbx_audit_revision_history.revision_date`, matching AlphaFold 3's template date-cutoff convention) and any other field still blank. Defaults to `data/mmcif_meta.json`, the same default used by `scan-mmcif --output` and `prepare-templates --mmcif-cache`.
 
-`deepfold3 scan-mmcif --mmcif-dir <pdb_mirror> --data-dir <data_dir> --output cache.json --workers N` walks the local mirror (parallel gemmi parse) and dumps `{pdb_id: {resolution, method, deposited, released}}` JSON. AF3-aligned: tries `_refine.ls_d_res_high` → `_em_3d_reconstruction.resolution` → `_reflns.d_resolution_high` for resolution and lowercases the comma-joined `_exptl.method` list. Implementation: `data/prepare/structure.py:extract_mmcif_metadata`. The fast path constructs `{mid2}/{pdb_id}.cif.gz` directly to avoid `find_pdb_mmcif_path`'s 9-candidate stat scan per entry.
+`deepfold3 scan-mmcif --mmcif-dir <pdb_mirror> --data-dir <data_dir> [--output cache.json] --workers N` walks the local mirror (parallel gemmi parse) and dumps `{pdb_id: {resolution, method, deposited, released}}` JSON. `--output` defaults to `data/mmcif_meta.json`; `prepare-templates` and `enrich-manifest` read from that same default, so running them from the repo root wires end-to-end automatically. AF3-aligned: tries `_refine.ls_d_res_high` → `_em_3d_reconstruction.resolution` → `_reflns.d_resolution_high` for resolution and lowercases the comma-joined `_exptl.method` list. Implementation: `data/prepare/structure.py:extract_mmcif_metadata`. The fast path constructs `{mid2}/{pdb_id}.cif.gz` directly to avoid `find_pdb_mmcif_path`'s 9-candidate stat scan per entry.
 
 ### Dropping Obsolete Records
 

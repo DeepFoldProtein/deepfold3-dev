@@ -107,14 +107,14 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 
 | Loss            | Weight                             | Description                                                                                                                                                                    |
 | --------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Diffusion MSE   | `alpha_diffusion` (4.0)            | EDM-weighted MSE: w(σ) = (σ²+σ_d²)/(σ·σ_d)²; mol-type reweight: DNA/RNA 5×, ligand 10×                                                                                         |
+| Diffusion MSE   | `alpha_diffusion` (4.0)            | EDM-weighted MSE per AF3 §5.3 eq. 3: `(1/3) · Σ‖Δ‖²·w·mask / Σ mask` (per-coordinate average; denominator is atom count, not sum-of-weights). w(σ) = (σ²+σ_d²)/(σ·σ_d)²; mol-type reweight: DNA/RNA 5×, ligand 10×. |
 | Smooth LDDT     | `alpha_diffusion` (4.0)            | Distance-based accuracy (cutoffs: 0.5, 1.0, 2.0, 4.0 Å)                                                                                                                        |
 | Bond violation  | `alpha_diffusion × alpha_bond` (0) | MSE on bonded atom distances vs observed GT; enable for stage 2                                                                                                                |
 | Distogram       | `alpha_distogram` (0.03)           | Cross-entropy on 64-bin distance predictions                                                                                                                                   |
-| pLDDT           | `alpha_confidence` (1e-4)          | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å                                                                                                |
+| pLDDT           | `alpha_confidence` (1e-4)          | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å. AF3 §4.3.1: j-axis restricted to representative atoms (CA / C1') of standard polymer tokens, with inclusion radius 15 Å for protein-rep j and 30 Å for nucleic-rep j; ligand j atoms drop. |
 | PDE             | `alpha_confidence` (1e-4)          | Predicted distance error cross-entropy                                                                                                                                         |
 | exp_resolved    | `alpha_confidence` (1e-4)          | Binary resolved/unresolved classification                                                                                                                                      |
-| PAE             | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1)                                                                                         |
+| PAE             | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1). Frames whose ∠(a, b, c) lies within 25° of co-linearity are dropped per-sample on both pred and GT. |
 | Single-repr reg | `alpha_single_reg` (0)             | Magnitude regularizer on trunk single output: mean per-token Σ_c &#124;s&#124;^p / C. Observation-only at α=0.                                                                 |
 | Pair-repr reg   | `alpha_pair_reg` (1e-4)            | Same form on pair output. Controls DistogramHead logit magnitude; prevents late-trajectory distogram destabilization (see [regularization-story.md](regularization-story.md)). |
 
@@ -136,14 +136,13 @@ Default: lr=0.0018, warmup=1000, decay starts at 50k, factor=0.95 every 50k.
 
 ### EMA
 
-Exponential Moving Average with warm-start ramp:
+Constant-decay exponential moving average (matches OF3 `ExponentialMovingAverage`):
 
 ```
-effective_decay = min(decay, (1 + n_updates) / (10 + n_updates))
-shadow = (1 - effective_decay) × param + effective_decay × shadow
+shadow = (1 - decay) × param + decay × shadow
 ```
 
-EMA weights are swapped in for evaluation and saved in checkpoints. Fused kernel parameters are excluded from EMA shadow copies (they are derived from base weights). After `apply()`/`restore()`, fused kernels are re-synced automatically.
+EMA weights are swapped in for evaluation (zero-copy pointer swap on `param.data`) and saved in checkpoints. Buffers are not tracked — DF3 buffers are constants set once at init (Fourier weights, ref-atom tables) or shadows derived from base params (fused/tiled kernels), so EMAing them would either be a no-op or actively wrong. Fused-kernel parameters are excluded from EMA shadow copies for the same reason — they are re-derived from base weights at every step.
 
 ### Recycling
 
@@ -229,11 +228,13 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py`: rea
 deepfold3 prepare --mmcif-dir /scratch/pdb/mmCIF --output /data/training \
     --max-resolution 9.0 --workers 16
 
-# 2. Enrich manifest with release dates (needed for template date cutoff)
-deepfold3 scan-mmcif --mmcif-dir /scratch/pdb/mmCIF --data-dir /data/training \
-    --output mmcif_meta.json --workers 32
-deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx \
-    --mmcif-cache mmcif_meta.json
+# 2. Enrich manifest with release dates (needed for template date cutoff).
+#    ``scan-mmcif`` defaults to ``--output data/mmcif_meta.json``, which is
+#    also the default ``--mmcif-cache`` for ``prepare-templates`` and
+#    ``enrich-manifest`` — just run them from the repo root and wiring
+#    happens automatically.
+deepfold3 scan-mmcif --mmcif-dir /scratch/pdb/mmCIF --data-dir /data/training --workers 32
+deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
 
 # 3. Apply sequence clustering (40% identity, wwPDB pre-computed)
 wget -q https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-40.txt
@@ -247,7 +248,9 @@ deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ \
     --gpu --use-pairing
 
-# 6. Discover monomer templates (per-chain m8 hits)
+# 6. Discover monomer templates (per-chain m8 hits). Auto-uses
+#    ``data/mmcif_meta.json`` from step 2 as the release-date source; without
+#    it every hit gets ``release_date=None`` and is dropped at training time.
 deepfold3 prepare-templates --data-dir /data/training \
     --m8-dir /data/msa/pdb/merged/m8 --max-templates 20 --workers 16
 

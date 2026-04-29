@@ -42,18 +42,18 @@ uv run pytest -m "not slow"                  # skip slow tests
 
 14 test files, ~190 tests total:
 
-| File | Purpose |
-|---|---|
-| `test_primitives.py` | LinearNoBias, LayerNorm, SwiGLU, TransitionBlock, AdaLayerNorm |
-| `test_attention.py` | GridSelfAttention (row/col), MSAAttention, SingleAttention |
-| `test_ops.py` | TriangleMul (incoming/outgoing), OuterProductMean |
-| `test_embedders.py` | Relative encoding, profile, deletion mean |
-| `test_evoformer.py` | EvoformerBlock, PairFormerBlock, full Evoformer |
-| `test_diffusion.py` | Noise schedule, Fourier embedding, random augmentation |
-| `test_jax_comparison.py` | PyTorch vs JAX/Haiku numerical validation |
-| `test_weight_loading.py` | AF3 weight converter: missing/unexpected keys, shapes |
-| `test_e2e.py` | Full forward pass, distogram properties, data pipeline |
-| `test_ligand.py` | CCD molecule loading, SMILES, JSON parsing, ligand featurization |
+| File                     | Purpose                                                          |
+| ------------------------ | ---------------------------------------------------------------- |
+| `test_primitives.py`     | LinearNoBias, LayerNorm, SwiGLU, TransitionBlock, AdaLayerNorm   |
+| `test_attention.py`      | GridSelfAttention (row/col), MSAAttention, SingleAttention       |
+| `test_ops.py`            | TriangleMul (incoming/outgoing), OuterProductMean                |
+| `test_embedders.py`      | Relative encoding, profile, deletion mean                        |
+| `test_evoformer.py`      | EvoformerBlock, PairFormerBlock, full Evoformer                  |
+| `test_diffusion.py`      | Noise schedule, Fourier embedding, random augmentation           |
+| `test_jax_comparison.py` | PyTorch vs JAX/Haiku numerical validation                        |
+| `test_weight_loading.py` | AF3 weight converter: missing/unexpected keys, shapes            |
+| `test_e2e.py`            | Full forward pass, distogram properties, data pipeline           |
+| `test_ligand.py`         | CCD molecule loading, SMILES, JSON parsing, ligand featurization |
 
 ### Fixtures (`conftest.py`)
 
