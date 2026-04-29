@@ -22,6 +22,7 @@ except ImportError as e:
 
 from deepfold3.data import const
 from deepfold3.data.parse.mmcif import mol_type_from_gemmi
+from deepfold3.data.prepare.canonical import get_canonical_one_letter, get_canonical_three_letter
 from deepfold3.data.types import (
     ATOM_DTYPE,
     BOND_DTYPE,
@@ -307,6 +308,9 @@ def process_mmcif(
     # loops; _read_cif_lenient strips them as a fallback.
     doc = _read_cif_lenient(path)
     st = gemmi.make_structure_from_block(doc[0])
+    # Populate entity.full_sequence from _entity_poly_seq / _entity_poly so we can
+    # compute canonical-sequence-based msa_id below (AF3 §2 spec). Idempotent.
+    st.setup_entities()
     file_stem = Path(path).stem.split(".")[0].lower()
     # Use entry ID from CIF, but fall back to filename for generic IDs
     # (e.g. ModelCIF files use "_entry.id model")
@@ -322,10 +326,25 @@ def process_mmcif(
 
     # Build entity → mol_type mapping
     entity_mol_type: dict[str, int] = {}
+    # Build entity → canonical 3-letter / 1-letter sequence mappings.
+    # Canonical sequence = _entity_poly.pdbx_seq_one_letter_code_can equivalent
+    # (gemmi's entity.full_sequence after setup_entities()), with non-standard
+    # residues mapped to standard parents. Used for ``msa_id`` hashing and the
+    # MSA query string. Polymer entities only — ligands keep observed-derived
+    # behaviour.
+    entity_canonical_three: dict[str, list[str]] = {}
+    entity_canonical_one: dict[str, str] = {}
     for entity in st.entities:
         mt = mol_type_from_gemmi(entity)
         if mt is not None:
             entity_mol_type[entity.name] = mt
+        if mt is not None and mt != const.MOL_NONPOLYMER:
+            three = get_canonical_three_letter(entity)
+            if three is not None:
+                entity_canonical_three[entity.name] = three
+                one = get_canonical_one_letter(entity)
+                if one is not None:
+                    entity_canonical_one[entity.name] = one
 
     # Expand assembly or use asymmetric unit
     if use_assembly:
@@ -395,6 +414,7 @@ def process_mmcif(
 
     chain_infos: list[ChainInfo] = []
     chain_atom_coords: dict[int, np.ndarray] = {}  # asym_id → coords for interface detection
+    chain_canonical_seqs: dict[int, str] = {}  # asym_id → canonical one-letter seq (polymer chains only)
     # Atom lookup for cross-entity bond extraction: (chain_label, res_id, atom_name) → global atom index
     # Uses parent chain.name as key because gemmi connections reference label_asym_id
     # which corresponds to the parent chain (not the subchain) after assembly expansion.
@@ -502,8 +522,26 @@ def process_mmcif(
             if not chain_res_data:
                 continue
 
-            # Entity/sym assignment
-            seq_key = _chain_sequence(chain_res_data)
+            # Entity/sym assignment.
+            # Polymer chains: hash the canonical (entity.full_sequence) 3-letter list
+            # so msa_id is stable under disorder and matches AF3 §2 / external MSA stashes.
+            # Ligands and pathological inputs (no full_sequence): fall back to observed.
+            canonical_three = entity_canonical_three.get(entity_name)
+            if canonical_three is not None:
+                seq_key = "|".join(canonical_three)
+                # Stash canonical one-letter for the MSA-query path (Structure NPZ).
+                canonical_one = entity_canonical_one.get(entity_name)
+                if canonical_one is not None:
+                    chain_canonical_seqs[asym_id] = canonical_one
+            else:
+                if mol_type != const.MOL_NONPOLYMER:
+                    logger.warning(
+                        "%s/%s: no canonical sequence for entity %s, falling back to observed",
+                        pdb_id,
+                        chain.name,
+                        entity_name,
+                    )
+                seq_key = _chain_sequence(chain_res_data)
             if seq_key in seq_to_entity:
                 entity_id = seq_to_entity[seq_key][0]
                 sym_id = seq_to_entity[seq_key][1]
@@ -590,6 +628,7 @@ def process_mmcif(
         residues=residues_arr,
         chains=chains_arr,
         name=pdb_id,
+        chain_canonical_seqs=chain_canonical_seqs if chain_canonical_seqs else None,
     )
 
     # Compute interfaces

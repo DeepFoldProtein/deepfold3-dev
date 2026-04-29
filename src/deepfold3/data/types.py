@@ -100,16 +100,28 @@ class Structure:
     residues: np.ndarray  # RESIDUE_DTYPE
     chains: np.ndarray  # CHAIN_DTYPE
     name: str = field(default="unset")
+    # Canonical one-letter sequence per polymer chain (asym_id → seq).
+    # Source: ``_entity_poly.pdbx_seq_one_letter_code_can`` (gemmi
+    # ``entity.full_sequence`` after ``setup_entities()``). Includes disordered
+    # residues; modified residues mapped to standard parents. None / missing
+    # asym_ids fall back to observed-residue extraction at MSA query time.
+    chain_canonical_seqs: dict[int, str] | None = None
 
     def save(self, path: Path) -> None:
-        np.savez_compressed(
-            str(path),
-            atoms=self.atoms,
-            bonds=self.bonds,
-            residues=self.residues,
-            chains=self.chains,
-            name=np.array(self.name),
-        )
+        kwargs: dict[str, np.ndarray] = {
+            "atoms": self.atoms,
+            "bonds": self.bonds,
+            "residues": self.residues,
+            "chains": self.chains,
+            "name": np.array(self.name),
+        }
+        if self.chain_canonical_seqs:
+            asym_ids = sorted(self.chain_canonical_seqs.keys())
+            seqs = [self.chain_canonical_seqs[a] for a in asym_ids]
+            max_len = max(len(s) for s in seqs)
+            kwargs["chain_canonical_asym_ids"] = np.array(asym_ids, dtype=np.int32)
+            kwargs["chain_canonical_seqs"] = np.array(seqs, dtype=f"U{max_len}")
+        np.savez_compressed(str(path), **kwargs)
 
     @classmethod
     def load(cls, path: Path) -> Structure:
@@ -125,12 +137,18 @@ class Structure:
         else:
             atoms_raw = atoms_raw.view(ATOM_DTYPE)
         name = str(data["name"]) if "name" in data else "unset"
+        chain_canonical_seqs: dict[int, str] | None = None
+        if "chain_canonical_asym_ids" in data and "chain_canonical_seqs" in data:
+            ids = data["chain_canonical_asym_ids"].tolist()
+            seqs = [str(s) for s in data["chain_canonical_seqs"]]
+            chain_canonical_seqs = dict(zip(ids, seqs, strict=True))
         return cls(
             atoms=atoms_raw,
             bonds=data["bonds"].view(BOND_DTYPE),
             residues=data["residues"].view(RESIDUE_DTYPE),
             chains=data["chains"].view(CHAIN_DTYPE),
             name=name,
+            chain_canonical_seqs=chain_canonical_seqs,
         )
 
     def save_split(self, directory: Path) -> None:

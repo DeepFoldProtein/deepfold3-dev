@@ -125,6 +125,11 @@ def extract_sequences_by_msa_id(
     """Extract unique protein sequences keyed by ``msa_id`` (SHA256).
 
     Used by ``msa-batch`` for MSA search — one sequence per unique hash.
+
+    Prefers the canonical sequence cached on the Structure NPZ
+    (``chain_canonical_seqs``, populated by ``process_mmcif`` from
+    ``entity.full_sequence``); falls back to observed-residue extraction
+    for older NPZs without the field.
     """
     from deepfold3.data.paths import structure_path
     from deepfold3.data.types import Structure
@@ -142,6 +147,8 @@ def extract_sequences_by_msa_id(
             logger.debug("Failed to load %s, skipping", npz_path)
             continue
 
+        canonical_seqs = structure.chain_canonical_seqs or {}
+
         for chain_info in record.chains:
             if not chain_info.valid:
                 continue
@@ -152,10 +159,16 @@ def extract_sequences_by_msa_id(
                 continue
             seen.add(msa_id)
 
-            res_types = get_chain_residue_types(structure, chain_info.chain_id)
-            if len(res_types) == 0:
+            seq = canonical_seqs.get(int(chain_info.chain_id))
+            if seq is None:
+                # Backward compat: no canonical cache → derive from observed.
+                res_types = get_chain_residue_types(structure, chain_info.chain_id)
+                if len(res_types) == 0:
+                    continue
+                seq = residue_types_to_sequence(res_types)
+            elif len(seq) == 0:
                 continue
-            sequences[msa_id] = residue_types_to_sequence(res_types)
+            sequences[msa_id] = seq
 
     return sequences
 
@@ -209,6 +222,7 @@ def extract_sequences_by_cluster_key(
     """Extract unique protein sequences keyed by ``{pdb_id}_{chain_name}``.
 
     Used by ``cluster`` for MMseqs2 clustering — one sequence per unique entity.
+    Prefers canonical sequences from the Structure NPZ; falls back to observed.
     """
     from deepfold3.data.paths import structure_path
     from deepfold3.data.prepare.clustering import sequence_to_cluster_key
@@ -227,6 +241,8 @@ def extract_sequences_by_cluster_key(
             logger.debug("Failed to load %s, skipping", npz_path)
             continue
 
+        canonical_seqs = structure.chain_canonical_seqs or {}
+
         for chain_info in record.chains:
             if not chain_info.valid or chain_info.mol_type != MOL_PROTEIN:
                 continue
@@ -235,11 +251,12 @@ def extract_sequences_by_cluster_key(
                 continue
             seen_entities.add(entity_key)
 
-            res_types = get_chain_residue_types(structure, chain_info.chain_id)
-            if len(res_types) == 0:
-                continue
-
-            seq = residue_types_to_sequence(res_types)
+            seq = canonical_seqs.get(int(chain_info.chain_id))
+            if seq is None:
+                res_types = get_chain_residue_types(structure, chain_info.chain_id)
+                if len(res_types) == 0:
+                    continue
+                seq = residue_types_to_sequence(res_types)
             if len(seq) < min_length:
                 continue
 

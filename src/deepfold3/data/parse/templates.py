@@ -531,33 +531,7 @@ def _parse_mmcif_chain(
     return st, ch
 
 
-def _one_letter(info) -> str:
-    """Extract one-letter code from a gemmi ResidueInfo, defaulting to 'X'.
-
-    Also treats whitespace codes as 'X' — ``find_tabulated_residue`` returns a
-    record with ``one_letter_code = ' '`` for unrecognised names (including the
-    ``"MSE,MET"``-style comma-joined strings gemmi emits at microheterogeneity
-    positions in ``entity.full_sequence``).
-    """
-    if info is None:
-        return "X"
-    c = info.one_letter_code
-    if not c or c in ("?", "\0") or not c.strip():
-        return "X"
-    return c
-
-
-def _seqres_one_letter(item) -> str:
-    """One-letter code for a seqres monomer name, handling microhet alternatives.
-
-    Gemmi encodes microheterogeneity as a comma-joined name (e.g. ``"MSE,MET"``)
-    in ``entity.full_sequence``. Use the first alternative so the seqres length
-    matches ``polymer.first_conformer()`` on the structure side.
-    """
-    primary = str(item).split(",", 1)[0].strip()
-    if not primary:
-        return "X"
-    return _one_letter(gemmi.find_tabulated_residue(primary))
+from deepfold3.data.prepare.canonical import _one_letter, _seqres_one_letter  # noqa: E402
 
 
 def _get_chain_sequences(st, chain) -> tuple[str | None, str]:
