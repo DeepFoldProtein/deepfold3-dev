@@ -1,26 +1,26 @@
 """Checkpoint save/load/rotate + pretrained-weight loading.
 
-On-disk format is **unchanged** from the pre-refactor trainer — the
-dict keys (``model``/``optimizer``/``scheduler``/``global_step``/
-``effective_step``/``best_eval_loss``/``model_cfg``/``train_cfg``/
-``ema``) match exactly so existing checkpoints round-trip through
-this module.
-
-RNG state + sampler epoch capture (accelerate-style) are intentionally
-deferred to a later phase — they'd bump the format and deserve their
-own round-trip tests.
+On-disk format adds (over the pre-refactor blob): ``epoch``,
+``rng_states`` (one entry per DDP rank; gathered on save, scattered
+on load), and ``scaler``. Older checkpoints missing these keys load
+through fallbacks (epoch derived from ``effective_step``; RNGs left
+at the seeds set by :func:`seed_everything`; scaler at default).
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import re
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from deepfold3.model.config import ModelConfig, TrainingConfig
+from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
 from deepfold3.training.rank_zero import rank_zero_info
 from deepfold3.training.schedule_free import optimizer_eval_mode
@@ -57,6 +57,67 @@ def load_pretrained_weights(
         rank_zero_info(f"Loaded pretrained weights from {p}")
 
 
+def _rng_state_local() -> dict:
+    """Snapshot the four RNG sources we re-seed in :func:`seed_everything`."""
+    cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    return {
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda_state,
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
+
+
+def _gather_rng_states(dist_info: DistInfo) -> list[dict]:
+    """Collect each rank's RNG state into a list indexed by rank.
+
+    Saved on rank 0 only, but every rank's state is captured so a later
+    load scatters the right slot back to each rank. On single-rank runs
+    skips the all-gather entirely.
+    """
+    local = _rng_state_local()
+    if not dist_info.is_distributed:
+        return [local]
+    gathered: list[dict | None] = [None] * dist_info.world_size
+    dist.all_gather_object(gathered, local)
+    return gathered  # type: ignore[return-value]
+
+
+def _restore_rng_state_local(state: dict) -> None:
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(cuda_state)
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+
+
+def _scatter_rng_states(dist_info: DistInfo, all_states: list[dict] | None) -> dict | None:
+    """Send each rank's slot from ``all_states`` (held on rank 0) back to it.
+
+    ``all_states is None`` means "old checkpoint without RNG capture" —
+    propagated to every rank as ``None``.
+    """
+    if not dist_info.is_distributed:
+        return all_states[0] if all_states else None
+    payload: list = [None]
+    if dist_info.is_main:
+        if all_states is None:
+            payload = [None] * dist_info.world_size
+        elif len(all_states) != dist_info.world_size:
+            # World size shrank/grew between save and resume — broadcast
+            # rank 0's slot to everyone as a degraded fallback rather than
+            # silently mis-mapping.
+            payload = [all_states[0]] * dist_info.world_size
+        else:
+            payload = list(all_states)
+    else:
+        payload = [None] * dist_info.world_size
+    out: list = [None]
+    dist.scatter_object_list(out, payload if dist_info.is_main else None, src=0)
+    return out[0]
+
+
 class CheckpointManager:
     """Save + load + rotate + find-latest for the training checkpoint blob.
 
@@ -80,9 +141,11 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         scheduler: AF3LRScheduler,
         ema: EMA | None,
+        scaler: torch.amp.GradScaler | None,
         state: TrainState,
         model_cfg: ModelConfig,
         train_cfg: TrainingConfig,
+        dist_info: DistInfo,
     ) -> None:
         """Save the checkpoint blob + rotate old files.
 
@@ -97,6 +160,11 @@ class CheckpointManager:
         storing checkpoints"). Restored to ``y`` on context exit. No-op
         for plain AdamW.
         """
+        # All ranks participate in the gather; only rank 0 actually writes.
+        rng_states = _gather_rng_states(dist_info)
+        if not dist_info.is_main:
+            return
+
         with optimizer_eval_mode(optimizer):
             blob: dict = {
                 "model": model.state_dict(),
@@ -104,12 +172,16 @@ class CheckpointManager:
                 "scheduler": scheduler.state_dict(),
                 "global_step": state.global_step,
                 "effective_step": state.effective_step,
+                "epoch": state.epoch,
                 "best_eval_loss": state.best_eval_loss,
+                "rng_states": rng_states,
                 "model_cfg": model_cfg,
                 "train_cfg": train_cfg,
             }
             if ema is not None:
                 blob["ema"] = ema.state_dict()
+            if scaler is not None and scaler.is_enabled():
+                blob["scaler"] = scaler.state_dict()
             torch.save(blob, path)
         logger.info(f"Saved checkpoint to {path}")
 
@@ -139,14 +211,23 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer,
         scheduler: AF3LRScheduler,
         ema: EMA | None,
+        scaler: torch.amp.GradScaler | None,
         state: TrainState,
         train_cfg: TrainingConfig,
+        dist_info: DistInfo,
+        steps_per_epoch: int | None = None,
     ) -> None:
         """Resume training state from ``path``, mutating the live objects in place.
 
         Handles DDP ``module.`` prefix stripping automatically.
         Partial-load gates (``skip_load_optimizer`` / ``skip_load_scheduler`` /
         ``skip_load_step``) follow the training config.
+
+        If the checkpoint includes per-rank ``rng_states``, each rank's
+        slot is scattered back to it; otherwise RNGs are left at the
+        seed values set by :func:`seed_everything` (current behavior).
+        Same for ``scaler`` and ``epoch``: missing keys fall back to
+        defaults / derivation from ``effective_step``.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
@@ -156,7 +237,20 @@ class CheckpointManager:
         model.load_state_dict(state_dict, strict=self.strict)
 
         if "optimizer" in ckpt and not train_cfg.skip_load_optimizer:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            # G5 invariant: SF saves with ``train_mode=False`` so the live
+            # params loaded from ``ckpt["model"]`` are ``x``. The follow-up
+            # ``optimizer.train()`` then lerps ``x → y``. If the saved
+            # state thought it was in train mode, the lerp would be the
+            # wrong direction → silent param drift.
+            opt_state = ckpt["optimizer"]
+            if hasattr(optimizer, "eval_mode"):
+                groups = opt_state.get("param_groups", [])
+                if groups and groups[0].get("train_mode", False):
+                    raise RuntimeError(
+                        f"Schedule-Free checkpoint at {path} was saved with train_mode=True; "
+                        "expected False (saver should wrap with optimizer_eval_mode)."
+                    )
+            optimizer.load_state_dict(opt_state)
         # Schedule-Free was saved with ``train_mode=False`` (live param =
         # x) so ``load_state_dict`` restored the same. Lerp ``p ← y`` from
         # ``(x, z)`` so training resumes at the same gradient point as
@@ -170,13 +264,30 @@ class CheckpointManager:
             scheduler.load_state_dict(ckpt["scheduler"])
         if "ema" in ckpt and ema is not None:
             ema.load_state_dict(ckpt["ema"])
+        if "scaler" in ckpt and scaler is not None and scaler.is_enabled():
+            scaler.load_state_dict(ckpt["scaler"])
 
         if not train_cfg.skip_load_step:
             state.global_step = ckpt.get("global_step", 0)
             state.effective_step = ckpt.get("effective_step", 0)
+            if "epoch" in ckpt:
+                state.epoch = ckpt["epoch"]
+            elif steps_per_epoch and steps_per_epoch > 0:
+                # Old checkpoint without ``epoch`` key: derive from
+                # opt-step count so the sampler RNG resumes near where
+                # it would have been (off by at most one boundary).
+                state.epoch = state.effective_step // steps_per_epoch
         state.best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
 
-        rank_zero_info(f"Resumed from {path} at step {state.effective_step}")
+        # Scatter per-rank RNG states (rank 0 holds the list; everyone
+        # else receives ``None`` and skips). Missing in old ckpts → rank
+        # 0 broadcasts ``None`` and seed_everything's state stands.
+        rng_all = ckpt.get("rng_states") if dist_info.is_main else None
+        my_rng = _scatter_rng_states(dist_info, rng_all)
+        if my_rng is not None:
+            _restore_rng_state_local(my_rng)
+
+        rank_zero_info(f"Resumed from {path} at step {state.effective_step} (epoch={state.epoch})")
 
     # ----- discovery -----
 

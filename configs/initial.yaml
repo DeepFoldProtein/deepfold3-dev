@@ -18,7 +18,11 @@ training:
   # Per-rank outlier guard: skip the whole step if any rank's pre-clip
   # grad_norm exceeds this. Clipping from 1e+6~1e+8 to max_norm=10 yields
   # random noise direction that degrades the update; skipping is cleaner.
-  grad_norm_skip_threshold: 1000.0
+  # 5000 lets the bulk of the heavy-tail (median 1.4k, p90 2.8k observed
+  # post-warmup at peak LR) through clip-to-10 instead of dropping ~25% of
+  # steps; only catastrophic outliers (>5k, ~5% of former skip events) are
+  # still gated.
+  grad_norm_skip_threshold: 5000.0
   max_consecutive_nan_skips: 10
   accumulate_grad_batches: 2
   ema_decay: 0.999
@@ -69,7 +73,7 @@ training:
   drop_last: true
   find_unused_parameters: false
   static_graph: true
-  bucket_cap_mb: 25
+  bucket_cap_mb: 32
   gradient_as_bucket_view: true
   # NCCL watchdog deadline (also used by ``collective_guard`` to attribute hangs).
   collective_timeout_s: 600.0
@@ -148,12 +152,7 @@ model:
     sigma_data: 16.0
     p_mean: -1.2
     p_std: 1.5
-    # AF3 runs both inference (sample) and training (sample_training) in the
-    # global bf16 context with selective fp32 upcasts (Gram-Schmidt, Fourier
-    # embedding, attention softmax). Keep both flags off to match AF3.
-    # Enable only for Protenix-style full-fp32 diffusion (requires fused
-    # Triton kernels in the diffusion head to be disabled).
-    skip_amp_sample: false
+    skip_amp_sample: true
     skip_amp_sample_training: true
   confidence:
     num_layer: 4

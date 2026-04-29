@@ -19,6 +19,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
+import torch.distributed as torch_dist
 import torch.nn as nn
 import yaml
 from torch.amp import GradScaler
@@ -358,6 +359,8 @@ class Trainer:
             device=self.dist.device,
             log_microsteps=self.cfg.log_microsteps,
         )
+        eval_total = eval_metrics.get("eval/total", float("inf"))
+        save_best = eval_total < self.state.best_eval_loss
         if self.dist.is_main:
             logger.info(f"Eval at step {self.state.effective_step}: {eval_metrics}")
             # Inject ``train/step`` so wandb's ``step_metric="train/step"``
@@ -369,10 +372,18 @@ class Trainer:
                 {**eval_metrics, "train/step": self.state.effective_step},
                 step=self.state.effective_step,
             )
-            eval_total = eval_metrics.get("eval/total", float("inf"))
-            if eval_total < self.state.best_eval_loss:
-                self.state.best_eval_loss = eval_total
-                self._save_checkpoint(output_dir / "checkpoint_best.pt")
+        # Broadcast the save decision so every rank participates in the
+        # RNG-gather inside ``_save_checkpoint``. ``eval_total`` may be
+        # rank-0-only when meters aren't all-reduced, so don't trust it
+        # on non-main ranks for the comparison.
+        if self.dist.is_distributed:
+            flag = torch.tensor(int(save_best), device=self.dist.device)
+            torch_dist.broadcast(flag, src=0)
+            save_best = bool(flag.item())
+        if save_best:
+            self.state.best_eval_loss = eval_total
+            self._save_checkpoint(output_dir / "checkpoint_best.pt")
+            if self.dist.is_main:
                 logger.info(f"New best eval loss: {eval_total:.4f}")
 
     # ------------------------------------------------------------------
@@ -380,16 +391,24 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, path: Path) -> None:
-        """Save checkpoint via :class:`CheckpointManager`."""
+        """Save checkpoint via :class:`CheckpointManager`.
+
+        All ranks call this so the cross-rank RNG-state gather can run;
+        only rank 0 actually writes the file. Callers that previously
+        guarded with ``self.dist.is_main`` no longer need to (the gate
+        moved into ``CheckpointManager.save``).
+        """
         self.ckpt_manager.save(
             path,
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             ema=self.ema,
+            scaler=self.scaler,
             state=self.state,
             model_cfg=self.model_cfg,
             train_cfg=self.cfg,
+            dist_info=self.dist,
         )
 
     @staticmethod
@@ -397,15 +416,27 @@ class Trainer:
         return CheckpointManager.find_latest(output_dir)
 
     def _load_checkpoint(self, path: Path) -> None:
-        """Load checkpoint via :class:`CheckpointManager`."""
+        """Load checkpoint via :class:`CheckpointManager`.
+
+        Computes ``steps_per_epoch`` so old checkpoints (no ``epoch``
+        key) can derive a sampler-epoch from ``effective_step`` — the
+        sampler RNG keys on it, so we want to land in the right basin
+        even when resuming from a pre-epoch-persistence ckpt.
+        """
+        cfg = self.cfg
+        effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
+        steps_per_epoch = max(1, cfg.epoch_size // max(1, effective_batch_size)) if cfg.epoch_size > 0 else 0
         self.ckpt_manager.load(
             path,
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             ema=self.ema,
+            scaler=self.scaler,
             state=self.state,
             train_cfg=self.cfg,
+            dist_info=self.dist,
+            steps_per_epoch=steps_per_epoch,
         )
 
     # ------------------------------------------------------------------
@@ -482,7 +513,9 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        epoch = 0
+        # Advance through ``state.epoch`` (carries over a resumed value
+        # when present in the checkpoint, or is derived from
+        # ``effective_step // steps_per_epoch`` for old checkpoints).
         meters = DistributedAverageMeters(self.dist.device)
         t0 = time.monotonic()
         t_last_ckpt = t0
@@ -501,7 +534,7 @@ class Trainer:
         while self.state.effective_step < self.cfg.max_steps:
             sampler = train_dl.sampler
             if hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
+                sampler.set_epoch(self.state.epoch)
 
             for features in train_dl:
                 if self.state.effective_step >= self.cfg.max_steps:
@@ -643,7 +676,7 @@ class Trainer:
                                 avg=avg,
                                 effective_step=self.state.effective_step,
                                 lr=lr,
-                                epoch=epoch,
+                                epoch=self.state.epoch,
                                 grad_norm=grad_norm,
                                 dt=dt,
                                 tok_per_sec=tok_per_sec,
@@ -653,11 +686,16 @@ class Trainer:
                         )
 
                 # --- Checkpoint (before eval so weights are saved even if eval crashes) ---
-                need_ckpt = False
-                if on_opt_step_boundary and self.dist.is_main:
-                    if self.state.effective_step % self.cfg.checkpoint_interval == 0:
-                        need_ckpt = True
-                    elif (
+                # ``effective_step`` is identical on all ranks, so the
+                # interval check decides locally without a broadcast.
+                # The time-based and signal-based triggers are rank-0
+                # local; we broadcast a single bool so save fires
+                # synchronously on every rank (RNG-gather requirement).
+                need_ckpt = on_opt_step_boundary and (
+                    self.state.effective_step % self.cfg.checkpoint_interval == 0
+                )
+                if on_opt_step_boundary and self.dist.is_main and not need_ckpt:
+                    if (
                         cfg.checkpoint_every_hours > 0
                         and (time.monotonic() - t_last_ckpt) / 3600 >= cfg.checkpoint_every_hours
                     ):
@@ -665,6 +703,10 @@ class Trainer:
                     elif ckpt_request.consume():
                         need_ckpt = True
                         logger.info("Signal-triggered checkpoint requested")
+                if self.dist.is_distributed and on_opt_step_boundary:
+                    flag = torch.tensor(int(need_ckpt), device=self.dist.device)
+                    torch_dist.broadcast(flag, src=0)
+                    need_ckpt = bool(flag.item())
 
                 if need_ckpt:
                     self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
@@ -705,17 +747,21 @@ class Trainer:
                             )
                         else:
                             logger.info(f"Shutdown at step {self.state.effective_step}")
-                        self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
+                    # All ranks must call save so the RNG-gather collective
+                    # runs on every rank (rank-0 write gate is inside).
+                    self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
                     break
 
             if shutdown.requested:
                 break
-            epoch += 1
+            self.state.epoch += 1
 
-        # Final checkpoint
+        # Final checkpoint — call on every rank so the cross-rank RNG
+        # gather inside ``CheckpointManager.save`` runs on all ranks
+        # (the rank-0 write gate is inside the manager).
+        if not shutdown.requested:
+            self._save_checkpoint(output_dir / "checkpoint_final.pt")
         if self.dist.is_main:
-            if not shutdown.requested:
-                self._save_checkpoint(output_dir / "checkpoint_final.pt")
             logger.info(
                 f"Training {'interrupted' if shutdown.requested else 'complete'} at step {self.state.effective_step}"
             )

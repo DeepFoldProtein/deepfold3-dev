@@ -36,6 +36,8 @@ import click
 
 from deepfold3.scripts import cli
 
+logger = logging.getLogger(__name__)
+
 # Dump Python tracebacks for all threads on SIGUSR1 — invaluable for
 # diagnosing DDP deadlocks where one rank blocks in an NCCL collective.
 faulthandler.enable()
@@ -291,6 +293,13 @@ def train(
     if grad_accum is not None:
         train_cfg.accumulate_grad_batches = grad_accum
     if seed is not None:
+        if resume is not None and seed != train_cfg.seed:
+            logger.warning(
+                "--seed=%s overrides config seed (%s) on a --resume run; sampler RNG "
+                "will diverge from the original run's data ordering at the resume point.",
+                seed,
+                train_cfg.seed,
+            )
         train_cfg.seed = seed
     if deterministic:
         train_cfg.deterministic = True

@@ -515,3 +515,222 @@ class TestAdamWScheduleFree:
                 assert torch.equal(p, s)
         for p, s in zip(model.parameters(), snapshot, strict=True):
             assert torch.equal(p, s)
+
+
+class TestCheckpointResume:
+    """Round-trip: epoch + RNG state + scaler are persisted and restored.
+
+    Single-rank only — multi-rank gather/scatter needs an MPI launcher,
+    which we don't run in unit tests.
+    """
+
+    def _make_world(self, tmp_path, *, optimizer_type="adamw"):
+        """Build a minimal model+optim+scheduler+state and a CheckpointManager."""
+        import random as _random
+
+        import numpy as np
+
+        from deepfold3.model.config import ModelConfig, TrainingConfig
+        from deepfold3.training.checkpointing import CheckpointManager
+        from deepfold3.training.distributed import DistInfo
+        from deepfold3.training.optim import build_optimizer
+        from deepfold3.training.scheduler import build_scheduler
+        from deepfold3.training.state import TrainState
+
+        cfg = TrainingConfig(lr=1e-3, optimizer_type=optimizer_type, warmup_steps=10)
+        model_cfg = ModelConfig()
+        model = _simple_model()
+        optimizer = build_optimizer(model, cfg)
+        scheduler = build_scheduler(optimizer, cfg)
+        state = TrainState()
+        state.global_step = 200
+        state.effective_step = 100
+        state.epoch = 4
+        state.best_eval_loss = 0.5
+        ckpt_mgr = CheckpointManager(max_checkpoints=0, strict=True, device=torch.device("cpu"))
+        dist_info = DistInfo(rank=0, world_size=1, local_rank=0, device=torch.device("cpu"))
+
+        # Burn some RNG draws so each source has a non-default state.
+        torch.randn(7)
+        np.random.rand(11)
+        _random.random()
+
+        return cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info
+
+    def test_round_trip_persists_epoch_and_rng(self, tmp_path):
+        """epoch + python/numpy/torch RNG states round-trip through save/load."""
+        import random as _random
+
+        import numpy as np
+
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
+        path = tmp_path / "ckpt.pt"
+
+        # Snapshot the RNG state we expect to be preserved.
+        torch_state_pre = torch.get_rng_state().clone()
+        py_state_pre = _random.getstate()
+        np_state_pre = np.random.get_state()
+
+        ckpt_mgr.save(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=state,
+            model_cfg=model_cfg,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+
+        # Burn the RNGs so state diverges before load.
+        for _ in range(10):
+            torch.randn(3)
+            np.random.rand(5)
+            _random.random()
+        from deepfold3.training.state import TrainState
+
+        new_state = TrainState()
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        assert new_state.epoch == 4
+        assert new_state.effective_step == 100
+        assert new_state.global_step == 200
+        # RNG state restored — first draw should match what would have
+        # come next at save time.
+        torch.set_rng_state(torch_state_pre)
+        expected_torch = torch.randn(3)
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        actual_torch = torch.randn(3)
+        assert torch.equal(expected_torch, actual_torch)
+
+        _random.setstate(py_state_pre)
+        expected_py = _random.random()
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        actual_py = _random.random()
+        assert expected_py == actual_py
+
+        np.random.set_state(np_state_pre)
+        expected_np = np.random.rand(5)
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        actual_np = np.random.rand(5)
+        assert (expected_np == actual_np).all()
+
+    def test_old_checkpoint_derives_epoch_from_steps(self, tmp_path):
+        """A blob without ``epoch`` / ``rng_states`` falls back gracefully."""
+        from deepfold3.training.state import TrainState
+
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
+        path = tmp_path / "old.pt"
+
+        # Hand-rolled "old format" blob — no epoch / rng_states / scaler keys.
+        old_blob = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "global_step": 1300 * 2,
+            "effective_step": 1300,
+            "best_eval_loss": 1.0,
+            "model_cfg": model_cfg,
+            "train_cfg": cfg,
+        }
+        torch.save(old_blob, path)
+
+        new_state = TrainState()
+        # steps_per_epoch=391 mimics epoch_size=100000 / effective_batch=256.
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+            steps_per_epoch=391,
+        )
+        assert new_state.effective_step == 1300
+        assert new_state.epoch == 1300 // 391  # == 3
+
+    def test_sf_invariant_violation_raises(self, tmp_path):
+        """Loading an SF blob whose optimizer state has train_mode=True must error."""
+        import pytest
+
+        from deepfold3.training.state import TrainState
+
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(
+            tmp_path, optimizer_type="schedule_free"
+        )
+        path = tmp_path / "bad.pt"
+        ckpt_mgr.save(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=state,
+            model_cfg=model_cfg,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        # Tamper with the saved blob: flip train_mode to True.
+        blob = torch.load(path, weights_only=False)
+        for g in blob["optimizer"]["param_groups"]:
+            g["train_mode"] = True
+        torch.save(blob, path)
+
+        new_state = TrainState()
+        with pytest.raises(RuntimeError, match="train_mode=True"):
+            ckpt_mgr.load(
+                path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                ema=None,
+                scaler=None,
+                state=new_state,
+                train_cfg=cfg,
+                dist_info=dist_info,
+            )
