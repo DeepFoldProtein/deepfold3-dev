@@ -19,8 +19,10 @@ from pathlib import Path
 
 import click
 
+from deepfold3.scripts import cli
 
-@click.command("convert")
+
+@cli.command("convert")
 @click.option(
     "--params",
     required=True,

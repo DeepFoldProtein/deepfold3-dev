@@ -15,8 +15,10 @@ from pathlib import Path
 import click
 import numpy as np
 
+from deepfold3.scripts import cli
 
-@click.command("plot")
+
+@cli.command("plot")
 @click.option(
     "--input",
     "input_path",

@@ -40,8 +40,10 @@ from pathlib import Path
 import click
 import torch
 
+from deepfold3.scripts import cli
 
-@click.command("inference")
+
+@cli.command("inference")
 @click.option(
     "--msa",
     default=None,
@@ -65,7 +67,7 @@ import torch
     "--params",
     required=True,
     type=click.Path(exists=True, path_type=Path),
-    help="Model parameters (.safetensors or .bin/.bin.zst)",
+    help="Model parameters (.safetensors converted weights, .pt training checkpoint, or .bin/.bin.zst raw AF3 params)",
 )
 @click.option(
     "--mol-type",
@@ -154,6 +156,20 @@ def inference(
         from safetensors.torch import load_file
 
         state_dict = load_file(str(params))
+    elif params.suffix == ".pt":
+        ckpt = torch.load(str(params), map_location="cpu", weights_only=False)
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        if any(k.startswith("module.") for k in state_dict):
+            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        # EMA runs (AdamW + ema_decay > 0): overlay shadow params on the model
+        # state_dict — buffers stay from the model snapshot. Schedule-free runs
+        # have no "ema" key and the saved "model" is already the inference
+        # target ``x`` (CheckpointManager.save flips into eval mode).
+        ema_state = ckpt.get("ema") if isinstance(ckpt, dict) else None
+        if ema_state and ema_state.get("shadow"):
+            shadow = ema_state["shadow"]
+            state_dict = {**state_dict, **shadow}
+            click.echo(f"  using EMA shadow ({len(shadow)} params)")
     else:
         import warnings
 

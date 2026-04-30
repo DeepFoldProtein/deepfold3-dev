@@ -24,6 +24,7 @@ from pathlib import Path
 import click
 
 from deepfold3.data.msa.mmseqs2 import MsaResult, _parse_fasta, parse_m8, search_local, search_server
+from deepfold3.scripts import cli
 
 # Regex to collapse leaf arrays (containing only numbers/strings) onto one line.
 # Matches: [\n  1,\n  2,\n  ...\n] and collapses whitespace.
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 _MAX_TEMPLATES_PER_CHAIN = 20
 
 
-@click.command("msa")
+@cli.command("msa")
 @click.option(
     "--fasta",
     default=None,
