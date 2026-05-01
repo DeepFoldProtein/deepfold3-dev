@@ -412,6 +412,48 @@ def compute_ranking_score(ptm: float, iptm: float, frac_disordered: float = 0.0,
     return ptm_iptm_average + 0.5 * frac_disordered - 100.0 * clash
 
 
+def _distogram_bin_centers(
+    first_break: float = DistogramConfig.first_break,
+    last_break: float = DistogramConfig.last_break,
+    num_bins: int = DistogramConfig.num_bins,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Distogram bin centers in Angstroms.
+
+    The model emits ``num_bins`` bins delimited by ``num_bins - 1`` linearly
+    spaced breaks in ``[first_break, last_break]``. Bin 0 covers ``[0, breaks[0])``
+    and the final bin extends one step past ``breaks[-1]``. Centers are taken
+    as midpoints (the leading and trailing bins use ``breaks[0] / 2`` and
+    ``breaks[-1] + step / 2`` respectively).
+    """
+    breaks = torch.linspace(first_break, last_break, num_bins - 1, device=device)
+    step = breaks[1] - breaks[0]
+    centers = torch.empty(num_bins, device=breaks.device)
+    centers[0] = breaks[0] / 2
+    centers[1:-1] = (breaks[:-1] + breaks[1:]) / 2
+    centers[-1] = breaks[-1] + step / 2
+    return centers
+
+
+def compute_distogram_expected(
+    distogram_logits: torch.Tensor,
+    first_break: float = DistogramConfig.first_break,
+    last_break: float = DistogramConfig.last_break,
+    num_bins: int = DistogramConfig.num_bins,
+) -> torch.Tensor:
+    """Per-pair expected distance from distogram logits.
+
+    Args:
+        distogram_logits: [N, N, num_bins] logits.
+
+    Returns:
+        [N, N] expected pairwise distance in Angstroms.
+    """
+    centers = _distogram_bin_centers(first_break, last_break, num_bins, device=distogram_logits.device)
+    probs = distogram_logits.softmax(dim=-1)
+    return (probs * centers).sum(-1)
+
+
 def compute_contact_probs(
     distogram_logits: torch.Tensor,
     threshold: float = 8.0,
@@ -556,8 +598,10 @@ def save_confidences_json(
                     atom_exp_resolved.append(round(float(er[i, j]), 3))
         result["atom_exp_resolved"] = atom_exp_resolved
 
-    # Contact probabilities from distogram
+    # Distogram (per-pair expected distance) and contact probabilities
     if output.distogram is not None:
+        distogram_expected = compute_distogram_expected(output.distogram)
+        result["distogram"] = [[round(float(v), 2) for v in row] for row in distogram_expected.cpu()]
         contact_probs = compute_contact_probs(output.distogram)
         result["contact_probs"] = [[round(float(v), 3) for v in row] for row in contact_probs.cpu()]
 

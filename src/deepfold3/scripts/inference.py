@@ -115,6 +115,12 @@ from deepfold3.scripts import cli
     show_default=True,
     help="Optimization preset: inference (default, Triton+tiling), recommended (training), triton (no tiling), none, all (testing)",
 )
+@click.option(
+    "--plot-confidences",
+    is_flag=True,
+    default=False,
+    help="Also write a PAE/PDE/contact-probability PNG next to each confidences JSON",
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -129,6 +135,7 @@ def inference(
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
     optim: str | None,
+    plot_confidences: bool,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -390,6 +397,13 @@ def inference(
                 f"{clash_str}, ranking={summary['ranking_score']:.3f}"
             )
             click.echo(f"  saved  {conf_path.resolve()}")
+
+            if plot_confidences:
+                from deepfold3.scripts.plot_confidences import plot_confidences_file
+
+                plot_path = conf_path.with_suffix(".png")
+                if plot_confidences_file(conf_path, plot_path):
+                    click.echo(f"  saved  {plot_path.resolve()}")
 
     # ------------------------------------------------------------------
     # Aggregate ranking outputs (JSON input only)

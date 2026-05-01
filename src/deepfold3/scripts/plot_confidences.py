@@ -18,20 +18,12 @@ import numpy as np
 from deepfold3.scripts import cli
 
 
-@cli.command("plot")
-@click.option(
-    "--input",
-    "input_path",
-    required=True,
-    type=click.Path(exists=True, path_type=Path),
-    help="Input confidences JSON file",
-)
-@click.option(
-    "--output", default="confidences.png", type=click.Path(path_type=Path), show_default=True, help="Output PNG path"
-)
-@click.option("--dpi", default=150, show_default=True, help="Output DPI")
-def plot(input_path: Path, output: Path, dpi: int) -> None:
-    """Plot PAE, PDE, and contact probabilities from a confidences JSON."""
+def plot_confidences_file(input_path: Path, output: Path, dpi: int = 150) -> bool:
+    """Render a PAE/PDE/contact-probability figure from a confidences JSON.
+
+    Returns True if the figure was written, False if the JSON had no plottable
+    fields (e.g. confidence head was disabled).
+    """
     try:
         import matplotlib
 
@@ -40,30 +32,29 @@ def plot(input_path: Path, output: Path, dpi: int) -> None:
     except ImportError as e:
         raise ImportError("matplotlib is required: pip install matplotlib") from e
 
-    from deepfold3.model.config import ConfidenceConfig
+    from deepfold3.model.config import ConfidenceConfig, DistogramConfig
 
     cfg = ConfidenceConfig()
+    dgram_cfg = DistogramConfig()
 
     data = json.loads(input_path.read_text())
     summary = data.get("summary", {})
     N = summary.get("num_tokens", 0)
 
-    # Determine which panels to show
-    has_pae = "pae" in data
-    has_pde = "pde" in data
-    has_contact = "contact_probs" in data
-
     panels = []
-    if has_pae:
+    if "pae" in data:
         panels.append(("PAE", np.array(data["pae"]), 0.0, cfg.max_error_bin, "Greens", "Å"))
-    if has_pde:
+    if "pde" in data:
         panels.append(("PDE", np.array(data["pde"]), 0.0, cfg.max_error_bin, "Greens", "Å"))
-    if has_contact:
+    if "distogram" in data:
+        panels.append(
+            ("Distogram (E[d])", np.array(data["distogram"]), 0.0, float(dgram_cfg.last_break), "viridis_r", "Å")
+        )
+    elif "contact_probs" in data:
         panels.append(("Contact Probability (d < 8 Å)", np.array(data["contact_probs"]), 0.0, 1.0, "Reds", ""))
 
     if not panels:
-        click.echo("[plot_confidences] No plottable data found in JSON.")
-        return
+        return False
 
     n_panels = len(panels)
     fig, axes = plt.subplots(1, n_panels, figsize=(5.5 * n_panels, 5))
@@ -78,7 +69,6 @@ def plot(input_path: Path, output: Path, dpi: int) -> None:
         label = unit if unit else None
         plt.colorbar(im, ax=ax, shrink=0.82, label=label)
 
-    # Build suptitle from summary
     parts = []
     if "mean_plddt" in summary:
         parts.append(f"pLDDT={summary['mean_plddt']:.1f}")
@@ -99,7 +89,28 @@ def plot(input_path: Path, output: Path, dpi: int) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(str(output), dpi=dpi, bbox_inches="tight")
-    click.echo(f"[plot_confidences] saved → {output.resolve()}")
+    plt.close(fig)
+    return True
+
+
+@cli.command("plot")
+@click.option(
+    "--input",
+    "input_path",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Input confidences JSON file",
+)
+@click.option(
+    "--output", default="confidences.png", type=click.Path(path_type=Path), show_default=True, help="Output PNG path"
+)
+@click.option("--dpi", default=150, show_default=True, help="Output DPI")
+def plot(input_path: Path, output: Path, dpi: int) -> None:
+    """Plot PAE, PDE, and contact probabilities from a confidences JSON."""
+    if plot_confidences_file(input_path, output, dpi=dpi):
+        click.echo(f"[plot_confidences] saved → {output.resolve()}")
+    else:
+        click.echo("[plot_confidences] No plottable data found in JSON.")
 
 
 if __name__ == "__main__":
