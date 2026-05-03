@@ -159,9 +159,25 @@ def inference(
     t0 = time.perf_counter()
     from deepfold3.model.model import DeepFold3
 
+    # Architectural ModelConfig embedded in training checkpoints — preserved
+    # so the inference build matches whatever flags (e.g.
+    # ``pairformer.deepnet_residual_scale``) were active at training time.
+    # Stays ``None`` only for raw-AF3 ``.bin`` / ``.bin.zst`` paths and for
+    # legacy ``.safetensors`` files exported before metadata embedding was
+    # introduced — both fall back to ``ModelConfig()`` defaults.
+    ckpt_model_cfg = None
+
     if params.suffix == ".safetensors":
+        from safetensors import safe_open
         from safetensors.torch import load_file
 
+        from deepfold3.model.config import model_cfg_from_metadata
+
+        # safetensors metadata read is cheap (header-only); pull ModelConfig
+        # JSON before loading tensors so we can build the model with the
+        # correct architectural flags.
+        with safe_open(str(params), framework="pt") as f:
+            ckpt_model_cfg = model_cfg_from_metadata(f.metadata())
         state_dict = load_file(str(params))
     elif params.suffix == ".pt":
         ckpt = torch.load(str(params), map_location="cpu", weights_only=False)
@@ -177,6 +193,14 @@ def inference(
             shadow = ema_state["shadow"]
             state_dict = {**state_dict, **shadow}
             click.echo(f"  using EMA shadow ({len(shadow)} params)")
+        # Capture the embedded model_cfg before discarding the ckpt blob —
+        # critical for runs that override architectural flags (residual
+        # scaling, layer counts, etc.) whose dataclass defaults differ from
+        # the values used during training.
+        if isinstance(ckpt, dict) and "model_cfg" in ckpt:
+            import copy
+
+            ckpt_model_cfg = copy.deepcopy(ckpt["model_cfg"])
     else:
         import warnings
 
@@ -194,7 +218,21 @@ def inference(
     # Build model config with optimization settings
     from deepfold3.model.config import ModelConfig, OptimConfig
 
-    model_cfg = ModelConfig()
+    if ckpt_model_cfg is not None:
+        model_cfg = ckpt_model_cfg
+        click.echo("[inference] using model_cfg embedded in checkpoint")
+    else:
+        model_cfg = ModelConfig()
+        if params.suffix == ".pt":
+            click.echo(
+                "[inference] checkpoint has no embedded model_cfg — falling "
+                "back to ModelConfig() defaults. If the checkpoint was trained "
+                "with non-default architectural flags (e.g. deepnet_residual_scale), "
+                "the inference build will silently disagree."
+            )
+    # ``--optim`` always overrides the OptimConfig sub-config so inference
+    # picks fused / SDPA / tiled kernels regardless of how the checkpoint
+    # was trained (training and inference often differ here).
     if optim == "all":
         model_cfg.optim = OptimConfig.all_enabled()
     elif optim == "recommended":
@@ -203,7 +241,7 @@ def inference(
         model_cfg.optim = OptimConfig.inference()
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
-    # else: default OptimConfig (all False)
+    # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
 
     if optim and optim != "none":
         torch.set_float32_matmul_precision("high")  # TF32 for better perf

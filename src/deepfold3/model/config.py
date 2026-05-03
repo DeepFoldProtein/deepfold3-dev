@@ -826,3 +826,69 @@ class ModelConfig:
 
         _mirror("fp32_diffusion_sample", "skip_amp_sample")
         _mirror("fp32_diffusion_sample_training", "skip_amp_sample_training")
+
+
+# Key under which ``ModelConfig`` JSON is embedded in ``safetensors`` metadata.
+# safetensors metadata is ``dict[str, str]``; one ASCII-JSON-serialised entry
+# is enough to round-trip the full nested ``ModelConfig`` for inference.
+SAFETENSORS_MODEL_CFG_KEY = "model_cfg_json"
+
+
+def model_cfg_to_metadata(cfg: ModelConfig) -> dict[str, str]:
+    """Serialize ``ModelConfig`` to safetensors-compatible metadata.
+
+    Returns a ``dict[str, str]`` suitable for the ``metadata=`` kwarg of
+    :func:`safetensors.torch.save_file`. Round-trippable via
+    :func:`model_cfg_from_metadata`.
+    """
+    import json
+    from dataclasses import asdict
+
+    return {SAFETENSORS_MODEL_CFG_KEY: json.dumps(asdict(cfg))}
+
+
+def model_cfg_from_metadata(metadata: dict[str, str] | None) -> ModelConfig | None:
+    """Reconstruct ``ModelConfig`` from safetensors metadata, or ``None``.
+
+    Returns ``None`` if ``metadata`` is missing or lacks the embedded key
+    (e.g. converted weights produced before this metadata convention was
+    introduced) — the caller falls back to ``ModelConfig()`` defaults.
+
+    Unknown fields in the JSON are silently dropped: a checkpoint produced
+    by a future codebase that added new fields stays loadable, with the
+    extra fields ignored. Missing fields fall back to the dataclass
+    defaults at the current revision.
+    """
+    if not metadata:
+        return None
+    raw = metadata.get(SAFETENSORS_MODEL_CFG_KEY)
+    if raw is None:
+        return None
+
+    import json
+    import typing
+    from dataclasses import fields, is_dataclass
+
+    data = json.loads(raw)
+
+    def _coerce(v, t):
+        # JSON has no tuple type — restore tuple-typed fields from list.
+        if isinstance(v, list) and typing.get_origin(t) is tuple:
+            return tuple(v)
+        if isinstance(v, dict) and is_dataclass(t):
+            return _rec(t, v)
+        return v
+
+    def _rec(cls, d):
+        if not is_dataclass(cls) or not isinstance(d, dict):
+            return d
+        hints = typing.get_type_hints(cls)
+        valid = {f.name for f in fields(cls)}
+        kwargs = {}
+        for k, v in d.items():
+            if k not in valid:
+                continue
+            kwargs[k] = _coerce(v, hints.get(k))
+        return cls(**kwargs)
+
+    return _rec(ModelConfig, data)

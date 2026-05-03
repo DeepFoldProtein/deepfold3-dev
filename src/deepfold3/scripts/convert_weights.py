@@ -63,13 +63,19 @@ def convert(params: Path, af3_ref: Path, output: Path) -> None:
         click.echo(f"  {k}: {tuple(v.shape)}")
         state_dict[k] = v
 
-    # Step 4: Save as safetensors
+    # Step 4: Save as safetensors with embedded ModelConfig metadata.
+    # Converted AF3 weights map onto the default ``ModelConfig`` (which is
+    # tuned to match AF3 architecture exactly), so embedding those defaults
+    # is what callers should reconstruct at inference time.
     click.echo(f"[convert] saving {output} …")
     output.parent.mkdir(parents=True, exist_ok=True)
     from safetensors.torch import save_file
 
-    save_file(state_dict, str(output))
-    click.echo(f"  saved {len(state_dict)} tensors to {output.resolve()}")
+    from deepfold3.model.config import ModelConfig, model_cfg_to_metadata
+
+    metadata = model_cfg_to_metadata(ModelConfig())
+    save_file(state_dict, str(output), metadata=metadata)
+    click.echo(f"  saved {len(state_dict)} tensors + ModelConfig metadata to {output.resolve()}")
 
 
 if __name__ == "__main__":
