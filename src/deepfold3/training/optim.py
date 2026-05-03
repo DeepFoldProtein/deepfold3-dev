@@ -80,27 +80,84 @@ def freeze_for_confidence(model: nn.Module) -> None:
     rank_zero_info(f"Confidence-only training: {trainable / 1e6:.1f}M trainable parameters")
 
 
+# Parameter-name substrings that mark a weight as "gate" or "embedding" — both
+# excluded from weight decay alongside LN/bias (1D) params. Substring match on
+# the qualified parameter name (so ``ModuleList`` indices like
+# ``attn_cond_scale.0.weight`` and ``cond_scale.weight`` both match).
+#
+# Gates: sigmoid-modulated multiplicative paths. Decaying their weights pulls
+# the gate toward 0.5 (always-on), erasing the conditional behaviour and
+# hurting expressivity. Covers ``to_g`` (attention output gate), ``out_gate``
+# / ``.gate.`` (TriangleMul gates), and the AdaLN-zero ``cond_scale``,
+# ``cond_bias``, ``zero_cond`` projections (incl. atom-transformer's
+# ``attn_cond_scale``, ``k_cond_scale``, ``ffn_cond_scale``, ``*_cond_bias``
+# ``ModuleList`` variants).
+#
+# Embeddings: first projection from raw features to channels (no LN before
+# them — they ARE the input lifting). Decaying these shrinks the input
+# representation toward zero. Covers per-atom and template ``embed_*``
+# linears, ``{single,msa}_activations``, ``{left,right}_single``,
+# ``position_activations``, ``bond_embedding``, ``extra_msa_target_feat``,
+# ``prev_embedding``, ``prev_single_embedding``.
+_NO_DECAY_NAME_SUBSTRINGS = (
+    # gates / AdaLN-zero scale·shift·gate (must end with ``.weight`` to skip
+    # biases, which are already 1D-no-decay)
+    ".to_g.",
+    ".out_gate.",
+    ".gate.",
+    "cond_scale.",
+    "cond_bias.",
+    "zero_cond.",
+    # embeddings — input feature → channel projections
+    ".embed_",
+    "single_activations.",
+    "msa_activations.",
+    "extra_msa_target_feat.",
+    "left_single.",
+    "right_single.",
+    "position_activations.",
+    "bond_embedding.",
+    "prev_embedding.",
+    "prev_single_embedding.",
+)
+
+
+def _is_no_decay_by_name(name: str) -> bool:
+    if not name.endswith(".weight"):
+        return False
+    return any(s in name for s in _NO_DECAY_NAME_SUBSTRINGS)
+
+
 def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
     """Build AdamW with decoupled weight decay.
 
-    Protenix / nanoGPT convention: decay 2D+ params (matmul weights,
-    embeddings); skip 1D params (LayerNorm gamma/beta, biases) —
-    applying L2 to scale/shift terms collapses them and hurts training
-    stability.
+    Protenix / nanoGPT convention extended for AF3 architecture:
+        * 1D params (LayerNorm gamma/beta, biases) → no-decay (collapses
+          scale/shift terms otherwise).
+        * 2D weights with ``min(shape) == 1`` (``LinearNoBias(1, C)`` etc.,
+          per-channel scale factors) → no-decay.
+        * Gate weights (``to_g``, ``out_gate``, ``.gate.``, AdaLN-zero
+          ``cond_scale`` / ``cond_bias`` / ``zero_cond``) → no-decay.
+          Decay would pull sigmoids toward 0.5 (always-on) and kill the
+          conditional / learned-mask behaviour.
+        * Embedding weights (input-feature → channel lift, e.g.
+          ``single_activations``, ``msa_activations``, ``embed_*`` in
+          per-atom and template stacks, ``prev_embedding``) → no-decay.
+          These have no preceding LN, so decay shrinks the input
+          representation directly.
+        * All remaining 2D+ weights (matmul weights inside attention
+          / FFN / triangle multiplication / OPM out_w) → decay.
 
-    Additional AF3-specific refinement: many AF3 projections are
-    ``LinearNoBias(1, C)`` or ``LinearNoBias(C, 1)`` — scalar-input or
-    scalar-output linears that behave as per-channel scale factors.
-    Their weight is technically 2D (``[C, 1]`` or ``[1, C]``) but
-    semantically equivalent to a 1D param. Treat any 2D weight where
-    ``min(shape) == 1`` as no-decay.
+    See :data:`_NO_DECAY_NAME_SUBSTRINGS` for the full pattern list.
     """
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
-    for param in model.parameters():
+    for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if param.dim() < 2 or min(param.shape) == 1:
+            no_decay_params.append(param)
+        elif _is_no_decay_by_name(name):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -145,9 +202,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         return optimizer
 
     if cfg.optimizer_type != "adamw":
-        raise ValueError(
-            f"optimizer_type must be 'adamw' or 'schedule_free', got {cfg.optimizer_type!r}"
-        )
+        raise ValueError(f"optimizer_type must be 'adamw' or 'schedule_free', got {cfg.optimizer_type!r}")
 
     # Fused AdamW on CUDA: single kernel launch per param group,
     # ~1.3-1.5x faster than the foreach implementation at our scale.
