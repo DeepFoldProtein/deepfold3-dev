@@ -132,6 +132,10 @@ Components:
 
 **`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition
 
+Optional DeepNet-style residual scaling on every PairFormerBlock branch: when `PairFormerConfig.deepnet_residual_scale=True` (and equivalently `ConfidenceConfig.deepnet_residual_scale` for the 4-layer confidence stack), each block scales its branch outputs by per-branch factors before adding to the residual stream — `tri_mul_out`, `tri_mul_in`, `single_attn`, `single_transition` use `1/sqrt(2L)`; `pair_attn_row`, `pair_attn_col`, `pair_transition` use `1/sqrt(L)`. `L` is the enclosing stack's `num_layer` (trunk: 48; confidence head: 4). Output projections retain zero-init.
+
+Because the residual scaling factor only affects the forward-pass scalar (no parameter shape change), `load_state_dict(strict=False)` will silently accept a checkpoint trained with one setting into a model built with the other and produce wrong outputs. Both `.pt` and `.safetensors` writers therefore embed the architectural `ModelConfig` (pickled blob and JSON metadata respectively); inference reconstructs the dataclass at load time. See `docs/training.md` § _Configuration persistence_.
+
 **`Evoformer`** input projections:
 
 - `target_feat [N, 447]` -> single `[N, 384]`, pair `[N, N, 128]` (outer sum of left/right projections)

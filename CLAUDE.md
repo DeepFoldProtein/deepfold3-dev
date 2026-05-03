@@ -49,6 +49,8 @@ deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-id-file pdb_ids.txt --no-assembly --workers 16
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --max-resolution 4.0 --workers 8
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --cluster-file clusters-by-entity-40.txt
+deepfold3 fetch-ccd        --output /data/ccd/
+deepfold3 build-ccd-cache  --components-cif /data/ccd/components.cif.gz --output /data/ccd/ccd_cache.json --ref-pos --automorphisms --workers 16
 deepfold3 cluster   --data-dir /data/training --output clusters.txt
 deepfold3 cluster   --data-dir /data/training --output clusters.txt --min-seq-id 0.3
 deepfold3 apply-clusters --manifest /data/training/manifest.json --cluster-file clusters-by-entity-40.txt --output /data/training/manifest.json
@@ -67,6 +69,11 @@ deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
 deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx --mmcif-cache data/mmcif_meta.json
 deepfold3 drop-obsolete --data-dir /data/training
 deepfold3 drop-obsolete --data-dir /data/training --delete-files
+deepfold3 refilter      --data-dir /data/training --max-unk-fraction 0.10 --max-tight-clashes 5
+deepfold3 export-complexes --data-dir /data/training --output complexes.json
+deepfold3 build-masks   --data-dir /data/training --json-dir /data/patchr/inpainting --workers 32
+deepfold3 inspect-example --data-dir /data/training --id 7jyb
+deepfold3 inspect-example --data-dir /data/training --id 7jyb,8qy0,1pfe --json
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors --mmcif-dir /data/pdb/mmcif
 deepfold3 train     --data-dir /data/training --output runs/exp1 --resume runs/exp1/checkpoint_1000.pt
@@ -175,17 +182,21 @@ src/deepfold3/
 │   ├── scheduler.py      # AF3LRScheduler + CosineAnnealingScheduler
 │   └── trainer.py        # DDP Trainer (training loop, checkpointing, eval, WandB)
 ├── scripts/         # CLI (click group: `deepfold3 <command>`)
-│   ├── __init__.py       # click.Group `cli` — unified entry point
+│   ├── __init__.py       # `_LazyGroup` click.Group `cli` — unified entry point (lazy submodule import)
 │   ├── _common.py        # setup_cli_logging(), require_manifest()
-│   ├── inference.py      # `deepfold3 inference`
-│   ├── msa_search.py     # `deepfold3 msa`
-│   ├── msa_batch.py      # `deepfold3 msa-batch`
+│   ├── build_masks.py    # `deepfold3 build-masks`
 │   ├── convert_weights.py  # `deepfold3 convert`
+│   ├── inference.py      # `deepfold3 inference`
+│   ├── inspect_example.py # `deepfold3 inspect-example`
+│   ├── msa_batch.py      # `deepfold3 msa-batch`
+│   ├── msa_search.py     # `deepfold3 msa`
 │   ├── plot_confidences.py # `deepfold3 plot`
-│   ├── prepare.py        # `deepfold3 prepare`, `import-msa`, `import-paired-msa`, `import-of3`, `enrich-manifest`, `drop-obsolete`, etc.
+│   ├── prepare.py        # `deepfold3 prepare`, `apply-clusters`, `cluster`, `fetch-ccd`, `build-ccd-cache`, `export-complexes`, `import-msa`, `import-paired-msa`, `import-of3`, `enrich-manifest`, `drop-obsolete`
 │   ├── prepare_templates.py # `deepfold3 prepare-templates`
+│   ├── refilter.py       # `deepfold3 refilter`
 │   ├── scan_mmcif.py     # `deepfold3 scan-mmcif` (parallel mmCIF metadata cache)
-│   └── train.py          # `deepfold3 train`
+│   ├── train.py          # `deepfold3 train`
+│   └── warmup_triton.py  # `deepfold3 warmup-triton`
 └── params.py        # read_af3_params() (zstd decompression)
 
 scripts/                     # Shell scripts for database setup and GPU server
@@ -235,6 +246,14 @@ Training uses native PyTorch DDP. The core training loop, losses, EMA, and LR sc
 | PAE                         | `alpha_confidence × alpha_pae` (0 until FT3)      | Set `alpha_pae=1.0` only in finetune3 (confidence-only stage). Frames within 25° of co-linearity dropped per-sample on both pred and GT (AF3 §4.3.2). |
 
 Confidence head forward is gated on `alpha_confidence > 0` ([model.py:557](src/deepfold3/model/model.py#L557)) — skipped entirely when disabled to avoid `0 × NaN = NaN` contamination of the total loss. Mini-rollout still runs (needed for chain permutation determinism). Distogram loss lives above the `is_distillation` early-return in `training_loss` so distillation samples contribute distogram gradient.
+
+### Optimizer
+
+AdamW or Schedule-Free AdamW with decoupled weight decay split by parameter role ([optim.py:build_optimizer](src/deepfold3/training/optim.py)). **No-decay** group: 1D params (LN scale/shift, biases), per-channel scale-like 2D weights (`min(shape)==1`), gates (`to_g`, `out_gate`, `.gate.`, AdaLN-zero `cond_scale` / `cond_bias` / `zero_cond` incl. atom-transformer `ModuleList` variants), and input embeddings (`single_activations`, `msa_activations`, `embed_*`, `{left,right}_single`, `position_activations`, `bond_embedding`, `prev_*`). **Decay** group: all remaining 2D+ matmul weights (attention QKV / output, FFN, triangle multiplication output, OPM `out_w`, …). See `_NO_DECAY_NAME_SUBSTRINGS` for the substring patterns.
+
+### Configuration Persistence
+
+`CheckpointManager.save` pickles `model_cfg` and `train_cfg` into the `.pt` blob, and `convert_weights.py` embeds the architectural `ModelConfig` as a JSON metadata entry (`SAFETENSORS_MODEL_CFG_KEY = "model_cfg_json"`) in `.safetensors`. `deepfold3 inference` reconstructs the dataclass at load time so flags whose default differs from the trained run (notably `pairformer.deepnet_residual_scale` and `confidence.deepnet_residual_scale` — both default `False` but enabled in `configs/schedule_free.yaml`) propagate correctly. `--optim` flag overrides only `OptimConfig`. Legacy `.safetensors` without metadata and raw AF3 `.bin/.bin.zst` fall back to `ModelConfig()` defaults with a warning. See `docs/training.md` § _Configuration persistence_.
 
 ### Token Masks (Loss Control)
 

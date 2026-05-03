@@ -41,6 +41,8 @@ deepfold3 convert \
     --output resources/deepfold3.safetensors
 ```
 
+The output `.safetensors` embeds the architectural `ModelConfig` as JSON metadata so `deepfold3 inference` reconstructs the model with the exact flags it was trained on (default `ModelConfig()` for AF3-converted weights). Same goes for training-produced `.pt` checkpoints, which carry the dataclass directly. `--optim` at inference still overrides only the optimization sub-config (fused kernels, SDPA, …).
+
 ### 2. Search for MSAs
 
 Search using the ColabFold MMseqs2 server (no local databases required):

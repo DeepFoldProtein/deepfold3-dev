@@ -37,7 +37,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 {
   "training": {
     "lr": 0.0018,
-    "weight_decay": 1e-8,
+    "weight_decay": 0.05,
     "betas": [0.9, 0.95],
     "warmup_steps": 1000,
     "start_decay_after": 50000,
@@ -63,7 +63,7 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
     "max_resolution": 4.0,
     "train_confidence_only": false,
     "finetune_scheduler": "af3",
-    "max_checkpoints": 5,
+    "max_checkpoints": 0,
     "wandb_project": "",
     "dtype": "bf16",
     "max_steps": 200000,
@@ -439,6 +439,18 @@ The featurizer produces these training-specific features:
 
 These are separate from `ref_pos` (CCD ideal coordinates used for atom cross-attention conditioning).
 
+## Optimizer
+
+AdamW (or Schedule-Free AdamW when `optimizer_type="schedule_free"`) with **decoupled weight decay split into two groups** (`build_optimizer` in `training/optim.py`):
+
+- **No-decay** group (`weight_decay=0`):
+  - 1D params (LayerNorm γ/β, biases) and 2D weights with `min(shape)==1` (per-channel scale-like projections).
+  - **Gates**: `to_g`, `out_gate`, `.gate.`, AdaLN-zero `cond_scale` / `cond_bias` / `zero_cond` (incl. `attn_cond_scale.{i}`, `k_cond_scale.{i}`, `ffn_cond_scale.{i}`, `*_cond_bias.{i}` `ModuleList` variants in the atom transformer). Decay would pull sigmoids toward 0.5 (always-on), erasing the conditional behaviour.
+  - **Input embeddings**: `single_activations`, `msa_activations`, `extra_msa_target_feat`, `{left,right}_single`, `position_activations`, `bond_embedding`, `prev_embedding`, `prev_single_embedding`, plus per-atom and template `embed_*` linears. No preceding LN, so decay shrinks the input representation directly.
+- **Decay** group (`weight_decay=cfg.weight_decay`): all remaining 2D+ matmul weights — attention QKV / output projections, FFN linears, triangle multiplication output projections, OPM `out_w`, etc.
+
+See `_NO_DECAY_NAME_SUBSTRINGS` in `training/optim.py` for the exact pattern list.
+
 ## Checkpointing
 
 Checkpoints are saved at configurable intervals (default: every 1000 steps) and contain:
@@ -448,15 +460,26 @@ Checkpoints are saved at configurable intervals (default: every 1000 steps) and 
 - LR scheduler state dict
 - EMA state (if enabled, also excludes fused params)
 - Step counters
-- Config (model + training)
+- Config (model + training) — `model_cfg` and `train_cfg` are pickled into the blob and used at inference time to rebuild the model with the exact architecture flags (e.g. `pairformer.deepnet_residual_scale`) that were active at training. See _Configuration persistence_ below.
 
-**Checkpoint rotation**: keeps the `max_checkpoints` (default 5) most recent checkpoints by modification time. `checkpoint_final.pt` is always preserved.
+**Checkpoint rotation**: keeps the `max_checkpoints` most recent checkpoints by modification time. Default is `0`, which disables rotation (all checkpoints are kept). `checkpoint_final.pt` and `checkpoint_best.pt` are always preserved.
 
 Resume training by passing `--resume path/to/checkpoint.pt`.
 
 **Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
 
 **Fused kernel portability**: `DeepFold3.state_dict()` automatically filters out derived fused kernel parameters (identified by `OptimConfig.FUSED_STATE_DICT_MARKERS`). On load, `load_state_dict()` re-syncs fused params from base weights. This means checkpoints saved with fused kernels enabled can be loaded without them, and vice versa.
+
+### Configuration persistence
+
+A fresh `ModelConfig()` at inference does **not** match a checkpoint trained with non-default flags (`pairformer.deepnet_residual_scale`, `confidence.deepnet_residual_scale`, layer counts, …). These flags often only change a forward-pass scalar, so `load_state_dict(strict=False)` reports `missing=0, unexpected=0` and the silent failure is a wrong prediction.
+
+The checkpoint pipeline embeds the architectural `ModelConfig` on both sides of the format:
+
+- **`.pt` training checkpoints**: `CheckpointManager.save` already pickles `model_cfg`. `deepfold3 inference --params <ckpt>.pt` deep-copies it out of the blob and uses it as the base.
+- **`.safetensors` files**: `convert_weights.py` and any future writer embed a JSON-serialised `ModelConfig` under the `model_cfg_json` metadata key (`SAFETENSORS_MODEL_CFG_KEY`). `deepfold3 inference --params <weights>.safetensors` reads the metadata via `safe_open(...).metadata()` (header-only, cheap) and reconstructs the dataclass via `model_cfg_from_metadata`. Forward-compatible: unknown future fields are silently dropped.
+
+The `--optim` flag always overrides only `OptimConfig`, never the architectural fields. Legacy `.safetensors` (no metadata) and raw AF3 `.bin` / `.bin.zst` paths fall back to `ModelConfig()` defaults with a one-line warning.
 
 ## Training Stages
 
