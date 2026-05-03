@@ -88,6 +88,7 @@ class ConfidenceHead(nn.Module):
         sum_fusion_init_(self.distogram_feat_project.weight, _conf_target, "one_hot")
 
         # 4-layer PairFormer with single track (same as trunk)
+        _conf_deepnet_L = cfg.num_layer if cfg.deepnet_residual_scale else None
         self.layers = nn.ModuleList(
             [
                 PairFormerBlock(
@@ -98,6 +99,7 @@ class ConfidenceHead(nn.Module):
                     single_key_dim=c_single,
                     single_value_dim=c_single,
                     optim=optim,
+                    deepnet_layer_scale=_conf_deepnet_L,
                 )
                 for _ in range(cfg.num_layer)
             ]

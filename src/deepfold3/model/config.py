@@ -63,6 +63,13 @@ class PairFormerConfig:
     single_key_dim: int = 384
     single_value_dim: int = 384
     pair_dropout: float = 0.25
+    # DeepNet-style residual scaling on every PairFormerBlock branch. When True,
+    # each block multiplies its branch outputs by a per-branch factor before
+    # adding to the residual stream (L = num_layer of this stack):
+    #   tri_mul_out / tri_mul_in / single_attn / single_transition: 1/sqrt(2L)
+    #   pair_attn_row / pair_attn_col / pair_transition:            1/sqrt(L)
+    # Output projections retain zero-init.
+    deepnet_residual_scale: bool = False
 
 
 @dataclass
@@ -126,6 +133,8 @@ class ConfidenceConfig:
     max_atoms_per_token: int = 24  # AF3 dense atom representation max
     pair_attention_num_head: int = 4
     single_attention_num_head: int = 16
+    # See PairFormerConfig.deepnet_residual_scale. L = this stack's num_layer (4).
+    deepnet_residual_scale: bool = False
 
 
 @dataclass

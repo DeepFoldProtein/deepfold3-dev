@@ -125,6 +125,7 @@ class PairFormerBlock(nn.Module):
         single_value_dim: int = 384,
         pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
+        deepnet_layer_scale: int | None = None,
     ):
         super().__init__()
         self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
@@ -145,6 +146,26 @@ class PairFormerBlock(nn.Module):
         self.single_transition = make_transition_block(c_single, config=optim)
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
+        # DeepNet-style residual scaling on both pair and single tracks.
+        # Output projections retain zero-init; only the forward residual is
+        # scaled. Per user spec:
+        #   tri_mul_out / tri_mul_in / single_attn / single_transition: 1/sqrt(2L)
+        #   pair_attn_row / pair_attn_col / pair_transition:            1/sqrt(L)
+        if deepnet_layer_scale is not None and deepnet_layer_scale > 0:
+            L = float(deepnet_layer_scale)
+            self._tri_residual_scale = 1.0 / math.sqrt(2.0 * L)
+            self._pair_attn_residual_scale = 1.0 / math.sqrt(L)
+            self._pair_ffn_residual_scale = 1.0 / math.sqrt(L)
+            self._attn_residual_scale = 1.0 / math.sqrt(2.0 * L)
+            self._ffn_residual_scale = 1.0 / math.sqrt(2.0 * L)
+            self._deepnet_active = True
+        else:
+            self._tri_residual_scale = 1.0
+            self._pair_attn_residual_scale = 1.0
+            self._pair_ffn_residual_scale = 1.0
+            self._attn_residual_scale = 1.0
+            self._ffn_residual_scale = 1.0
+            self._deepnet_active = False
 
     def forward(
         self,
@@ -155,16 +176,31 @@ class PairFormerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         p, training = self.pair_dropout, self.training
         use_fused = self.use_fused_dropout
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
-        pair = pair + self.pair_transition(pair)
-        # Single update: pair → logits, then single attention
-        pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
-        pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
-        single = single + self.single_attn(single, seq_mask, pair_logits)
-        single = single + self.single_transition(single)
+        if self._deepnet_active:
+            s_tri = self._tri_residual_scale
+            s_pa = self._pair_attn_residual_scale
+            s_pf = self._pair_ffn_residual_scale
+            pair = dropout_add_rowwise(pair, s_tri * self.tri_mul_out(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_rowwise(pair, s_tri * self.tri_mul_in(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_rowwise(pair, s_pa * self.pair_attn_row(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_columnwise(pair, s_pa * self.pair_attn_col(pair, pair_mask), p, training, use_fused)
+            pair = pair + s_pf * self.pair_transition(pair)
+            # Single update: pair → logits, then single attention
+            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+            pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
+            single = single + self._attn_residual_scale * self.single_attn(single, seq_mask, pair_logits)
+            single = single + self._ffn_residual_scale * self.single_transition(single)
+        else:
+            pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
+            pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
+            pair = pair + self.pair_transition(pair)
+            # Single update: pair → logits, then single attention
+            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+            pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
+            single = single + self.single_attn(single, seq_mask, pair_logits)
+            single = single + self.single_transition(single)
         return pair, single
 
 
@@ -263,6 +299,7 @@ class Evoformer(nn.Module):
         )
 
         # PairFormer stack
+        _trunk_deepnet_L = pf_cfg.num_layer if pf_cfg.deepnet_residual_scale else None
         self.trunk_pairformer = nn.ModuleList(
             [
                 PairFormerBlock(
@@ -274,6 +311,7 @@ class Evoformer(nn.Module):
                     single_value_dim=pf_cfg.single_value_dim,
                     pair_dropout=pf_cfg.pair_dropout,
                     optim=optim,
+                    deepnet_layer_scale=_trunk_deepnet_L,
                 )
                 for _ in range(pf_cfg.num_layer)
             ]
