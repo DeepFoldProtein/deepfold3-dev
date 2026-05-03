@@ -133,7 +133,7 @@ class CheckpointManager:
     one and call methods directly.
     """
 
-    def __init__(self, *, max_checkpoints: int, strict: bool, device: torch.device) -> None:
+    def __init__(self, *, max_checkpoints: int = 0, strict: bool, device: torch.device) -> None:
         self.max_checkpoints = max_checkpoints
         self.strict = strict
         self.device = device
