@@ -18,9 +18,31 @@ base: initial.yaml
 # averaging truth.
 training:
   optimizer_type: schedule_free
-  lr: 0.0018
+  lr: 0.001
+  betas: [0.9, 0.95]
   warmup_steps: 1000
   ema_decay: 0.0
+
+  # AdamW decoupled weight decay. Probe of df3-sf-bs3-12n-deepnet-20260502-012417
+  # (scripts/probe_layer_amp.py @ step100/400/800) showed zero-init out_proj
+  # Frobenius norms growing 8-14× over 700 steps: msa_stack.0.outer_product
+  # 0.33→3.58, pf.0.single_transition.linear2 0.66→8.04, pf.0.tri_mul_out
+  # 0.10→1.45. With weight_decay=0 there is no force to bound them, so the
+  # PairFormer single residual stream grows ~1.166×/layer (geom. mean) and
+  # single_l2 doubles every ~150 steps.
+  #
+  # Decay applied to matmul weights only. No-decay group covers (substring
+  # match on the qualified parameter name, see optim.py:_NO_DECAY_NAME_SUBSTRINGS):
+  #   * 1D params (LayerNorm gamma/beta, biases) — auto-detected by dim<2.
+  #   * Gates (to_g, out_gate, .gate., cond_scale, cond_bias, zero_cond,
+  #     incl. ModuleList variants like attn_cond_scale.0 / k_cond_scale.1
+  #     / ffn_cond_bias.2 inside the atom transformer) — decaying gate
+  #     weights pulls sigmoids toward 0.5 (always-on).
+  #   * Input embeddings (single_activations, msa_activations, embed_*,
+  #     {left,right}_single, position_activations, bond_embedding,
+  #     prev_embedding, prev_single_embedding) — no preceding LN, so
+  #     decay shrinks the input representation directly.
+  weight_decay: 0.05
 
   # Trust the clip: per-rank magnitude skip disabled. max_norm=10 always
   # runs and bounds the optimizer-visible gradient; NaN/Inf gate is
@@ -28,3 +50,13 @@ training:
   # from clipped spikes.
   grad_norm_skip_threshold: 0.0
   grad_norm_log_threshold: 1000.0
+
+# DeepNet-style residual scaling on the single track of every PairFormer block
+# (trunk: L=48, confidence head: L=4). Single-attention output is multiplied by
+# 1/sqrt(2L) and single FFN output by 1/sqrt(L) before adding to the residual
+# stream. Output projections retain zero-init.
+model:
+  pairformer:
+    deepnet_residual_scale: true
+  confidence:
+    deepnet_residual_scale: true

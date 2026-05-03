@@ -21,6 +21,22 @@ training:
   skip_load_scheduler: true
   skip_load_step: true
 
+# Architectural flags must match the stage-1 checkpoint loaded via --params.
+# Upstream stage 1 (configs/schedule_free.yaml) enables DeepNet residual
+# scaling on both PairFormer stacks; without these flags here the stage-2
+# model would build a different forward pass and silently mis-apply the
+# loaded weights (load_state_dict reports missing=0, unexpected=0 because
+# only forward-pass scalars change).
+#
+# To inherit the full stage-1 optimizer setup (Schedule-Free AdamW,
+# weight_decay=0.05, lr=0.001, …), chain configs at submit time:
+#   --config configs/schedule_free.yaml --config configs/finetune1_structure_640.yaml
+# Click last-wins handles the duplicate --config; finetune1's training
+# overrides (cosine LR / max_tokens / alphas) take precedence.
 model:
+  pairformer:
+    deepnet_residual_scale: true
+  confidence:
+    deepnet_residual_scale: true
   data:
     max_chains: 20

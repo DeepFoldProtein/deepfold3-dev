@@ -1,5 +1,13 @@
 training:
   lr: 0.0018
+  # Default 0 here matches the AF3 supplement (no weight decay during
+  # initial training). Production runs set this from the optimizer config
+  # layered on top — configs/schedule_free.yaml overrides to 0.05 to
+  # bound zero-init out_proj weight growth (the PairFormer single-stream
+  # divergence diagnosed in df3-sf-bs3-12n-deepnet-20260502-012417). Decay
+  # is applied only to matmul weights — LN scales/biases, gates, and
+  # input embeddings auto-route to the no-decay group via
+  # optim.py:_NO_DECAY_NAME_SUBSTRINGS. See docs/training.md § Optimizer.
   weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -110,7 +118,7 @@ datasets:
     is_distillation: false
     format: df3
     cutoff_date: "2021-09-30"
-    exclude_loss_mol_types: [] # Exclude ligands
+    exclude_loss_mol_types: []
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
