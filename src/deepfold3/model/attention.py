@@ -32,6 +32,8 @@ All modules support both unbatched and batched (leading B dim) inputs.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -340,7 +342,14 @@ class SingleAttention(nn.Module):
     """
 
     def __init__(
-        self, c: int, num_heads: int = 16, key_dim: int = 384, value_dim: int = 384, optim: OptimConfig | None = None
+        self,
+        c: int,
+        num_heads: int = 16,
+        key_dim: int = 384,
+        value_dim: int = 384,
+        optim: OptimConfig | None = None,
+        pair_bias_gate: bool = False,
+        pair_bias_gate_init_tau: float = 0.25,
     ):
         super().__init__()
         assert key_dim % num_heads == 0
@@ -352,6 +361,22 @@ class SingleAttention(nn.Module):
 
         # Regular LayerNorm (single_cond=None → no AdaLN)
         self.norm = LayerNorm(c)
+
+        # Per-head learnable PairBias gate (log-parameterised). Calibrates
+        # the strength of ``pair_logits`` relative to ``q·kᵀ`` inside the
+        # attention softmax. Useful when the network needs to re-balance the
+        # PairBias contribution per head independently of QK magnitude.
+        #     τ_h = exp(a_h),   a_h initialised to log(τ₀)  (default τ₀=0.25)
+        # Log-param keeps τ_h > 0 always and grows multiplicatively under
+        # additive AdamW updates. Shape ``[num_heads]`` — auto-routed to the
+        # no-decay group via the 1-D parameter rule in ``optim.py``.
+        if pair_bias_gate:
+            if pair_bias_gate_init_tau <= 0.0:
+                raise ValueError(f"pair_bias_gate_init_tau must be > 0, got {pair_bias_gate_init_tau}")
+            a_init = math.log(float(pair_bias_gate_init_tau))
+            self.pair_bias_gate_a = nn.Parameter(torch.full((num_heads,), a_init))
+        else:
+            self.register_parameter("pair_bias_gate_a", None)
 
         self.to_q = nn.Linear(c, key_dim)
         af3_linear_init_(self.to_q.weight, "linear")
@@ -375,6 +400,10 @@ class SingleAttention(nn.Module):
         k = self.to_k(xn).view(B, N, H, Dk).permute(0, 2, 1, 3)
         v = self.to_v(xn).view(B, N, H, Dv).permute(0, 2, 1, 3)
         logits = torch.matmul(q * self.scale, k.transpose(-2, -1))
+        if self.pair_bias_gate_a is not None:
+            # τ_h = exp(a_h), shape [H]; broadcast over [B, H, N, N].
+            tau = torch.exp(self.pair_bias_gate_a).to(pair_logits.dtype)
+            pair_logits = pair_logits * tau.view(1, H, 1, 1)
         logits = logits + pair_logits
         bias_mask = 1e9 * (mask.float() - 1.0)
         logits = logits + bias_mask.view(B, 1, 1, N)

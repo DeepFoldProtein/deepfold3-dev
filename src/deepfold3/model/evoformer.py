@@ -42,7 +42,13 @@ from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAtt
 from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
+from deepfold3.model.primitives import (
+    LayerNorm,
+    LinearNoBias,
+    block_residual_scale,
+    rms_normalize,
+    sum_fusion_init_,
+)
 from deepfold3.model.template_embedding import TemplateEmbedding
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 
@@ -52,6 +58,35 @@ _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check
 _TARGET_FEAT_DIM = 447
 # MSA feature dimension: one_hot(32) + has_deletion(1) + deletion_value(1)
 _MSA_FEAT_DIM = 34
+
+
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    """No-op used as the off-path of the optional RMSNorm-residual wrap."""
+    return x
+
+
+def _resolve_branch_residual_gain(layer_idx: int, base_gain: float | None, per_layer_extra: bool) -> float | None:
+    """Resolve a per-block residual-gain factor for layer ``layer_idx``.
+
+    Used by both the ``single_transition`` and ``pair_transition`` branches
+    (and by the confidence-head PairFormer mirror) to multiply the
+    block-wide ``s_ros`` by an additional factor.
+
+    Returns ``None`` (= no override = 1.0) when neither knob is set,
+    otherwise the composed scalar
+    ``base_gain · (1/sqrt(layer_idx+1) if per_layer_extra else 1)``.
+    """
+    base = 1.0 if base_gain is None else float(base_gain)
+    if per_layer_extra:
+        base *= 1.0 / math.sqrt(float(layer_idx + 1))
+    if not per_layer_extra and base_gain is None:
+        return None
+    return base
+
+
+# Backwards-compatible alias for older imports during the deepnet-removal
+# refactor; remove once no callers reference the old name.
+_resolve_single_transition_gain = _resolve_branch_residual_gain
 
 
 class EvoformerBlock(nn.Module):
@@ -70,8 +105,14 @@ class EvoformerBlock(nn.Module):
         msa_dropout: float = 0.15,
         pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
+        residual_out_scale: float = 1.0,
     ):
         super().__init__()
+        # ``residual_out_scale = s`` policy in this block — F-output side for every
+        # residual update. Each F's output is multiplied by ``s`` in
+        # ``forward`` before being added to the residual stream. Inputs (the
+        # LayerNorm at the start of each F) stay unscaled — the absorption
+        # target is the final linear projection of each F at inference time.
         self.row_attn = MSAAttention(c_msa, c_pair, num_heads=num_msa_heads, optim=optim)
         self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=outer_product_hidden)
         if optim is not None and optim.tiled_opm_chunk > 0:
@@ -85,6 +126,8 @@ class EvoformerBlock(nn.Module):
         self.msa_dropout = msa_dropout
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
+        # Per-block residual-output multiplier for OPM / TriMul / TriAttn / Transition.
+        self.residual_out_scale = float(residual_out_scale)
 
     def forward(
         self,
@@ -95,14 +138,15 @@ class EvoformerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         p_pair, p_msa, training = self.pair_dropout, self.msa_dropout, self.training
         use_fused = self.use_fused_dropout
-        pair = pair + self.outer_product(msa, msa_mask)
-        msa = dropout_add_rowwise(msa, self.row_attn(msa, msa_mask, pair), p_msa, training, use_fused)
-        msa = msa + self.msa_transition(msa)
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
-        pair = pair + self.pair_transition(pair)
+        s = self.residual_out_scale
+        pair = pair + s * self.outer_product(msa, msa_mask)
+        msa = dropout_add_rowwise(msa, s * self.row_attn(msa, msa_mask, pair), p_msa, training, use_fused)
+        msa = msa + s * self.msa_transition(msa)
+        pair = dropout_add_rowwise(pair, s * self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
+        pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
+        pair = pair + s * self.pair_transition(pair)
         return msa, pair
 
 
@@ -125,16 +169,35 @@ class PairFormerBlock(nn.Module):
         single_value_dim: int = 384,
         pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
-        deepnet_layer_scale: int | None = None,
+        residual_out_scale: float = 1.0,
+        pair_bias_gate: bool = False,
+        pair_bias_gate_init_tau: float = 0.25,
+        single_transition_linear_out_init_gain: float | None = None,
+        single_transition_residual_gain: float | None = None,
+        pair_transition_residual_gain: float | None = None,
+        residual_branch_rmsnorm: bool = False,
     ):
         super().__init__()
+        # ``residual_out_scale`` (= s_ros) policy — F-output side only:
+        #  * Every residual update (TriMul, GridSelfAttention pair-track,
+        #    Transitions, SingleAttention) has F's output multiplied by
+        #    ``s_ros`` in ``forward``. Inputs (LayerNorms inside each F)
+        #    are left unscaled, so SingleAttention's q·kᵀ stays at
+        #    baseline magnitude and its softmax distribution is unperturbed.
+        #  * ``single_to_pair_norm`` (PairBias side input): untouched.
+        #  * The per-head learnable PairBias gate ``τ_h = exp(a_h)`` inside
+        #    SingleAttention is independent of ``residual_out_scale`` — it
+        #    rescales ``pair_logits`` so the network can re-balance the
+        #    QK-vs-PairBias contribution to the attention softmax per head.
+        #  * ``{single,pair}_transition_residual_gain`` (defaults 1.0)
+        #    multiplies ``s_ros`` on the corresponding transition branch
+        #    only — used by the trunk transition aligned-gain ablation.
         self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
         self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
         self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
         self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
-        # Single track
-        self.single_to_pair_norm = LayerNorm(c_pair)  # normalizes pair act
+        self.single_to_pair_norm = LayerNorm(c_pair)
         self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
         self.single_attn = SingleAttention(
             c_single,
@@ -142,30 +205,27 @@ class PairFormerBlock(nn.Module):
             key_dim=single_key_dim,
             value_dim=single_value_dim,
             optim=optim,
+            pair_bias_gate=pair_bias_gate,
+            pair_bias_gate_init_tau=pair_bias_gate_init_tau,
         )
-        self.single_transition = make_transition_block(c_single, config=optim)
+        self.single_transition = make_transition_block(
+            c_single, config=optim, linear_out_init_gain=single_transition_linear_out_init_gain
+        )
+        self.residual_out_scale = float(residual_out_scale)
+        # Branch-specific multipliers on the per-transition residual updates
+        # (None ≡ 1.0). Compose with the block-wide ``s_ros`` to give the
+        # final ``s_single_ffn`` / ``s_pair_ffn``.
+        self.single_transition_residual_gain = (
+            float(single_transition_residual_gain) if single_transition_residual_gain is not None else 1.0
+        )
+        self.pair_transition_residual_gain = (
+            float(pair_transition_residual_gain) if pair_transition_residual_gain is not None else 1.0
+        )
+        # Non-learnable RMSNorm at every residual-branch output (PairFormer
+        # only); see :class:`PairFormerConfig.residual_branch_rmsnorm`.
+        self.residual_branch_rmsnorm = bool(residual_branch_rmsnorm)
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
-        # DeepNet-style residual scaling on both pair and single tracks.
-        # Output projections retain zero-init; only the forward residual is
-        # scaled. Per user spec:
-        #   tri_mul_out / tri_mul_in / single_attn / single_transition: 1/sqrt(2L)
-        #   pair_attn_row / pair_attn_col / pair_transition:            1/sqrt(L)
-        if deepnet_layer_scale is not None and deepnet_layer_scale > 0:
-            L = float(deepnet_layer_scale)
-            self._tri_residual_scale = 1.0 / math.sqrt(2.0 * L)
-            self._pair_attn_residual_scale = 1.0 / math.sqrt(L)
-            self._pair_ffn_residual_scale = 1.0 / math.sqrt(L)
-            self._attn_residual_scale = 1.0 / math.sqrt(2.0 * L)
-            self._ffn_residual_scale = 1.0 / math.sqrt(2.0 * L)
-            self._deepnet_active = True
-        else:
-            self._tri_residual_scale = 1.0
-            self._pair_attn_residual_scale = 1.0
-            self._pair_ffn_residual_scale = 1.0
-            self._attn_residual_scale = 1.0
-            self._ffn_residual_scale = 1.0
-            self._deepnet_active = False
 
     def forward(
         self,
@@ -176,31 +236,42 @@ class PairFormerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         p, training = self.pair_dropout, self.training
         use_fused = self.use_fused_dropout
-        if self._deepnet_active:
-            s_tri = self._tri_residual_scale
-            s_pa = self._pair_attn_residual_scale
-            s_pf = self._pair_ffn_residual_scale
-            pair = dropout_add_rowwise(pair, s_tri * self.tri_mul_out(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_rowwise(pair, s_tri * self.tri_mul_in(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_rowwise(pair, s_pa * self.pair_attn_row(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_columnwise(pair, s_pa * self.pair_attn_col(pair, pair_mask), p, training, use_fused)
-            pair = pair + s_pf * self.pair_transition(pair)
-            # Single update: pair → logits, then single attention
-            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
-            pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
-            single = single + self._attn_residual_scale * self.single_attn(single, seq_mask, pair_logits)
-            single = single + self._ffn_residual_scale * self.single_transition(single)
-        else:
-            pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
-            pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
-            pair = pair + self.pair_transition(pair)
-            # Single update: pair → logits, then single attention
-            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
-            pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
-            single = single + self.single_attn(single, seq_mask, pair_logits)
-            single = single + self.single_transition(single)
+        # All branches multiply F's output by the block-wide ``s_ros``.
+        # The two transition branches additionally multiply by their
+        # branch-specific residual gain.
+        s_ros = self.residual_out_scale
+        s_tri = s_ros
+        s_pa = s_ros
+        s_pf = s_ros * self.pair_transition_residual_gain
+        s_single_ffn = s_ros * self.single_transition_residual_gain
+        s_single_attn = s_ros
+        # Optional non-learnable RMSNorm on every branch's output, applied
+        # *before* the per-block ``s`` multiplier. ``residual_branch_rmsnorm``
+        # is mutually exclusive with the per-branch residual gain knobs
+        # (validated in ``PairFormerConfig.__post_init__``), so when enabled
+        # ``s_pf == s_ros`` and ``s_single_ffn == s_ros``.
+        rmsn = rms_normalize if self.residual_branch_rmsnorm else _identity
+        pair = dropout_add_rowwise(pair, s_tri * rmsn(self.tri_mul_out(pair, pair_mask)), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, s_tri * rmsn(self.tri_mul_in(pair, pair_mask)), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, s_pa * rmsn(self.pair_attn_row(pair, pair_mask)), p, training, use_fused)
+        pair = dropout_add_columnwise(pair, s_pa * rmsn(self.pair_attn_col(pair, pair_mask)), p, training, use_fused)
+        pair = pair + s_pf * rmsn(self.pair_transition(pair))
+        # Single update: pair → logits, then single attention.
+        # PairBias is fed in unrescaled — under LNS, ``q·kᵀ ∝ s²`` softens
+        # the QK contribution to the softmax, and we accept the resulting
+        # PairBias-leaning attention rather than introducing a depth- or
+        # head-dependent calibrator.
+        # ``single_to_pair`` is *not* a residual-stream branch (its output is
+        # consumed as ``pair_logits`` for the SingleAttention PairBias path);
+        # leave it un-RMSNormed.
+        pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+        pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
+        single = single + s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
+        u_single = self.single_transition(single)
+        probe = getattr(self, "_probe", None)
+        if probe is not None and probe.enabled:
+            probe.record_block(self._probe_layer_idx, single, u_single, s_single_ffn)
+        single = single + s_single_ffn * rmsn(u_single)
         return pair, single
 
 
@@ -293,13 +364,15 @@ class Evoformer(nn.Module):
                     msa_dropout=cfg.msa_dropout,
                     pair_dropout=cfg.pair_dropout,
                     optim=optim,
+                    residual_out_scale=block_residual_scale(
+                        i, cfg.num_layer, cfg.residual_output_scaling, cfg.uniform_residual_scale
+                    ),
                 )
-                for _ in range(cfg.num_layer)
+                for i in range(cfg.num_layer)
             ]
         )
 
         # PairFormer stack
-        _trunk_deepnet_L = pf_cfg.num_layer if pf_cfg.deepnet_residual_scale else None
         self.trunk_pairformer = nn.ModuleList(
             [
                 PairFormerBlock(
@@ -311,9 +384,25 @@ class Evoformer(nn.Module):
                     single_value_dim=pf_cfg.single_value_dim,
                     pair_dropout=pf_cfg.pair_dropout,
                     optim=optim,
-                    deepnet_layer_scale=_trunk_deepnet_L,
+                    residual_out_scale=block_residual_scale(
+                        i, pf_cfg.num_layer, pf_cfg.residual_output_scaling, pf_cfg.uniform_residual_scale
+                    ),
+                    pair_bias_gate=pf_cfg.pair_bias_gate,
+                    pair_bias_gate_init_tau=pf_cfg.pair_bias_gate_init_tau,
+                    single_transition_linear_out_init_gain=pf_cfg.single_transition_linear_out_init_gain,
+                    single_transition_residual_gain=_resolve_branch_residual_gain(
+                        i,
+                        pf_cfg.single_transition_residual_gain,
+                        pf_cfg.single_transition_residual_per_layer_extra,
+                    ),
+                    pair_transition_residual_gain=_resolve_branch_residual_gain(
+                        i,
+                        pf_cfg.pair_transition_residual_gain,
+                        pf_cfg.pair_transition_residual_per_layer_extra,
+                    ),
+                    residual_branch_rmsnorm=pf_cfg.residual_branch_rmsnorm,
                 )
-                for _ in range(pf_cfg.num_layer)
+                for i in range(pf_cfg.num_layer)
             ]
         )
 

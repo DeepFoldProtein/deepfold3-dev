@@ -7,6 +7,69 @@ import math
 import torch
 
 
+class TestAdaLNCondBiasInit:
+    """``cond_bias_init_beta`` overrides AF3 zeros init on AdaLN bias projections."""
+
+    def test_default_is_zeros(self):
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        blk = DiffusionTransformerBlock(c=768, c_single_cond=384, num_heads=16, num_intermediate_factor=2)
+        assert blk.attn_cond_bias.weight.abs().max().item() == 0.0
+        assert blk.ffn_cond_bias.weight.abs().max().item() == 0.0
+
+    def test_small_normal_init_magnitude(self):
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        torch.manual_seed(0)
+        beta = 1e-3
+        blk = DiffusionTransformerBlock(
+            c=768,
+            c_single_cond=384,
+            num_heads=16,
+            num_intermediate_factor=2,
+            cond_bias_init_beta=beta,
+        )
+        # Output stddev for unit-variance input should be ≈ β. (User-facing
+        # property: ``W_b·x`` ≈ β for ``x ~ N(0, I)``.)
+        d = 384
+        for name, W in [("attn_cond_bias", blk.attn_cond_bias.weight),
+                        ("ffn_cond_bias", blk.ffn_cond_bias.weight)]:
+            x = torch.randn(2048, d)
+            out = x @ W.T
+            out_std = out.std().item()
+            assert abs(out_std - beta) / beta < 0.2, f"{name}: out_std={out_std:.6f} expected≈{beta}"
+
+    def test_other_cond_projections_still_zero(self):
+        """Only cond_bias receives the override — scale/zero_cond stay zeros."""
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        blk = DiffusionTransformerBlock(c=768, c_single_cond=384, cond_bias_init_beta=1e-3)
+        assert blk.attn_cond_scale.weight.abs().max().item() == 0.0
+        assert blk.ffn_cond_scale.weight.abs().max().item() == 0.0
+        assert blk.zero_cond.weight.abs().max().item() == 0.0
+        assert blk.ffn_zero_cond.weight.abs().max().item() == 0.0
+
+    def test_transformer_propagates_to_all_blocks(self):
+        from deepfold3.model.diffusion import DiffusionTransformer
+
+        beta = 2e-3
+        tr = DiffusionTransformer(
+            c=768, c_single_cond=384, num_blocks=8, num_heads=16, num_intermediate_factor=2,
+            super_block_size=4, c_pair=128, cond_bias_init_beta=beta,
+        )
+        for layer in tr.layers:
+            assert layer.attn_cond_bias.weight.abs().max().item() > 0
+            assert layer.ffn_cond_bias.weight.abs().max().item() > 0
+
+    def test_invalid_beta_raises(self):
+        import pytest
+
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        with pytest.raises(ValueError, match="must be > 0"):
+            DiffusionTransformerBlock(c=768, c_single_cond=384, cond_bias_init_beta=0.0)
+
+
 class TestNoiseSchedule:
     """Verify the AF3 noise schedule."""
 

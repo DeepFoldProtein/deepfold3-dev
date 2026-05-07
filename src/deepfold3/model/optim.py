@@ -46,7 +46,10 @@ def is_available(backend: str) -> bool:
 
 
 def make_transition_block(
-    channels: int, num_intermediate_factor: int = 4, config: OptimConfig | None = None
+    channels: int,
+    num_intermediate_factor: int = 4,
+    config: OptimConfig | None = None,
+    linear_out_init_gain: float | None = None,
 ) -> nn.Module:
     """Create a TransitionBlock, optionally using fused Triton kernels.
 
@@ -54,6 +57,11 @@ def make_transition_block(
     at vastly different M sizes:
     - Pair transitions: M = N² (up to 590k) — Triton wins at 1.2-1.3x
     - Single transitions: M = N (384-768) — PyTorch wins (Triton overhead dominates)
+
+    ``linear_out_init_gain`` overrides the AF3 zeros init on the SwiGLU output
+    projection (``linear2`` / ``linear_out``) with a scaled row-orthogonal
+    init. Fused transition kernels carry the projection internally and have
+    no hook for this; combining them is rejected with ``ValueError``.
     """
     block = None
     use_fused = False
@@ -63,13 +71,24 @@ def make_transition_block(
         elif config.use_fused_transition_single and channels in _SINGLE_TRANSITION_CHANNELS:
             use_fused = True
         if use_fused:
+            if linear_out_init_gain is not None:
+                raise ValueError(
+                    "linear_out_init_gain requires use_fused_transition_pair=False and "
+                    "use_fused_transition_single=False; the fused kernel carries the output "
+                    "projection internally and would bypass the override."
+                )
             cls = _try_import("deepfold3.model.triton.fused_transition", "FusedTransitionBlock")
             if cls is not None:
                 block = cls(channels, num_intermediate_factor=num_intermediate_factor)
     if block is None:
         from deepfold3.model.primitives import TransitionBlock
 
-        block = TransitionBlock(channels, num_intermediate_factor=num_intermediate_factor, optim=config)
+        block = TransitionBlock(
+            channels,
+            num_intermediate_factor=num_intermediate_factor,
+            optim=config,
+            linear_out_init_gain=linear_out_init_gain,
+        )
     # Tiled recomputation: only wrap non-fused blocks. FusedTransitionBlock
     # contains a fused LayerNorm+Linear — tiling would compute LN statistics
     # per chunk instead of globally, corrupting the normalization.

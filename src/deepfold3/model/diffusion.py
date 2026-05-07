@@ -25,7 +25,14 @@ from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncode
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.precision import upcast_fp32 as _upcast_fp32
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, chunked_linear_init_, layer_norm
+from deepfold3.model.primitives import (
+    TRUNCATED_NORMAL_STDDEV_FACTOR,
+    LayerNorm,
+    LinearNoBias,
+    af3_linear_init_,
+    chunked_linear_init_,
+    layer_norm,
+)
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -194,6 +201,7 @@ class DiffusionTransformerBlock(nn.Module):
         value_dim: int | None = None,
         num_intermediate_factor: int = 2,
         optim: OptimConfig | None = None,
+        cond_bias_init_beta: float | None = None,
     ):
         super().__init__()
         # AF3: key_dim/value_dim default to c (num_channels) when None
@@ -247,6 +255,17 @@ class DiffusionTransformerBlock(nn.Module):
         nn.init.zeros_(self.ffn_zero_cond.weight)
         nn.init.constant_(self.ffn_zero_cond.bias, -2.0)
 
+        # AdaLN ``cond_bias`` projections: AF3 ships with zeros init (so the
+        # AdaLN bias starts at 0). ``cond_bias_init_beta`` overrides this with
+        # a small trunc-normal init: ``W_b ~ trunc_normal(0, (β/√fan_in)²)``.
+        # For unit-variance ``LN(single_cond)`` input, output stddev ≈ β.
+        # Recommended starting range: β ∈ [1e-3, 3e-3]. ``None`` keeps zeros.
+        # Applied to both the attention-side (``attn_cond_bias``) and the
+        # FFN-side (``ffn_cond_bias``) projections of every block.
+        if cond_bias_init_beta is not None:
+            self._init_cond_bias_small_normal(self.attn_cond_bias.weight, cond_bias_init_beta)
+            self._init_cond_bias_small_normal(self.ffn_cond_bias.weight, cond_bias_init_beta)
+
         # Fused FFN kernels (optional). Stateless — read parent's ffn_linear1
         # weight at call time (single source of truth; no sync).
         self._fused_ada_ln_linear = None
@@ -263,6 +282,16 @@ class DiffusionTransformerBlock(nn.Module):
 
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
+
+    @staticmethod
+    def _init_cond_bias_small_normal(weight: torch.Tensor, beta: float) -> None:
+        """``W ~ trunc_normal(0, (β/√fan_in)²)`` — output stddev ≈ β for unit input."""
+        if beta <= 0:
+            raise ValueError(f"cond_bias_init_beta must be > 0, got {beta}")
+        fan_in = weight.shape[1]
+        target_std = float(beta) / math.sqrt(fan_in)
+        std = target_std / TRUNCATED_NORMAL_STDDEV_FACTOR
+        nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-2.0, b=2.0)
 
     def _compute(
         self,
@@ -373,6 +402,7 @@ class DiffusionTransformer(nn.Module):
         super_block_size: int = 4,
         c_pair: int = 128,
         optim: OptimConfig | None = None,
+        cond_bias_init_beta: float | None = None,
     ):
         super().__init__()
         assert num_blocks % super_block_size == 0
@@ -390,7 +420,14 @@ class DiffusionTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [
                 DiffusionTransformerBlock(
-                    c, c_single_cond, num_heads, key_dim, value_dim, num_intermediate_factor, optim=optim
+                    c,
+                    c_single_cond,
+                    num_heads,
+                    key_dim,
+                    value_dim,
+                    num_intermediate_factor,
+                    optim=optim,
+                    cond_bias_init_beta=cond_bias_init_beta,
                 )
                 for _ in range(num_blocks)
             ]
@@ -630,6 +667,7 @@ class DiffusionHead(nn.Module):
             super_block_size=cfg.transformer.super_block_size,
             c_pair=cfg.conditioning_pair_channel,
             optim=optim,
+            cond_bias_init_beta=cfg.transformer.cond_bias_init_beta,
         )
 
         # Atom decoder

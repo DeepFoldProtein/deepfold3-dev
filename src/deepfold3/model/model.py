@@ -11,6 +11,7 @@ msa_feat: [S, N, 34]  (one_hot(32) + has_deletion + deletion_value)
 from __future__ import annotations
 
 import dataclasses
+import math
 from functools import partial as _partial
 
 import torch
@@ -25,7 +26,7 @@ from deepfold3.model.diffusion import DiffusionHead
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import LayerNorm, LinearNoBias
+from deepfold3.model.primitives import TRUNCATED_NORMAL_STDDEV_FACTOR, LayerNorm, LinearNoBias
 
 # Disable the determinism metadata check that compares saved vs recomputed
 # tensor shapes.  View reshapes inside checkpointed functions (e.g.
@@ -79,8 +80,26 @@ class DistogramHead(nn.Module):
         if use_half_logits_ln is None:
             use_half_logits_ln = bool(getattr(cfg, "use_half_logits_ln", False))
         self.half_logits_ln = LayerNorm(pair_channels) if use_half_logits_ln else None
-        # AF3: half_logits uses final_init (zeros)
-        self.half_logits = LinearNoBias(pair_channels, self.num_bins, initializer="zeros")
+        # AF3 ships ``final_init = zeros`` so the distogram starts as the
+        # uniform 1/64 distribution. Side effect: the distogram CE delivers
+        # no gradient back to ``pair`` until the projection accumulates
+        # non-zero weight, leaving ``‖pair‖`` unconstrained for the first
+        # ~hundreds of steps (the "stuck near log(64)" pattern seen in
+        # 051858). We use a *small-normal* init instead:
+        #     W ~ trunc_normal(0, (α/√fan_in)²)   default α = 0.05
+        # → output stddev ≈ α (≈0.05) per element, softmax sits near uniform,
+        # CE starts ≈ log(64), but backward through the Linear delivers
+        # non-zero gradient to ``pair`` from step 0. ``α = 0`` recovers
+        # AF3's zeros init.
+        self.half_logits = LinearNoBias(pair_channels, self.num_bins)
+        alpha = float(getattr(cfg, "half_logits_init_alpha", 0.0))
+        if alpha == 0.0:
+            nn.init.zeros_(self.half_logits.weight)
+        else:
+            fan_in = self.half_logits.weight.shape[1]
+            target_std = alpha / math.sqrt(fan_in)
+            stddev = target_std / TRUNCATED_NORMAL_STDDEV_FACTOR
+            nn.init.trunc_normal_(self.half_logits.weight, mean=0.0, std=stddev, a=-2.0, b=2.0)
 
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
         """Symmetrised logits [..., N, N, num_bins]."""

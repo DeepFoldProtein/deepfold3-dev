@@ -17,6 +17,33 @@ import torch.nn.functional as F
 TRUNCATED_NORMAL_STDDEV_FACTOR = 0.87962566103423978
 
 
+def block_residual_scale(layer_idx: int, num_layer: int, per_layer: bool, uniform: bool) -> float:
+    """Resolve the Residual Output Scaling factor for layer ``layer_idx`` of a
+    depth-``num_layer`` residual stack.
+
+    Each F sub-module of the block has its output multiplied by this scalar
+    before being added to the residual stream:
+
+        x ← x + s · F(x)
+
+    Two mutually exclusive policies (see :class:`EvoformerConfig`):
+
+      * ``per_layer`` — per-layer ``1/sqrt(layer_idx + 1)``  (Sun-et-al.-flavoured;
+        not literal LayerNorm Scaling because we scale F's output, not LN's).
+      * ``uniform``  — depth-flat ``1/sqrt(num_layer)`` for every layer.
+
+    Returns ``1.0`` (no rescale) when neither is set. Raises ``ValueError`` if
+    both are set on the same stack.
+    """
+    if per_layer and uniform:
+        raise ValueError("residual_output_scaling and uniform_residual_scale are mutually exclusive on the same stack")
+    if per_layer:
+        return 1.0 / math.sqrt(float(layer_idx + 1))
+    if uniform:
+        return 1.0 / math.sqrt(float(num_layer))
+    return 1.0
+
+
 def af3_linear_init_(weight: torch.Tensor, initializer: str = "linear") -> None:
     """Initialize a weight tensor using AF3's variance-scaled truncated normal.
 
@@ -116,6 +143,17 @@ class LinearNoBias(nn.Linear):
         af3_linear_init_(self.weight, initializer)
 
 
+def rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Non-learnable RMSNorm over the last channel axis.
+
+    Thin wrapper over :func:`torch.nn.functional.rms_norm` (no learnable
+    scale or shift). Used at PairFormer residual-branch outputs to force
+    each branch contribution to unit per-token RMS before the per-block
+    ``γ`` multiplier (see :class:`PairFormerConfig.residual_branch_rmsnorm`).
+    """
+    return F.rms_norm(x, (x.shape[-1],), eps=eps)
+
+
 def layer_norm(
     x: torch.Tensor,
     normalized_shape: int | tuple[int, ...] | list[int],
@@ -151,6 +189,13 @@ class LayerNorm(nn.LayerNorm):
     ``bias`` like the base class. AF3 trunk LNs use the default
     ``elementwise_affine=True``; AdaLN-zero patterns pass
     ``elementwise_affine=False`` for a parameter-free LN.
+
+    ``output_scale`` is a constant multiplier applied to the LN output.
+    Stored on the module so a constant scalar can be folded into the LN
+    forward path without a separate multiply. Currently unused by any
+    config — kept as a primitive utility (e.g. for future absorption of a
+    constant gain into LN). Default ``1.0`` keeps the unscaled fast path
+    intact (the multiply is skipped).
     """
 
     def __init__(
@@ -160,6 +205,7 @@ class LayerNorm(nn.LayerNorm):
         eps: float = 1e-5,
         elementwise_affine: bool = True,
         bias: bool = True,
+        output_scale: float = 1.0,
     ):
         super().__init__(
             normalized_shape,
@@ -167,9 +213,13 @@ class LayerNorm(nn.LayerNorm):
             elementwise_affine=elementwise_affine,
             bias=bias,
         )
+        self.output_scale = float(output_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        out = layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        if self.output_scale != 1.0:
+            out = out * self.output_scale
+        return out
 
 
 class AdaLayerNorm(nn.Module):
@@ -224,13 +274,35 @@ class TransitionBlock(nn.Module):
         transition2      → linear2  (projects back to c)
     """
 
-    def __init__(self, channels: int, num_intermediate_factor: int = 4, optim=None):
+    def __init__(
+        self,
+        channels: int,
+        num_intermediate_factor: int = 4,
+        optim=None,
+        linear_out_init_gain: float | None = None,
+    ):
         super().__init__()
         num_intermediate = channels * num_intermediate_factor
         self.norm = LayerNorm(channels)
-        # AF3 uses SwiGLU: transition1 projects to 2 × intermediate
-        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")
-        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")
+        # SwiGLU transition. Internal attribute names ``linear1`` /
+        # ``linear2`` are preserved (state-dict compat with existing
+        # checkpoints / AF3 converter); semantically these are the
+        # **linear_gate** (projects channels → 2× intermediate, fed to
+        # SwiGLU) and **linear_out** (projects intermediate → channels)
+        # respectively.
+        self.linear1 = LinearNoBias(channels, num_intermediate * 2, initializer="relu")  # linear_gate
+        self.linear2 = LinearNoBias(num_intermediate, channels, initializer="zeros")  # linear_out
+        # ``linear_out_init_gain``: replace the AF3 zeros init on
+        # ``linear_out`` (= ``linear2``) with a scaled row-orthogonal init
+        # ``W = gain · Q`` (`Q` row-orthonormal). Breaks the zero-wake-up
+        # bias that otherwise pushes ``linear_out`` along the loss gradient
+        # direction during the first updates — random orthogonal rows give
+        # backward signal in all directions immediately, so the residual
+        # update ``u`` does not get aligned with the residual stream ``s``
+        # by construction. ``gain = 0.01`` keeps the residual update tiny
+        # at init (output stddev ≈ gain). ``None`` keeps the AF3 zeros init.
+        if linear_out_init_gain is not None:
+            nn.init.orthogonal_(self.linear2.weight, gain=float(linear_out_init_gain))
         self._act = SwiGLU()
         if optim is not None and optim.use_fused_swiglu:
             try:

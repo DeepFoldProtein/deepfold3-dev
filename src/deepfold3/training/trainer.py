@@ -540,6 +540,19 @@ class Trainer:
         shutdown = ShutdownCoordinator(self.dist)
         ckpt_request = CheckpointRequestHandler()
 
+        # Single-track stability probe (file-only logging, no WandB).
+        # Attached only on rank 0 — the per-block stats are local to each
+        # rank's forward and we don't need a cross-rank reduction.
+        self._single_track_probe = None
+        if cfg.single_track_probe and self.dist.is_main:
+            from deepfold3.training.single_track_probe import SingleTrackProbe
+
+            probe_path = output_dir / "single_track_probe.jsonl"
+            self._single_track_probe = SingleTrackProbe(self.model, probe_path)
+            rank_zero_info(
+                f"Single-track probe enabled → {probe_path} (every {cfg.single_track_probe_interval} steps)"
+            )
+
         if cfg.eval_before and eval_dl is not None:
             self._run_eval_and_track_best(eval_dl, output_dir)
 
@@ -558,6 +571,26 @@ class Trainer:
                 # into the optimizer so NaN-skip warnings can name the
                 # offending record(s).
                 record_ids = features.pop("_record_id", None)
+                # Single-track probe gate. Fire on the LAST microstep of the
+                # accumulation window that builds toward a target effective
+                # step matching the probe interval. Captures per-block stats
+                # during this microstep's forward pass.
+                probe = self._single_track_probe
+                if probe is not None:
+                    # Clear any stale flag from a skipped opt step (NaN/Inf)
+                    # so non-probe microsteps don't accidentally accumulate.
+                    probe.discard_step()
+                    last_microstep_in_window = (
+                        (self.state.global_step + 1) % self.cfg.accumulate_grad_batches
+                    ) == 0
+                    target_step = self.state.effective_step + (1 if last_microstep_in_window else 0)
+                    should_probe = (
+                        last_microstep_in_window
+                        and target_step > 0
+                        and target_step % self.cfg.single_track_probe_interval == 0
+                    )
+                    if should_probe:
+                        probe.begin_step(target_step)
                 # No except-and-continue on OOM/exception: ``continue`` skips
                 # the per-microstep shutdown_flag all_reduce + the sync-boundary
                 # NaN all_gather, which desynchronizes collective participation
@@ -577,6 +610,17 @@ class Trainer:
                 # one-per-microstep. Backward runs unconditionally here; any
                 # NaN grads are discarded at the boundary before the opt step.
                 on_opt_step_boundary = self._optimizer_step(loss, record_ids=record_ids)
+
+                # Flush probe row (rank-0 only); pass per-microstep loss
+                # (total + components from ``loss_dict``) so the probe JSONL
+                # is self-contained — plot scripts don't need to align with
+                # the slower ``log_interval`` stdout cadence.
+                if probe is not None and probe.enabled:
+                    probe_extra = {"loss": float(loss.detach().item())}
+                    for k, v in loss_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            probe_extra[k] = float(v.detach().item())
+                    probe.end_step(extra=probe_extra)
 
                 # Accumulate logging metrics locally (no collective).
                 # Inject token count so it rides the same all-reduce as losses.

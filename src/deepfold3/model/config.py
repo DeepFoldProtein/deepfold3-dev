@@ -51,6 +51,13 @@ class EvoformerConfig:
     pair_attention: GridAttentionConfig = field(default_factory=GridAttentionConfig)
     msa_dropout: float = 0.15
     pair_dropout: float = 0.25
+    # Residual Output Scaling (ROS) on every F sub-module of this stack:
+    # ``x ← x + s · F(x)`` where ``s`` is determined per-block. Two
+    # mutually exclusive policies:
+    #   residual_output_scaling : per-layer ``s = 1/sqrt(ℓ)``  (Sun-et-al.-flavoured)
+    #   uniform_residual_scale  : depth-uniform ``s = 1/sqrt(num_layer)``
+    residual_output_scaling: bool = False
+    uniform_residual_scale: bool = False
 
 
 @dataclass
@@ -63,13 +70,75 @@ class PairFormerConfig:
     single_key_dim: int = 384
     single_value_dim: int = 384
     pair_dropout: float = 0.25
-    # DeepNet-style residual scaling on every PairFormerBlock branch. When True,
-    # each block multiplies its branch outputs by a per-branch factor before
-    # adding to the residual stream (L = num_layer of this stack):
-    #   tri_mul_out / tri_mul_in / single_attn / single_transition: 1/sqrt(2L)
-    #   pair_attn_row / pair_attn_col / pair_transition:            1/sqrt(L)
-    # Output projections retain zero-init.
-    deepnet_residual_scale: bool = False
+    # Residual Output Scaling (ROS) on every F sub-module of this stack
+    # (see :class:`EvoformerConfig` for the two policies).
+    residual_output_scaling: bool = False
+    uniform_residual_scale: bool = False
+    # Per-head learnable PairBias gate inside SingleAttention (log-param,
+    # τ_h = exp(a_h), init τ₀ = pair_bias_gate_init_tau). Calibrates
+    # PairBias vs ``q·kᵀ`` in the attention softmax. Shape [num_heads] per
+    # attention; auto-routed to the no-decay AdamW group via the 1-D rule.
+    pair_bias_gate: bool = False
+    pair_bias_gate_init_tau: float = 0.25
+    # ``single_transition`` SwiGLU output projection (linear_out / linear2)
+    # init: ``None`` keeps the AF3 zeros init; a float ``gain`` replaces it
+    # with a scaled row-orthogonal init ``W = gain · Q``. Breaks the
+    # zero-wake-up bias that drives the SingleAttention/SingleTransition
+    # output to align with the residual stream. ``0.01`` is small enough
+    # that initial residual updates are tiny (output stddev ≈ gain).
+    single_transition_linear_out_init_gain: float | None = None
+    # Branch-specific scaling on the ``single_transition`` / ``pair_transition``
+    # residual updates. Composes multiplicatively with the block-wide ROS:
+    #
+    #   s_branch = s_ros · gain · (1/sqrt(layer_idx+1) if per_layer_extra else 1)
+    #
+    # ``gain`` ``None`` ≡ 1.0. ``per_layer_extra`` adds a fresh
+    # ``1/sqrt(ℓ+1)`` factor — under per-layer ROS this composes with
+    # ``s_ros = 1/sqrt(ℓ+1)`` to give an effective ``1/(ℓ+1)`` schedule.
+    # Used for the trunk transition aligned-gain stability ablation
+    # (``docs/single-track-stability-experiments.md`` §11).
+    single_transition_residual_gain: float | None = None
+    single_transition_residual_per_layer_extra: bool = False
+    pair_transition_residual_gain: float | None = None
+    pair_transition_residual_per_layer_extra: bool = False
+    # Apply non-learnable RMSNorm to every PairFormer residual branch output
+    # before the per-block ``γ`` multiplier (so each branch's contribution to
+    # the residual stream is exactly ``γ_k · unit-RMS``, regardless of how
+    # the branch's internal scale drifts during training).
+    #
+    # Wraps the 7 branches: tri_mul_in, tri_mul_out, pair_attn_row,
+    # pair_attn_col, pair_transition, single_attn, single_transition.
+    # ``single_to_pair`` is **not** a residual branch (its output is consumed
+    # as ``pair_logits`` for SingleAttention's PairBias) and is left alone.
+    #
+    # Trunk PairFormer scope only — Evoformer MSA stack, template
+    # PairFormer, and confidence-head PairFormer are unaffected (they each
+    # read their own ``PairFormerConfig`` instance for this flag).
+    #
+    # When True, validates in ``__post_init__`` that the per-branch residual
+    # gain knobs are at default — RMSNorm makes them redundant (the branch
+    # is already unit-RMS so an extra constant gain just rescales the
+    # block-wide ``γ``).
+    residual_branch_rmsnorm: bool = False
+
+    def __post_init__(self) -> None:
+        if self.residual_branch_rmsnorm:
+            conflicts = []
+            if self.single_transition_residual_gain is not None:
+                conflicts.append("single_transition_residual_gain")
+            if self.pair_transition_residual_gain is not None:
+                conflicts.append("pair_transition_residual_gain")
+            if self.single_transition_residual_per_layer_extra:
+                conflicts.append("single_transition_residual_per_layer_extra")
+            if self.pair_transition_residual_per_layer_extra:
+                conflicts.append("pair_transition_residual_per_layer_extra")
+            if conflicts:
+                raise ValueError(
+                    "PairFormerConfig.residual_branch_rmsnorm=True is incompatible with "
+                    f"per-branch residual gain knobs: {conflicts}. RMSNorm forces each "
+                    "branch output to unit-RMS, so extra branch-specific gains just "
+                    "rescale the block-wide γ — set them to default (None / False)."
+                )
 
 
 @dataclass
@@ -80,6 +149,13 @@ class DiffusionTransformerConfig:
     value_dim: int | None = None  # None → use num_channels
     num_intermediate_factor: int = 2
     super_block_size: int = 4
+    # AdaLN ``cond_bias`` (attn + ffn) projection init: ``None`` keeps the
+    # AF3 zeros init (initial AdaLN bias = 0). A float ``β`` overrides with
+    # ``W_b ~ trunc_normal(0, (β/√fan_in)²)`` — output stddev ≈ β. Breaks
+    # the zero-wake-up bias in the AdaLN bias path so the conditioning
+    # contribution is non-zero from step 0 without amplification.
+    # Recommended starting range: β ∈ [1e-3, 3e-3].
+    cond_bias_init_beta: float | None = None
 
 
 @dataclass
@@ -133,8 +209,44 @@ class ConfidenceConfig:
     max_atoms_per_token: int = 24  # AF3 dense atom representation max
     pair_attention_num_head: int = 4
     single_attention_num_head: int = 16
-    # See PairFormerConfig.deepnet_residual_scale. L = this stack's num_layer (4).
-    deepnet_residual_scale: bool = False
+    # Residual Output Scaling (see EvoformerConfig). L = this stack's num_layer (4).
+    residual_output_scaling: bool = False
+    uniform_residual_scale: bool = False
+    # See PairFormerConfig.pair_bias_gate.
+    pair_bias_gate: bool = False
+    pair_bias_gate_init_tau: float = 0.25
+    # See PairFormerConfig.single_transition_linear_out_init_gain.
+    single_transition_linear_out_init_gain: float | None = None
+    # Mirror of PairFormerConfig.{single,pair}_transition_residual_gain /
+    # _per_layer_extra for the confidence-head PairFormer (L=4).
+    # ``None``/``False`` ≡ no extra gain.
+    single_transition_residual_gain: float | None = None
+    single_transition_residual_per_layer_extra: bool = False
+    pair_transition_residual_gain: float | None = None
+    pair_transition_residual_per_layer_extra: bool = False
+    # Mirror of PairFormerConfig.residual_branch_rmsnorm — apply non-learnable
+    # RMSNorm to every residual branch output of the confidence-head
+    # PairFormer (L=4). Same validation rule applies in ``__post_init__``.
+    residual_branch_rmsnorm: bool = False
+
+    def __post_init__(self) -> None:
+        if self.residual_branch_rmsnorm:
+            conflicts = []
+            if self.single_transition_residual_gain is not None:
+                conflicts.append("single_transition_residual_gain")
+            if self.pair_transition_residual_gain is not None:
+                conflicts.append("pair_transition_residual_gain")
+            if self.single_transition_residual_per_layer_extra:
+                conflicts.append("single_transition_residual_per_layer_extra")
+            if self.pair_transition_residual_per_layer_extra:
+                conflicts.append("pair_transition_residual_per_layer_extra")
+            if conflicts:
+                raise ValueError(
+                    "ConfidenceConfig.residual_branch_rmsnorm=True is incompatible with "
+                    f"per-branch residual gain knobs: {conflicts}. RMSNorm forces each "
+                    "branch output to unit-RMS, so extra branch-specific gains just "
+                    "rescale the block-wide γ — set them to default (None / False)."
+                )
 
 
 @dataclass
@@ -149,6 +261,9 @@ class TemplatePairFormerConfig:
     num_heads: int = 4
     num_intermediate_factor: int = 2
     pair_dropout: float = 0.25
+    # Residual Output Scaling (see EvoformerConfig). L = this stack's num_layer (2).
+    residual_output_scaling: bool = False
+    uniform_residual_scale: bool = False
 
 
 @dataclass
@@ -586,6 +701,13 @@ class TrainingConfig:
     eval_interval: int = 5000
     log_interval: int = 50  # in optimizer steps (after grad accumulation)
     log_microsteps: bool = False  # debug: log every microstep instead of every effective step
+    # Single-track stability probe (per-block RMS / cos(s, u) / weight norms).
+    # When enabled, attaches a :class:`SingleTrackProbe` to the PairFormer trunk
+    # and writes one JSONL row per probed step to ``output_dir/single_track_probe.jsonl``.
+    # Compute cost is small (one extra no_grad RMS/cos per block per probed step);
+    # safe under autocast.
+    single_track_probe: bool = False
+    single_track_probe_interval: int = 50  # in optimizer steps
     uniform_recycle: bool = (
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )
@@ -692,6 +814,13 @@ class DistogramConfig:
     first_break: float = 2.3125
     last_break: float = 21.6875
     use_half_logits_ln: bool = False
+    # ``half_logits`` weight init: stddev = α / sqrt(fan_in). Default α=0.05
+    # gives very small initial logits — softmax stays close to uniform
+    # 1/num_bins so the distogram CE starts near log(num_bins) — but the
+    # weight is non-zero, so the distogram gradient reaches ``pair`` from
+    # step 0 and constrains its magnitude during early training. AF3 ships
+    # α=0 (zeros init); set ``half_logits_init_alpha=0.0`` to restore that.
+    half_logits_init_alpha: float = 0.05
 
 
 @dataclass

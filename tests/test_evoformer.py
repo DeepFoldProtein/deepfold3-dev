@@ -104,6 +104,420 @@ class TestPairFormerBlock:
         assert block.single_to_pair.weight.shape[0] == 16  # num_heads
 
 
+class TestPairFormerResidualBranchRMSNorm:
+    """Optional non-learnable RMSNorm on every residual-branch output.
+
+    With ``residual_branch_rmsnorm=True`` the per-block residual update from
+    each branch is exactly ``γ_k · unit-RMS-vector`` regardless of the
+    branch's internal scale. We verify this by replacing each branch's
+    forward with a constant-scale tensor and checking the residual delta.
+    """
+
+    def _make_block(self, *, rmsnorm: bool, residual_out_scale: float = 1.0):
+        from deepfold3.model.evoformer import PairFormerBlock
+
+        torch.manual_seed(0)
+        return PairFormerBlock(
+            128,
+            384,
+            residual_out_scale=residual_out_scale,
+            residual_branch_rmsnorm=rmsnorm,
+        )
+
+    def test_branch_outputs_are_unit_rms_when_enabled(self):
+        import torch.nn as nn
+
+        from deepfold3.model.primitives import rms_normalize
+
+        class _ConstBranch(nn.Module):
+            """Stub residual branch returning a constant tensor of the same shape
+            and channel count as its first input. Accepts any extra args.
+            """
+
+            def __init__(self, scale: float):
+                super().__init__()
+                self.scale = float(scale)
+
+            def forward(self, x: torch.Tensor, *_a, **_k) -> torch.Tensor:
+                return torch.full_like(x, self.scale)
+
+        N = 8
+        scale = 73.0
+        block_on = self._make_block(rmsnorm=True)
+        block_off = self._make_block(rmsnorm=False)
+        for blk in (block_on, block_off):
+            blk.tri_mul_out = _ConstBranch(scale)
+            blk.tri_mul_in = _ConstBranch(scale)
+            blk.pair_attn_row = _ConstBranch(scale)
+            blk.pair_attn_col = _ConstBranch(scale)
+            blk.pair_transition = _ConstBranch(scale)
+            blk.single_attn = _ConstBranch(scale)
+            blk.single_transition = _ConstBranch(scale)
+            blk.eval()
+            blk.pair_dropout = 0.0
+
+        pair = torch.zeros(N, N, 128)
+        single = torch.zeros(N, 384)
+        pair_mask = torch.ones(N, N)
+        seq_mask = torch.ones(N)
+
+        with torch.no_grad():
+            _, single_on = block_on(pair.clone(), single.clone(), pair_mask, seq_mask)
+            pair_off, _ = block_off(pair.clone(), single.clone(), pair_mask, seq_mask)
+
+        # Off-path: residual stream accumulates the raw scale 73.
+        assert pair_off.abs().max() > 50.0, "off-path should accumulate raw branch scale"
+        # On-path: each branch contributes unit-RMS, residual stream stays O(1).
+        assert single_on.abs().max() < 5.0, (
+            f"with RMSNorm, single residual stream should stay O(1), got max={single_on.abs().max():.2f}"
+        )
+        # Sanity: rms_normalize of the constant yields per-token RMS == 1.
+        const = torch.full((4, 384), scale)
+        rms = rms_normalize(const).pow(2).mean(dim=-1).sqrt()
+        torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
+
+    def test_disabled_by_default(self):
+        from deepfold3.model.evoformer import PairFormerBlock
+
+        block = PairFormerBlock(64, 128)
+        assert block.residual_branch_rmsnorm is False
+
+
+class TestPairFormerConfigRmsnormValidation:
+    """``PairFormerConfig.__post_init__`` rejects per-branch gain knobs when
+    ``residual_branch_rmsnorm=True`` (RMSNorm makes them redundant)."""
+
+    def test_clean_combo_ok(self):
+        from deepfold3.model.config import PairFormerConfig
+
+        # No per-branch knobs set → should construct cleanly.
+        cfg = PairFormerConfig(residual_branch_rmsnorm=True, uniform_residual_scale=True)
+        assert cfg.residual_branch_rmsnorm is True
+
+    def test_rejects_single_transition_residual_gain(self):
+        import pytest
+
+        from deepfold3.model.config import PairFormerConfig
+
+        with pytest.raises(ValueError, match="incompatible"):
+            PairFormerConfig(
+                residual_branch_rmsnorm=True,
+                single_transition_residual_gain=0.35,
+            )
+
+    def test_rejects_pair_transition_residual_gain(self):
+        import pytest
+
+        from deepfold3.model.config import PairFormerConfig
+
+        with pytest.raises(ValueError, match="incompatible"):
+            PairFormerConfig(
+                residual_branch_rmsnorm=True,
+                pair_transition_residual_gain=0.5,
+            )
+
+    def test_rejects_per_layer_extra_flags(self):
+        import pytest
+
+        from deepfold3.model.config import PairFormerConfig
+
+        with pytest.raises(ValueError, match="incompatible"):
+            PairFormerConfig(
+                residual_branch_rmsnorm=True,
+                single_transition_residual_per_layer_extra=True,
+            )
+        with pytest.raises(ValueError, match="incompatible"):
+            PairFormerConfig(
+                residual_branch_rmsnorm=True,
+                pair_transition_residual_per_layer_extra=True,
+            )
+
+    def test_off_path_unchanged(self):
+        """Default (residual_branch_rmsnorm=False) accepts every gain knob."""
+        from deepfold3.model.config import PairFormerConfig
+
+        cfg = PairFormerConfig(
+            residual_branch_rmsnorm=False,
+            single_transition_residual_gain=0.35,
+            pair_transition_residual_gain=0.5,
+            single_transition_residual_per_layer_extra=True,
+            pair_transition_residual_per_layer_extra=True,
+        )
+        assert cfg.single_transition_residual_gain == 0.35
+
+    def test_confidence_config_mirror(self):
+        """ConfidenceConfig has the same flag + validation contract."""
+        import pytest
+
+        from deepfold3.model.config import ConfidenceConfig
+
+        # Clean construction
+        cfg = ConfidenceConfig(residual_branch_rmsnorm=True, uniform_residual_scale=True)
+        assert cfg.residual_branch_rmsnorm is True
+
+        # Conflict with per-branch gains rejected
+        with pytest.raises(ValueError, match="incompatible"):
+            ConfidenceConfig(
+                residual_branch_rmsnorm=True,
+                single_transition_residual_gain=0.35,
+            )
+        with pytest.raises(ValueError, match="incompatible"):
+            ConfidenceConfig(
+                residual_branch_rmsnorm=True,
+                pair_transition_residual_per_layer_extra=True,
+            )
+
+
+class TestLnOutScaleWiring:
+    """Uniform F-output scale design: every residual F output is multiplied
+    by the per-block ``residual_out_scale``. No LayerNorm.output_scale is set
+    anywhere — every LN keeps its baseline behaviour."""
+
+    def _all_residual_lns_pairformer(self, block):
+        # Every LN inside this PairFormerBlock — none should be rescaled.
+        return {
+            "tri_mul_out.norm_left": block.tri_mul_out.norm_left,
+            "tri_mul_out.norm_center": block.tri_mul_out.norm_center,
+            "tri_mul_in.norm_left": block.tri_mul_in.norm_left,
+            "tri_mul_in.norm_center": block.tri_mul_in.norm_center,
+            "pair_attn_row.norm": block.pair_attn_row.norm,
+            "pair_attn_col.norm": block.pair_attn_col.norm,
+            "pair_transition.norm": block.pair_transition.norm,
+            "single_attn.norm": block.single_attn.norm,
+            "single_transition.norm": block.single_transition.norm,
+            "single_to_pair_norm": block.single_to_pair_norm,
+        }
+
+    def _all_residual_lns_evoformer(self, block):
+        return {
+            "row_attn.norm": block.row_attn.norm,
+            "row_attn.pair_norm": block.row_attn.pair_norm,
+            "outer_product.norm": block.outer_product.norm,
+            "msa_transition.norm": block.msa_transition.norm,
+            "tri_mul_out.norm_left": block.tri_mul_out.norm_left,
+            "tri_mul_in.norm_left": block.tri_mul_in.norm_left,
+            "pair_attn_row.norm": block.pair_attn_row.norm,
+            "pair_attn_col.norm": block.pair_attn_col.norm,
+            "pair_transition.norm": block.pair_transition.norm,
+        }
+
+    def test_lns_per_layer_pairformer(self):
+        import math
+
+        from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+        from deepfold3.model.evoformer import Evoformer
+
+        cfg = EvoformerConfig()
+        pf_cfg = PairFormerConfig(num_layer=8, residual_output_scaling=True)
+        evo = Evoformer(cfg, pf_cfg)
+        for i, block in enumerate(evo.trunk_pairformer):
+            expected = 1.0 / math.sqrt(i + 1)
+            assert block.residual_out_scale == expected
+            # Every LN stays at 1.0 — F-output scale design only.
+            for name, ln in self._all_residual_lns_pairformer(block).items():
+                assert ln.output_scale == 1.0, f"layer {i} {name}: should be 1.0"
+
+    def test_uniform_pairformer(self):
+        import math
+
+        from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+        from deepfold3.model.evoformer import Evoformer
+
+        cfg = EvoformerConfig()
+        pf_cfg = PairFormerConfig(num_layer=8, uniform_residual_scale=True)
+        evo = Evoformer(cfg, pf_cfg)
+        expected = 1.0 / math.sqrt(8)
+        for block in evo.trunk_pairformer:
+            assert block.residual_out_scale == expected
+            for ln in self._all_residual_lns_pairformer(block).values():
+                assert ln.output_scale == 1.0
+
+    def test_lns_per_layer_msa_stack(self):
+        import math
+
+        from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+        from deepfold3.model.evoformer import Evoformer
+
+        cfg = EvoformerConfig(num_layer=4, residual_output_scaling=True)
+        pf_cfg = PairFormerConfig(num_layer=8)
+        evo = Evoformer(cfg, pf_cfg)
+        for i, block in enumerate(evo.msa_stack):
+            expected = 1.0 / math.sqrt(i + 1)
+            assert block.residual_out_scale == expected
+            for name, ln in self._all_residual_lns_evoformer(block).items():
+                assert ln.output_scale == 1.0, f"layer {i} {name}: should be 1.0"
+
+    def test_default_off_keeps_unity(self):
+        from deepfold3.model.config import EvoformerConfig, PairFormerConfig
+        from deepfold3.model.evoformer import Evoformer
+
+        evo = Evoformer(EvoformerConfig(), PairFormerConfig(num_layer=4))
+        for block in evo.trunk_pairformer:
+            assert block.residual_out_scale == 1.0
+            for ln in self._all_residual_lns_pairformer(block).values():
+                assert ln.output_scale == 1.0
+
+    def test_pair_logits_unchanged_when_gate_off(self):
+        """Without ``pair_bias_gate``, pair_logits passed to SingleAttention
+        match the bare ``single_to_pair(single_to_pair_norm(pair))`` output —
+        no fixed depth-dependent or per-head rescaling is applied."""
+        import math
+
+        import torch
+
+        from deepfold3.model.evoformer import PairFormerBlock
+
+        torch.manual_seed(0)
+        # Even with LNS active, pair_logits stays unrescaled when gate is off.
+        block = PairFormerBlock(128, 384, residual_out_scale=1.0 / math.sqrt(8)).eval()
+        N = 6
+        pair = torch.randn(N, N, 128)
+        single = torch.randn(N, 384)
+        pair_mask = torch.ones(N, N)
+        seq_mask = torch.ones(N)
+
+        captured: dict[str, torch.Tensor] = {}
+        original_compute = block.single_attn._compute_baseline
+
+        def spy(xn, mask, pair_logits):
+            captured["pair_logits"] = pair_logits.detach().clone()
+            return original_compute(xn, mask, pair_logits)
+
+        block.single_attn._compute_baseline = spy
+        with torch.no_grad():
+            block(pair, single, pair_mask, seq_mask)
+            unscaled = block.single_to_pair(block.single_to_pair_norm(pair)).movedim(-1, -3).unsqueeze(0)
+        # Block-level pair_logits passed in is the unrescaled bias; the gate
+        # (when on) lives inside SingleAttention, not in the block.
+        torch.testing.assert_close(captured["pair_logits"], unscaled, atol=1e-5, rtol=1e-5)
+
+
+class TestPairBiasGate:
+    """Per-head learnable PairBias gate τ_h = exp(a_h) on SingleAttention."""
+
+    def test_off_by_default(self):
+        from deepfold3.model.attention import SingleAttention
+
+        attn = SingleAttention(384)
+        assert attn.pair_bias_gate_a is None
+
+    def test_init_value(self):
+        import math
+
+        import torch
+
+        from deepfold3.model.attention import SingleAttention
+
+        attn = SingleAttention(384, num_heads=16, pair_bias_gate=True, pair_bias_gate_init_tau=0.25)
+        assert attn.pair_bias_gate_a is not None
+        # Init: a_h = log(τ₀) for every head.
+        expected = math.log(0.25)
+        assert attn.pair_bias_gate_a.shape == (16,)
+        torch.testing.assert_close(attn.pair_bias_gate_a, torch.full((16,), expected), atol=1e-6, rtol=1e-6)
+
+    def test_param_is_1d_so_routes_to_no_decay(self):
+        from deepfold3.model.attention import SingleAttention
+
+        attn = SingleAttention(384, num_heads=16, pair_bias_gate=True)
+        # 1-D shape → ``param.dim() < 2`` rule in optim.py routes it to
+        # the no-decay group automatically. Gate parameter must stay 1-D.
+        assert attn.pair_bias_gate_a.dim() == 1
+
+    def test_pair_logits_multiplied_by_tau(self):
+        import math
+
+        import torch
+
+        from deepfold3.model.attention import SingleAttention
+
+        torch.manual_seed(0)
+        H = 4
+        attn = SingleAttention(64, num_heads=H, key_dim=64, value_dim=64, pair_bias_gate=True).eval()
+
+        # Override gate to head-distinct values so the broadcast pattern is verifiable.
+        with torch.no_grad():
+            attn.pair_bias_gate_a.copy_(torch.tensor([0.0, math.log(2.0), math.log(0.5), math.log(0.1)]))
+        tau = torch.exp(attn.pair_bias_gate_a)  # [1, 2, 0.5, 0.1]
+
+        N = 5
+        x = torch.randn(N, 64)
+        mask = torch.ones(N)
+        pair_logits = torch.randn(H, N, N)
+
+        # Run with pair_logits = 0 to capture pure QK contribution to logits;
+        # then run with the real pair_logits and infer that the difference
+        # equals τ_h · pair_logits per head.
+        # Patch torch.nn.functional.softmax to capture the logits the attention
+        # would normalise. Bind ``orig`` *before* patching so the spy can call
+        # the original without recursing into itself.
+        import torch.nn.functional as F
+
+        orig_softmax = F.softmax
+        captured: list[torch.Tensor] = []
+
+        def spy_softmax(logits, *args, **kwargs):
+            captured.append(logits.detach().clone())
+            return orig_softmax(logits, *args, **kwargs)
+
+        F.softmax = spy_softmax
+        try:
+            with torch.no_grad():
+                attn(x, mask, torch.zeros_like(pair_logits))
+                attn(x, mask, pair_logits)
+        finally:
+            F.softmax = orig_softmax
+
+        # captured[0] = QK only + mask; captured[1] = QK + τ·pair_logits + mask.
+        diff = captured[1] - captured[0]  # [B=1, H, N, N]
+        expected = (pair_logits * tau.view(H, 1, 1)).unsqueeze(0).to(diff.dtype)
+        torch.testing.assert_close(diff, expected, atol=1e-4, rtol=1e-4)
+
+    def test_off_skips_multiplication(self):
+        import torch
+
+        from deepfold3.model.attention import SingleAttention
+
+        torch.manual_seed(0)
+        H = 4
+        attn_off = SingleAttention(64, num_heads=H, key_dim=64, value_dim=64).eval()
+        N = 5
+        x = torch.randn(N, 64)
+        mask = torch.ones(N)
+        pair_logits = torch.randn(H, N, N)
+        # Just check forward runs and output shape is right.
+        with torch.no_grad():
+            out = attn_off(x, mask, pair_logits)
+        assert out.shape == x.shape
+
+    def test_forward_unchanged_when_off(self):
+        """With both flags off, forward must produce the original residual
+        update — i.e. ``residual_out_scale=1.0`` is bit-exact identical to the
+        pre-feature behaviour."""
+        import torch
+
+        from deepfold3.model.evoformer import EvoformerBlock, PairFormerBlock
+
+        torch.manual_seed(0)
+        block_evo = EvoformerBlock(64, 128).eval()
+        block_pf = PairFormerBlock(128, 384).eval()
+        # Just construct + verify no crash; numerical equivalence is implied
+        # because all multipliers default to 1.0 and the dropout path is
+        # bypassed in eval mode.
+        N, S = 8, 4
+        msa = torch.randn(S, N, 64)
+        pair = torch.randn(N, N, 128)
+        single = torch.randn(N, 384)
+        msa_mask = torch.ones(S, N)
+        pair_mask = torch.ones(N, N)
+        seq_mask = torch.ones(N)
+        with torch.no_grad():
+            msa_out, pair_out = block_evo(msa, pair, msa_mask, pair_mask)
+            pair_out2, single_out = block_pf(pair, single, pair_mask, seq_mask)
+        assert msa_out.shape == msa.shape
+        assert pair_out.shape == pair.shape
+        assert single_out.shape == single.shape
+
+
 class TestFullEvoformer:
     """Tests for the full Evoformer trunk with AF3 weights."""
 

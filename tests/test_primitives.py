@@ -66,6 +66,152 @@ class TestLayerNorm:
         assert y.mean().abs() < 0.1
         assert (y.std() - 1.0).abs() < 0.1
 
+    def test_output_scale_multiplies_output(self):
+        """LayerNorm(output_scale=k) should produce k× the unscaled output."""
+        from deepfold3.model.primitives import LayerNorm
+
+        torch.manual_seed(0)
+        ln = LayerNorm(64)
+        ln_scaled = LayerNorm(64, output_scale=0.25)
+        ln_scaled.weight.data.copy_(ln.weight.data)
+        ln_scaled.bias.data.copy_(ln.bias.data)
+        x = torch.randn(8, 64)
+        with torch.no_grad():
+            y = ln(x)
+            y_scaled = ln_scaled(x)
+        torch.testing.assert_close(y_scaled, y * 0.25, atol=1e-6, rtol=1e-5)
+
+    def test_output_scale_default_is_unity(self):
+        """Default output_scale=1.0 should match plain LayerNorm bit-for-bit."""
+        from deepfold3.model.primitives import LayerNorm
+
+        ln = LayerNorm(32)
+        assert ln.output_scale == 1.0
+
+
+class TestBlockResidualScale:
+    """Per-layer / uniform Residual Output Scaling factor resolution."""
+
+    def test_neither_returns_one(self):
+        from deepfold3.model.primitives import block_residual_scale
+
+        for i in range(5):
+            assert block_residual_scale(i, 5, per_layer=False, uniform=False) == 1.0
+
+    def test_per_layer(self):
+        import math
+
+        from deepfold3.model.primitives import block_residual_scale
+
+        for i, n in [(0, 48), (1, 48), (5, 48), (47, 48)]:
+            expected = 1.0 / math.sqrt(i + 1)
+            assert block_residual_scale(i, n, per_layer=True, uniform=False) == expected
+
+    def test_uniform_depth_flat(self):
+        import math
+
+        from deepfold3.model.primitives import block_residual_scale
+
+        n = 48
+        for i in range(n):
+            assert block_residual_scale(i, n, per_layer=False, uniform=True) == 1.0 / math.sqrt(n)
+
+    def test_mutual_exclusion(self):
+        import pytest
+
+        from deepfold3.model.primitives import block_residual_scale
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            block_residual_scale(0, 4, per_layer=True, uniform=True)
+
+
+class TestRmsNormalize:
+    """Non-learnable RMSNorm over the last channel axis."""
+
+    def test_unit_rms_output(self):
+        from deepfold3.model.primitives import rms_normalize
+
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 64) * 5.7  # arbitrary non-unit scale
+        y = rms_normalize(x)
+        # Per-token RMS over channel axis ≈ 1.
+        rms = y.float().pow(2).mean(dim=-1).sqrt()
+        torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
+
+    def test_invariant_to_input_scale(self):
+        from deepfold3.model.primitives import rms_normalize
+
+        torch.manual_seed(1)
+        x = torch.randn(4, 32)
+        y_a = rms_normalize(x)
+        y_b = rms_normalize(x * 137.0)
+        torch.testing.assert_close(y_a, y_b, atol=1e-4, rtol=1e-4)
+
+    def test_bf16_passthrough(self):
+        from deepfold3.model.primitives import rms_normalize
+
+        x = torch.randn(2, 4, 16, dtype=torch.bfloat16) * 2.5
+        y = rms_normalize(x)
+        assert y.dtype == torch.bfloat16
+        rms = y.float().pow(2).mean(dim=-1).sqrt()
+        torch.testing.assert_close(rms, torch.ones_like(rms), atol=2e-2, rtol=2e-2)
+
+    def test_handles_near_zero_input(self):
+        from deepfold3.model.primitives import rms_normalize
+
+        # Zero input → output stays finite (eps prevents div-by-zero).
+        x = torch.zeros(2, 16)
+        y = rms_normalize(x)
+        assert torch.isfinite(y).all()
+
+
+class TestTransitionBlockLinearOutInit:
+    """``linear_out_init_gain`` overrides the AF3 zeros init on linear2 with
+    a scaled row-orthogonal init."""
+
+    def test_default_is_zeros(self):
+        from deepfold3.model.primitives import TransitionBlock
+
+        tb = TransitionBlock(384, num_intermediate_factor=2)
+        assert tb.linear2.weight.abs().max().item() == 0.0
+
+    def test_orthogonal_init_gain(self):
+        import torch
+
+        from deepfold3.model.primitives import TransitionBlock
+
+        gain = 0.01
+        torch.manual_seed(0)
+        tb = TransitionBlock(384, num_intermediate_factor=2, linear_out_init_gain=gain)
+        W = tb.linear2.weight.detach()  # shape [384, 768]
+
+        # Row-orthonormal scaled by gain: W W^T = gain² · I_384.
+        gram = W @ W.transpose(0, 1)
+        I_scaled = torch.eye(384) * (gain**2)
+        torch.testing.assert_close(gram, I_scaled, atol=1e-6, rtol=1e-5)
+
+        # All rows have norm ≈ gain.
+        row_norms = W.norm(dim=1)
+        torch.testing.assert_close(row_norms, torch.full((384,), gain), atol=1e-6, rtol=1e-5)
+
+    def test_make_transition_block_passes_gain(self):
+        from deepfold3.model.optim import make_transition_block
+
+        block = make_transition_block(384, num_intermediate_factor=2, linear_out_init_gain=0.05)
+        # Row-orthonormal × 0.05 → frobenius² = 384 · 0.05² = 0.96
+        fro_sq = block.linear2.weight.pow(2).sum().item()
+        assert abs(fro_sq - 384 * 0.05**2) < 1e-3
+
+    def test_fused_transition_rejects_gain(self):
+        import pytest
+
+        from deepfold3.model.config import OptimConfig
+        from deepfold3.model.optim import make_transition_block
+
+        optim = OptimConfig(use_fused_transition_pair=True)
+        with pytest.raises(ValueError, match="linear_out_init_gain"):
+            make_transition_block(128, num_intermediate_factor=2, config=optim, linear_out_init_gain=0.01)
+
 
 class TestLinearNoBias:
     """Verify LinearNoBias matches manual computation."""

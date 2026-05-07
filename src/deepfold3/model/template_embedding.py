@@ -44,7 +44,7 @@ from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
 from deepfold3.model.embedders import dgram_from_positions as _dgram_from_positions
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, sum_fusion_init_
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 
 # Dense atom indices for backbone atoms
@@ -191,8 +191,12 @@ class TemplatePairFormerBlock(nn.Module):
         num_intermediate_factor: int = 2,
         pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
+        residual_out_scale: float = 1.0,
     ):
         super().__init__()
+        # Pair-only template stack: every residual update is output-scaled by
+        # ``residual_out_scale`` in ``forward``. No LNS-path module here (no
+        # SingleAttention/MSAAttention).
         self.tri_mul_out = TriangleMulOutgoing(num_channels, optim=optim)
         self.tri_mul_in = TriangleMulIncoming(num_channels, optim=optim)
         self.pair_attn_row = GridSelfAttention(num_channels, num_heads=num_heads, transpose=False, optim=optim)
@@ -200,6 +204,7 @@ class TemplatePairFormerBlock(nn.Module):
         self.pair_transition = make_transition_block(num_channels, num_intermediate_factor, config=optim)
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
+        self.residual_out_scale = float(residual_out_scale)
 
     def forward(self, pair: torch.Tensor, pair_mask: torch.Tensor) -> torch.Tensor:
         """Forward pass through one template PairFormer block.
@@ -213,11 +218,12 @@ class TemplatePairFormerBlock(nn.Module):
         """
         p, training = self.pair_dropout, self.training
         use_fused = self.use_fused_dropout
-        pair = dropout_add_rowwise(pair, self.tri_mul_out(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.tri_mul_in(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, self.pair_attn_row(pair, pair_mask), p, training, use_fused)
-        pair = dropout_add_columnwise(pair, self.pair_attn_col(pair, pair_mask), p, training, use_fused)
-        pair = pair + self.pair_transition(pair)
+        s = self.residual_out_scale
+        pair = dropout_add_rowwise(pair, s * self.tri_mul_out(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p, training, use_fused)
+        pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p, training, use_fused)
+        pair = pair + s * self.pair_transition(pair)
         return pair
 
 
@@ -295,8 +301,11 @@ class SingleTemplateEmbedding(nn.Module):
                     num_intermediate_factor=pf.num_intermediate_factor,
                     pair_dropout=pf.pair_dropout,
                     optim=optim,
+                    residual_out_scale=block_residual_scale(
+                        i, pf.num_layer, pf.residual_output_scaling, pf.uniform_residual_scale
+                    ),
                 )
-                for _ in range(pf.num_layer)
+                for i in range(pf.num_layer)
             ]
         )
 

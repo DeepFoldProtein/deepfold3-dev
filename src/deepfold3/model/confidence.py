@@ -31,7 +31,8 @@ from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, sum_fusion_init_
+from deepfold3.model.evoformer import _resolve_branch_residual_gain
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, sum_fusion_init_
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -88,7 +89,6 @@ class ConfidenceHead(nn.Module):
         sum_fusion_init_(self.distogram_feat_project.weight, _conf_target, "one_hot")
 
         # 4-layer PairFormer with single track (same as trunk)
-        _conf_deepnet_L = cfg.num_layer if cfg.deepnet_residual_scale else None
         self.layers = nn.ModuleList(
             [
                 PairFormerBlock(
@@ -99,9 +99,25 @@ class ConfidenceHead(nn.Module):
                     single_key_dim=c_single,
                     single_value_dim=c_single,
                     optim=optim,
-                    deepnet_layer_scale=_conf_deepnet_L,
+                    residual_out_scale=block_residual_scale(
+                        i, cfg.num_layer, cfg.residual_output_scaling, cfg.uniform_residual_scale
+                    ),
+                    pair_bias_gate=cfg.pair_bias_gate,
+                    pair_bias_gate_init_tau=cfg.pair_bias_gate_init_tau,
+                    single_transition_linear_out_init_gain=cfg.single_transition_linear_out_init_gain,
+                    single_transition_residual_gain=_resolve_branch_residual_gain(
+                        i,
+                        cfg.single_transition_residual_gain,
+                        cfg.single_transition_residual_per_layer_extra,
+                    ),
+                    pair_transition_residual_gain=_resolve_branch_residual_gain(
+                        i,
+                        cfg.pair_transition_residual_gain,
+                        cfg.pair_transition_residual_per_layer_extra,
+                    ),
+                    residual_branch_rmsnorm=cfg.residual_branch_rmsnorm,
                 )
-                for _ in range(cfg.num_layer)
+                for i in range(cfg.num_layer)
             ]
         )
 
