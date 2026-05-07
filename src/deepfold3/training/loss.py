@@ -198,6 +198,49 @@ def pair_repr_reg_loss(
     return (per_pair * mask).sum() / n_valid
 
 
+def single_repr_log_rms_loss(
+    single: torch.Tensor,  # [..., N, C]
+    seq_mask: torch.Tensor,  # [..., N]
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMS magnitude of the single representation under ``seq_mask``, plus its log.
+
+    ``RMS = sqrt(mean over (valid token, channel) of single²)``. Computed in
+    fp32 regardless of ambient autocast — large activations can overflow under
+    bf16 and this metric exists to track magnitude blow-ups.
+
+    Returns ``(rms, log_rms)`` so the caller can log the RMS value while using
+    ``log_rms`` as the loss term — the log keeps the gradient bounded even
+    when activations are very large.
+    """
+    mask = seq_mask.float()
+    n_valid = mask.sum().clamp(min=1)
+    C = single.shape[-1]
+    s32 = single.float()
+    sq_per_token = (s32 * s32).sum(dim=-1) / C  # [..., N]
+    mean_sq = (sq_per_token * mask).sum() / n_valid
+    rms = mean_sq.sqrt()
+    log_rms = (rms + eps).log()
+    return rms, log_rms
+
+
+def pair_repr_log_rms_loss(
+    pair: torch.Tensor,  # [..., N, N, C]
+    pair_mask: torch.Tensor,  # [..., N, N]
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pair-RMS analogue of :func:`single_repr_log_rms_loss`."""
+    mask = pair_mask.float()
+    n_valid = mask.sum().clamp(min=1)
+    C = pair.shape[-1]
+    p32 = pair.float()
+    sq_per_pair = (p32 * p32).sum(dim=-1) / C  # [..., N, N]
+    mean_sq = (sq_per_pair * mask).sum() / n_valid
+    rms = mean_sq.sqrt()
+    log_rms = (rms + eps).log()
+    return rms, log_rms
+
+
 # ---------------------------------------------------------------------------
 # Smooth LDDT loss (diffusion)
 # ---------------------------------------------------------------------------
@@ -1066,30 +1109,51 @@ def training_loss(
         loss_atom_mask = atom_mask
         loss_seq_mask = seq_mask
 
-    # --- Single-representation magnitude regularization ---
+    # --- Single/pair-representation magnitude regularization ---
     # ``alpha_{single,pair}_reg is None`` disables entirely; 0.0 is
-    # observation-only (compute under no_grad and log); >0 adds
-    # ``alpha * L_p`` to the total.
+    # observation-only (compute under no_grad and log); >0 adds the loss
+    # term to the total. ``cfg.reg_form`` selects between two forms:
+    #   * "lp"      → loss = α · L_p,        log key = single_l{p} / pair_l{p}
+    #   * "log_rms" → loss = α · log(RMS+ε), log key = single_rms / pair_rms
+    #                 (the RMS value, not log(RMS), is logged)
     if cfg.alpha_single_reg is not None and "single" in pred:
-        if cfg.alpha_single_reg > 0:
-            l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
-            total = total + cfg.alpha_single_reg * l_sreg
+        if cfg.reg_form == "log_rms":
+            if cfg.alpha_single_reg > 0:
+                rms, log_rms = single_repr_log_rms_loss(pred["single"], seq_mask)
+                total = total + cfg.alpha_single_reg * log_rms
+            else:
+                with torch.no_grad():
+                    rms, _ = single_repr_log_rms_loss(pred["single"], seq_mask)
+            losses["single_rms"] = rms
         else:
-            with torch.no_grad():
+            if cfg.alpha_single_reg > 0:
                 l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
-        losses[f"single_l{cfg.single_reg_p}"] = l_sreg
+                total = total + cfg.alpha_single_reg * l_sreg
+            else:
+                with torch.no_grad():
+                    l_sreg = single_repr_reg_loss(pred["single"], seq_mask, cfg.single_reg_p)
+            losses[f"single_l{cfg.single_reg_p}"] = l_sreg
 
     if cfg.alpha_pair_reg is not None and "pair" in pred:
         pmask = features.get("pair_mask")
         if pmask is None:
             pmask = seq_mask.unsqueeze(-1) & seq_mask.unsqueeze(-2)
-        if cfg.alpha_pair_reg > 0:
-            l_preg = pair_repr_reg_loss(pred["pair"], pmask, cfg.pair_reg_p)
-            total = total + cfg.alpha_pair_reg * l_preg
+        if cfg.reg_form == "log_rms":
+            if cfg.alpha_pair_reg > 0:
+                rms, log_rms = pair_repr_log_rms_loss(pred["pair"], pmask)
+                total = total + cfg.alpha_pair_reg * log_rms
+            else:
+                with torch.no_grad():
+                    rms, _ = pair_repr_log_rms_loss(pred["pair"], pmask)
+            losses["pair_rms"] = rms
         else:
-            with torch.no_grad():
+            if cfg.alpha_pair_reg > 0:
                 l_preg = pair_repr_reg_loss(pred["pair"], pmask, cfg.pair_reg_p)
-        losses[f"pair_l{cfg.pair_reg_p}"] = l_preg
+                total = total + cfg.alpha_pair_reg * l_preg
+            else:
+                with torch.no_grad():
+                    l_preg = pair_repr_reg_loss(pred["pair"], pmask, cfg.pair_reg_p)
+            losses[f"pair_l{cfg.pair_reg_p}"] = l_preg
 
     # --- Diffusion loss ---
     # When ``forward_training`` ran the chunked-diffusion path, it already

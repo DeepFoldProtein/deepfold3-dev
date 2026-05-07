@@ -517,6 +517,16 @@ class TrainingConfig:
     # where IntFold observes the explosion *first*).
     pair_reg_p: int = 2
     alpha_pair_reg: float | None = None
+    # Regularization metric form.
+    #   ``"lp"`` (default) — per-token / per-pair L_p norm:
+    #       loss term = α · L_p, logged key = ``single_l{p}`` / ``pair_l{p}``.
+    #   ``"log_rms"`` — per-token / per-pair RMS = sqrt(mean(x²)):
+    #       loss term = α · log(RMS + eps), logged key = ``single_rms`` / ``pair_rms``
+    #       (the RMS value, not log(RMS); log only enters the loss).
+    # Default ``"lp"`` preserves the existing behaviour bit-for-bit. The
+    # ``"log_rms"`` form is wired so a follow-up arm can raise α without a
+    # code change; with α=0 the metric is still recorded, no gradient.
+    reg_form: Literal["lp", "log_rms"] = "lp"
 
     # Molecule-type loss reweighting (Protenix: DNA/RNA 5×, ligand 10×)
     nucleotide_loss_weight: float = 5.0

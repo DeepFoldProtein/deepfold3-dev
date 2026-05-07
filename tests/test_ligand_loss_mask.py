@@ -125,7 +125,12 @@ def test_ligand_atom_gradients_are_zero_under_mask():
 
 def test_pair_reg_unaffected_by_ligand_mask():
     """``pair_l2`` / ``single_l2`` regularizer values must NOT depend on the mask
-    (regularizers continue to bound activations on ligand tokens)."""
+    (regularizers continue to bound activations on ligand tokens).
+
+    Parametrized over ``reg_form``: ``"lp"`` (existing behaviour, keys
+    ``single_l2``/``pair_l2``) and ``"log_rms"`` (keys ``single_rms``/``pair_rms``).
+    Both forms must be mask-invariant for the same reason.
+    """
     from deepfold3.model.config import TrainingConfig
     from deepfold3.training.loss import training_loss
 
@@ -135,11 +140,10 @@ def test_pair_reg_unaffected_by_ligand_mask():
     pair = torch.randn(N, N, 16)
     single = torch.randn(N, 32)
 
-    def _build(with_mask: bool):
+    def _build(with_mask: bool, reg_form: str):
         pred = {
             "single": single.clone(),
             "pair": pair.clone(),
-            # Anchor for total: include distogram_features so the grad path stays.
             "distogram_features": torch.randn(N, N, 8, requires_grad=True),
             "distogram_weight": torch.randn(64, 8),
         }
@@ -155,23 +159,68 @@ def test_pair_reg_unaffected_by_ligand_mask():
         if with_mask:
             features[f"mask_{MASK_LOSS_WEIGHT}"] = torch.tensor([1.0] * 6 + [0.0, 0.0], dtype=torch.float32)
         cfg = TrainingConfig()
-        cfg.alpha_pair_reg = 0.0  # observation only
+        cfg.alpha_pair_reg = 0.0
         cfg.alpha_single_reg = 0.0
-        cfg.alpha_diffusion = 0.0  # turn off other losses to isolate reg signal
+        cfg.alpha_diffusion = 0.0
         cfg.alpha_distogram = 0.0
         cfg.alpha_confidence = 0.0
+        cfg.reg_form = reg_form
         return pred, features, cfg
 
-    pred_no, feats_no, cfg = _build(with_mask=False)
-    pred_w, feats_w, _ = _build(with_mask=True)
-    _, losses_no = training_loss(pred_no, feats_no, cfg)
-    _, losses_w = training_loss(pred_w, feats_w, cfg)
+    for reg_form, expected_keys in [("lp", ("pair_l2", "single_l2")), ("log_rms", ("pair_rms", "single_rms"))]:
+        pred_no, feats_no, cfg = _build(with_mask=False, reg_form=reg_form)
+        pred_w, feats_w, _ = _build(with_mask=True, reg_form=reg_form)
+        _, losses_no = training_loss(pred_no, feats_no, cfg)
+        _, losses_w = training_loss(pred_w, feats_w, cfg)
 
-    # Both pair_l2 and single_l2 should be present and identical.
-    for key in ("pair_l2", "single_l2"):
-        assert key in losses_no
-        assert key in losses_w
-        torch.testing.assert_close(losses_no[key], losses_w[key])
+        for key in expected_keys:
+            assert key in losses_no, f"reg_form={reg_form}: missing {key}"
+            assert key in losses_w, f"reg_form={reg_form}: missing {key}"
+            torch.testing.assert_close(losses_no[key], losses_w[key])
+
+
+def test_log_rms_metric_matches_sqrt_of_l2():
+    """For the same activations, ``single_rms`` (log_rms form) equals
+    ``sqrt(single_l2)`` (lp form, p=2). Documents the relationship between
+    the two reg_form metric definitions.
+    """
+    from deepfold3.model.config import TrainingConfig
+    from deepfold3.training.loss import training_loss
+
+    torch.manual_seed(123)
+    N, M = 6, 4
+    pair = torch.randn(N, N, 16)
+    single = torch.randn(N, 32)
+
+    def _build(reg_form: str):
+        pred = {
+            "single": single.clone(),
+            "pair": pair.clone(),
+            "distogram_features": torch.randn(N, N, 8, requires_grad=True),
+            "distogram_weight": torch.randn(64, 8),
+        }
+        features = {
+            "atom_gt_positions": torch.zeros(N, M, 3),
+            "atom_gt_mask": torch.ones(N, M, dtype=torch.bool),
+            "seq_mask": torch.ones(N, dtype=torch.bool).float(),
+            "token_to_rep_atom": torch.ones(N, dtype=torch.long),
+            "mol_type": torch.zeros(N, dtype=torch.long),
+        }
+        cfg = TrainingConfig()
+        cfg.alpha_pair_reg = 0.0
+        cfg.alpha_single_reg = 0.0
+        cfg.alpha_diffusion = 0.0
+        cfg.alpha_distogram = 0.0
+        cfg.alpha_confidence = 0.0
+        cfg.reg_form = reg_form
+        return pred, features, cfg
+
+    _, lp = training_loss(*_build("lp")[:2], _build("lp")[2])
+    _, lr = training_loss(*_build("log_rms")[:2], _build("log_rms")[2])
+
+    # single_rms == sqrt(single_l2), pair_rms == sqrt(pair_l2)
+    torch.testing.assert_close(lr["single_rms"], lp["single_l2"].sqrt(), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(lr["pair_rms"], lp["pair_l2"].sqrt(), atol=1e-5, rtol=1e-5)
 
 
 def test_dataset_config_exclude_loss_mol_types_default_empty():
@@ -182,8 +231,12 @@ def test_dataset_config_exclude_loss_mol_types_default_empty():
     assert cfg.exclude_loss_mol_types == []
 
 
-def test_initial_yaml_patchr_excludes_ligand():
-    """``configs/initial.yaml`` configures PATCHR to drop ligand tokens (mol_type=3)."""
+def test_initial_yaml_patchr_exclude_loss_mol_types():
+    """``configs/initial.yaml`` declares ``exclude_loss_mol_types`` per dataset.
+
+    Current policy: no datasets exclude any mol_type (PATCHR keeps ligand
+    supervision). The field is still surfaced through the loader.
+    """
     from pathlib import Path
 
     from deepfold3.config_loader import load_config
@@ -191,7 +244,6 @@ def test_initial_yaml_patchr_excludes_ligand():
     cfg = load_config(Path(__file__).parent.parent / "configs" / "initial.yaml")
     extras = cfg["training"]["extra_datasets"]
     by_name = {d["name"]: d for d in extras}
-    assert by_name["patchr"]["exclude_loss_mol_types"] == [3]
-    # Other datasets keep ligand supervision (no exclusion).
+    assert by_name["patchr"]["exclude_loss_mol_types"] == []
     assert by_name["long_monomers"]["exclude_loss_mol_types"] == []
     assert by_name["short_monomers"]["exclude_loss_mol_types"] == []
