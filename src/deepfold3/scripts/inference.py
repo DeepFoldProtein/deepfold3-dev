@@ -161,7 +161,7 @@ def inference(
 
     # Architectural ModelConfig embedded in training checkpoints — preserved
     # so the inference build matches whatever flags (e.g.
-    # ``pairformer.deepnet_residual_scale``) were active at training time.
+    # ``pairformer.residual_output_scaling``) were active at training time.
     # Stays ``None`` only for raw-AF3 ``.bin`` / ``.bin.zst`` paths and for
     # legacy ``.safetensors`` files exported before metadata embedding was
     # introduced — both fall back to ``ModelConfig()`` defaults.
@@ -227,7 +227,7 @@ def inference(
             click.echo(
                 "[inference] checkpoint has no embedded model_cfg — falling "
                 "back to ModelConfig() defaults. If the checkpoint was trained "
-                "with non-default architectural flags (e.g. deepnet_residual_scale), "
+                "with non-default architectural flags (e.g. residual_output_scaling), "
                 "the inference build will silently disagree."
             )
     # ``--optim`` always overrides the OptimConfig sub-config so inference
