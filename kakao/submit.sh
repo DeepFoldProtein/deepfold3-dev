@@ -39,7 +39,12 @@ WANDB_ENTITY="${WANDB_ENTITY:-DeepFoldProtein}"
 N_NODES="${N_NODES:-8}"
 
 # k8s names must be DNS-1123 (lowercase alphanumerics + hyphens).
-JOB_NAME="$(printf '%s' "${RUN_NAME}" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-' | cut -c1-52)"
+# Cap at 45 so JobSet-generated pod names fit the 63-char DNS-1123 label
+# limit. Pods are ``<jobset>-launcher-0-<jobIdx>-<podIdx>``: the
+# ``-launcher-0-X-YYY`` suffix can reach ~18 chars, leaving 63 - 18 = 45
+# for the run name. JobSet's admission webhook rejects anything longer
+# (``JobSet name is too long, pod names ... will exceed 63 characters``).
+JOB_NAME="$(printf '%s' "${RUN_NAME}" | tr '[:upper:]_' '[:lower:]-' | tr -cd 'a-z0-9-' | cut -c1-45)"
 if [[ -z "${JOB_NAME}" ]]; then
     echo "run name '${RUN_NAME}' sanitises to empty job name" >&2
     exit 1
