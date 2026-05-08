@@ -526,6 +526,90 @@ class Trainer:
                 if base_lrs is not None:
                     self.scheduler.base_lrs = [target_lr] * len(base_lrs)
 
+        # Resume audit (warn-only): catalogue every yaml-controlled field
+        # that's silently shadowed by checkpoint state on resume. lr is
+        # already force-overridden above; everything else here is reported
+        # to the user so they can decide whether the saved value should win
+        # (intentional) or the yaml should win (typo / forgot to update).
+        # No state is mutated by this block.
+        if resumed:
+            mismatches: list[str] = []
+
+            # weight_decay (per param-group). build_optimizer constructs
+            # param_groups as [decay (cfg.weight_decay), no_decay (0.0)] in
+            # that fixed order; param_groups have no `name` key.
+            decay_targets = (float(self.cfg.weight_decay), 0.0)
+            for gi, g in enumerate(self.optimizer.param_groups):
+                saved_wd = float(g.get("weight_decay", 0.0))
+                target_wd = decay_targets[gi] if gi < len(decay_targets) else 0.0
+                if abs(saved_wd - target_wd) > 1e-12:
+                    label = ("decay", "no_decay")[gi] if gi < 2 else f"group_{gi}"
+                    mismatches.append(
+                        f"  weight_decay[{label}]: saved={saved_wd:.4g} != cfg={target_wd:.4g}"
+                    )
+
+            # Optimizer betas / eps (stored in param_groups; restored verbatim
+            # by optimizer.load_state_dict). Saved as list; cfg keeps tuple.
+            if self.optimizer.param_groups:
+                saved_betas = tuple(self.optimizer.param_groups[0].get("betas", ()))
+                target_betas = tuple(self.cfg.betas)
+                if saved_betas and saved_betas != target_betas:
+                    mismatches.append(f"  betas: saved={saved_betas} != cfg={target_betas}")
+                saved_eps = float(self.optimizer.param_groups[0].get("eps", 0.0))
+                target_eps = float(self.cfg.eps)
+                if abs(saved_eps - target_eps) > 1e-20:
+                    mismatches.append(f"  eps: saved={saved_eps:.3e} != cfg={target_eps:.3e}")
+
+            # EMA decay (only when EMA is enabled and was loaded).
+            if self.ema is not None:
+                saved_ema = float(getattr(self.ema, "decay", self.cfg.ema_decay))
+                target_ema = float(self.cfg.ema_decay)
+                if abs(saved_ema - target_ema) > 1e-12:
+                    mismatches.append(f"  ema_decay: saved={saved_ema} != cfg={target_ema}")
+
+            # Scheduler instance attributes. PyTorch's LambdaLR.state_dict
+            # currently filters these out, so they stay at the cfg-derived
+            # __init__ value after load — but if that ever changes, this
+            # audit catches a silent restore.
+            sched = self.scheduler
+            sched_pairs: list[tuple[str, str]] = []
+            for sched_attr, cfg_attr in (
+                ("warmup_steps", "warmup_steps"),
+                ("start_decay_after", "start_decay_after"),
+                ("decay_every", "decay_every"),
+                ("decay_factor", "decay_factor"),
+                ("max_steps", "cosine_max_steps"),
+                ("min_ratio", "cosine_min_lr_ratio"),
+            ):
+                if hasattr(sched, sched_attr) and hasattr(self.cfg, cfg_attr):
+                    sched_pairs.append((sched_attr, cfg_attr))
+            for sched_attr, cfg_attr in sched_pairs:
+                saved_val = getattr(sched, sched_attr)
+                target_val = getattr(self.cfg, cfg_attr)
+                if saved_val != target_val:
+                    mismatches.append(
+                        f"  scheduler.{sched_attr}: saved={saved_val} != cfg={target_val}"
+                    )
+            # WSDS-only: windows are list-of-tuples internally vs list-of-list in cfg.
+            if hasattr(sched, "windows"):
+                saved_w = [tuple(p) for p in getattr(sched, "windows", [])]
+                target_w = [tuple(p) for p in getattr(self.cfg, "wsds_decay_windows", [])]
+                if saved_w != target_w:
+                    mismatches.append(
+                        f"  wsds_decay_windows: saved={saved_w} != cfg={target_w}"
+                    )
+
+            if mismatches:
+                rank_zero_warn(
+                    "[resume] yaml fields silently shadowed by checkpoint state — "
+                    "the values below come from the saved run, NOT your --config. "
+                    "Fix the yaml or accept the saved value:\n" + "\n".join(mismatches)
+                )
+            else:
+                rank_zero_info(
+                    "[resume] yaml-vs-checkpoint state audit: all shadowed fields match"
+                )
+
         cfg = self.cfg
         tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
         effective_batch_size = cfg.batch_size_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
