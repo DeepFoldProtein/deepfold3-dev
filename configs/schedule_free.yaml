@@ -51,12 +51,5 @@ training:
   grad_norm_skip_threshold: 0.0
   grad_norm_log_threshold: 1000.0
 
-# DeepNet-style residual scaling on the single track of every PairFormer block
-# (trunk: L=48, confidence head: L=4). Single-attention output is multiplied by
-# 1/sqrt(2L) and single FFN output by 1/sqrt(L) before adding to the residual
-# stream. Output projections retain zero-init.
-model:
-  pairformer:
-    deepnet_residual_scale: true
-  confidence:
-    deepnet_residual_scale: true
+# Trunk residual-scaling policy is delegated to the inheriting config.
+# (See configs/ros_scheduledfree.yaml for the per-layer ROS variant.)

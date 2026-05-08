@@ -1,0 +1,65 @@
+base: schedule_free.yaml
+
+# Uniform ROS + PairFormer non-learnable RMSNorm at residual branch outputs
+# + log(RMS) reg loss form wired but alpha=0 (record-only).
+#
+# Motivation (see docs/single-track-stability-experiments.md §12):
+#   - Per-layer ROS gives layer-0 scale 1.0 vs layer-47 0.144 → L0 dominates
+#     when zero-init gates wake up. Uniform ROS flattens to 1/sqrt(L_total)
+#     ≈ 0.144 everywhere, removing the per-layer scale asymmetry that
+#     concentrates amplification at L0.
+#   - DeepNet history (§3, §11.1) shows schedule alone won't bound the
+#     aligned-residual dynamic. PairFormer ``residual_branch_rmsnorm``
+#     forces every residual update to ``γ_k · unit-RMS`` regardless of
+#     branch-internal scale drift — the gate wake-up cannot inflate the
+#     residual stream past the budget set by ``Σ γ_k``.
+#   - log(RMS) reg loss form is wired so a follow-up arm can raise α
+#     without a code change. With both alphas=0, the metric is recorded
+#     (logged as ``single_rms`` / ``pair_rms``) but contributes no gradient.
+#
+# RMSNorm scope: trunk PairFormer only (Evoformer MSA stack, template
+# PairFormer, confidence-head PairFormer untouched). Per-branch residual
+# gain knobs (single_transition_residual_gain, etc.) MUST stay at default
+# when residual_branch_rmsnorm is on — PairFormerConfig __post_init__
+# raises if violated.
+#
+# Trade-offs vs s035_lr2_5e4_wd10:
+#   - lr 2.5e-4 → 1.5e-4 (further damps post-warmup amplitude jump that
+#     was visible at step 1k → 1.2k under the previous run)
+#   - clip 10 → 20 (current 93% clip rate at clip=10 turned the optimizer
+#     into normalized-direction descent and suppressed Adam's adaptive
+#     role; doubling the threshold should restore Adam preconditioning
+#     under the now-bounded residual updates)
+#   - wd 0.10 retained (matmul-weight Frobenius growth is already well
+#     controlled at this value — see analyze_checkpoint diagnostics)
+
+model:
+  evoformer:
+    uniform_residual_scale: true
+  pairformer:
+    uniform_residual_scale: true
+    residual_branch_rmsnorm: true
+  confidence:
+    uniform_residual_scale: true
+    residual_branch_rmsnorm: true
+  template:
+    pairformer:
+      uniform_residual_scale: true
+
+training:
+  lr: 2.5e-4
+  weight_decay: 0.10
+  warmup_steps: 1000
+  grad_clip_norm: 20.0
+
+  # Match s035's batch geometry (effective batch = 96 ranks × 3 × 1 = 288,
+  # tokens_per_opt_step = 110,592). initial.yaml default is 2/2 → 384,
+  # which is 33% more compute/step and not the apples-to-apples comparison
+  # we want against df3-12n-s035-lr2-5e4-wd10-0504-181609.
+  batch_size_per_rank: 3
+  accumulate_grad_batches: 1
+
+  # log(RMS) reg form wired, both alphas at 0 (record-only).
+  reg_form: log_rms
+  alpha_single_reg: 0.0
+  alpha_pair_reg: 0.0
