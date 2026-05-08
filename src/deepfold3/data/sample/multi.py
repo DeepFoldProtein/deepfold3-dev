@@ -50,6 +50,14 @@ class MultiDatasetSampler(Sampler[int]):
         self.rank = rank
         self.seed = seed
         self.epoch = 0
+        # Within-epoch position. Advanced once per yielded index. Reset
+        # by ``set_epoch`` only when the epoch number actually changes,
+        # so a resumed sampler whose state was loaded after construction
+        # is not clobbered by the trainer's ``set_epoch(state.epoch)``
+        # at the top of the loop. Mirrors WeightedClusterSampler's
+        # state-aware resume protocol so CheckpointManager can persist
+        # and restore the exact within-epoch position.
+        self.sample_idx = 0
 
         self.configs = dataset_configs
         self.weighted_kwargs = weighted_kwargs
@@ -103,10 +111,41 @@ class MultiDatasetSampler(Sampler[int]):
 
         # Shard by rank
         shard = indices[self.rank :: self.num_replicas]
-        yield from shard.tolist()
+        for i in range(self.sample_idx, len(shard)):
+            self.sample_idx = i + 1
+            yield int(shard[i])
+        # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
+        # state_dict captured after the iterator drained reads as
+        # "epoch fully consumed". ``set_epoch`` resets it on the next
+        # outer-loop tick.
 
     def __len__(self) -> int:
         return self.epoch_size // self.num_replicas
 
     def set_epoch(self, epoch: int) -> None:
+        if epoch != self.epoch:
+            self.sample_idx = 0
         self.epoch = epoch
+
+    def state_dict(self) -> dict:
+        """Snapshot for checkpoint resume.
+
+        Captures epoch + within-epoch position so the iterator can
+        fast-forward past indices already trained on. Saving ``seed``
+        makes resume catch a same-seed mismatch loud (the per-epoch
+        ``np.random.default_rng(self.seed + self.epoch)`` derives the
+        full sample sequence from this seed).
+        """
+        return {"epoch": self.epoch, "sample_idx": self.sample_idx, "seed": self.seed}
+
+    def load_state_dict(self, state: dict) -> None:
+        if "seed" in state and state["seed"] != self.seed:
+            import warnings
+
+            warnings.warn(
+                f"MultiDatasetSampler resume with seed={self.seed} but ckpt sampler had "
+                f"seed={state['seed']}; sample sequence will diverge.",
+                stacklevel=2,
+            )
+        self.epoch = state["epoch"]
+        self.sample_idx = state.get("sample_idx", 0)

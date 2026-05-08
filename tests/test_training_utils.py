@@ -823,6 +823,117 @@ class TestCheckpointResume:
         assert sampler2.epoch == 2
         assert sampler2.sample_idx == 6
 
+    def test_multi_dataset_sampler_iter_position_round_trip(self, tmp_path):
+        """``MultiDatasetSampler.sample_idx`` is captured + restored across resume.
+
+        Mirror of ``test_sampler_iter_position_round_trip`` for the
+        multi-dataset path that the trainer takes when extra datasets
+        (e.g. PDB + distillation) are configured.
+        """
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+
+        records = _make_records(30)
+        configs = [{"records": records, "dataset_len": 30, "weight": 1.0, "strategy": "uniform"}]
+
+        sampler_a = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_a.set_epoch(2)
+        full = list(iter(sampler_a))
+        assert len(full) == 20
+
+        sampler_b = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_b.set_epoch(2)
+        prefix = []
+        for i, idx in enumerate(iter(sampler_b)):
+            prefix.append(idx)
+            if i + 1 == 7:
+                break
+        snap = sampler_b.state_dict()
+        assert snap["sample_idx"] == 7
+        assert snap["epoch"] == 2
+        assert snap["seed"] == 7
+
+        sampler_c = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
+        )
+        sampler_c.load_state_dict(snap)
+        sampler_c.set_epoch(snap["epoch"])
+        tail = list(iter(sampler_c))
+
+        assert prefix + tail == full
+        assert sampler_c.sample_idx == 20
+
+    def test_multi_dataset_sampler_set_epoch_resets_idx_only_on_change(self, tmp_path):
+        """``set_epoch`` only resets ``sample_idx`` when epoch number actually changes."""
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+
+        records = _make_records(20)
+        configs = [{"records": records, "dataset_len": 20, "weight": 1.0, "strategy": "uniform"}]
+        sampler = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=1
+        )
+        sampler.set_epoch(5)
+        sampler.sample_idx = 4
+        sampler.set_epoch(5)  # same epoch — keep
+        assert sampler.sample_idx == 4
+        sampler.set_epoch(6)  # new epoch — reset
+        assert sampler.sample_idx == 0
+
+    def test_multi_dataset_sampler_full_round_trip_through_checkpoint_manager(self, tmp_path):
+        """End-to-end: MultiDatasetSampler state goes through CheckpointManager save/load."""
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+        from deepfold3.training.state import TrainState
+
+        records = _make_records(30)
+        configs = [{"records": records, "dataset_len": 30, "weight": 1.0, "strategy": "uniform"}]
+
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
+        sampler = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11
+        )
+        sampler.set_epoch(2)
+        it = iter(sampler)
+        for _ in range(6):
+            next(it)
+        assert sampler.sample_idx == 6
+
+        path = tmp_path / "ckpt_multi.pt"
+        ckpt_mgr.save(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=state,
+            model_cfg=model_cfg,
+            train_cfg=cfg,
+            dist_info=dist_info,
+            train_sampler=sampler,
+        )
+
+        sampler2 = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11
+        )
+        new_state = TrainState()
+        ckpt_mgr.load(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=cfg,
+            dist_info=dist_info,
+            train_sampler=sampler2,
+        )
+        assert sampler2.epoch == 2
+        assert sampler2.sample_idx == 6
+
     def test_sf_invariant_violation_raises(self, tmp_path):
         """Loading an SF blob whose optimizer state has train_mode=True must error."""
         import pytest
