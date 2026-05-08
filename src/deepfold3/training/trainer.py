@@ -493,12 +493,38 @@ class Trainer:
                 logger.info(f"Run provenance saved to {prov_out}")
 
         # Auto-resume: find latest checkpoint in output_dir if none specified
+        resumed = False
         if resume_from is not None:
             self._load_checkpoint(Path(resume_from))
+            resumed = True
         elif self.cfg.auto_resume:
             latest = self._find_latest_checkpoint(output_dir)
             if latest is not None:
                 self._load_checkpoint(latest)
+                resumed = True
+
+        # Resume LR override: optimizer.load_state_dict and
+        # scheduler.load_state_dict both restore the lr/initial_lr/base_lrs
+        # baked into the checkpoint, which silently shadows any --config
+        # change. When the configured lr differs from the saved peak, force
+        # the new value into both so the schedule honors the override.
+        # SF-AdamW's accumulator state (z buffer, lr_max, weight_sum) is
+        # preserved — only the per-step `lr`/`initial_lr` is bumped.
+        if resumed and self.optimizer.param_groups:
+            saved_lr = float(self.optimizer.param_groups[0].get("initial_lr", self.optimizer.param_groups[0]["lr"]))
+            target_lr = float(self.cfg.lr)
+            if abs(saved_lr - target_lr) > 1e-12:
+                rank_zero_info(
+                    f"[resume] LR override: {saved_lr:.3e} → {target_lr:.3e} "
+                    "(forcing optimizer.param_groups['lr','initial_lr'] + scheduler.base_lrs; "
+                    "SF accumulator state preserved)"
+                )
+                for g in self.optimizer.param_groups:
+                    g["lr"] = target_lr
+                    g["initial_lr"] = target_lr
+                base_lrs = getattr(self.scheduler, "base_lrs", None)
+                if base_lrs is not None:
+                    self.scheduler.base_lrs = [target_lr] * len(base_lrs)
 
         cfg = self.cfg
         tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank

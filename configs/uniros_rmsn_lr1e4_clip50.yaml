@@ -1,0 +1,33 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Resume of df3-12n-uniros-rmsn-lr2-5e4-0507-152307 with the
+# "Trunk OK, Head overshooting" prescription:
+#
+#   1. lr 2.5e-4 → 1.0e-4
+#      Trunk magnitude (single_rms ≈ 11) is bounded by uniform ROS +
+#      branch RMSNorm, but diff_mse / loss have re-exploded ~4× as the
+#      model entered higher-curvature geometry-fitting territory.
+#      Halving lr cuts the per-step impulse so we stop overshooting the
+#      narrow valleys.
+#
+#   2. grad_clip_norm 20 → 50
+#      grad_norm p50 is now sitting at ~16 (window 1000-2000 p50 = 8.3
+#      but recent p50 is climbing past 15 per the diagnosis). At clip=20
+#      half of all steps are clipped, which collapses Adam preconditioning
+#      to direction-only descent (Sign-SGD-like). Loosening the threshold
+#      to 50 restores Adam's adaptive scale information without raising
+#      lr — the "safety belt" instead lives on the lr side.
+#
+#   3. SF-AdamW retained — its x-averaging is exactly what damps the
+#      transient under the new lr. Optimizer state (z, lr_max, weight_sum)
+#      is preserved across resume; trainer applies the new peak lr via the
+#      [resume] LR override hook.
+#
+# Resume command:
+#   bash kakao/submit.sh df3-12n-uniros-rmsn-lr1e4-clip50 \
+#     "--config configs/uniros_rmsn_lr1e4_clip50.yaml \
+#      --resume runs/df3-12n-uniros-rmsn-lr2-5e4-0507-152307/checkpoint_2600.pt"
+
+training:
+  lr: 1.0e-4
+  grad_clip_norm: 50.0
