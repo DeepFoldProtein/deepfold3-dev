@@ -204,6 +204,47 @@ def distogram_loss_fused(
     )
 
 
+@torch.no_grad()
+def distogram_entropy_fused(
+    features: torch.Tensor,
+    weight: torch.Tensor,
+    token_mask: torch.Tensor,
+    chunk_n: int = 32,
+    symmetrize: bool = True,
+) -> torch.Tensor:
+    """Chunked predictive entropy of the fused distogram head (no-grad).
+
+    Mirrors the chunking + symmetrise structure of :func:`distogram_loss_fused`
+    so the entropy and CE see identical logits, but skips all gradient
+    accounting (no ``grad_input`` / ``grad_weight`` accumulators).
+    """
+    has_batch = features.dim() == 4
+    if not has_batch:
+        features = features.unsqueeze(0)
+    S, N, _, H = features.shape
+
+    pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask = pair_mask.unsqueeze(0).expand(S, -1, -1)  # [S, N, N]
+    n_valid = pair_mask.sum().clamp(min=1)
+
+    weight_f = weight.float()
+    entropy_acc = torch.zeros((), dtype=torch.float32, device=features.device)
+    for i in range(0, N, chunk_n):
+        end = min(i + chunk_n, N)
+        feat_chunk = features[:, i:end]
+        if symmetrize:
+            feat_col = features[:, :, i:end]
+            h_row = feat_chunk.float() @ weight_f.T
+            h_col = feat_col.float() @ weight_f.T
+            logits_chunk = h_row + h_col.transpose(1, 2)
+        else:
+            logits_chunk = feat_chunk.float() @ weight_f.T
+        log_probs = F.log_softmax(logits_chunk, dim=-1)
+        entropy_chunk = -(log_probs.exp() * log_probs).sum(-1)
+        entropy_acc = entropy_acc + (entropy_chunk * pair_mask[:, i:end]).sum()
+    return (entropy_acc / n_valid).to(torch.float32)
+
+
 def pae_loss_fused(
     features: torch.Tensor,
     weight: torch.Tensor,

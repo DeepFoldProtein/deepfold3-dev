@@ -27,7 +27,7 @@ from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
 from deepfold3.training.rank_zero import rank_zero_info, rank_zero_warn
-from deepfold3.training.schedule_free import optimizer_eval_mode
+from deepfold3.training.schedule_free import AdamWScheduleFree, optimizer_eval_mode
 from deepfold3.training.scheduler import AF3LRScheduler
 from deepfold3.training.state import TrainState
 
@@ -174,6 +174,13 @@ class CheckpointManager:
             return
 
         with optimizer_eval_mode(optimizer):
+            # snapshot_kind: descriptor for what's in ``blob["model"]`` to aid
+            # inference-time selection. Schedule-Free flips into eval mode
+            # above, so model.state_dict() captures ``x`` (the SF averaged
+            # iterate); plain AdamW captures the live params. EMA shadow,
+            # when present, is always EMA of this snapshot — inference
+            # composes by overlay (see scripts/inference.py:_select_snapshot).
+            snapshot_kind = "x" if isinstance(optimizer, AdamWScheduleFree) else "live"
             blob: dict = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -185,6 +192,7 @@ class CheckpointManager:
                 "rng_states": rng_states,
                 "model_cfg": model_cfg,
                 "train_cfg": train_cfg,
+                "snapshot_kind": snapshot_kind,
             }
             if ema is not None:
                 blob["ema"] = ema.state_dict()

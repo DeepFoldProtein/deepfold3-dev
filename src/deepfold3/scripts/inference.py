@@ -43,6 +43,74 @@ import torch
 from deepfold3.scripts import cli
 
 
+def _select_snapshot(ckpt: dict, choice: str) -> dict:
+    """Return the chosen weight snapshot as a state_dict.
+
+    Vocabulary (per arxiv 2405.15682 Defazio 2024 + arxiv 2507.09846):
+        - 'average' = SF's averaged iterate ``x`` (paper-recommended inference
+          target). Stored in ``ckpt['model']`` because :class:`CheckpointManager`
+          flips into eval mode before the save. For plain AdamW, this is the
+          live params at save time.
+        - 'shadow'  = External EMA shadow over ``x`` (or over live params for
+          AdamW). An independent smoothing layer with its own time constant
+          (~1/(1-decay) step), decoupled from SF's own averaging. Stored under
+          ``ckpt['ema']['shadow']`` and overlaid onto ``ckpt['model']`` at
+          load time.
+        - 'fast'    = SF's fast iterate ``z`` (the SGD-like point that takes
+          the raw step before averaging). Reconstructed from
+          ``ckpt['optimizer']['state']``. Rarely the right choice for
+          inference — exposed for ablation only.
+        - 'auto'    = smart default: shadow if present (overlaid on
+          ``ckpt['model']``), else ``ckpt['model']``. Inspects the
+          ``ckpt['snapshot_kind']`` metadata for logging.
+    """
+    model = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    shadow = (ckpt.get("ema") or {}).get("shadow") if isinstance(ckpt, dict) else None
+    optim_state = ckpt.get("optimizer", {}).get("state", {}) if isinstance(ckpt, dict) else {}
+    has_optim_z = any("z" in s for s in optim_state.values())
+
+    if choice == "auto":
+        kind = ckpt.get("snapshot_kind") if isinstance(ckpt, dict) else None
+        if shadow:
+            tag = f"shadow (auto: shadow present, kind={kind})" if kind else "shadow (auto: shadow present)"
+            click.echo(f"  snapshot={tag} — overlay {len(shadow)} shadow params")
+            return {**model, **shadow}
+        click.echo(f"  snapshot=average (auto{f', kind={kind}' if kind else ''})")
+        return model
+
+    if choice == "shadow":
+        if not shadow:
+            raise click.ClickException("--snapshot shadow: no 'ema'/'shadow' entry in checkpoint")
+        click.echo(f"  snapshot=shadow ({len(shadow)} shadow params)")
+        return {**model, **shadow}
+
+    if choice == "average":
+        click.echo("  snapshot=average (= ckpt['model'])")
+        return model
+
+    if choice == "fast":
+        if not has_optim_z:
+            raise click.ClickException("--snapshot fast: no SF 'z' state in checkpoint")
+        # Map (param_id_in_optim_state) → param_name by ordering. SF's z
+        # always equals model.parameters() in shape and (insertion) order
+        # because :class:`AdamWScheduleFree` adds entries one param at a
+        # time during step(). Brittle if the model architecture differs
+        # from save time, so this path errors loudly on length mismatch
+        # and is documented as ablation-only.
+        z_by_id = {pid: s["z"] for pid, s in optim_state.items() if "z" in s}
+        model_items = list(model.items())
+        if len(z_by_id) != len(model_items):
+            raise click.ClickException(
+                f"--snapshot fast: z count ({len(z_by_id)}) != model param count "
+                f"({len(model_items)}); ablation path requires matched ordering."
+            )
+        z_state = {name: z for (name, _), z in zip(model_items, z_by_id.values(), strict=True)}
+        click.echo(f"  snapshot=fast (= SF z; {len(z_state)} params)")
+        return z_state
+
+    raise click.ClickException(f"--snapshot: unknown choice {choice!r}")
+
+
 @cli.command("inference")
 @click.option(
     "--msa",
@@ -78,6 +146,21 @@ from deepfold3.scripts import cli
 )
 @click.option("--num-recycles", default=10, show_default=True, help="Evoformer recycling iterations")
 @click.option("--num-samples", default=5, show_default=True, help="Number of diffusion samples per seed")
+@click.option(
+    "--snapshot",
+    type=click.Choice(["auto", "shadow", "average", "fast"]),
+    default="auto",
+    show_default=True,
+    help=(
+        "Which weight snapshot to load from a .pt training checkpoint. "
+        "'auto' = shadow when present (overlaid on ckpt['model']), else ckpt['model']. "
+        "'shadow' forces the external EMA shadow (errors if absent). "
+        "'average' forces ckpt['model'] (= SF's averaged iterate x post eval-mode flip; "
+        "= live params for AdamW). 'fast' forces the SF z buffer reconstructed from "
+        "ckpt['optimizer']['state'] (SF only; ablation use). For .safetensors / raw "
+        "AF3 params this flag is ignored."
+    ),
+)
 @click.option(
     "--seed",
     default=None,
@@ -129,6 +212,7 @@ def inference(
     mol_type: str,
     num_recycles: int,
     num_samples: int,
+    snapshot: str,
     seed: int | None,
     device: str | None,
     templates: Path | None,
@@ -181,18 +265,9 @@ def inference(
         state_dict = load_file(str(params))
     elif params.suffix == ".pt":
         ckpt = torch.load(str(params), map_location="cpu", weights_only=False)
-        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        state_dict = _select_snapshot(ckpt, snapshot)
         if any(k.startswith("module.") for k in state_dict):
             state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-        # EMA runs (AdamW + ema_decay > 0): overlay shadow params on the model
-        # state_dict — buffers stay from the model snapshot. Schedule-free runs
-        # have no "ema" key and the saved "model" is already the inference
-        # target ``x`` (CheckpointManager.save flips into eval mode).
-        ema_state = ckpt.get("ema") if isinstance(ckpt, dict) else None
-        if ema_state and ema_state.get("shadow"):
-            shadow = ema_state["shadow"]
-            state_dict = {**state_dict, **shadow}
-            click.echo(f"  using EMA shadow ({len(shadow)} params)")
         # Capture the embedded model_cfg before discarding the ckpt blob —
         # critical for runs that override architectural flags (residual
         # scaling, layer counts, etc.) whose dataclass defaults differ from

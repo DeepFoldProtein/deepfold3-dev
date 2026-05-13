@@ -179,24 +179,33 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
             betas=cfg.betas,
             eps=cfg.eps,
             warmup_steps=cfg.warmup_steps,
+            average_concentration=cfg.average_concentration,
         )
         # SF.step() raises if not in train mode. Eval/checkpoint save flip it
         # via ``optimizer_eval_mode`` and restore on exit.
         optimizer.train()
-        # SF maintains its own averaged sequence ``x`` (the inference target,
-        # surfaced at eval / checkpoint via ``optimizer_eval_mode``). Running
-        # EMA on top averages ``y`` (the gradient point) into a *different*
-        # iterate that competes with ``x`` for the eval/inference role and
-        # doubles per-param memory for averaging. Disable EMA explicitly via
-        # ``ema_decay: 0`` (configs/schedule_free.yaml does this).
+        # SF + EMA(x): the trainer wraps ``ema.update(model)`` in
+        # ``optimizer_eval_mode(optimizer)`` so the shadow tracks ``x`` (the
+        # SF inference target), not ``y`` (the gradient point). Disable
+        # explicitly via ``ema_decay: 0`` (configs/schedule_free.yaml does
+        # this) when relying on SF's own implicit averaging.
+        #
+        # Through the River (arxiv 2507.09846 §6) finds that EMA on top of
+        # vanilla SF gives little benefit (because SF's x already provides
+        # implicit weight averaging with a wide window). With refined SF
+        # (``average_concentration`` set), x's window is tighter, so external
+        # EMA can add complementary smoothing — a useful ablation knob.
         if cfg.ema_decay > 0:
-            rank_zero_warn(
-                f"optimizer_type='schedule_free' with ema_decay={cfg.ema_decay} > 0: "
-                "EMA(y) will replace SF's x at eval, defeating the purpose of SF's averaging. "
-                "Set ema_decay=0 unless you're deliberately A/B-testing the two averages."
+            rank_zero_info(
+                f"AdamWScheduleFree + EMA(x): ema_decay={cfg.ema_decay}. "
+                "EMACallback wraps ema.update() in optimizer_eval_mode() so "
+                "the shadow tracks x, not y. Per-step cost: 2 extra "
+                "param-sized lerps."
             )
         rank_zero_info(
-            f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, weight_decay={cfg.weight_decay} "
+            f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, "
+            f"weight_decay={cfg.weight_decay}, "
+            f"average_concentration={cfg.average_concentration} "
             f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
         )
         return optimizer

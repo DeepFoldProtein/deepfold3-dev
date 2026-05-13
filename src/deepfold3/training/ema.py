@@ -9,6 +9,14 @@ weights, ref-atom tables) or a derived shadow re-synced from params
 Legacy fused-kernel parameter names are filtered out of the shadow dict
 so old EMA state_dicts still load cleanly and so the EMA update doesn't
 double-decay against the base params they shadow.
+
+SF + EMA(x) compose pattern: when tracking Schedule-Free's averaged
+iterate ``x`` rather than the live ``y``, the trainer wraps
+``ema.update(model)`` in ``optimizer_eval_mode(optimizer)`` so
+``param.data`` holds ``x`` for the duration of the foreach_lerp. See
+``trainer.py`` for the wiring. ``reseed_from(model)`` re-clones the
+shadow from the live params after a resume that has no saved EMA state
+(e.g. when an EMA-on-x arm starts from a vanilla-SF checkpoint).
 """
 
 from __future__ import annotations
@@ -104,6 +112,22 @@ class EMA:
         for name, param in model.named_parameters():
             if name in self.shadow:
                 self.shadow[name], param.data = param.data, self.shadow[name]
+        self._invalidate_cache()
+
+    @torch.no_grad()
+    def reseed_from(self, model: nn.Module) -> None:
+        """Re-clone shadow buffers from the (possibly just-loaded) ``model.parameters``.
+
+        Used on resume when the checkpoint has model + optimizer state but
+        no saved EMA shadow (e.g. when an EMA-on-x arm starts from a
+        vanilla-SF checkpoint). Without this, the shadow remains at the
+        random init from ``__init__`` while the model holds the resumed
+        weights — the EMA becomes meaningless until the resumed-weight
+        signal decays through.
+        """
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name] = param.data.clone()
         self._invalidate_cache()
 
     def state_dict(self) -> dict:

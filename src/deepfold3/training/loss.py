@@ -527,6 +527,24 @@ def distogram_loss(
     return (nll * pair_mask).sum() / n_pairs
 
 
+@torch.no_grad()
+def distogram_entropy(
+    logits: torch.Tensor,  # [N, N, num_bins]
+    token_mask: torch.Tensor,  # [N]
+) -> torch.Tensor:
+    """Predictive entropy of the distogram softmax (logged-only metric).
+
+    Returns ``H(p_θ) = -Σ_b p_b log p_b`` averaged over (i, j) pairs in the
+    token mask. Pair masking and num-pairs normalisation mirror
+    :func:`distogram_loss` so ``CE - entropy = KL(p_θ ‖ p_data)`` is exact.
+    """
+    pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    n_pairs = pair_mask.sum().clamp(min=1)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    entropy = -(log_probs.exp() * log_probs).sum(-1)
+    return (entropy * pair_mask).sum() / n_pairs
+
+
 # ---------------------------------------------------------------------------
 # Confidence losses
 # ---------------------------------------------------------------------------
@@ -660,6 +678,42 @@ def _frame_angle_mask(
     return (cos_angle < cos_max) & (cos_angle > cos_min)
 
 
+def _tm_score_from_error(
+    error: torch.Tensor,  # [S, N, N] per-pair distance (Å)
+    mask: torch.Tensor,   # [S, N, N] float
+    n_eff: int,
+) -> torch.Tensor:
+    """TM-like scalar in [0, 1] from a per-pair distance error tensor.
+
+    Mirrors :func:`deepfold3.io.confidences._compute_tm_adjusted_pae` but
+    operates on the distance directly — i.e. either the *true* alignment
+    error (yielding ``tm_true``) or the PAE-derived expected distance
+    (yielding ``tm_pred``). The 1/(1+(d/d0)²) kernel and row-normalised
+    max-over-alignments aggregation are identical to the inference-time
+    pTM computation, so train-time ``tm_true`` is on the same scale as
+    inference-time pTM and can be compared directly.
+
+    Args:
+        error: per-pair distance, ``[S, N, N]``. Sample dim S is averaged.
+        mask: per-pair valid mask in ``[0, 1]``. Padding / co-linear
+              frames / cross-chain restriction all enter via this mask.
+        n_eff: per-pair token count used for ``d0``. Use total token count
+               for the global TM (``n_eff = N``); when ``mask`` already
+               restricts to a chain pair, callers should pass the per-pair
+               token count for ipTM-style scaling.
+    """
+    clipped = max(int(n_eff), 19)
+    d0 = 1.24 * (clipped - 15) ** (1.0 / 3) - 1.8
+    tm_per_pair = 1.0 / (1.0 + (error / d0) ** 2)  # [S, N, N]
+    denom = mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    normed_mask = mask / denom
+    per_alignment = (tm_per_pair * normed_mask).sum(dim=-1)  # [S, N]
+    # max over i picks the best alignment frame; mean over S averages
+    # across diffusion samples (S=1 for mini-rollout, S=num_samples for
+    # the confidence-head PAE path).
+    return per_alignment.max(dim=-1).values.mean()
+
+
 def pae_loss(
     logits: torch.Tensor,  # [S, N, N, num_bins]
     pred_rep: torch.Tensor,  # [S, N, 3] representative atoms
@@ -685,8 +739,6 @@ def pae_loss(
     ill-defined orientation and would otherwise inject noise into the
     alignment-error supervision.
     """
-    S = logits.shape[0]
-
     pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
     gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
     error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
@@ -1229,7 +1281,10 @@ def training_loss(
     # regardless of sample origin. Only confidence losses are PDB-only (§4.3).
     if cfg.alpha_distogram > 0:
         if "distogram_features" in pred:
-            from deepfold3.training.fused_loss import distogram_loss_fused
+            from deepfold3.training.fused_loss import (
+                distogram_entropy_fused,
+                distogram_loss_fused,
+            )
 
             l_disto = distogram_loss_fused(
                 pred["distogram_features"],
@@ -1238,13 +1293,76 @@ def training_loss(
                 loss_seq_mask,
                 chunk_n=cfg.fused_ce_chunk_n,
             )
+            with torch.no_grad():
+                e_disto = distogram_entropy_fused(
+                    pred["distogram_features"],
+                    pred["distogram_weight"],
+                    loss_seq_mask,
+                    chunk_n=cfg.fused_ce_chunk_n,
+                )
         elif "distogram" in pred:
             l_disto = distogram_loss(pred["distogram"], gt_rep, loss_seq_mask)
+            with torch.no_grad():
+                e_disto = distogram_entropy(pred["distogram"], loss_seq_mask)
         else:
             l_disto = None
+            e_disto = None
         if l_disto is not None:
             losses["distogram"] = l_disto
             total = total + cfg.alpha_distogram * l_disto
+        if e_disto is not None:
+            losses["distogram_entropy"] = e_disto
+
+    # --- TM-true / iTM-true (global accuracy from mini-rollout positions) ---
+    # Mirrors the pTM kernel but uses the *true* alignment error instead of
+    # the PAE-derived expected distance. Always computable when
+    # ``mini_rollout_pos`` and frame features are present — no dependency
+    # on the confidence head, so it fires in stage 0 too. Logged-only
+    # (``with no_grad``); not added to ``total``. Cross-chain ``itm_true``
+    # is emitted only when the batch contains at least one cross-chain pair
+    # (DDP-safe via DistributedAverageMeters' per-key counts + key-set
+    # union; single-chain ranks simply don't contribute that key).
+    mini_pos_for_tm = pred.get("mini_rollout_pos")  # [1, N, M, 3] or None
+    frame_idx_feat = features.get("frame_atom_index")
+    frame_tok_feat = features.get("frame_token_index")
+    frames_mask_feat = features.get("frames_mask")
+    if (
+        mini_pos_for_tm is not None
+        and frame_idx_feat is not None
+        and frames_mask_feat is not None
+    ):
+        with torch.no_grad():
+            arange_n_tm = torch.arange(N, device=gt_pos.device)
+            if rep_idx is not None:
+                pred_rep_tm = mini_pos_for_tm[:, arange_n_tm, rep_idx]  # [1, N, 3]
+            else:
+                pred_rep_tm = mini_pos_for_tm[:, :, 1, :]
+            if frame_tok_feat is None:
+                frame_tok_feat = arange_n_tm.unsqueeze(-1).expand(N, 3)
+            gt_frames_atoms_tm = gt_pos[frame_tok_feat, frame_idx_feat]  # [N, 3, 3]
+            pred_frames_atoms_tm = mini_pos_for_tm[:, frame_tok_feat, frame_idx_feat]  # [1, N, 3, 3]
+
+            pred_local_tm = express_coordinates_in_frame(pred_rep_tm, pred_frames_atoms_tm)  # [1, N, N, 3]
+            gt_local_tm = express_coordinates_in_frame(gt_rep, gt_frames_atoms_tm)  # [N, N, 3]
+            true_error = (pred_local_tm - gt_local_tm.unsqueeze(0)).norm(dim=-1)  # [1, N, N]
+
+            pair_mask_for_tm = features.get("pair_mask")
+            if pair_mask_for_tm is None:
+                pair_mask_for_tm = loss_seq_mask.unsqueeze(1) & loss_seq_mask.unsqueeze(0)
+            pae_mask_for_tm = (frames_mask_feat.bool().unsqueeze(-1) & pair_mask_for_tm.bool()).float()
+            pred_angle_ok_tm = _frame_angle_mask(pred_frames_atoms_tm, 25.0).float()  # [1, N]
+            gt_angle_ok_tm = _frame_angle_mask(gt_frames_atoms_tm, 25.0).float()  # [N]
+            mask_s_tm = pae_mask_for_tm.unsqueeze(0) * pred_angle_ok_tm.unsqueeze(-1) * gt_angle_ok_tm.unsqueeze(0).unsqueeze(-1)  # [1, N, N]
+
+            n_eff_tm = int(loss_seq_mask.sum().item())
+            if mask_s_tm.sum() > 0 and n_eff_tm > 0:
+                losses["tm_true"] = _tm_score_from_error(true_error, mask_s_tm, n_eff_tm)
+                asym_id_for_tm = features.get("asym_id")
+                if asym_id_for_tm is not None:
+                    cc_mask_2d = (asym_id_for_tm.unsqueeze(0) != asym_id_for_tm.unsqueeze(1)).float()
+                    cc_mask_s_tm = mask_s_tm * cc_mask_2d.unsqueeze(0)
+                    if cc_mask_s_tm.sum() > 0:
+                        losses["itm_true"] = _tm_score_from_error(true_error, cc_mask_s_tm, n_eff_tm)
 
     # --- Distillation: skip confidence losses (AF3 §4.3: PDB-only, res-gated) ---
     is_distillation = features.get("is_distillation")

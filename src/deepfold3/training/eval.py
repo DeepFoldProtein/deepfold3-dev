@@ -112,8 +112,16 @@ def run_eval(
     target) for the duration of the pass and restores ``y`` on exit.
     For plain AdamW this is a no-op.
     """
+    use_shadow = cfg.eval_snapshot == "shadow"
+    if use_shadow and ema is None:
+        logger.warning(
+            "eval_snapshot='shadow' requested but EMA is disabled "
+            "(ema_decay <= 0); falling back to 'average' (or live params "
+            "if optimizer is not Schedule-Free)."
+        )
+        use_shadow = False
     with optimizer_eval_mode(optimizer):
-        if ema is not None:
+        if ema is not None and use_shadow:
             ema.apply(model)
 
         model.eval()
@@ -168,7 +176,7 @@ def run_eval(
 
         model.train()
 
-        if ema is not None:
+        if ema is not None and use_shadow:
             ema.restore(model)
 
     return _reduce_eval_metrics(metrics, device)

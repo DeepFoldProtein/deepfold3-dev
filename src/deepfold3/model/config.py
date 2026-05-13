@@ -589,6 +589,15 @@ class TrainingConfig:
 
     # EMA
     ema_decay: float = 0.999
+    # Eval snapshot — applies to run_eval forward pass. "average" reads
+    # SF's x directly (responsive, current state). "shadow" reads EMA-over-x
+    # (slow, 1/(1-ema_decay) lag). Training-time shadow update is unaffected.
+    eval_snapshot: Literal["average", "shadow"] = "average"
+    # Refined SF averaging width (Through the River, arxiv 2507.09846).
+    # ``None`` keeps vanilla SF (`c_t = γ_t²/Σγ_i² ≈ 1/t`); a float ``C``
+    # switches to ``c_t = (1−β₁)·C / t`` decoupling β₁ from x's averaging window.
+    # Ignored unless ``optimizer_type == "schedule_free"``.
+    average_concentration: float | None = None
 
     # Data
     max_tokens: int = 384

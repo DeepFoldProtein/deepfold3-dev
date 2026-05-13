@@ -10,13 +10,40 @@ Algorithm 1 (paper §3, defaults β₁=0.9, β₂=0.999, r=0, weight_lr_power=2)
 
     z_1 = x_1,  v_0 = 0
     for t = 1 to T:
-        y_t   = (1 − β₁)·z_t + β₁·x_t              # interpolation (line 5)
+        y_t   = (1 - β₁)·z_t + β₁·x_t              # interpolation (line 5)
         g_t   = ∂f(y_t)                            # gradient at y (line 6)
-        v_t   = β₂·v_{t-1} + (1 − β₂)·g_t²         # AdamW 2nd moment (line 7)
-        γ_t   = γ · √(1 − β₂^t) · min(1, t/T_warm) # bias-corrected LR (line 8)
-        z_{t+1} = z_t − γ_t·g_t/(√v_t + ε) − γ_t·λ·y_t   # primary step (line 9)
+        v_t   = β₂·v_{t-1} + (1 - β₂)·g_t²         # AdamW 2nd moment (line 7)
+        γ_t   = γ · √(1 - β₂^t) · min(1, t/T_warm) # bias-corrected LR (line 8)
+        z_{t+1} = z_t - γ_t·g_t/(√v_t + ε) - γ_t·λ·y_t   # primary step (line 9)
         c_{t+1} = γ_t² / Σ_{i=1}^{t} γ_i²          # averaging weight (line 10)
-        x_{t+1} = (1 − c_{t+1})·x_t + c_{t+1}·z_{t+1}    # x average (line 11)
+        x_{t+1} = (1 - c_{t+1})·x_t + c_{t+1}·z_{t+1}    # x average (line 11)
+
+Refined averaging variant (arxiv 2507.09846, "Through the River:
+Understanding the Benefit of Schedule-Free Methods for Language Model
+Training", 2025):
+
+The vanilla averaging weight ``c_t = γ_t² / Σ γ_i² ≈ 1/t`` ties the
+effective averaging window of x to β₁ implicitly (because the y
+interpolation is ``(1-β₁)·z + β₁·x`` so β₁ controls how much fresh z
+bleeds through to the loss point each step, AND through ``weight_lr_power=2``
+the lr_max² accumulator post-warmup geometrically determines x's window).
+Set ``average_concentration=C`` to switch to::
+
+    c_t = (1 - β₁) · C / t       (Through the River, eq. (Refined SF))
+
+so β₁ governs only the momentum role and C governs only the averaging
+width. The closed-form weight of z_i in x_T is
+``α_i^T ≈ α · i^(α-1) / T^α`` with ``α = (1-β₁)·C``:
+
+    α = 1   (≡ C = 1/(1-β₁), e.g. β₁=0.9 → C=10): vanilla equivalent
+                                                  (uniform-ish over all past z)
+    α > 1   :  concentration on recent z (narrow window)
+    α >> 1  :  x ≈ most-recent z (no averaging)
+    α < 1   :  past dominates (rarely useful)
+
+Default ``average_concentration=None`` keeps the paper-faithful Defazio
+2024 path unchanged, including ``weight_sum`` / ``lr_max`` accumulator
+state for checkpoint compat.
 
 State layout — three iterates, two tensors per parameter:
 
@@ -24,7 +51,7 @@ State layout — three iterates, two tensors per parameter:
 * ``v`` — AdamW second moment (= ``exp_avg_sq``), ``optimizer.state[p]["exp_avg_sq"]``
 * ``x`` — running average of ``z`` (the inference target). NOT stored
   separately. Live ``p`` holds ``y`` while in train mode; flipping to
-  eval mode lerps ``p ← x`` via the relation ``x = (1/β₁)·y + (1−1/β₁)·z``
+  eval mode lerps ``p ← x`` via the relation ``x = (1/β₁)·y + (1-1/β₁)·z``
   obtained by inverting the line-5 interpolation. Saves ~4 GB / rank for
   a 1 B-param fp32 model — ``y``'s storage is reused.
 
@@ -32,11 +59,11 @@ Step is implemented as a single in-place fused update of ``y`` and ``z``
 that's mathematically equivalent to (line 9) + (line 11) + (line 5 for
 t+1). Derivation:
 
-    y_{t+1} = (1−β₁)·z_{t+1} + β₁·x_{t+1}
-            = (1−β₁)·z_{t+1} + β₁·[(1−c)·x_t + c·z_{t+1}]
-    Substitute x_t = (1/β₁)·y_t − ((1−β₁)/β₁)·z_t (inverse of line 5):
-    y_{t+1} = (1−c)·y_t + c·z_t + γ_t·[β₁·(1−c) − 1]·ĝ_t
-    z_{t+1} = z_t − γ_t·ĝ_t                      (where ĝ = g/(√v+ε) + λ·y)
+    y_{t+1} = (1-β₁)·z_{t+1} + β₁·x_{t+1}
+            = (1-β₁)·z_{t+1} + β₁·[(1-c)·x_t + c·z_{t+1}]
+    Substitute x_t = (1/β₁)·y_t - ((1-β₁)/β₁)·z_t (inverse of line 5):
+    y_{t+1} = (1-c)·y_t + c·z_t + γ_t·[β₁·(1-c) - 1]·ĝ_t
+    z_{t+1} = z_t - γ_t·ĝ_t                      (where ĝ = g/(√v+ε) + λ·y)
 
 Vendored from facebookresearch/schedule_free with deltas vs upstream:
 
@@ -79,6 +106,12 @@ class AdamWScheduleFree(Optimizer):
         r: Power on ``(k+1)`` in the running-average weight (paper default 0).
         weight_lr_power: Power on ``lr_max`` in the running-average weight
             (paper default 2.0).
+        average_concentration: Refined-SF averaging width C (arxiv
+            2507.09846 "Through the River"). When set, replaces the
+            vanilla c_t = γ_t²/Σγ_i² averaging weight with
+            c_t = (1-β₁)·C/(k+1), decoupling β₁ from x's averaging window.
+            ``None`` (default) preserves paper-faithful Defazio 2024
+            behaviour. Must be > 0 if not None.
     """
 
     def __init__(
@@ -91,6 +124,7 @@ class AdamWScheduleFree(Optimizer):
         warmup_steps: int = 0,
         r: float = 0.0,
         weight_lr_power: float = 2.0,
+        average_concentration: float | None = None,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"lr must be >= 0, got {lr}")
@@ -102,6 +136,10 @@ class AdamWScheduleFree(Optimizer):
             raise ValueError(f"eps must be >= 0, got {eps}")
         if warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
+        if average_concentration is not None and average_concentration <= 0:
+            raise ValueError(
+                f"average_concentration must be > 0 or None, got {average_concentration}"
+            )
 
         defaults = dict(
             lr=lr,
@@ -116,6 +154,7 @@ class AdamWScheduleFree(Optimizer):
             scheduled_lr=0.0,
             weight_lr_power=weight_lr_power,
             weight_decay=weight_decay,
+            average_concentration=average_concentration,
         )
         super().__init__(params, defaults)
 
@@ -139,9 +178,9 @@ class AdamWScheduleFree(Optimizer):
     def eval(self) -> None:
         """Mutate live ``p``: ``y → x``. Idempotent.
 
-        Derived from ``y = β₁·x + (1−β₁)·z`` ⇒
-        ``x = (1/β₁)·y + (1 − 1/β₁)·z``, expressed as the in-place
-        ``p.lerp_(z, weight=1 − 1/β₁)``.
+        Derived from ``y = β₁·x + (1-β₁)·z`` ⇒
+        ``x = (1/β₁)·y + (1 - 1/β₁)·z``, expressed as the in-place
+        ``p.lerp_(z, weight=1 - 1/β₁)``.
         """
         for group in self.param_groups:
             if not group["train_mode"]:
@@ -157,7 +196,7 @@ class AdamWScheduleFree(Optimizer):
     def train(self) -> None:
         """Mutate live ``p``: ``x → y``. Idempotent.
 
-        ``y = β₁·x + (1−β₁)·z``, in-place via ``p.lerp_(z, 1−β₁)``.
+        ``y = β₁·x + (1-β₁)·z``, in-place via ``p.lerp_(z, 1-β₁)``.
         """
         for group in self.param_groups:
             if group["train_mode"]:
@@ -202,7 +241,7 @@ class AdamWScheduleFree(Optimizer):
                 beta1, _ = group["betas"]
                 z = state["z"].to(p.device)
                 if group["train_mode"]:
-                    # p = y. x = (1/β₁)·y + (1 − 1/β₁)·z.
+                    # p = y. x = (1/β₁)·y + (1 - 1/β₁)·z.
                     return p.detach().clone().lerp_(end=z, weight=1 - 1 / beta1)
                 # Already x.
                 return p.detach().clone()
@@ -231,7 +270,7 @@ class AdamWScheduleFree(Optimizer):
             warmup_steps = group["warmup_steps"]
             weight_lr_power = group["weight_lr_power"]
 
-            # Algorithm 1 line 8: γ_t = γ · √(1 − β₂^t) · min(1, t/T_warm).
+            # Algorithm 1 line 8: γ_t = γ · √(1 - β₂^t) · min(1, t/T_warm).
             # Bias correction is folded into γ_t (and therefore into the
             # averaging weight on line 10 via lr_max), exactly as in the
             # paper. Upstream's v1.3+ "main" variant moves this into the
@@ -243,9 +282,25 @@ class AdamWScheduleFree(Optimizer):
             group["scheduled_lr"] = lr
 
             lr_max = group["lr_max"] = max(lr, group["lr_max"])
-            weight = ((k + 1) ** r) * (lr_max**weight_lr_power)
-            weight_sum = group["weight_sum"] = group["weight_sum"] + weight
-            ckp1 = weight / weight_sum if weight_sum > 0 else 0.0
+
+            ac = group["average_concentration"]
+            if ac is None:
+                # Defazio 2024 Algorithm 1, line 10 — paper-faithful.
+                weight = ((k + 1) ** r) * (lr_max**weight_lr_power)
+                weight_sum = group["weight_sum"] = group["weight_sum"] + weight
+                ckp1 = weight / weight_sum if weight_sum > 0 else 0.0
+            else:
+                # Through the River (arxiv 2507.09846), refined averaging:
+                # c_t = (1 - β₁) · C / t, decoupling β₁ from x's averaging
+                # width. weight_sum / lr_max are NOT updated here — they
+                # remain at their last paper-faithful value for state-dict
+                # round-trip but do not influence the refined ckp1.
+                #
+                # The min(1.0, ...) clamp keeps the lerp valid for the first
+                # ⌈(1-β₁)·C⌉ steps where the literal formula could exceed 1
+                # (β₁=0.9, C=200 → first 20 steps clamped; x just tracks z
+                # there, then transitions to the (1-β)C/t schedule).
+                ckp1 = min(1.0, (1.0 - beta1) * ac / (k + 1))
 
             active = [p for p in group["params"] if p.grad is not None]
             for p in active:
@@ -263,7 +318,7 @@ class AdamWScheduleFree(Optimizer):
                 strict=True,
             )
 
-            # Algorithm 1 line 7: v ← β₂·v + (1−β₂)·g². Denominator is
+            # Algorithm 1 line 7: v ← β₂·v + (1-β₂)·g². Denominator is
             # plain √v + ε (no bias correction here — it's already in lr).
             torch._foreach_mul_(exp_avg_sq, beta2)
             torch._foreach_addcmul_(exp_avg_sq, grad, grad, value=1 - beta2)
@@ -278,11 +333,11 @@ class AdamWScheduleFree(Optimizer):
                 torch._foreach_add_(grad, y, alpha=decay)
 
             # Combined x-average + new-y update on p in-place:
-            #   y ← (1 − ckp1)·y + ckp1·z + lr·(β₁(1−ckp1) − 1)·ĝ
+            #   y ← (1 - ckp1)·y + ckp1·z + lr·(β₁(1-ckp1) - 1)·ĝ
             torch._foreach_lerp_(y, z, weight=ckp1)
             torch._foreach_add_(y, grad, alpha=lr * (beta1 * (1 - ckp1) - 1))
 
-            # z ← z − lr·ĝ
+            # z ← z - lr·ĝ
             torch._foreach_sub_(z, grad, alpha=lr)
 
             group["k"] = k + 1

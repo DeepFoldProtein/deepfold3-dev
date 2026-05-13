@@ -174,10 +174,12 @@ class Trainer:
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
 
         # EMA — owned by the trainer (for eval swap + checkpoint save/load),
-        # driven by ``EMACallback`` on every successful optimizer step.
+        # driven by ``EMACallback`` on every successful optimizer step. The
+        # callback wraps ``ema.update`` in ``optimizer_eval_mode`` for the
+        # SF case so the shadow tracks ``x`` not ``y``; AdamW is unaffected.
         if self.cfg.ema_decay > 0:
             self.ema = EMA(self.model, decay=self.cfg.ema_decay)
-            self.callbacks.append(EMACallback(self.ema))
+            self.callbacks.append(EMACallback(self.ema, optimizer=self.optimizer))
 
         # Mixed precision scaler (only for fp16; bf16 doesn't need scaling)
         self.scaler = GradScaler("cuda", enabled=(self.cfg.dtype == "fp16"))
@@ -525,6 +527,42 @@ class Trainer:
                 base_lrs = getattr(self.scheduler, "base_lrs", None)
                 if base_lrs is not None:
                     self.scheduler.base_lrs = [target_lr] * len(base_lrs)
+
+        # Resume average_concentration override: same "yaml wins" pattern as
+        # the LR override above. Justified because average_concentration is
+        # purely a hyperparameter; nothing in optimizer.state[p] is tied to
+        # its specific value (weight_sum/lr_max are vanilla-only and remain
+        # frozen on the refined branch). Switching a saved vanilla-SF run
+        # to refined mid-trajectory is exactly the new arm's case.
+        if resumed and self.optimizer.param_groups:
+            target_ac = self.cfg.average_concentration
+            saved_ac = self.optimizer.param_groups[0].get("average_concentration", None)
+            if saved_ac != target_ac:
+                rank_zero_info(
+                    f"[resume] average_concentration override: {saved_ac} → {target_ac} "
+                    "(yaml wins; no internal accumulator entangled with this field)"
+                )
+                for g in self.optimizer.param_groups:
+                    g["average_concentration"] = target_ac
+
+        # Resume EMA shadow re-seed: if the source checkpoint has no saved
+        # EMA shadow (e.g. an EMA-on-x arm starting from a vanilla-SF
+        # checkpoint), the freshly constructed shadow is at random init
+        # while the model holds the resumed weights. Re-clone the shadow
+        # from the (now-loaded) model so the EMA starts equal to the
+        # resumed weights and decays naturally from there.
+        if resumed and self.ema is not None and resume_from is not None:
+            try:
+                raw = torch.load(str(Path(resume_from)), map_location="cpu", weights_only=False)
+                has_ema = isinstance(raw, dict) and "ema" in raw
+            except Exception:
+                has_ema = True  # don't second-guess the load if introspection fails
+            if not has_ema:
+                self.ema.reseed_from(self.model)
+                rank_zero_info(
+                    "[resume] EMA shadow re-seeded from loaded weights "
+                    "(source checkpoint has no 'ema' key)"
+                )
 
         # Resume audit (warn-only): catalogue every yaml-controlled field
         # that's silently shadowed by checkpoint state on resume. lr is
