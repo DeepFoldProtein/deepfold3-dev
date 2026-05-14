@@ -846,9 +846,19 @@ class Trainer:
                     meters.reset()
 
                     # Per-PF-layer activation RMS — packed all_reduce on every
-                    # rank in lockstep with the meters sync above.
+                    # rank in lockstep with the meters sync above. Gated by
+                    # ``act_rms_log_interval`` so the meter can accumulate
+                    # multiple log windows before each ρ snapshot is emitted
+                    # (reduces WandB cost ~10× without losing the slow-dynamic
+                    # depth profile). The collective gate must remain identical
+                    # across ranks — uses ``effective_step`` only.
                     act_rms = {}
-                    if self._act_meter is not None:
+                    if (
+                        self._act_meter is not None
+                        and self.state.effective_step
+                        % (self.cfg.log_interval * self.cfg.act_rms_log_interval)
+                        == 0
+                    ):
                         act_rms = self._act_meter.flush_to_dict()
                         self._act_meter.reset()
 

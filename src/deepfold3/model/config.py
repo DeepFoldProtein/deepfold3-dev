@@ -749,6 +749,13 @@ class TrainingConfig:
     # keep train-window averages clean. See
     # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
     log_activation_rms: bool = False
+    # Multiplier on ``log_interval`` controlling how often the activation-RMS
+    # meter is flushed to WandB. The meter accumulates every training
+    # forward (cheap, rank-local); only the all-reduce + dict emission is
+    # gated. ``act_rms_log_interval = 10`` with the default ``log_interval = 1``
+    # gives one ρ snapshot per 10 effective steps — sufficient for the
+    # slow-dynamic depth profile, and reduces ~960 keys × 10 in WandB cost.
+    act_rms_log_interval: int = 1
     uniform_recycle: bool = (
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )

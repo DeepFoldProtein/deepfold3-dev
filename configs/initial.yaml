@@ -34,6 +34,12 @@ training:
   max_consecutive_nan_skips: 10
   accumulate_grad_batches: 2
   ema_decay: 0.999
+  # eval_snapshot: "average" (SF's x — fast response, default) or
+  # "shadow" (EMA over x — slow, 1/(1-ema_decay) step lag, matches
+  # `deepfold3 inference --snapshot ema/auto`). Training callbacks
+  # update shadow regardless; this flag only controls which snapshot
+  # is forward-passed during run_eval.
+  eval_snapshot: average
 
   max_tokens: 384
   max_atoms: 4096
@@ -90,7 +96,7 @@ training:
   max_steps: 100_000
   seed: 42
   checkpoint_interval: 100
-  checkpoint_every_hours: 1.0
+  checkpoint_every_hours: 0.0
   eval_samples: 1024
   eval_interval: 100
   eval_before: true
@@ -105,6 +111,13 @@ training:
   # PF block per forward; one packed all_reduce per log boundary. See
   # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
   log_activation_rms: true
+  # Multiplier on ``log_interval`` for the act_rms flush cadence. With
+  # ``log_interval=1`` and ``act_rms_log_interval=10`` the meter emits one
+  # ρ snapshot per 10 effective steps; the meter still accumulates every
+  # step locally so window-averaged values are reported (cleaner than
+  # per-step noise). Drops WandB cost ~10× without losing the slow-dynamic
+  # depth profile.
+  act_rms_log_interval: 10
 
   auto_resume: false
   load_strict: true
