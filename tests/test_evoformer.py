@@ -104,16 +104,16 @@ class TestPairFormerBlock:
         assert block.single_to_pair.weight.shape[0] == 16  # num_heads
 
 
-class TestPairFormerResidualBranchRMSNorm:
-    """Optional non-learnable RMSNorm on every residual-branch output.
+class TestPairFormerBranchScaler:
+    """Per-branch residual scaler module (``identity`` | ``rmsnorm``).
 
-    With ``residual_branch_rmsnorm=True`` the per-block residual update from
-    each branch is exactly ``γ_k · unit-RMS-vector`` regardless of the
-    branch's internal scale. We verify this by replacing each branch's
-    forward with a constant-scale tensor and checking the residual delta.
+    With ``branch_scaler="rmsnorm"`` the per-block residual update from each
+    branch is exactly ``γ_k · unit-RMS-vector`` regardless of the branch's
+    internal scale. Verified by replacing each branch's forward with a
+    constant-scale tensor and checking the residual delta.
     """
 
-    def _make_block(self, *, rmsnorm: bool, residual_out_scale: float = 1.0):
+    def _make_block(self, *, scaler: str, residual_out_scale: float = 1.0):
         from deepfold3.model.evoformer import PairFormerBlock
 
         torch.manual_seed(0)
@@ -121,19 +121,15 @@ class TestPairFormerResidualBranchRMSNorm:
             128,
             384,
             residual_out_scale=residual_out_scale,
-            residual_branch_rmsnorm=rmsnorm,
+            branch_scaler=scaler,
         )
 
-    def test_branch_outputs_are_unit_rms_when_enabled(self):
+    def test_branch_outputs_are_unit_rms_when_rmsnorm(self):
         import torch.nn as nn
 
         from deepfold3.model.primitives import rms_normalize
 
         class _ConstBranch(nn.Module):
-            """Stub residual branch returning a constant tensor of the same shape
-            and channel count as its first input. Accepts any extra args.
-            """
-
             def __init__(self, scale: float):
                 super().__init__()
                 self.scale = float(scale)
@@ -143,8 +139,8 @@ class TestPairFormerResidualBranchRMSNorm:
 
         N = 8
         scale = 73.0
-        block_on = self._make_block(rmsnorm=True)
-        block_off = self._make_block(rmsnorm=False)
+        block_on = self._make_block(scaler="rmsnorm")
+        block_off = self._make_block(scaler="identity")
         for blk in (block_on, block_off):
             blk.tri_mul_out = _ConstBranch(scale)
             blk.tri_mul_in = _ConstBranch(scale)
@@ -165,34 +161,31 @@ class TestPairFormerResidualBranchRMSNorm:
             _, single_on = block_on(pair.clone(), single.clone(), pair_mask, seq_mask)
             pair_off, _ = block_off(pair.clone(), single.clone(), pair_mask, seq_mask)
 
-        # Off-path: residual stream accumulates the raw scale 73.
-        assert pair_off.abs().max() > 50.0, "off-path should accumulate raw branch scale"
-        # On-path: each branch contributes unit-RMS, residual stream stays O(1).
+        assert pair_off.abs().max() > 50.0, "identity scaler should accumulate raw branch scale"
         assert single_on.abs().max() < 5.0, (
-            f"with RMSNorm, single residual stream should stay O(1), got max={single_on.abs().max():.2f}"
+            f"with rmsnorm, single residual stream should stay O(1), got max={single_on.abs().max():.2f}"
         )
-        # Sanity: rms_normalize of the constant yields per-token RMS == 1.
         const = torch.full((4, 384), scale)
         rms = rms_normalize(const).pow(2).mean(dim=-1).sqrt()
         torch.testing.assert_close(rms, torch.ones_like(rms), atol=1e-3, rtol=1e-3)
 
-    def test_disabled_by_default(self):
+    def test_default_is_identity(self):
         from deepfold3.model.evoformer import PairFormerBlock
 
         block = PairFormerBlock(64, 128)
-        assert block.residual_branch_rmsnorm is False
+        assert block.branch_scaler_kind == "identity"
 
 
-class TestPairFormerConfigRmsnormValidation:
+class TestPairFormerConfigBranchScalerValidation:
     """``PairFormerConfig.__post_init__`` rejects per-branch gain knobs when
-    ``residual_branch_rmsnorm=True`` (RMSNorm makes them redundant)."""
+    ``branch_scaler != "identity"`` (magnitude-fixing scalers make them
+    redundant)."""
 
     def test_clean_combo_ok(self):
         from deepfold3.model.config import PairFormerConfig
 
-        # No per-branch knobs set → should construct cleanly.
-        cfg = PairFormerConfig(residual_branch_rmsnorm=True, uniform_residual_scale=True)
-        assert cfg.residual_branch_rmsnorm is True
+        cfg = PairFormerConfig(branch_scaler="rmsnorm", uniform_residual_scale=True)
+        assert cfg.branch_scaler == "rmsnorm"
 
     def test_rejects_single_transition_residual_gain(self):
         import pytest
@@ -201,7 +194,7 @@ class TestPairFormerConfigRmsnormValidation:
 
         with pytest.raises(ValueError, match="incompatible"):
             PairFormerConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 single_transition_residual_gain=0.35,
             )
 
@@ -212,7 +205,7 @@ class TestPairFormerConfigRmsnormValidation:
 
         with pytest.raises(ValueError, match="incompatible"):
             PairFormerConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 pair_transition_residual_gain=0.5,
             )
 
@@ -223,21 +216,21 @@ class TestPairFormerConfigRmsnormValidation:
 
         with pytest.raises(ValueError, match="incompatible"):
             PairFormerConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 single_transition_residual_per_layer_extra=True,
             )
         with pytest.raises(ValueError, match="incompatible"):
             PairFormerConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 pair_transition_residual_per_layer_extra=True,
             )
 
-    def test_off_path_unchanged(self):
-        """Default (residual_branch_rmsnorm=False) accepts every gain knob."""
+    def test_identity_path_unchanged(self):
+        """Default (``branch_scaler='identity'``) accepts every gain knob."""
         from deepfold3.model.config import PairFormerConfig
 
         cfg = PairFormerConfig(
-            residual_branch_rmsnorm=False,
+            branch_scaler="identity",
             single_transition_residual_gain=0.35,
             pair_transition_residual_gain=0.5,
             single_transition_residual_per_layer_extra=True,
@@ -246,24 +239,21 @@ class TestPairFormerConfigRmsnormValidation:
         assert cfg.single_transition_residual_gain == 0.35
 
     def test_confidence_config_mirror(self):
-        """ConfidenceConfig has the same flag + validation contract."""
         import pytest
 
         from deepfold3.model.config import ConfidenceConfig
 
-        # Clean construction
-        cfg = ConfidenceConfig(residual_branch_rmsnorm=True, uniform_residual_scale=True)
-        assert cfg.residual_branch_rmsnorm is True
+        cfg = ConfidenceConfig(branch_scaler="rmsnorm", uniform_residual_scale=True)
+        assert cfg.branch_scaler == "rmsnorm"
 
-        # Conflict with per-branch gains rejected
         with pytest.raises(ValueError, match="incompatible"):
             ConfidenceConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 single_transition_residual_gain=0.35,
             )
         with pytest.raises(ValueError, match="incompatible"):
             ConfidenceConfig(
-                residual_branch_rmsnorm=True,
+                branch_scaler="rmsnorm",
                 pair_transition_residual_per_layer_extra=True,
             )
 

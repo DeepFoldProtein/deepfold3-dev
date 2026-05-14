@@ -38,10 +38,10 @@ model:
     uniform_residual_scale: true
   pairformer:
     uniform_residual_scale: true
-    residual_branch_rmsnorm: true
+    branch_scaler: rmsnorm
   confidence:
     uniform_residual_scale: true
-    residual_branch_rmsnorm: true
+    branch_scaler: rmsnorm
   template:
     pairformer:
       uniform_residual_scale: true

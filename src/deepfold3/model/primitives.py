@@ -149,7 +149,7 @@ def rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     Thin wrapper over :func:`torch.nn.functional.rms_norm` (no learnable
     scale or shift). Used at PairFormer residual-branch outputs to force
     each branch contribution to unit per-token RMS before the per-block
-    ``γ`` multiplier (see :class:`PairFormerConfig.residual_branch_rmsnorm`).
+    ``γ`` multiplier (used by :class:`deepfold3.model.branch_scaler.RMSNormScaler`).
     """
     return F.rms_norm(x, (x.shape[-1],), eps=eps)
 

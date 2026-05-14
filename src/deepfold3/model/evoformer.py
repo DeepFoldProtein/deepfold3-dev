@@ -46,7 +46,6 @@ from deepfold3.model.primitives import (
     LayerNorm,
     LinearNoBias,
     block_residual_scale,
-    rms_normalize,
     sum_fusion_init_,
 )
 from deepfold3.model.template_embedding import TemplateEmbedding
@@ -58,11 +57,6 @@ _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check
 _TARGET_FEAT_DIM = 447
 # MSA feature dimension: one_hot(32) + has_deletion(1) + deletion_value(1)
 _MSA_FEAT_DIM = 34
-
-
-def _identity(x: torch.Tensor) -> torch.Tensor:
-    """No-op used as the off-path of the optional RMSNorm-residual wrap."""
-    return x
 
 
 def _resolve_branch_residual_gain(layer_idx: int, base_gain: float | None, per_layer_extra: bool) -> float | None:
@@ -175,7 +169,7 @@ class PairFormerBlock(nn.Module):
         single_transition_linear_out_init_gain: float | None = None,
         single_transition_residual_gain: float | None = None,
         pair_transition_residual_gain: float | None = None,
-        residual_branch_rmsnorm: bool = False,
+        branch_scaler: str = "identity",
     ):
         super().__init__()
         # ``residual_out_scale`` (= s_ros) policy — F-output side only:
@@ -221,9 +215,12 @@ class PairFormerBlock(nn.Module):
         self.pair_transition_residual_gain = (
             float(pair_transition_residual_gain) if pair_transition_residual_gain is not None else 1.0
         )
-        # Non-learnable RMSNorm at every residual-branch output (PairFormer
-        # only); see :class:`PairFormerConfig.residual_branch_rmsnorm`.
-        self.residual_branch_rmsnorm = bool(residual_branch_rmsnorm)
+        # Function ``s(F(x))`` applied to every residual-branch output before
+        # the per-block γ. See :mod:`deepfold3.model.branch_scaler`.
+        from deepfold3.model.branch_scaler import make_branch_scaler
+
+        self.branch_scaler_kind = str(branch_scaler)
+        self.branch_scaler = make_branch_scaler(self.branch_scaler_kind)
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
 
@@ -245,12 +242,11 @@ class PairFormerBlock(nn.Module):
         s_pf = s_ros * self.pair_transition_residual_gain
         s_single_ffn = s_ros * self.single_transition_residual_gain
         s_single_attn = s_ros
-        # Optional non-learnable RMSNorm on every branch's output, applied
-        # *before* the per-block ``s`` multiplier. ``residual_branch_rmsnorm``
-        # is mutually exclusive with the per-branch residual gain knobs
-        # (validated in ``PairFormerConfig.__post_init__``), so when enabled
+        # Branch-output scaler applied *before* the per-block ``s`` multiplier.
+        # When non-identity, the per-branch residual gain knobs must be at
+        # default (validated in ``PairFormerConfig.__post_init__``), so
         # ``s_pf == s_ros`` and ``s_single_ffn == s_ros``.
-        rmsn = rms_normalize if self.residual_branch_rmsnorm else _identity
+        rmsn = self.branch_scaler
         # Capture each residual-stream branch contribution as a named
         # intermediate so the activation meter can record per-branch RMS
         # / ρ_l. ``_act_meter`` is set by
@@ -424,7 +420,7 @@ class Evoformer(nn.Module):
                         pf_cfg.pair_transition_residual_gain,
                         pf_cfg.pair_transition_residual_per_layer_extra,
                     ),
-                    residual_branch_rmsnorm=pf_cfg.residual_branch_rmsnorm,
+                    branch_scaler=pf_cfg.branch_scaler,
                 )
                 for i in range(pf_cfg.num_layer)
             ]

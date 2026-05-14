@@ -101,10 +101,14 @@ class PairFormerConfig:
     single_transition_residual_per_layer_extra: bool = False
     pair_transition_residual_gain: float | None = None
     pair_transition_residual_per_layer_extra: bool = False
-    # Apply non-learnable RMSNorm to every PairFormer residual branch output
-    # before the per-block ``γ`` multiplier (so each branch's contribution to
-    # the residual stream is exactly ``γ_k · unit-RMS``, regardless of how
-    # the branch's internal scale drifts during training).
+    # Function ``s(·)`` applied to every PairFormer residual branch output
+    # before the per-block ``γ`` multiplier — extensibility hook for the
+    # branch-output magnitude control (see
+    # :class:`deepfold3.model.branch_scaler.BranchScalerKind`).
+    #
+    # * ``"identity"`` — raw branch (AF3 baseline)
+    # * ``"rmsnorm"``  — non-learnable RMSNorm; each branch contributes
+    #   exactly ``γ_k · unit-RMS`` regardless of internal scale drift
     #
     # Wraps the 7 branches: tri_mul_in, tri_mul_out, pair_attn_row,
     # pair_attn_col, pair_transition, single_attn, single_transition.
@@ -115,14 +119,14 @@ class PairFormerConfig:
     # PairFormer, and confidence-head PairFormer are unaffected (they each
     # read their own ``PairFormerConfig`` instance for this flag).
     #
-    # When True, validates in ``__post_init__`` that the per-branch residual
-    # gain knobs are at default — RMSNorm makes them redundant (the branch
-    # is already unit-RMS so an extra constant gain just rescales the
-    # block-wide ``γ``).
-    residual_branch_rmsnorm: bool = False
+    # When non-identity, validates in ``__post_init__`` that the per-branch
+    # residual gain knobs are at default — magnitude-fixing scalers make
+    # them redundant (branch is already unit-RMS so an extra constant gain
+    # just rescales the block-wide ``γ``).
+    branch_scaler: Literal["identity", "rmsnorm"] = "identity"
 
     def __post_init__(self) -> None:
-        if self.residual_branch_rmsnorm:
+        if self.branch_scaler != "identity":
             conflicts = []
             if self.single_transition_residual_gain is not None:
                 conflicts.append("single_transition_residual_gain")
@@ -134,10 +138,10 @@ class PairFormerConfig:
                 conflicts.append("pair_transition_residual_per_layer_extra")
             if conflicts:
                 raise ValueError(
-                    "PairFormerConfig.residual_branch_rmsnorm=True is incompatible with "
-                    f"per-branch residual gain knobs: {conflicts}. RMSNorm forces each "
-                    "branch output to unit-RMS, so extra branch-specific gains just "
-                    "rescale the block-wide γ — set them to default (None / False)."
+                    f"PairFormerConfig.branch_scaler={self.branch_scaler!r} is incompatible "
+                    f"with per-branch residual gain knobs: {conflicts}. Magnitude-fixing "
+                    "scalers force each branch output to unit-RMS, so extra branch-specific "
+                    "gains just rescale the block-wide γ — set them to default (None / False)."
                 )
 
 
@@ -224,13 +228,13 @@ class ConfidenceConfig:
     single_transition_residual_per_layer_extra: bool = False
     pair_transition_residual_gain: float | None = None
     pair_transition_residual_per_layer_extra: bool = False
-    # Mirror of PairFormerConfig.residual_branch_rmsnorm — apply non-learnable
-    # RMSNorm to every residual branch output of the confidence-head
-    # PairFormer (L=4). Same validation rule applies in ``__post_init__``.
-    residual_branch_rmsnorm: bool = False
+    # Mirror of PairFormerConfig.branch_scaler — function applied to every
+    # confidence-head PairFormer residual branch output before the per-block
+    # γ. Same kinds + validation rule.
+    branch_scaler: Literal["identity", "rmsnorm"] = "identity"
 
     def __post_init__(self) -> None:
-        if self.residual_branch_rmsnorm:
+        if self.branch_scaler != "identity":
             conflicts = []
             if self.single_transition_residual_gain is not None:
                 conflicts.append("single_transition_residual_gain")
@@ -242,10 +246,10 @@ class ConfidenceConfig:
                 conflicts.append("pair_transition_residual_per_layer_extra")
             if conflicts:
                 raise ValueError(
-                    "ConfidenceConfig.residual_branch_rmsnorm=True is incompatible with "
-                    f"per-branch residual gain knobs: {conflicts}. RMSNorm forces each "
-                    "branch output to unit-RMS, so extra branch-specific gains just "
-                    "rescale the block-wide γ — set them to default (None / False)."
+                    f"ConfidenceConfig.branch_scaler={self.branch_scaler!r} is incompatible "
+                    f"with per-branch residual gain knobs: {conflicts}. Magnitude-fixing "
+                    "scalers force each branch output to unit-RMS, so extra branch-specific "
+                    "gains just rescale the block-wide γ — set them to default (None / False)."
                 )
 
 
@@ -598,6 +602,25 @@ class TrainingConfig:
     # switches to ``c_t = (1−β₁)·C / t`` decoupling β₁ from x's averaging window.
     # Ignored unless ``optimizer_type == "schedule_free"``.
     average_concentration: float | None = None
+
+    # Per-bucket strong weight decay. Maps a substring pattern → multiplier;
+    # weights whose ``named_parameters`` name contains any key get routed to
+    # a dedicated AdamW param group with ``weight_decay = multiplier · weight_decay``.
+    # First match wins (substrings checked in iteration order). Empty dict
+    # (default) disables — all decay-eligible params land in the standard group.
+    #
+    # Motivation: ``single_transition_residual_gain=0.35`` (s035 era) is a
+    # forward-time 0.35× scaling of single_transition's residual contribution.
+    # Under AdamW the stationary norm ``|w|²* ~ η/(2λ_w)·E|Pg|²``, so achieving
+    # |w|* ≈ 0.35·|w|_normal requires ``λ_w / λ_w_normal = 1/0.35² ≈ 8.16``.
+    # With multiplier=8 on the targeted weights they settle to ~0.35× normal
+    # magnitude — approximating the gain's steady-state forward output (the
+    # transient differs: gain is immediate, wd-driven shrinkage is gradual).
+    #
+    # Example (replicate s035 single_transition brake on the output projection):
+    #   strong_decay:
+    #     ".single_transition.linear2": 8.0
+    strong_decay: dict[str, float] = field(default_factory=dict)
 
     # Data
     max_tokens: int = 384

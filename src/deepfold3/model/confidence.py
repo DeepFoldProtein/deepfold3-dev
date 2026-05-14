@@ -29,9 +29,8 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
-from deepfold3.model.evoformer import PairFormerBlock
+from deepfold3.model.evoformer import PairFormerBlock, _resolve_branch_residual_gain
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.evoformer import _resolve_branch_residual_gain
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, sum_fusion_init_
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
@@ -115,7 +114,7 @@ class ConfidenceHead(nn.Module):
                         cfg.pair_transition_residual_gain,
                         cfg.pair_transition_residual_per_layer_extra,
                     ),
-                    residual_branch_rmsnorm=cfg.residual_branch_rmsnorm,
+                    branch_scaler=cfg.branch_scaler,
                 )
                 for i in range(cfg.num_layer)
             ]
