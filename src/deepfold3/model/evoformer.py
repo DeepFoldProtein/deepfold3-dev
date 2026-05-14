@@ -251,11 +251,21 @@ class PairFormerBlock(nn.Module):
         # (validated in ``PairFormerConfig.__post_init__``), so when enabled
         # ``s_pf == s_ros`` and ``s_single_ffn == s_ros``.
         rmsn = rms_normalize if self.residual_branch_rmsnorm else _identity
-        pair = dropout_add_rowwise(pair, s_tri * rmsn(self.tri_mul_out(pair, pair_mask)), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, s_tri * rmsn(self.tri_mul_in(pair, pair_mask)), p, training, use_fused)
-        pair = dropout_add_rowwise(pair, s_pa * rmsn(self.pair_attn_row(pair, pair_mask)), p, training, use_fused)
-        pair = dropout_add_columnwise(pair, s_pa * rmsn(self.pair_attn_col(pair, pair_mask)), p, training, use_fused)
-        pair = pair + s_pf * rmsn(self.pair_transition(pair))
+        # Capture each residual-stream branch contribution as a named
+        # intermediate so the activation meter can record per-branch RMS
+        # / ρ_l. ``_act_meter`` is set by
+        # :func:`activation_meter.attach_activation_meter`; the per-branch
+        # plumbing is a no-op when the meter is absent or disabled.
+        b_tri_out = s_tri * rmsn(self.tri_mul_out(pair, pair_mask))
+        pair = dropout_add_rowwise(pair, b_tri_out, p, training, use_fused)
+        b_tri_in = s_tri * rmsn(self.tri_mul_in(pair, pair_mask))
+        pair = dropout_add_rowwise(pair, b_tri_in, p, training, use_fused)
+        b_pair_attn_row = s_pa * rmsn(self.pair_attn_row(pair, pair_mask))
+        pair = dropout_add_rowwise(pair, b_pair_attn_row, p, training, use_fused)
+        b_pair_attn_col = s_pa * rmsn(self.pair_attn_col(pair, pair_mask))
+        pair = dropout_add_columnwise(pair, b_pair_attn_col, p, training, use_fused)
+        b_pair_ffn = s_pf * rmsn(self.pair_transition(pair))
+        pair = pair + b_pair_ffn
         # Single update: pair → logits, then single attention.
         # PairBias is fed in unrescaled — under LNS, ``q·kᵀ ∝ s²`` softens
         # the QK contribution to the softmax, and we accept the resulting
@@ -266,12 +276,26 @@ class PairFormerBlock(nn.Module):
         # leave it un-RMSNormed.
         pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
         pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
-        single = single + s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
+        b_single_attn = s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
+        single = single + b_single_attn
         u_single = self.single_transition(single)
         probe = getattr(self, "_probe", None)
         if probe is not None and probe.enabled:
             probe.record_block(self._probe_layer_idx, single, u_single, s_single_ffn)
-        single = single + s_single_ffn * rmsn(u_single)
+        b_single_ffn = s_single_ffn * rmsn(u_single)
+        act_meter = getattr(self, "_act_meter", None)
+        if act_meter is not None and getattr(act_meter, "enabled", False):
+            act_meter.record_all_branches(
+                self._act_layer_idx,
+                b_tri_out=b_tri_out,
+                b_tri_in=b_tri_in,
+                b_pair_attn_row=b_pair_attn_row,
+                b_pair_attn_col=b_pair_attn_col,
+                b_pair_ffn=b_pair_ffn,
+                b_single_attn=b_single_attn,
+                b_single_ffn=b_single_ffn,
+            )
+        single = single + b_single_ffn
         return pair, single
 
 
