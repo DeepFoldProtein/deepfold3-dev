@@ -480,12 +480,20 @@ class Evoformer(nn.Module):
             else:
                 msa_act, pair = layer(msa_act, pair, msa_mask, pair_mask)
 
-        # PairFormer stack (optionally checkpointed per block during training)
-        for layer in self.trunk_pairformer:
+        # PairFormer stack (optionally checkpointed per block during training).
+        # ``_act_meter`` (set by :func:`activation_meter.attach_activation_meter`)
+        # captures single/pair RMS at the PF input plus each layer output. No-op
+        # when ``_act_meter`` is ``None`` or ``meter.enabled`` is ``False``.
+        act_meter = getattr(self, "_act_meter", None)
+        if act_meter is not None:
+            act_meter.record(0, single, pair)
+        for i, layer in enumerate(self.trunk_pairformer):
             if use_ckpt:
                 pair, single = _checkpoint(layer, pair, single, pair_mask, seq_mask)
             else:
                 pair, single = layer(pair, single, pair_mask, seq_mask)
+            if act_meter is not None:
+                act_meter.record(i + 1, single, pair)
 
         return {
             "pair": pair,

@@ -717,6 +717,15 @@ class TrainingConfig:
     # safe under autocast.
     single_track_probe: bool = False
     single_track_probe_interval: int = 50  # in optimizer steps
+    # Always-on per-PairFormer-layer activation RMS sentinel. When enabled,
+    # records single/pair RMS at the PF input plus each of the 48 layer
+    # outputs every training forward and emits them as
+    # ``act_rms/pf_in_single``, ``act_rms/pf_00_single``, ... at every
+    # ``log_interval``. Cost: ~98 scalar reductions per microstep + one
+    # packed all_reduce per log boundary; eval forwards are skipped to
+    # keep train-window averages clean. See
+    # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
+    log_activation_rms: bool = False
     uniform_recycle: bool = (
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )

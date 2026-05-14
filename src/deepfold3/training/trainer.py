@@ -701,6 +701,20 @@ class Trainer:
                 f"Single-track probe enabled → {probe_path} (every {cfg.single_track_probe_interval} steps)"
             )
 
+        # Per-PF-layer activation RMS sentinel. Attached on every rank (the
+        # flush does a packed all_reduce so cross-rank averaging is correct).
+        # Enabled only around the training forward; eval / mini-rollout
+        # forwards run with ``meter.enabled = False``.
+        self._act_meter = None
+        if cfg.log_activation_rms:
+            from deepfold3.training.activation_meter import attach_activation_meter
+
+            self._act_meter = attach_activation_meter(self.model, self.dist.device)
+            rank_zero_info(
+                f"Activation-RMS meter attached ({self._act_meter.num_points} points × 2 tracks, "
+                f"flush every {cfg.log_interval} steps)"
+            )
+
         if cfg.eval_before and eval_dl is not None:
             self._run_eval_and_track_best(eval_dl, output_dir)
 
@@ -746,12 +760,19 @@ class Trainer:
                 # so torchrun reaps the whole process group; the surviving
                 # traceback (logged via the rank-tagged handler in train.py)
                 # identifies the offending rank.
+                # Activation-RMS meter is enabled only around the training
+                # forward — eval / mini-rollout forwards run uninstrumented
+                # so they don't contaminate train-window averages.
+                if self._act_meter is not None:
+                    self._act_meter.enabled = True
                 with torch.autocast(
                     device_type="cuda",
                     dtype=self.cfg.torch_dtype,
                     enabled=(self.cfg.dtype != "fp32"),
                 ):
                     loss, loss_dict = self._training_step(features)
+                if self._act_meter is not None:
+                    self._act_meter.enabled = False
 
                 # NaN/Inf detection is deferred to the opt-step boundary inside
                 # ``_optimizer_step`` — a single all-reduce per window replaces
@@ -824,6 +845,13 @@ class Trainer:
                     avg, sums = meters.sync()
                     meters.reset()
 
+                    # Per-PF-layer activation RMS — packed all_reduce on every
+                    # rank in lockstep with the meters sync above.
+                    act_rms = {}
+                    if self._act_meter is not None:
+                        act_rms = self._act_meter.flush_to_dict()
+                        self._act_meter.reset()
+
                     # Flush the compute-time accumulator regardless of is_main so
                     # all ranks stay in sync if the flag ever changes.
                     compute_time_window = microstep_compute_time
@@ -875,19 +903,21 @@ class Trainer:
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
 
-                        self.trackers.log(
-                            build_step_payload(
-                                avg=avg,
-                                effective_step=self.state.effective_step,
-                                lr=lr,
-                                epoch=self.state.epoch,
-                                grad_norm=grad_norm,
-                                dt=dt,
-                                tok_per_sec=tok_per_sec,
-                                peak_mem_gb=peak_mem_gb,
-                            ),
-                            step=self.state.effective_step,
+                        payload = build_step_payload(
+                            avg=avg,
+                            effective_step=self.state.effective_step,
+                            lr=lr,
+                            epoch=self.state.epoch,
+                            grad_norm=grad_norm,
+                            dt=dt,
+                            tok_per_sec=tok_per_sec,
+                            peak_mem_gb=peak_mem_gb,
                         )
+                        # Per-PF-layer activation RMS — already prefixed
+                        # with ``act_rms/``; pass through verbatim so the
+                        # WandB workspace's saved panel grouping picks it up.
+                        payload.update(act_rms)
+                        self.trackers.log(payload, step=self.state.effective_step)
 
                 # --- Checkpoint (before eval so weights are saved even if eval crashes) ---
                 # ``effective_step`` is identical on all ranks, so the

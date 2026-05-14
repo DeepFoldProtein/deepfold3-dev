@@ -87,6 +87,7 @@ class WandBTracker:
         wandb.define_metric("train/*", step_metric="train/step")
         wandb.define_metric("eval/*", step_metric="train/step")
         wandb.define_metric("system/*", step_metric="train/step")
+        wandb.define_metric("act_rms/*", step_metric="train/step")
         logger.info(f"WandB initialized: project={self.project}, run={self.run_name}")
 
     def log(self, values: dict[str, Any], step: int) -> None:

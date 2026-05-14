@@ -99,6 +99,12 @@ training:
   log_microsteps: false
   uniform_recycle: true
   max_checkpoints: 500
+  # Always-on per-PF-layer activation RMS sentinel. Logs
+  # ``act_rms/pf_in_{single,pair}`` + ``act_rms/pf_{00..47}_{single,pair}``
+  # to WandB every ``log_interval`` steps. Compute is two reductions per
+  # PF block per forward; one packed all_reduce per log boundary. See
+  # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
+  log_activation_rms: true
 
   auto_resume: false
   load_strict: true
