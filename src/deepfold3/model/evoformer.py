@@ -482,18 +482,24 @@ class Evoformer(nn.Module):
 
         # PairFormer stack (optionally checkpointed per block during training).
         # ``_act_meter`` (set by :func:`activation_meter.attach_activation_meter`)
-        # captures single/pair RMS at the PF input plus each layer output. No-op
+        # captures single/pair RMS at the PF input plus each layer output, and
+        # the per-layer branch contribution ``Δ = post - pre`` for ρ_l. No-op
         # when ``_act_meter`` is ``None`` or ``meter.enabled`` is ``False``.
+        # Pre-block references (``single_pre``/``pair_pre``) are just Python
+        # rebinds — the original tensors are already saved by the block as its
+        # backward inputs, so keeping a reference adds zero memory.
         act_meter = getattr(self, "_act_meter", None)
         if act_meter is not None:
             act_meter.record(0, single, pair)
         for i, layer in enumerate(self.trunk_pairformer):
+            single_pre, pair_pre = single, pair
             if use_ckpt:
                 pair, single = _checkpoint(layer, pair, single, pair_mask, seq_mask)
             else:
                 pair, single = layer(pair, single, pair_mask, seq_mask)
             if act_meter is not None:
                 act_meter.record(i + 1, single, pair)
+                act_meter.record_branch(i, single - single_pre, pair - pair_pre)
 
         return {
             "pair": pair,
