@@ -37,13 +37,13 @@ _KEY_RE = re.compile(
 
 # Branch buckets that ``ActivationRMSMeter.flush_to_dict`` writes.
 _BRANCH_NAMES = (
+    "single_attn",
+    "single_ffn",
     "tri_out",
     "tri_in",
     "pair_attn_row",
     "pair_attn_col",
     "pair_ffn",
-    "single_attn",
-    "single_ffn",
 )
 
 
@@ -253,50 +253,95 @@ def _collect_values_per_layer(
     return buckets
 
 
+def _rho_panels():
+    """Shared 9-panel ρ definition used by box-plot + time-series.
+
+    Each entry is ``(title, predicate, branch_count_for_ceiling)`` where
+    ``branch_count_for_ceiling`` is the number of independent residual
+    branches feeding into that panel's track at every layer. Karras's
+    ``ρ ≲ c/√L`` budget partitions energy across branches: if a layer
+    injects through ``B`` branches that contribute roughly orthogonal
+    energy, each individual branch sits at ``ρ ≲ c/√(L·B)``.
+
+    * Block-level ρ (aggregate of all branches per track): ``B = 1``
+      (total per-layer injection vs ``c/√L``).
+    * Single track: 2 sub-branches (single_attn, single_ffn) → ``B = 2``.
+    * Pair track: 5 sub-branches (tri_in/out, pair_attn_row/col,
+      pair_ffn) → ``B = 5``.
+    """
+    return [
+        (r"block $\rho$ single", lambda pk: pk.kind == "block_rho" and pk.track == "single", 1),
+        (r"block $\rho$ pair", lambda pk: pk.kind == "block_rho" and pk.track == "pair", 1),
+        (r"$\rho$ single_attn", lambda pk: pk.kind == "branch_single_attn_rho", 2),
+        (r"$\rho$ single_ffn", lambda pk: pk.kind == "branch_single_ffn_rho", 2),
+        (r"$\rho$ tri_out", lambda pk: pk.kind == "branch_tri_out_rho", 5),
+        (r"$\rho$ tri_in", lambda pk: pk.kind == "branch_tri_in_rho", 5),
+        (r"$\rho$ pair_attn_row", lambda pk: pk.kind == "branch_pair_attn_row_rho", 5),
+        (r"$\rho$ pair_attn_col", lambda pk: pk.kind == "branch_pair_attn_col_rho", 5),
+        (r"$\rho$ pair_ffn", lambda pk: pk.kind == "branch_pair_ffn_rho", 5),
+    ]
+
+
+def _panel_ceiling(c: float, num_layers: int, branch_count: int) -> float:
+    """Karras ceiling for a panel with ``B`` orthogonal branches per layer.
+
+    ``c/√(L·B)`` — ``L`` is the residual-stack depth, ``B`` is the
+    branch multiplicity factor for the relevant track.
+    """
+    return c / math.sqrt(num_layers * branch_count)
+
+
+def _total_amp_series(series: dict, track: str, num_layers: int) -> list[tuple[int, float]]:
+    """Return ``[(step, RMS(stream_out_{L-1}) / RMS(stream_in))]`` for ``track``.
+
+    Drops steps where either endpoint is missing or zero. Output is sorted
+    by step. Used to annotate / overlay the cumulative residual-stream
+    amplification on the block panels.
+    """
+    in_key = f"act_rms/pf_in_{track}"
+    out_key = f"act_rms/pf_{num_layers - 1:02d}_{track}"
+    in_map = dict(series.get(in_key, []))
+    out_map = dict(series.get(out_key, []))
+    out: list[tuple[int, float]] = []
+    for s in sorted(set(in_map) & set(out_map)):
+        a, b = in_map[s], out_map[s]
+        if a <= 0 or b <= 0:
+            continue
+        out.append((s, b / a))
+    return out
+
+
 def _render_boxplots(
     series: dict,
     output_path: str,
-    ceiling: float,
+    c: float,
     latest_step: int,
     num_layers: int = 48,
 ) -> None:
     """Write a per-layer box-plot PNG covering 9 ρ panels.
 
-    Layout (3×3 grid):
-
-    ::
-
-        block-ρ single    block-ρ pair       b_tri_out ρ
-        b_tri_in ρ        b_pair_attn_row    b_pair_attn_col
-        b_pair_ffn ρ      b_single_attn ρ    b_single_ffn ρ
-
     Each panel shows 48 box-and-whiskers — one per layer — covering the
     distribution of that layer's ρ across the fetched step window. The
-    Karras ``c/√L`` ceiling is drawn as a horizontal reference line.
+    Karras ``c/√(L·B)`` ceiling is drawn as a horizontal reference line
+    (panel-specific; block panels use ``B=1``, single per-branch ``B=2``,
+    pair per-branch ``B=5``).
     """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    panels = [
-        (r"block $\rho$ single", lambda pk: pk.kind == "block_rho" and pk.track == "single"),
-        (r"block $\rho$ pair", lambda pk: pk.kind == "block_rho" and pk.track == "pair"),
-        (r"$\rho$ tri_out", lambda pk: pk.kind == "branch_tri_out_rho"),
-        (r"$\rho$ tri_in", lambda pk: pk.kind == "branch_tri_in_rho"),
-        (r"$\rho$ pair_attn_row", lambda pk: pk.kind == "branch_pair_attn_row_rho"),
-        (r"$\rho$ pair_attn_col", lambda pk: pk.kind == "branch_pair_attn_col_rho"),
-        (r"$\rho$ pair_ffn", lambda pk: pk.kind == "branch_pair_ffn_rho"),
-        (r"$\rho$ single_attn", lambda pk: pk.kind == "branch_single_attn_rho"),
-        (r"$\rho$ single_ffn", lambda pk: pk.kind == "branch_single_ffn_rho"),
-    ]
+    panels = _rho_panels()
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 13), sharex=True)
     fig.suptitle(
-        rf"act_rms $\rho$ per layer @ step {latest_step}  (Karras ceiling $c/\sqrt{{L}}$ = {ceiling:.3f})",
+        rf"act_rms $\rho$ per layer @ step {latest_step}  "
+        rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)",
         fontsize=13,
     )
-    for ax, (title, pred) in zip(axes.flat, panels, strict=False):
+    amp_single = _total_amp_series(series, "single", num_layers)
+    amp_pair = _total_amp_series(series, "pair", num_layers)
+    for ax, (title, pred, b_count) in zip(axes.flat, panels, strict=False):
         buckets = _collect_values_per_layer(series, pred, num_layers=num_layers)
         n_points = sum(len(b) for b in buckets)
         if n_points == 0:
@@ -316,16 +361,125 @@ def _render_boxplots(
             whiskerprops=dict(linewidth=0.6),
             capprops=dict(linewidth=0.6),
         )
-        ax.axhline(ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
-        ax.set_title(f"{title}  (N={n_points})", fontsize=10)
+        panel_ceiling = _panel_ceiling(c, num_layers, b_count)
+        ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
+        suffix = "" if b_count == 1 else f", B={b_count}"
+        ax.set_title(f"{title}  (N={n_points}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
         ax.set_xlim(-1, num_layers)
         ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
-        # Tick every 4 layers to keep the axis legible
         ax.set_xticks(list(range(0, num_layers, 4)))
         ax.tick_params(axis="both", labelsize=8)
+        # Total residual-stream amplification (single track block panel).
+        if title.endswith("single") and "block" in title and amp_single:
+            ax.text(
+                0.02, 0.96,
+                rf"$\mathrm{{amp}}_\mathrm{{single}}={amp_single[-1][1]:.2f}\times$"
+                rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
+                transform=ax.transAxes, fontsize=9, va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
+            )
+        elif title.endswith("pair") and "block" in title and amp_pair:
+            ax.text(
+                0.02, 0.96,
+                rf"$\mathrm{{amp}}_\mathrm{{pair}}={amp_pair[-1][1]:.2f}\times$"
+                rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
+                transform=ax.transAxes, fontsize=9, va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
+            )
     for ax in axes[-1, :]:
         ax.set_xlabel("layer index", fontsize=9)
     plt.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output_path, dpi=110)
+    plt.close(fig)
+
+
+def _render_timeseries(
+    series: dict,
+    output_path: str,
+    c: float,
+    latest_step: int,
+    num_layers: int = 48,
+    cmap_name: str = "turbo",
+) -> None:
+    """Write a per-layer ρ time-series PNG (9 panels × 48 rainbow lines).
+
+    Each panel plots all 48 layers' ρ trajectories across the fetched
+    step window, with the layer index encoded in the colormap
+    (``turbo`` rainbow by default — early layers cool, late layers
+    warm). The Karras ``c/√(L·B)`` ceiling is overlaid as a horizontal
+    reference (panel-specific). A shared colorbar on the right encodes
+    layer index.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    panels = _rho_panels()
+    norm = Normalize(vmin=0, vmax=num_layers - 1)
+    cmap = plt.get_cmap(cmap_name)
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 13), sharex=True)
+    fig.suptitle(
+        rf"act_rms $\rho$ time-series per layer @ step {latest_step}  "
+        rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)",
+        fontsize=13,
+    )
+
+    amp_single = _total_amp_series(series, "single", num_layers)
+    amp_pair = _total_amp_series(series, "pair", num_layers)
+    for ax, (title, pred, b_count) in zip(axes.flat, panels, strict=False):
+        # Build {layer_idx: [(step, value), ...]} for this metric.
+        traj: dict[int, list[tuple[int, float]]] = {}
+        for k, vals in series.items():
+            pk = _parse_key(k)
+            if pk is None or pk.layer == "in" or not pred(pk):
+                continue
+            li = int(pk.layer)
+            if 0 <= li < num_layers and vals:
+                traj[li] = vals
+        if not traj:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes, ha="center", va="center")
+            ax.set_title(title)
+            continue
+        for li in sorted(traj.keys()):
+            xs = [s for s, _ in traj[li]]
+            ys = [v for _, v in traj[li]]
+            ax.plot(xs, ys, color=cmap(norm(li)), linewidth=0.6, alpha=0.7)
+        panel_ceiling = _panel_ceiling(c, num_layers, b_count)
+        ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
+        suffix = "" if b_count == 1 else f", B={b_count}"
+        ax.set_title(f"{title}  (L={len(traj)}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
+        ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
+        ax.tick_params(axis="both", labelsize=8)
+        # Overlay total residual-stream amplification on block panels —
+        # secondary y-axis so the line doesn't compete with ρ for vertical
+        # range (ρ ~ 0.01-0.5 vs amp ~ 1-100×).
+        if "block" in title and (title.endswith("single") or title.endswith("pair")):
+            amp = amp_single if title.endswith("single") else amp_pair
+            if amp:
+                xs = [s for s, _ in amp]
+                ys = [v for _, v in amp]
+                ax2 = ax.twinx()
+                ax2.plot(xs, ys, color="#222222", linewidth=1.3, label="total amp")
+                ax2.set_ylabel("amp ×", fontsize=8, color="#222222")
+                ax2.tick_params(axis="y", labelsize=8, colors="#222222")
+                ax2.text(
+                    0.98, 0.96,
+                    rf"$\mathrm{{amp}}_\mathrm{{latest}}={ys[-1]:.2f}\times$",
+                    transform=ax2.transAxes, fontsize=9, va="top", ha="right",
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#444", alpha=0.85),
+                )
+    for ax in axes[-1, :]:
+        ax.set_xlabel("step", fontsize=9)
+    plt.tight_layout(rect=(0, 0, 0.93, 0.97))
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar_ax = fig.add_axes((0.945, 0.07, 0.012, 0.86))
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label("PF layer index", fontsize=9)
     fig.savefig(output_path, dpi=110)
     plt.close(fig)
 
@@ -362,6 +516,15 @@ def main() -> None:
             "summarising the distribution of its recent ρ values over the "
             "fetched window. With --watch, the PNG is overwritten on each "
             "refresh."
+        ),
+    )
+    p.add_argument(
+        "--timeseries",
+        help=(
+            "Path for the per-layer ρ time-series PNG (9 panels × 48 "
+            "rainbow-colored layer trajectories, with the total residual-"
+            "stream amplification overlaid on the two block panels). "
+            "With --watch, the PNG is overwritten on each refresh."
         ),
     )
     p.add_argument(
@@ -522,11 +685,14 @@ def _run_one(args, series, ceiling, latest_step):
         print(f"\nCSV dump → {args.csv}")
 
     # ============================================================
-    # Optional box-plot rendering (3x3 ρ panels)
+    # Optional plot rendering (3x3 ρ panels)
     # ============================================================
     if args.boxplot:
-        _render_boxplots(series, args.boxplot, ceiling, latest_step, num_layers=args.depth)
+        _render_boxplots(series, args.boxplot, args.c, latest_step, num_layers=args.depth)
         print(f"\nBox-plot PNG → {args.boxplot}")
+    if args.timeseries:
+        _render_timeseries(series, args.timeseries, args.c, latest_step, num_layers=args.depth)
+        print(f"\nTime-series PNG → {args.timeseries}")
 
 
 if __name__ == "__main__":
