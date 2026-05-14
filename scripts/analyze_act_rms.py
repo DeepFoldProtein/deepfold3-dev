@@ -346,7 +346,7 @@ def _total_amp_series(series: dict, track: str, num_layers: int) -> list[tuple[i
 def _render_boxplots(
     series: dict,
     output_path: str,
-    c: float,
+    c: float | None,
     latest_step: int,
     num_layers: int = 48,
 ) -> None:
@@ -366,11 +366,14 @@ def _render_boxplots(
     panels = _rho_panels()
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 13), sharex=True)
-    fig.suptitle(
-        rf"act_rms $\rho$ per layer @ step {latest_step}  "
-        rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)",
-        fontsize=13,
-    )
+    if c is not None:
+        suptitle = (
+            rf"act_rms $\rho$ per layer @ step {latest_step}  "
+            rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)"
+        )
+    else:
+        suptitle = rf"act_rms $\rho$ per layer @ step {latest_step}  ($L={num_layers}$)"
+    fig.suptitle(suptitle, fontsize=13)
     amp_single = _total_amp_series(series, "single", num_layers)
     amp_pair = _total_amp_series(series, "pair", num_layers)
     for ax, (title, pred, b_count) in zip(axes.flat, panels, strict=False):
@@ -393,10 +396,14 @@ def _render_boxplots(
             whiskerprops=dict(linewidth=0.6),
             capprops=dict(linewidth=0.6),
         )
-        panel_ceiling = _panel_ceiling(c, num_layers, b_count)
-        ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
         suffix = "" if b_count == 1 else f", B={b_count}"
-        ax.set_title(f"{title}  (N={n_points}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
+        if c is not None:
+            panel_ceiling = _panel_ceiling(c, num_layers, b_count)
+            ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
+            ax.set_title(f"{title}  (N={n_points}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
+        else:
+            extra = f"  ({suffix.lstrip(', ')})" if suffix else ""
+            ax.set_title(f"{title}  (N={n_points}){extra}", fontsize=10)
         ax.set_xlim(-1, num_layers)
         ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
         ax.set_xticks(list(range(0, num_layers, 4)))
@@ -404,18 +411,18 @@ def _render_boxplots(
         # Total residual-stream amplification (single track block panel).
         if title.endswith("single") and "block" in title and amp_single:
             ax.text(
-                0.02, 0.96,
+                0.5, 0.96,
                 rf"$\mathrm{{amp}}_\mathrm{{single}}={amp_single[-1][1]:.2f}\times$"
                 rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
-                transform=ax.transAxes, fontsize=9, va="top", ha="left",
+                transform=ax.transAxes, fontsize=9, va="top", ha="center",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
             )
         elif title.endswith("pair") and "block" in title and amp_pair:
             ax.text(
-                0.02, 0.96,
+                0.5, 0.96,
                 rf"$\mathrm{{amp}}_\mathrm{{pair}}={amp_pair[-1][1]:.2f}\times$"
                 rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
-                transform=ax.transAxes, fontsize=9, va="top", ha="left",
+                transform=ax.transAxes, fontsize=9, va="top", ha="center",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
             )
     for ax in axes[-1, :]:
@@ -428,7 +435,7 @@ def _render_boxplots(
 def _render_timeseries(
     series: dict,
     output_path: str,
-    c: float,
+    c: float | None,
     latest_step: int,
     num_layers: int = 48,
     cmap_name: str = "turbo",
@@ -454,11 +461,14 @@ def _render_timeseries(
     cmap = plt.get_cmap(cmap_name)
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 13), sharex=True)
-    fig.suptitle(
-        rf"act_rms $\rho$ time-series per layer @ step {latest_step}  "
-        rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)",
-        fontsize=13,
-    )
+    if c is not None:
+        suptitle = (
+            rf"act_rms $\rho$ time-series per layer @ step {latest_step}  "
+            rf"(Karras ceiling $c/\sqrt{{L \cdot B}}$, $c={c:.2f}$, $L={num_layers}$)"
+        )
+    else:
+        suptitle = rf"act_rms $\rho$ time-series per layer @ step {latest_step}  ($L={num_layers}$)"
+    fig.suptitle(suptitle, fontsize=13)
 
     amp_single = _total_amp_series(series, "single", num_layers)
     amp_pair = _total_amp_series(series, "pair", num_layers)
@@ -480,10 +490,14 @@ def _render_timeseries(
             xs = [s for s, _ in traj[li]]
             ys = [v for _, v in traj[li]]
             ax.plot(xs, ys, color=cmap(norm(li)), linewidth=0.6, alpha=0.7)
-        panel_ceiling = _panel_ceiling(c, num_layers, b_count)
-        ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
         suffix = "" if b_count == 1 else f", B={b_count}"
-        ax.set_title(f"{title}  (L={len(traj)}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
+        if c is not None:
+            panel_ceiling = _panel_ceiling(c, num_layers, b_count)
+            ax.axhline(panel_ceiling, color="#cc6600", linestyle="--", linewidth=0.9, alpha=0.85)
+            ax.set_title(f"{title}  (L={len(traj)}, ceil={panel_ceiling:.3f}{suffix})", fontsize=10)
+        else:
+            extra = f"  ({suffix.lstrip(', ')})" if suffix else ""
+            ax.set_title(f"{title}  (L={len(traj)}){extra}", fontsize=10)
         ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
         ax.tick_params(axis="both", labelsize=8)
         # Overlay total residual-stream amplification on block panels —
@@ -499,9 +513,9 @@ def _render_timeseries(
                 ax2.set_ylabel("amp ×", fontsize=8, color="#222222")
                 ax2.tick_params(axis="y", labelsize=8, colors="#222222")
                 ax2.text(
-                    0.98, 0.96,
+                    0.04, 0.96,
                     rf"$\mathrm{{amp}}_\mathrm{{latest}}={ys[-1]:.2f}\times$",
-                    transform=ax2.transAxes, fontsize=9, va="top", ha="right",
+                    transform=ax2.transAxes, fontsize=9, va="top", ha="left",
                     bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#444", alpha=0.85),
                 )
     for ax in axes[-1, :]:
@@ -545,7 +559,18 @@ def main() -> None:
     p.add_argument("--last", type=int, default=200, help="Number of recent steps to fetch (default: 200)")
     p.add_argument("--top", type=int, default=5, help="Top-K outlier layers per metric (default: 5)")
     p.add_argument("--depth", type=int, default=48, help="PF layer count for Karras ceiling c/√L (default: 48)")
-    p.add_argument("--c", type=float, default=1.0, help="Karras ρ ceiling numerator (default: 1.0; ρ ≲ c/√L)")
+    p.add_argument(
+        "--c",
+        type=float,
+        default=None,
+        help=(
+            "Karras ρ ceiling numerator. When set, draws a dashed horizontal "
+            "reference at c/√(L·B) on every ρ panel and reports breach counts "
+            "in the text output. Omit to skip the ceiling overlay (e.g., for "
+            "runs where the orthogonal-branch assumption is violated and the "
+            "c/√L budget no longer applies)."
+        ),
+    )
     p.add_argument(
         "--slope-window",
         type=int,
@@ -586,7 +611,7 @@ def main() -> None:
     if not args.run and not args.csv_input:
         sys.exit("--run or --csv-input is required.")
 
-    ceiling = args.c / math.sqrt(args.depth)
+    ceiling = args.c / math.sqrt(args.depth) if args.c is not None else None
     iteration = 0
     while True:
         iteration += 1
@@ -633,7 +658,10 @@ def main() -> None:
 
         latest_step = max(s for vals in series.values() for s, _ in vals)
         print(f"  latest step = {latest_step}")
-        print(f"  Karras ceiling c/√L = {args.c:.2f}/√{args.depth} = {ceiling:.4f}\n")
+        if ceiling is not None:
+            print(f"  Karras ceiling c/√L = {args.c:.2f}/√{args.depth} = {ceiling:.4f}\n")
+        else:
+            print("  (no --c given → ceiling overlay disabled)\n")
         _run_one(args, series, ceiling, latest_step)
         if args.watch <= 0:
             break
@@ -666,7 +694,8 @@ def _run_one(args, series, ceiling, latest_step):
     # ============================================================
     # Section 2: block-level ρ at the latest step (one ρ per layer per track)
     # ============================================================
-    print(f"\n=== Block-level ρ @ step {latest_step} (ρ ≲ {ceiling:.3f}) ===")
+    ceil_hdr = f" (ρ ≲ {ceiling:.3f})" if ceiling is not None else ""
+    print(f"\n=== Block-level ρ @ step {latest_step}{ceil_hdr} ===")
     for track in ("single", "pair"):
         vals_by_layer = _per_layer_at_latest(
             series, lambda pk, t=track: pk.kind == "block_rho" and pk.track == t
@@ -677,7 +706,7 @@ def _run_one(args, series, ceiling, latest_step):
     # ============================================================
     # Section 3: per-branch ρ at the latest step (7 sub-branches × per-layer)
     # ============================================================
-    print(f"\n=== Per-branch ρ @ step {latest_step} (ρ ≲ {ceiling:.3f}) ===")
+    print(f"\n=== Per-branch ρ @ step {latest_step}{ceil_hdr} ===")
     for branch in _BRANCH_NAMES:
         vals_by_layer = _per_layer_at_latest(
             series, lambda pk, b=branch: pk.kind == f"branch_{b}_rho"
