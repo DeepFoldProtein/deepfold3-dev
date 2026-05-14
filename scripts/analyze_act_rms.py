@@ -138,6 +138,38 @@ def _fmt(v: float, width: int = 7, prec: int = 3) -> str:
     return f"{v:>{width}.{prec}f}"
 
 
+def _load_csv_series(path: str, last_steps: int) -> tuple[dict, dict]:
+    """Reconstruct ``series`` + ``meta`` from a long-format CSV.
+
+    CSV schema matches what ``--csv`` writes: ``step,key,kind,layer,track,value``.
+    Filters to the most recent ``last_steps`` step range. Returns the same
+    ``(series, meta)`` shape ``_fetch_rows`` + ``_organize`` produce, so
+    the downstream pipeline is unchanged.
+    """
+    import csv as _csv
+    from collections import defaultdict as _dd
+
+    series: dict[str, list[tuple[int, float]]] = _dd(list)
+    max_step = -1
+    with open(path) as f:
+        for row in _csv.DictReader(f):
+            try:
+                s = int(row["step"])
+                v = float(row["value"])
+            except (KeyError, ValueError):
+                continue
+            series[row["key"]].append((s, v))
+            if s > max_step:
+                max_step = s
+    if max_step < 0:
+        return {}, {"id": "csv", "state": "offline", "created": "", "name": path}
+    cutoff = max(0, max_step - last_steps + 1)
+    series = {k: sorted([(s, v) for s, v in vals if s >= cutoff], key=lambda p: p[0]) for k, vals in series.items()}
+    series = {k: v for k, v in series.items() if v}
+    meta = {"id": "csv", "state": "offline", "created": "(from CSV)", "name": path}
+    return series, meta
+
+
 def _fetch_rows(entity: str, project: str, run_name: str, last_steps: int) -> tuple[list[dict], dict]:
     """Pull recent rows from WandB.
 
@@ -497,7 +529,19 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--entity", default="DeepFoldProtein", help="WandB entity (default: DeepFoldProtein)")
     p.add_argument("--project", default="deepfold3-stage0", help="WandB project (default: deepfold3-stage0)")
-    p.add_argument("--run", required=True, help="WandB display name of the run")
+    p.add_argument(
+        "--run",
+        help="WandB display name of the run. Required unless --csv-input is set.",
+    )
+    p.add_argument(
+        "--csv-input",
+        dest="csv_input",
+        help=(
+            "Read act_rms data from a CSV (in the long format that --csv writes) "
+            "instead of fetching from WandB. Bypasses wandb auth; useful for "
+            "offline analysis of a saved snapshot."
+        ),
+    )
     p.add_argument("--last", type=int, default=200, help="Number of recent steps to fetch (default: 200)")
     p.add_argument("--top", type=int, default=5, help="Top-K outlier layers per metric (default: 5)")
     p.add_argument("--depth", type=int, default=48, help="PF layer count for Karras ceiling c/√L (default: 48)")
@@ -539,6 +583,9 @@ def main() -> None:
     )
     args = p.parse_args()
 
+    if not args.run and not args.csv_input:
+        sys.exit("--run or --csv-input is required.")
+
     ceiling = args.c / math.sqrt(args.depth)
     iteration = 0
     while True:
@@ -547,31 +594,44 @@ def main() -> None:
             import time as _time
 
             print(f"\n[iteration {iteration} @ {_time.strftime('%Y-%m-%d %H:%M:%S')}]")
-        print(f"Fetching last {args.last} steps from WandB run {args.entity}/{args.project}/{args.run}...")
-        try:
-            rows, meta = _fetch_rows(args.entity, args.project, args.run, args.last)
-        except Exception as exc:
-            print(f"  fetch failed: {exc}")
-            if args.watch > 0:
-                _sleep_with_msg(args.watch)
-                continue
-            raise
-        print(f"  run id={meta['id']}  state={meta['state']}  created={meta['created']}")
-        print(f"  fetched {len(rows)} rows")
-        if not rows:
-            if args.watch > 0:
-                _sleep_with_msg(args.watch)
-                continue
-            sys.exit("No rows returned.")
+        if args.csv_input:
+            print(f"Loading last {args.last} steps from CSV {args.csv_input}...")
+            try:
+                series, meta = _load_csv_series(args.csv_input, args.last)
+            except Exception as exc:
+                print(f"  load failed: {exc}")
+                if args.watch > 0:
+                    _sleep_with_msg(args.watch)
+                    continue
+                raise
+            print(f"  source={meta['name']}  state={meta['state']}")
+        else:
+            print(f"Fetching last {args.last} steps from WandB run {args.entity}/{args.project}/{args.run}...")
+            try:
+                rows, meta = _fetch_rows(args.entity, args.project, args.run, args.last)
+            except Exception as exc:
+                print(f"  fetch failed: {exc}")
+                if args.watch > 0:
+                    _sleep_with_msg(args.watch)
+                    continue
+                raise
+            print(f"  run id={meta['id']}  state={meta['state']}  created={meta['created']}")
+            print(f"  fetched {len(rows)} rows")
+            if not rows:
+                if args.watch > 0:
+                    _sleep_with_msg(args.watch)
+                    continue
+                sys.exit("No rows returned.")
+            series = _organize(rows)
 
-        series = _organize(rows)
         if not series:
             if args.watch > 0:
                 print("  no act_rms keys yet — meter may not have flushed")
                 _sleep_with_msg(args.watch)
                 continue
-            sys.exit("No act_rms keys found in the fetched rows.")
-        latest_step = max(int(r["train/step"]) for r in rows if r.get("train/step") is not None)
+            sys.exit("No act_rms data found.")
+
+        latest_step = max(s for vals in series.values() for s, _ in vals)
         print(f"  latest step = {latest_step}")
         print(f"  Karras ceiling c/√L = {args.c:.2f}/√{args.depth} = {ceiling:.4f}\n")
         _run_one(args, series, ceiling, latest_step)
