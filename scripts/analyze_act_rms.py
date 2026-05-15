@@ -500,6 +500,15 @@ def _render_timeseries(
 
     amp_single = _total_amp_series(series, "single", num_layers)
     amp_pair = _total_amp_series(series, "pair", num_layers)
+    # Compute ρ-window step range from any ρ key so top panels' x-axis
+    # matches the windowed ρ data instead of being stretched by full-history
+    # stream/amp series.
+    rho_steps: list[int] = []
+    for k, vals in series.items():
+        pk = _parse_key(k)
+        if pk is not None and "rho" in pk.kind:
+            rho_steps.extend(s for s, _ in vals)
+    rho_xlim: tuple[float, float] | None = (min(rho_steps), max(rho_steps)) if rho_steps else None
     for ax, (title, pred, b_count) in zip(axes_flat, panels, strict=False):
         # Build {layer_idx: [(step, value), ...]} for this metric.
         traj: dict[int, list[tuple[int, float]]] = {}
@@ -528,11 +537,18 @@ def _render_timeseries(
             ax.set_title(f"{title}  (L={len(traj)}){extra}", fontsize=10)
         ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6)
         ax.tick_params(axis="both", labelsize=8)
+        # Lock primary x-axis to ρ window so amp twin axis (which can span
+        # the full run) doesn't stretch the view.
+        if rho_xlim is not None:
+            ax.set_xlim(rho_xlim)
         # Overlay total residual-stream amplification on block panels —
         # secondary y-axis so the line doesn't compete with ρ for vertical
-        # range (ρ ~ 0.01-0.5 vs amp ~ 1-100×).
+        # range (ρ ~ 0.01-0.5 vs amp ~ 1-100×). Amp is windowed to match
+        # the ρ x-axis so the trace ends with the same right-most step.
         if "block" in title and (title.endswith("single") or title.endswith("pair")):
             amp = amp_single if title.endswith("single") else amp_pair
+            if amp and rho_xlim is not None:
+                amp = [(s, v) for s, v in amp if rho_xlim[0] <= s <= rho_xlim[1]]
             if amp:
                 xs = [s for s, _ in amp]
                 ys = [v for _, v in amp]
