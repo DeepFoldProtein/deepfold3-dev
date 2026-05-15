@@ -142,9 +142,11 @@ def _load_csv_series(path: str, last_steps: int) -> tuple[dict, dict]:
     """Reconstruct ``series`` + ``meta`` from a long-format CSV.
 
     CSV schema matches what ``--csv`` writes: ``step,key,kind,layer,track,value``.
-    Filters to the most recent ``last_steps`` step range. Returns the same
-    ``(series, meta)`` shape ``_fetch_rows`` + ``_organize`` produce, so
-    the downstream pipeline is unchanged.
+    Filters per-layer ρ / branch series to the most recent ``last_steps``
+    step range (keeps ρ panels visually digestible), but **preserves the
+    full history for stream-RMS keys** (``act_rms/pf_in_*`` and
+    ``act_rms/pf_<ii>_{single,pair}``) so the bottom-row stream
+    trajectory always covers the full run regardless of ``--last``.
     """
     import csv as _csv
     from collections import defaultdict as _dd
@@ -164,10 +166,19 @@ def _load_csv_series(path: str, last_steps: int) -> tuple[dict, dict]:
     if max_step < 0:
         return {}, {"id": "csv", "state": "offline", "created": "", "name": path}
     cutoff = max(0, max_step - last_steps + 1)
-    series = {k: sorted([(s, v) for s, v in vals if s >= cutoff], key=lambda p: p[0]) for k, vals in series.items()}
-    series = {k: v for k, v in series.items() if v}
+    out: dict[str, list[tuple[int, float]]] = {}
+    for k, vals in series.items():
+        pk = _parse_key(k)
+        # Stream keys (PF input + per-layer stream) bypass the window filter
+        # so the bottom-row trajectory shows the full run.
+        if pk is not None and pk.kind == "stream":
+            kept = sorted(vals, key=lambda p: p[0])
+        else:
+            kept = sorted([(s, v) for s, v in vals if s >= cutoff], key=lambda p: p[0])
+        if kept:
+            out[k] = kept
     meta = {"id": "csv", "state": "offline", "created": "(from CSV)", "name": path}
-    return series, meta
+    return out, meta
 
 
 def _fetch_rows(entity: str, project: str, run_name: str, last_steps: int) -> tuple[list[dict], dict]:
