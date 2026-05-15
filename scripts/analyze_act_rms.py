@@ -460,7 +460,21 @@ def _render_timeseries(
     norm = Normalize(vmin=0, vmax=num_layers - 1)
     cmap = plt.get_cmap(cmap_name)
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 13), sharex=True)
+    # 4-row layout: 3 rows × 3 cols for ρ panels + 1 wide bottom row for the
+    # PF-input/output stream RMS trajectories. The bottom row is split into
+    # ``single`` and ``pair`` panels so the two tracks' different magnitudes
+    # don't clash on a shared axis.
+    fig = plt.figure(figsize=(18, 16))
+    gs = fig.add_gridspec(4, 3, height_ratios=[1, 1, 1, 0.7], hspace=0.4)
+    axes_rho: list[list] = [[None] * 3 for _ in range(3)]
+    for r in range(3):
+        for col in range(3):
+            sharex = axes_rho[0][0] if (r or col) else None
+            axes_rho[r][col] = fig.add_subplot(gs[r, col], sharex=sharex)
+    axes_flat = [axes_rho[r][c] for r in range(3) for c in range(3)]
+    gs_bottom = gs[3, :].subgridspec(1, 2, wspace=0.18)
+    axes_bottom_single = fig.add_subplot(gs_bottom[0, 0], sharex=axes_rho[0][0])
+    axes_bottom_pair = fig.add_subplot(gs_bottom[0, 1], sharex=axes_rho[0][0])
     if c is not None:
         suptitle = (
             rf"act_rms $\rho$ time-series per layer @ step {latest_step}  "
@@ -472,7 +486,7 @@ def _render_timeseries(
 
     amp_single = _total_amp_series(series, "single", num_layers)
     amp_pair = _total_amp_series(series, "pair", num_layers)
-    for ax, (title, pred, b_count) in zip(axes.flat, panels, strict=False):
+    for ax, (title, pred, b_count) in zip(axes_flat, panels, strict=False):
         # Build {layer_idx: [(step, value), ...]} for this metric.
         traj: dict[int, list[tuple[int, float]]] = {}
         for k, vals in series.items():
@@ -518,8 +532,33 @@ def _render_timeseries(
                     transform=ax2.transAxes, fontsize=9, va="top", ha="left",
                     bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#444", alpha=0.85),
                 )
-    for ax in axes[-1, :]:
+    # Last ρ row gets the "step" label on the x-axis (above the input-stream
+    # row, which has its own label).
+    for ax in axes_rho[-1]:
         ax.set_xlabel("step", fontsize=9)
+
+    # Bottom row — PF input/output stream RMS trajectories.
+    # in_key = pf_in_<track>; the deepest layer's stream (h_47 == post-block-47)
+    # provides the upper bound trace.
+    for ax, track in [(axes_bottom_single, "single"), (axes_bottom_pair, "pair")]:
+        in_vals = series.get(f"act_rms/pf_in_{track}", [])
+        out_vals = series.get(f"act_rms/pf_{num_layers - 1:02d}_{track}", [])
+        if in_vals:
+            xs = [s for s, _ in in_vals]
+            ys = [v for _, v in in_vals]
+            ax.plot(xs, ys, color="#1f6fb5", linewidth=1.3, label=rf"$h_\mathrm{{in}}^\mathrm{{{track}}}$")
+        if out_vals:
+            xs = [s for s, _ in out_vals]
+            ys = [v for _, v in out_vals]
+            ax.plot(xs, ys, color="#cc3333", linewidth=1.3, label=rf"$h_{{47}}^\mathrm{{{track}}}$")
+        ax.set_title(f"{track} stream RMS (in + out)", fontsize=10)
+        ax.set_yscale("log")
+        ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.6, which="both")
+        ax.set_xlabel("step", fontsize=9)
+        ax.set_ylabel("RMS", fontsize=9)
+        ax.legend(fontsize=9, loc="lower right")
+        ax.tick_params(axis="both", labelsize=8)
+
     plt.tight_layout(rect=(0, 0, 0.93, 0.97))
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
