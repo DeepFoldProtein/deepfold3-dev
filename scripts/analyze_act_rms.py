@@ -484,8 +484,11 @@ def _render_timeseries(
             axes_rho[r][col] = fig.add_subplot(gs[r, col], sharex=sharex)
     axes_flat = [axes_rho[r][c] for r in range(3) for c in range(3)]
     gs_bottom = gs[3, :].subgridspec(1, 2, wspace=0.18)
-    axes_bottom_single = fig.add_subplot(gs_bottom[0, 0], sharex=axes_rho[0][0])
-    axes_bottom_pair = fig.add_subplot(gs_bottom[0, 1], sharex=axes_rho[0][0])
+    # Bottom row uses its OWN x-axis — the ρ panels are windowed by
+    # ``--last`` while stream RMS spans the full run, so sharing x would
+    # squeeze the top panels to the right end.
+    axes_bottom_single = fig.add_subplot(gs_bottom[0, 0])
+    axes_bottom_pair = fig.add_subplot(gs_bottom[0, 1])
     if c is not None:
         suptitle = (
             rf"act_rms $\rho$ time-series per layer @ step {latest_step}  "
