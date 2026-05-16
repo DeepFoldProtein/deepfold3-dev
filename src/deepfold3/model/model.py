@@ -297,7 +297,15 @@ class DeepFold3(nn.Module):
         asym_id_tensor = features["asym_id"].to(device)
         multichain_mask = (asym_id_tensor.unsqueeze(-1) == asym_id_tensor.unsqueeze(-2)).float()
 
-        # Per-recycle MSA subsampling (AF3 §3.3, Algorithm 8)
+        # Per-recycle MSA subsampling (AF3 §3.3, Algorithm 8). Two-stage:
+        #   (1) Subsample the full MSA pool (up to ``max_msa_seqs``, e.g. 16384)
+        #       down to a *fixed* tensor of ``msa_crop_size`` rows (default 1024).
+        #       Index selection content is random per recycle, but tensor shape
+        #       stays fixed → DDP-static-graph- / compile-friendly.
+        #   (2) AF3 §2.3 random-``k`` mask. During training, ``k = Uniform[1, crop]``
+        #       and rows ``k..crop-1`` are zeroed via ``msa_mask`` (tensor shape
+        #       unchanged). At eval, ``k = crop`` so no extra masking.
+        # Query row (index 0) is always retained.
         S_full = full_msa.shape[-2]  # MSA rows dimension
         crop = self.cfg.msa_crop_size
         rng = torch.Generator(device="cpu").manual_seed(seed)
@@ -305,7 +313,7 @@ class DeepFold3(nn.Module):
 
         # Recycle
         for recycle_idx in range(num_recycles + 1):
-            # Sample MSA rows: always include query (row 0), shuffle the rest
+            # --- Stage 1: subsample to a fixed-size pool of ``crop`` rows ---
             if S_full <= crop:
                 msa_sub = full_msa
                 msa_mask_sub = full_msa_mask
@@ -317,6 +325,19 @@ class DeepFold3(nn.Module):
                 msa_sub = full_msa.index_select(msa_rows_dim, idx)
                 msa_mask_sub = full_msa_mask.index_select(msa_rows_dim, idx)
                 del_sub = full_del_matrix.index_select(msa_rows_dim, idx) if full_del_matrix is not None else None
+
+            # --- Stage 2: random-``k`` mask within the fixed-size pool ---
+            # Always keep row 0 (query); for k < S_crop, zero rows k..S_crop-1
+            # in the mask. Tensor shape unchanged → static graph compatible.
+            if self.training:
+                S_crop = msa_sub.shape[msa_rows_dim]
+                k = int(torch.randint(1, S_crop + 1, (1,), generator=rng).item())
+                if k < S_crop:
+                    active = torch.zeros(S_crop, dtype=msa_mask_sub.dtype, device=device)
+                    active[:k] = 1
+                    bcast_shape = [1] * msa_mask_sub.dim()
+                    bcast_shape[msa_rows_dim] = S_crop
+                    msa_mask_sub = msa_mask_sub * active.view(*bcast_shape)
 
             # Build MSA features for this recycle [..., S_crop, N, 34]
             msa_feat = self._build_msa_feat_from_tensors(msa_sub, del_sub)

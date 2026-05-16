@@ -43,7 +43,7 @@ training:
 
   max_tokens: 384
   max_atoms: 4096
-  max_msa_seqs: 1024
+  max_msa_seqs: 16384
   max_recycles: 3
 
   batch_size_per_rank: 2
@@ -161,7 +161,7 @@ eval_datasets:
 
 model:
   num_recycles: 10
-  msa_crop_size: 512
+  msa_crop_size: 1024
   evoformer:
     num_layer: 4
     msa_channel: 64
