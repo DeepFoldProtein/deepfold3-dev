@@ -310,9 +310,10 @@ class TrainingDataset(torch.utils.data.Dataset):
             elif self._has_templates:
                 tpl_index = template_path(self.data_dir / "templates", record.id)
                 if tpl_index.exists():
-                    n_templates = random.randint(0, self.max_templates)
-                    if n_templates > 0:
-                        template_feats_per_chain = self._load_multimer_templates(record, n_templates)
+                    # AF3 §2.4 sampling (``k = min(Uniform[0, n_avail],
+                    # max_templates)``) is applied inside
+                    # ``_load_multimer_templates`` from the actual hit count.
+                    template_feats_per_chain = self._load_multimer_templates(record)
 
         # Tokenize -> attach mask -> crop -> featurize
         tokenized = self.tokenizer.tokenize(inp)
@@ -475,8 +476,12 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         return result if result else None
 
-    def _load_multimer_templates(self, record: Record, n_templates: int) -> dict[int, list[TemplateFeatures]] | None:
+    def _load_multimer_templates(self, record: Record) -> dict[int, list[TemplateFeatures]] | None:
         """Load multimer template features from pre-indexed JSON + PDB mmCIF.
+
+        Sampling follows AF3 §2.4: ``k = min(Uniform[0, n_avail], max_templates)``
+        — almost always returns ``max_templates`` when n_avail is large, but
+        respects bounds when fewer hits are available.
 
         Parses each template PDB once and reuses the gemmi Structure across
         chain alignments to avoid redundant mmCIF parsing.
@@ -500,8 +505,14 @@ class TrainingDataset(torch.utils.data.Dataset):
             logger.debug("Failed to load template index for %s", record.id)
             return None
 
-        if len(hits) > n_templates:
-            hits = random.sample(hits, n_templates)
+        n_avail = len(hits)
+        if n_avail == 0:
+            return None
+        # AF3 §2.4: k ~ min(Uniform[0, n_avail], max_templates).
+        k = min(random.randint(0, n_avail), self.max_templates)
+        if k == 0:
+            return None
+        hits = random.sample(hits, k) if n_avail > k else hits
 
         result: dict[int, list[TemplateFeatures]] = {}
         for hit in hits:
