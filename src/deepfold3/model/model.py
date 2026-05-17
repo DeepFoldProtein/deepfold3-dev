@@ -326,17 +326,27 @@ class DeepFold3(nn.Module):
                 msa_mask_sub = full_msa_mask.index_select(msa_rows_dim, idx)
                 del_sub = full_del_matrix.index_select(msa_rows_dim, idx) if full_del_matrix is not None else None
 
-            # --- Stage 2: random-``k`` mask within the fixed-size pool ---
-            # Always keep row 0 (query); for k < S_crop, zero rows k..S_crop-1
-            # in the mask. Tensor shape unchanged → static graph compatible.
+            # --- Stage 2: AF3 §2.3 random-``k`` mask ---
+            # ``k = Uniform[1, n_full]`` and **at random** ``k`` rows are kept
+            # (always including the query row 0). When ``k >= pool_size``
+            # (≈94% of training steps when n_full=16384, crop=1024) no rows
+            # are masked. When ``k < pool_size`` the kept rows are scattered
+            # at random across the pool — *not* a leading prefix — so we do
+            # not bias toward the closest homologs that Stage 1's sort puts
+            # at low indices. Tensor shape unchanged → DDP static_graph safe.
+            # Matches Protenix ``sample_indices``: ``randperm(n)[:k][:cutoff]``.
             if self.training:
-                S_crop = msa_sub.shape[msa_rows_dim]
-                k = int(torch.randint(1, S_crop + 1, (1,), generator=rng).item())
-                if k < S_crop:
-                    active = torch.zeros(S_crop, dtype=msa_mask_sub.dtype, device=device)
-                    active[:k] = 1
+                pool_size = msa_sub.shape[msa_rows_dim]
+                k = int(torch.randint(1, S_full + 1, (1,), generator=rng).item())
+                if k < pool_size:
+                    perm_k = torch.randperm(pool_size - 1, generator=rng) + 1
+                    keep = torch.cat(
+                        [torch.zeros(1, dtype=torch.long), perm_k[: k - 1]]
+                    ).to(device)
+                    active = torch.zeros(pool_size, dtype=msa_mask_sub.dtype, device=device)
+                    active[keep] = 1
                     bcast_shape = [1] * msa_mask_sub.dim()
-                    bcast_shape[msa_rows_dim] = S_crop
+                    bcast_shape[msa_rows_dim] = pool_size
                     msa_mask_sub = msa_mask_sub * active.view(*bcast_shape)
 
             # Build MSA features for this recycle [..., S_crop, N, 34]
