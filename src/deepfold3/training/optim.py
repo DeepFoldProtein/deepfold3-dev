@@ -152,13 +152,26 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
     """
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
+    # Per-multiplier strong-decay buckets: multiplier (float) → list of params
+    strong_buckets: dict[float, list[nn.Parameter]] = {}
+    strong_decay_map = dict(cfg.strong_decay or {})  # substring → multiplier
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if param.dim() < 2 or min(param.shape) == 1:
             no_decay_params.append(param)
-        elif _is_no_decay_by_name(name):
+            continue
+        if _is_no_decay_by_name(name):
             no_decay_params.append(param)
+            continue
+        # Strong-decay first-match wins
+        matched = None
+        for sub, mult in strong_decay_map.items():
+            if sub in name:
+                matched = mult
+                break
+        if matched is not None:
+            strong_buckets.setdefault(matched, []).append(param)
         else:
             decay_params.append(param)
 
@@ -166,9 +179,12 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         {"params": decay_params, "weight_decay": cfg.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
+    for mult, ps in strong_buckets.items():
+        param_groups.append({"params": ps, "weight_decay": cfg.weight_decay * mult})
 
     n_decay = sum(p.numel() for p in decay_params) / 1e6
     n_nodecay = sum(p.numel() for p in no_decay_params) / 1e6
+    n_strong = {m: sum(p.numel() for p in ps) / 1e6 for m, ps in strong_buckets.items()}
 
     if cfg.optimizer_type == "schedule_free":
         # SF manages its own warmup-then-flat schedule; ``finetune_scheduler``
@@ -202,11 +218,14 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
                 "the shadow tracks x, not y. Per-step cost: 2 extra "
                 "param-sized lerps."
             )
+        strong_summary = "".join(
+            f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items())
+        )
         rank_zero_info(
             f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, "
             f"weight_decay={cfg.weight_decay}, "
             f"average_concentration={cfg.average_concentration} "
-            f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
+            f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay{strong_summary})"
         )
         return optimizer
 
@@ -223,9 +242,12 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         eps=cfg.eps,
         fused=use_fused_adam,
     )
+    strong_summary = "".join(
+        f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items())
+    )
     rank_zero_info(
         f"AdamW: fused={use_fused_adam}, weight_decay={cfg.weight_decay} "
-        f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay)"
+        f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay{strong_summary})"
     )
     return optimizer
 
