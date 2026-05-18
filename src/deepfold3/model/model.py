@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from contextlib import nullcontext
 from functools import partial as _partial
 
 import torch
@@ -234,23 +235,38 @@ class DeepFold3(nn.Module):
         ref_atom_name_chars = features["ref_atom_name_chars"]
 
         use_ckpt = torch.is_grad_enabled()
-        if use_ckpt:
-            evo_cond_act = torch_checkpoint(
-                self.evo_cond_encoder,
-                ref_pos,
-                ref_mask,
-                ref_element,
-                ref_charge,
-                ref_atom_name_chars,
-            )
-        else:
-            evo_cond_act = self.evo_cond_encoder(
-                ref_pos=ref_pos,
-                ref_mask=ref_mask,
-                ref_element=ref_element,
-                ref_charge=ref_charge,
-                ref_atom_name_chars=ref_atom_name_chars,
-            )
+        # Match OF3 ``input_embedders.py:127`` — wrap the atom conditioning
+        # encoder in fp32 autocast when ``cfg.precision.fp32_evo_cond_encoder``
+        # is set. The 3D ref_pos projection + offset / inverse-distance pair
+        # features have high dynamic range and bf16 accumulates noticeable
+        # rounding error there. Cast the output back to surrounding dtype so
+        # the downstream concat with ``raw_feat`` is shape- and dtype-clean.
+        fp32_ace = self.cfg.precision.fp32_evo_cond_encoder
+        amp_ctx = (
+            torch.amp.autocast(device_type=ref_pos.device.type, dtype=torch.float32)
+            if fp32_ace
+            else nullcontext()
+        )
+        with amp_ctx:
+            if use_ckpt:
+                evo_cond_act = torch_checkpoint(
+                    self.evo_cond_encoder,
+                    ref_pos,
+                    ref_mask,
+                    ref_element,
+                    ref_charge,
+                    ref_atom_name_chars,
+                )
+            else:
+                evo_cond_act = self.evo_cond_encoder(
+                    ref_pos=ref_pos,
+                    ref_mask=ref_mask,
+                    ref_element=ref_element,
+                    ref_charge=ref_charge,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                )
+        if fp32_ace:
+            evo_cond_act = evo_cond_act.to(raw_feat.dtype)
 
         # Full target_feat [..., N, 447] = concat(raw[63], evo_cond[384])
         target_feat = torch.cat([raw_feat, evo_cond_act], dim=-1)

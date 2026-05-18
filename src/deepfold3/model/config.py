@@ -898,6 +898,16 @@ class PrecisionConfig:
     # Run DistogramHead.half_logits in fp32. Off by default; flip on if the
     # distogram loss shows bursts beyond its theoretical max (ln(num_bins)).
     fp32_distogram_head: bool = False
+    # Run the trunk-input atom conditioning encoder
+    # (:class:`EvoformerConditioningEncoder`) in fp32. The 3D coordinate
+    # projection ``embed_ref_pos`` (Linear(3→128)) and the offset/distance
+    # projections handle features with high dynamic range that bf16
+    # accumulates noisily — matching Protenix
+    # (``precision=torch.float32`` per-Linear on ref_pos / d / r) and OF3
+    # (``with torch.amp.autocast(...dtype=fp32)`` wrap on
+    # ``input_embedders.py:127``). Default on; flip off only to A/B the
+    # numerical effect of the bf16 path.
+    fp32_evo_cond_encoder: bool = True
     # Run the diffusion sampler (inference) in fp32. Mirrors
     # ``DiffusionConfig.skip_amp_sample`` — ``ModelConfig.__post_init__``
     # keeps the two in sync.
