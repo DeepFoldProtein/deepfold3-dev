@@ -959,6 +959,72 @@ def chirality_loss(
     return loss.to(out_dtype)
 
 
+@torch.no_grad()
+def chirality_violation_rates(
+    pred_pos: torch.Tensor,
+    frame_token_index: torch.Tensor,
+    frame_atom_index: torch.Tensor,
+    chirality_atom_idx: torch.Tensor,
+    chirality_target: torch.Tensor,
+    margin: float = 0.5,
+) -> dict[str, torch.Tensor]:
+    """Logged-only diagnostics for :func:`chirality_loss`.
+
+    Returns:
+        Dict with three scalars (sample- and residue-averaged over the
+        validity mask):
+
+        * ``chirality_mirror_rate`` — fraction of residues with
+          ``correctness < 0`` (sign-flipped Cβ, i.e. definite mirror).
+        * ``chirality_ambiguous_rate`` — fraction with ``correctness < margin``
+          (mirror OR Cβ too close to the frame plane).
+        * ``chirality_correctness_mean`` — mean signed projection
+          ``local_z * target_sign`` in Å. Approaches the CCD ideal ~+1.0
+          as chirality is learned.
+    """
+    target = chirality_target.float()
+    valid_n = (target.abs() > 0).float()
+    if valid_n.sum().item() == 0:
+        z = pred_pos.new_zeros(())
+        return {
+            "chirality_mirror_rate": z,
+            "chirality_ambiguous_rate": z,
+            "chirality_correctness_mean": z,
+        }
+
+    with torch.amp.autocast(device_type=pred_pos.device.type, enabled=False):
+        pred32 = pred_pos.float()
+        N = pred32.shape[1]
+        arange_n = torch.arange(N, device=pred32.device)
+        frame_atoms = pred32[:, frame_token_index, frame_atom_index]
+        a = frame_atoms[..., 0, :]
+        b = frame_atoms[..., 1, :]
+        c = frame_atoms[..., 2, :]
+        probe = pred32[:, arange_n, chirality_atom_idx]
+
+        w1 = F.normalize(a - b, dim=-1, eps=1e-8)
+        w2 = F.normalize(c - b, dim=-1, eps=1e-8)
+        e1 = F.normalize(w1 + w2, dim=-1, eps=1e-8)
+        e2 = F.normalize(w2 - w1, dim=-1, eps=1e-8)
+        e3 = torch.cross(e1, e2, dim=-1)
+
+        local_z = ((probe - b) * e3).sum(-1)
+        correctness = local_z * target.unsqueeze(0)
+
+        mask = valid_n.unsqueeze(0).expand_as(correctness)
+        n_valid = mask.sum().clamp(min=1)
+
+        mirror = ((correctness < 0).float() * mask).sum() / n_valid
+        ambiguous = ((correctness < margin).float() * mask).sum() / n_valid
+        mean_corr = (correctness * mask).sum() / n_valid
+
+    return {
+        "chirality_mirror_rate": mirror,
+        "chirality_ambiguous_rate": ambiguous,
+        "chirality_correctness_mean": mean_corr,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1208,6 +1274,15 @@ def diffusion_only_loss(
             )
             components["chirality"] = l_chir.detach()
             total = total + cfg.alpha_chirality * l_chir
+            for k, v in chirality_violation_rates(
+                denoised,
+                features["frame_token_index"],
+                features["frame_atom_index"],
+                features["chirality_atom_idx"],
+                features["chirality_target"],
+                margin=cfg.chirality_margin,
+            ).items():
+                components[k] = v.detach()
 
     return total, components
 
@@ -1388,6 +1463,17 @@ def training_loss(
             )
             losses["chirality"] = l_chir
             total = total + cfg.alpha_chirality * l_chir
+            # Diagnostics: logged-only, no grad.
+            losses.update(
+                chirality_violation_rates(
+                    denoised,
+                    features["frame_token_index"],
+                    features["frame_atom_index"],
+                    features["chirality_atom_idx"],
+                    features["chirality_target"],
+                    margin=cfg.chirality_margin,
+                )
+            )
 
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]
