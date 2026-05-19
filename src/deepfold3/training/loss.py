@@ -880,29 +880,36 @@ def chirality_loss(
     frame_atom_index: torch.Tensor,     # [N, 3] long
     chirality_atom_idx: torch.Tensor,   # [N] long
     chirality_target: torch.Tensor,     # [N] float, in {-1, 0, +1}
-    margin: float = 0.5,
 ) -> torch.Tensor:
-    """Per-residue chirality hinge on the Cβ projection onto the frame normal.
+    """Per-residue chirality quadratic on the Cβ projection onto the frame normal.
 
-    For each token ``i`` with ``chirality_target[i] != 0``:
-      1. Build a right-handed orthonormal basis from ``(N_i, CA_i, C_i)``
-         using the same Gram-Schmidt construction as
-         :func:`express_coordinates_in_frame` — ``e3 = e1 × e2`` is the
-         plane normal.
-      2. Project the probe atom (Cβ for protein L-aa; index given by
-         ``chirality_atom_idx[i]``) onto ``e3``:
-         ``proj = (probe - CA) · e3``.
-      3. Hinge loss against the precomputed target sign (from CCD ideal):
-         ``ReLU(margin - proj * target)``.
+    Quadratic-toward-target form (2026-05-19 redesign):
 
-    Distance-based losses (smooth_lddt, distogram, bond) are invariant to
-    reflection; the post-Kabsch diffusion MSE is the only other chirality
-    signal but is dominated by global topology. This loss adds an explicit
-    O(N) per-residue signed-direction penalty so mirror predictions cannot
-    settle into a low-loss basin during stage 1.
+      ``loss = mean over valid residues of (local_z − target_sign)²``
 
-    Runs in fp32 with autocast disabled — the cross-product orthogonality
-    and the hinge sign are noise-sensitive under bf16.
+    where ``local_z = (Cβ − CA) · e3`` and ``e3`` is the (N, CA, C) frame
+    normal. ``target_sign`` is taken from the CCD ideal projection (≈ ±1 Å
+    for natural L/D amino acids); ``0`` masks the residue out.
+
+    Physics rationale — the equilibrium CA → Cβ vector lies at ≈ 0.95 Å
+    off the (N, CA, C) plane for any tetrahedral CA, set by the
+    ``Cβ-CA`` bond length (1.527 Å) and the ``N-CA-Cβ``/``C-CA-Cβ``
+    angles (~110°). Penalising the squared distance to ``±1`` (a) drives
+    the correct sign, (b) holds the magnitude near the physical ideal,
+    and (c) keeps a smooth gradient everywhere (vs the older
+    ``relu(margin - corr)`` hinge which had a flat dead zone above the
+    margin and a sharp kink at it). Net range is ``[0, 4]`` per residue:
+
+      * Correct (local_z = +1, target = +1) → 0
+      * Cβ on the (N, CA, C) plane (local_z = 0) → 1
+      * Mirror (local_z = −1, target = +1) → 4
+      * Severe mispredict (local_z = −2) → 9
+
+    Distance-based losses (smooth_lddt, distogram, bond) are invariant
+    to reflection; the post-Kabsch diffusion MSE is the only other
+    chirality signal but is dominated by global topology. Runs in fp32
+    with autocast disabled — the cross-product orthogonality is
+    noise-sensitive under bf16.
 
     Args:
         pred_pos: Per-sample predicted atom positions ``[S, N, M, 3]``.
@@ -913,9 +920,6 @@ def chirality_loss(
             ignored when ``chirality_target == 0``.
         chirality_target: Pre-computed sign ``[N]`` (``+1`` natural L-aa,
             ``-1`` D-aa, ``0`` mask out — Gly, missing, ambiguous).
-        margin: Hinge margin in Å. Default ``0.5``; the natural projection
-            magnitude is ~1 Å so the loss saturates at 0 when chirality
-            is correct.
 
     Returns:
         Scalar loss in the input dtype. Zero when no valid residues.
@@ -949,8 +953,8 @@ def chirality_loss(
         e3 = torch.cross(e1, e2, dim=-1)
 
         local_z = ((probe - b) * e3).sum(-1)  # [S, N]
-        correctness = local_z * target.unsqueeze(0)  # [S, N]
-        loss_per = F.relu(margin - correctness)  # [S, N]
+        # Quadratic-toward-target: penalises sign AND magnitude.
+        loss_per = (local_z - target.unsqueeze(0)) ** 2  # [S, N]
 
         mask = valid_n.unsqueeze(0).expand_as(loss_per)  # [S, N]
         n_valid = mask.sum().clamp(min=1)
@@ -1270,7 +1274,6 @@ def diffusion_only_loss(
                 features["frame_atom_index"],
                 features["chirality_atom_idx"],
                 features["chirality_target"],
-                margin=cfg.chirality_margin,
             )
             components["chirality"] = l_chir.detach()
             total = total + cfg.alpha_chirality * l_chir
@@ -1459,11 +1462,12 @@ def training_loss(
                 features["frame_atom_index"],
                 features["chirality_atom_idx"],
                 features["chirality_target"],
-                margin=cfg.chirality_margin,
             )
             losses["chirality"] = l_chir
             total = total + cfg.alpha_chirality * l_chir
-            # Diagnostics: logged-only, no grad.
+            # Diagnostics: logged-only, no grad. ``chirality_margin`` here
+            # is purely the threshold for the ``ambiguous_rate`` indicator,
+            # not a loss hyperparameter (the loss is now quadratic).
             losses.update(
                 chirality_violation_rates(
                     denoised,
