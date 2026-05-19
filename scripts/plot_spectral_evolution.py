@@ -64,15 +64,15 @@ def load_series(src_dir: Path, prefix: str) -> list[tuple[int, dict]]:
 
 def main() -> None:
     src_dir = Path("tmp/spectral")
-    af3spec_rows = load_series(src_dir, "af3spec")
+    chiral_rows = load_series(src_dir, "chiral")
     rsf_rows = load_series(src_dir, "rsf")
-    if not (af3spec_rows or rsf_rows):
-        print("No spectral files found (expected af3spec_step_*.txt / rsf_step_*.txt)")
+    if not (chiral_rows or rsf_rows):
+        print("No spectral files found (expected chiral_step_*.txt / rsf_step_*.txt)")
         return
 
-    af3spec_steps = [r[0] for r in af3spec_rows]
+    chiral_steps = [r[0] for r in chiral_rows]
     rsf_steps = [r[0] for r in rsf_rows]
-    print(f"Loaded {len(af3spec_rows)} af3spec (current; +AF3-spec MSA/tmpl fix): {af3spec_steps}")
+    print(f"Loaded {len(chiral_rows)} chiral (current; +AF3-spec MSA/tmpl fix + chirality hinge): {chiral_steps}")
     print(f"Loaded {len(rsf_rows)} rsf (prev run, df3-rsf-25e5-c10-g35; no spec fix): {rsf_steps}")
 
     # Reference model values (from references/ static analysis).
@@ -83,7 +83,7 @@ def main() -> None:
         "Boltz-2": {"pairformer": 67, "diffusion": 78, "msa": 48, "atom_encoder": 36, "template": 30},
     }
     buckets = ["pairformer", "diffusion", "msa", "atom_encoder", "template"]
-    # Architectural notes (current arm = `af3spec`: AF3 baseline + refined SF +
+    # Architectural notes (current arm = `chiral`: AF3 baseline + refined SF +
     # AF3-spec MSA/template fixes — NO uniros, NO RMSN). All buckets are
     # architecturally comparable with the AF3/PX/Boltz reference lines.
     # Lineage / s035 series may differ — see series-level legend.
@@ -97,14 +97,14 @@ def main() -> None:
             ax.plot(
                 rsf_steps, ys, marker="s", color="tab:red",
                 label="rsf (previous run, df3-rsf-25e5-c10-g35; no spec fix)",
-                linewidth=1.2, alpha=0.7,
+                linewidth=0.8, markersize=2.5, markeredgewidth=0, alpha=0.7,
             )
-        if af3spec_rows:
-            ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in af3spec_rows]
+        if chiral_rows:
+            ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in chiral_rows]
             ax.plot(
-                af3spec_steps, ys, marker="o", color="tab:blue",
-                label="af3spec (current; +AF3-spec MSA pool + tmpl k-sampling)",
-                linewidth=1.8,
+                chiral_steps, ys, marker="o", color="tab:blue",
+                label="chiral (current; +AF3-spec MSA/tmpl fix + chirality hinge α=2)",
+                linewidth=1.0, markersize=2.5, markeredgewidth=0,
             )
         # Reference horizontal lines
         ref_colors = {"AF3": "red", "Protenix": "purple", "Boltz-1": "darkgreen", "Boltz-2": "brown"}
@@ -119,22 +119,25 @@ def main() -> None:
         note = arch_note.get(b, "")
         ax.set_title(f"{b}\n{note}", fontsize=9)
         ax.grid(True, alpha=0.3)
-        if i == 0:
-            ax.legend(fontsize=7, loc="best")
-    axes[1, 2].axis("off")
+    # Hide last subplot but reuse its area for the shared legend so the
+    # in-axes plots are never obstructed.
+    legend_ax = axes[1, 2]
+    legend_ax.axis("off")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    legend_ax.legend(handles, labels, fontsize=9, loc="center", frameon=False)
     fig.suptitle(
         "Bucket-level effective rank p50 evolution\n"
-        "Current arm (af3spec) is AF3-architecturally equivalent to AF3/PX/Boltz reference lines.",
+        "Current arm (chiral) is AF3-architecturally equivalent to AF3/PX/Boltz reference lines.",
         fontsize=11,
     )
     fig.tight_layout()
-    out = src_dir / "af3spec_eff_rank.png"
+    out = src_dir / "chiral_eff_rank.png"
     fig.savefig(out, dpi=140, bbox_inches="tight")
     print(f"saved {out}")
 
     # Save CSV for the current arm only.
-    csv_path = src_dir / "af3spec_eff_rank.csv"
-    primary_rows = af3spec_rows or rsf_rows
+    csv_path = src_dir / "chiral_eff_rank.csv"
+    primary_rows = chiral_rows or rsf_rows
     with csv_path.open("w") as f:
         w = csv.writer(f)
         w.writerow(["step", *buckets])

@@ -3,7 +3,7 @@
 # then refresh the evolution plot. Idempotent — skips already-processed steps.
 #
 # Usage:
-#   bash scripts/process_spectral_ckpts.sh                   # default: af3spec arm
+#   bash scripts/process_spectral_ckpts.sh                   # default: chiral arm
 #   bash scripts/process_spectral_ckpts.sh <arm-name> <prefix>
 #
 # Example:
@@ -12,13 +12,13 @@
 # Outputs:
 #   tmp/spectral/<prefix>_step_<N>.txt   — per-ckpt spectral text dump
 #   tmp/spectral/<arm>/step_<N>/         — per-ckpt plots / artifacts
-#   tmp/spectral/af3spec_eff_rank.png    — evolution plot (af3spec vs rsf)
-#   tmp/spectral/af3spec_eff_rank.csv    — eff_rank CSV for current arm
+#   tmp/spectral/chiral_eff_rank.png    — evolution plot (chiral vs rsf)
+#   tmp/spectral/chiral_eff_rank.csv    — eff_rank CSV for current arm
 
 set -euo pipefail
 
-ARM="${1:-df3-af3spec-25e5-c10-g35}"
-PREFIX="${2:-af3spec}"
+ARM="${1:-df3-chiral-25e5-c10-g35}"
+PREFIX="${2:-chiral}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 RUN_DIR="${REPO}/runs/${ARM}"
 SPECTRAL_DIR="${REPO}/tmp/spectral"
