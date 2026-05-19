@@ -644,6 +644,16 @@ class TrainingConfig:
     alpha_confidence: float = 1e-4
     alpha_pae: float = 0.0
     alpha_bond: float = 0.0
+    # Chirality hinge loss weight — AF3-spec deviation. Off by default;
+    # turn on (e.g. ``0.5``) to add sign-target supervision on the Cβ
+    # projection onto the (N/CA/C) frame normal, providing an explicit
+    # signal that distance-based losses (smooth_lddt, distogram) lack.
+    # See ``loss.py:chirality_loss`` and the featurizer-side ``chirality_*``
+    # features. Currently protein-only (RNA/DNA TODO via N1/N9).
+    alpha_chirality: float = 0.0
+    # Hinge margin in Å. The natural projection magnitude is ~1 Å so 0.5
+    # leaves room before saturation.
+    chirality_margin: float = 0.5
     # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0

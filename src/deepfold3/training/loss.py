@@ -85,10 +85,14 @@ def weighted_rigid_align(
         U, _S, Vh = torch.linalg.svd(H)
         U_T = U.transpose(-2, -1)
         V = Vh.transpose(-2, -1)
-        # Reflection fix: R = V · diag(1, 1, sign(det(V·U^T))) · U^T
+        # Reflection fix: R = V · diag(1, 1, sign(det(V·U^T))) · U^T.
+        # ``sign`` (not ``det`` directly) guards against the fp32 SVD
+        # noise that lets ``det(V·U^T)`` drift from exactly ±1 — matches
+        # the numpy path in ``chain_perm.py:_kabsch_rmsd_np``.
         det = torch.linalg.det(torch.matmul(V, U_T))
-        ones = torch.ones_like(det)
-        diag = torch.diag_embed(torch.stack([ones, ones, det], dim=-1))
+        sign = torch.sign(det)
+        ones = torch.ones_like(sign)
+        diag = torch.diag_embed(torch.stack([ones, ones, sign], dim=-1))
         rot = torch.matmul(V, torch.matmul(diag, U_T))  # [..., 3, 3]
 
         # Apply: (gt - μ_gt) @ R^T + μ_pred
@@ -866,6 +870,96 @@ def bond_loss(
 
 
 # ---------------------------------------------------------------------------
+# Chirality (sign-target) loss — AF3-spec deviation
+# ---------------------------------------------------------------------------
+
+
+def chirality_loss(
+    pred_pos: torch.Tensor,             # [S, N, M, 3]
+    frame_token_index: torch.Tensor,    # [N, 3] long
+    frame_atom_index: torch.Tensor,     # [N, 3] long
+    chirality_atom_idx: torch.Tensor,   # [N] long
+    chirality_target: torch.Tensor,     # [N] float, in {-1, 0, +1}
+    margin: float = 0.5,
+) -> torch.Tensor:
+    """Per-residue chirality hinge on the Cβ projection onto the frame normal.
+
+    For each token ``i`` with ``chirality_target[i] != 0``:
+      1. Build a right-handed orthonormal basis from ``(N_i, CA_i, C_i)``
+         using the same Gram-Schmidt construction as
+         :func:`express_coordinates_in_frame` — ``e3 = e1 × e2`` is the
+         plane normal.
+      2. Project the probe atom (Cβ for protein L-aa; index given by
+         ``chirality_atom_idx[i]``) onto ``e3``:
+         ``proj = (probe - CA) · e3``.
+      3. Hinge loss against the precomputed target sign (from CCD ideal):
+         ``ReLU(margin - proj * target)``.
+
+    Distance-based losses (smooth_lddt, distogram, bond) are invariant to
+    reflection; the post-Kabsch diffusion MSE is the only other chirality
+    signal but is dominated by global topology. This loss adds an explicit
+    O(N) per-residue signed-direction penalty so mirror predictions cannot
+    settle into a low-loss basin during stage 1.
+
+    Runs in fp32 with autocast disabled — the cross-product orthogonality
+    and the hinge sign are noise-sensitive under bf16.
+
+    Args:
+        pred_pos: Per-sample predicted atom positions ``[S, N, M, 3]``.
+        frame_token_index: Token index of each frame atom ``[N, 3]``
+            (== self for polymers; see :func:`Featurizer.process`).
+        frame_atom_index: Atom slot within the referenced token ``[N, 3]``.
+        chirality_atom_idx: Probe atom slot per token ``[N]``. Value is
+            ignored when ``chirality_target == 0``.
+        chirality_target: Pre-computed sign ``[N]`` (``+1`` natural L-aa,
+            ``-1`` D-aa, ``0`` mask out — Gly, missing, ambiguous).
+        margin: Hinge margin in Å. Default ``0.5``; the natural projection
+            magnitude is ~1 Å so the loss saturates at 0 when chirality
+            is correct.
+
+    Returns:
+        Scalar loss in the input dtype. Zero when no valid residues.
+    """
+    out_dtype = pred_pos.dtype
+    target = chirality_target.float()
+    valid_n = (target.abs() > 0).float()  # [N]
+    if valid_n.sum().item() == 0:
+        return pred_pos.new_zeros(())
+
+    with torch.amp.autocast(device_type=pred_pos.device.type, enabled=False):
+        pred32 = pred_pos.float()
+        N = pred32.shape[1]
+        arange_n = torch.arange(N, device=pred32.device)
+
+        # Gather frame atoms via advanced indexing: result is [S, N, 3, 3]
+        # (last two dims = (a, b, c) atom × xyz).
+        frame_atoms = pred32[:, frame_token_index, frame_atom_index]  # [S, N, 3, 3]
+        a = frame_atoms[..., 0, :]
+        b = frame_atoms[..., 1, :]  # CA (or sugar C3' for nucleic acids)
+        c = frame_atoms[..., 2, :]
+
+        # Probe atom — Cβ (protein) or N1/N9 (nucleic acid, future).
+        probe = pred32[:, arange_n, chirality_atom_idx]  # [S, N, 3]
+
+        # Gram-Schmidt → e3 normal (matches express_coordinates_in_frame).
+        w1 = F.normalize(a - b, dim=-1, eps=1e-8)
+        w2 = F.normalize(c - b, dim=-1, eps=1e-8)
+        e1 = F.normalize(w1 + w2, dim=-1, eps=1e-8)
+        e2 = F.normalize(w2 - w1, dim=-1, eps=1e-8)
+        e3 = torch.cross(e1, e2, dim=-1)
+
+        local_z = ((probe - b) * e3).sum(-1)  # [S, N]
+        correctness = local_z * target.unsqueeze(0)  # [S, N]
+        loss_per = F.relu(margin - correctness)  # [S, N]
+
+        mask = valid_n.unsqueeze(0).expand_as(loss_per)  # [S, N]
+        n_valid = mask.sum().clamp(min=1)
+        loss = (loss_per * mask).sum() / n_valid
+
+    return loss.to(out_dtype)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1103,6 +1197,18 @@ def diffusion_only_loss(
             components["bond"] = l_bond.detach()
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
 
+        if cfg.alpha_chirality > 0 and "chirality_target" in features:
+            l_chir = chirality_loss(
+                denoised,
+                features["frame_token_index"],
+                features["frame_atom_index"],
+                features["chirality_atom_idx"],
+                features["chirality_target"],
+                margin=cfg.chirality_margin,
+            )
+            components["chirality"] = l_chir.detach()
+            total = total + cfg.alpha_chirality * l_chir
+
     return total, components
 
 
@@ -1267,6 +1373,21 @@ def training_loss(
             )
             losses["bond"] = l_bond
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
+
+        # Chirality hinge — explicit sign-target supervision on Cβ frame
+        # projection. Off by default (alpha_chirality=0); enable to bound
+        # the mirror-image saddle that distance-based losses cannot see.
+        if cfg.alpha_chirality > 0 and "chirality_target" in features:
+            l_chir = chirality_loss(
+                denoised,
+                features["frame_token_index"],
+                features["frame_atom_index"],
+                features["chirality_atom_idx"],
+                features["chirality_target"],
+                margin=cfg.chirality_margin,
+            )
+            losses["chirality"] = l_chir
+            total = total + cfg.alpha_chirality * l_chir
 
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]

@@ -357,6 +357,56 @@ class Featurizer:
         frames_mask = torch.from_numpy(frames_mask_np)
 
         # ------------------------------------------------------------------
+        # Chirality probe — per-token off-plane atom whose projection sign
+        # on the local (N/CA/C) frame normal disambiguates L vs D (or
+        # purine vs pyrimidine attachment, future). ``chirality_target``
+        # holds ±1 derived from the CCD ideal geometry, or ``0`` when the
+        # residue should be masked out (Gly, missing atom, ambiguous
+        # projection). Consumed by :func:`deepfold3.training.loss.chirality_loss`.
+        # Currently protein-only; RNA / DNA / ligand left as 0.
+        # ------------------------------------------------------------------
+        chirality_atom_idx_np = np.zeros(N, dtype=np.int64)
+        chirality_target_np = np.zeros(N, dtype=np.float32)
+        _CHIRALITY_PROJ_MIN = 0.3  # Å — discard ambiguous near-plane projections
+        for i, tok in enumerate(tokens):
+            mt = int(tok["mol_type"])
+            rt = int(tok["res_type"])
+            if mt != const.MOL_PROTEIN:
+                continue  # TODO: N1/N9 probe for RNA/DNA
+            if rt == 7:
+                continue  # Gly — no Cβ
+            if not ref_mask[i, 4]:
+                continue  # Cβ missing
+            if not frames_mask_np[i]:
+                continue  # (N, CA, C) not all present
+            n_xyz = ref_pos[i, 0]
+            ca_xyz = ref_pos[i, 1]
+            c_xyz = ref_pos[i, 2]
+            cb_xyz = ref_pos[i, 4]
+            w1 = n_xyz - ca_xyz
+            w2 = c_xyz - ca_xyz
+            n1 = float(np.linalg.norm(w1))
+            n2 = float(np.linalg.norm(w2))
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+            w1 /= n1
+            w2 /= n2
+            e1 = w1 + w2
+            e2 = w2 - w1
+            ne1 = float(np.linalg.norm(e1))
+            ne2 = float(np.linalg.norm(e2))
+            if ne1 < 1e-6 or ne2 < 1e-6:
+                continue
+            e1 /= ne1
+            e2 /= ne2
+            e3 = np.cross(e1, e2)
+            proj = float(np.dot(cb_xyz - ca_xyz, e3))
+            if abs(proj) < _CHIRALITY_PROJ_MIN:
+                continue  # ambiguous — mask out
+            chirality_atom_idx_np[i] = 4
+            chirality_target_np[i] = 1.0 if proj > 0 else -1.0
+
+        # ------------------------------------------------------------------
         # mol_type: molecule type per token (protein/DNA/RNA/non-polymer)
         # Used by output layer to determine entity type correctly (ligands
         # have res_type=20 same as UNK protein, so res_type alone is ambiguous).
@@ -392,6 +442,8 @@ class Featurizer:
             "token_to_rep_atom": torch.from_numpy(token_to_rep_atom),
             "frame_atom_index": torch.from_numpy(frame_atom_index),
             "frame_token_index": torch.from_numpy(frame_token_index),
+            "chirality_atom_idx": torch.from_numpy(chirality_atom_idx_np),
+            "chirality_target": torch.from_numpy(chirality_target_np),
             "ref_pos": torch.from_numpy(ref_pos),
             "ref_mask": torch.from_numpy(ref_mask),
             "ref_element": torch.from_numpy(ref_element),
@@ -1093,6 +1145,8 @@ class Featurizer:
             "token_to_rep_atom": torch.zeros(0, dtype=torch.int64),
             "frame_atom_index": torch.zeros(0, 3, dtype=torch.int64),
             "frame_token_index": torch.zeros(0, 3, dtype=torch.int64),
+            "chirality_atom_idx": torch.zeros(0, dtype=torch.int64),
+            "chirality_target": torch.zeros(0),
             "ref_pos": torch.zeros(0, M, 3),
             "ref_mask": torch.zeros(0, M, dtype=torch.bool),
             "ref_element": torch.zeros(0, M, dtype=torch.int64),
