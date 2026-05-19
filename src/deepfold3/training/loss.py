@@ -885,25 +885,33 @@ def chirality_loss(
 
     Quadratic-toward-target form (2026-05-19 redesign):
 
-      ``loss = mean over valid residues of (local_z − target_sign)²``
+      ``loss = mean over valid residues of (local_z − target)²``
 
-    where ``local_z = (Cβ − CA) · e3`` and ``e3`` is the (N, CA, C) frame
-    normal. ``target_sign`` is taken from the CCD ideal projection (≈ ±1 Å
-    for natural L/D amino acids); ``0`` masks the residue out.
+    where ``local_z = (Cβ − CA) · e3``, ``e3`` is the (N, CA, C) frame
+    normal, and ``target`` is the *signed* CCD ideal projection (≈ ±1.20
+    Å for natural L/D amino acids, stored per-residue in
+    ``features["chirality_target"]``). ``0.0`` masks the residue out.
 
-    Physics rationale — the equilibrium CA → Cβ vector lies at ≈ 0.95 Å
-    off the (N, CA, C) plane for any tetrahedral CA, set by the
-    ``Cβ-CA`` bond length (1.527 Å) and the ``N-CA-Cβ``/``C-CA-Cβ``
-    angles (~110°). Penalising the squared distance to ``±1`` (a) drives
-    the correct sign, (b) holds the magnitude near the physical ideal,
-    and (c) keeps a smooth gradient everywhere (vs the older
-    ``relu(margin - corr)`` hinge which had a flat dead zone above the
-    margin and a sharp kink at it). Net range is ``[0, 4]`` per residue:
+    Physics rationale — the equilibrium CA → Cβ vector lies at
+    ``|local_z| ≈ 1.20 ± 0.03 Å`` off the (N, CA, C) plane for any
+    natural tetrahedral CA (measured: 122/122 residues of PDB 11CF).
+    Penalising the squared distance to the *signed CCD value* (a) drives
+    the correct sign, (b) drives the magnitude to the biological ideal
+    rather than to a fictitious ``±1`` (the old hardcoded target had a
+    17 % systematic underbias), and (c) keeps a smooth gradient
+    everywhere (vs the older ``relu(margin − corr)`` hinge which had a
+    flat dead zone above the margin and a sharp kink at it). Net per-residue
+    range with ``|target| = 1.20``:
 
-      * Correct (local_z = +1, target = +1) → 0
-      * Cβ on the (N, CA, C) plane (local_z = 0) → 1
-      * Mirror (local_z = −1, target = +1) → 4
-      * Severe mispredict (local_z = −2) → 9
+      * Correct (local_z = +1.20, target = +1.20) → 0
+      * Cβ on the (N, CA, C) plane (local_z = 0) → 1.44
+      * Mirror (local_z = −1.20, target = +1.20) → 5.76
+      * Severe mispredict (local_z = −2) → 10.24
+
+    The pre-quadratic baseline measured on af3spec ckpt 8500 ranged
+    ~1.0–1.4 per residue (most predictions sat near the (N, CA, C)
+    plane with |local_z| ≈ 0.01 Å — the Cβ stereocentre had collapsed
+    rather than landed on the wrong side).
 
     Distance-based losses (smooth_lddt, distogram, bond) are invariant
     to reflection; the post-Kabsch diffusion MSE is the only other
