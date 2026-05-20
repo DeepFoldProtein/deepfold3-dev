@@ -1,0 +1,31 @@
+base: af3_rsf_25e5_c10_g35.yaml
+
+# `df3-fape-25e5-c10-g35` — replace chirality_loss + backbone_chirality_loss
+# with AF2 §4.2.7 FAPE on the diffusion training output.
+#
+# Why: df3-chiral 2026-05-19→20 (Cβ quadratic + backbone Cα-dihedral sin-match,
+# α=0.5+1.0) drove mirror_rate 38→5 % on Cβ but every 11CF inference ckpt
+# 8600→11000 still gave det(V·U^T) = −1 — backbone helix stayed mirror.
+# Diagnosis: Cβ stereocentre and backbone-trace handedness are decoupled
+# under distance/MSE losses. FAPE projects rep atoms into Gram-Schmidt
+# frames; mirrored frames flip handedness → per-pair error saturates →
+# strong global chirality gradient that AF2 had and AF3 dropped.
+#
+# Single-knob A/B vs `df3-chiral-25e5-c10-g35` ckpt 11000:
+#   chir/bb_chir off, FAPE on, everything else identical.
+#
+# Resume from chiral 11000 (warm — Cβ already converged, won't be undone
+# since correct Cβ → upright frame → FAPE = 0 on that token).
+#
+# Watch:
+#   * eval/fape: baseline ~0.6-0.8 → target < 0.2 (saturated)
+#   * det(V·U^T) on 11CF inference at step ~11500: −1 → +1 (binary verdict)
+#   * smooth_lddt regression < 0.05 (if >, drop α to 0.5)
+#   * tm_true: 0.20 → ↑
+
+training:
+  alpha_chirality: 0.0
+  alpha_backbone_chirality: 0.0
+  alpha_fape: 1.0
+  fape_clip_distance: 10.0
+  fape_normalize: true

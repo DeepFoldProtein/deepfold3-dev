@@ -666,6 +666,22 @@ class TrainingConfig:
     # missing gradient on backbone handedness. Off by default; flip on
     # (e.g. ``1.0``) for stage-1 mirror remediation.
     alpha_backbone_chirality: float = 0.0
+    # FAPE (Frame-Aligned Point Error) — AF2 §4.2.7. For every ordered
+    # token pair (i, j), projects token j's representative atom into
+    # token i's local rigid frame in both pred and GT, clamps the L2
+    # error at ``fape_clip_distance``, and (when ``fape_normalize``)
+    # divides by the clamp so the loss is dimensionless ``∈ [0, 1]``.
+    # The Gram-Schmidt frames encode chirality, so a mirrored prediction
+    # gives saturated loss everywhere — the gradient signal that diffusion
+    # MSE + smooth_lddt lacks (cf. ``df3-chiral`` 2026-05-19→20: Cβ-only
+    # and Cβ+backbone-Cα-dihedral chirality losses both failed to flip
+    # the helix on 11CF). Off by default; AF2 used ``0.5`` paired with
+    # ``alpha_distogram=0.3`` (our distogram is at ``0.03`` instead, so
+    # the FAPE/distogram ratio doesn't transfer — tune against
+    # ``alpha_diffusion=4.0`` instead).
+    alpha_fape: float = 0.0
+    fape_clip_distance: float = 10.0
+    fape_normalize: bool = True
     # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0
