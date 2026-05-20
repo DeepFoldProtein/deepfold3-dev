@@ -1,0 +1,39 @@
+base: af3_rsf_25e5_c10_g35.yaml
+
+# `df3-fape1c-25e5-c10-g35` — Option C: raw-Å FAPE w/ tail emphasis, K=1.
+#
+# Motivation: K=4 fape (α=1.0, clip=10, norm=True) at 300 step showed
+# 27% descent acceleration over K=1 but zero sample-level chirality
+# change on 11CF (5-sample proper count stuck at 1/5 = af3spec
+# baseline). Hypothesis: the saturated tail (clipping at 10 Å) is
+# where the mirror-induced per-pair error lives — those pairs see
+# zero gradient under clip=10.
+#
+# Option C: clip=20 (captures the tail), normalize=False (raw Å),
+# α=0.5 (AF2's original FAPE weight). Net per-pair contribution:
+#   * pair with err=5 Å: 5 × 0.5 = 2.5 (vs current 0.5/10 × 1 = 0.5,
+#     ~5× stronger)
+#   * pair with err=15 Å: was clipped at 10/10 = 1; now 15 × 0.5 = 7.5
+#     (~7.5× stronger, plus tail captured at all)
+# Overall ~5-10× signal increase concentrated on the tail.
+#
+# K=1 (rep-only) mode: ``fape_use_frame_atoms=false`` masks the three
+# frame-atom slots (N, CA, C) at the loss-time mask. Only the rep
+# atom (CB for protein, C1' for nucleic) is projected. K=4 expansion
+# yielded only +27% descent rate at 300 step with no sample-level
+# effect; K=1 + Option C tests whether raw signal amplification
+# (5-10× per pair) on the CB stereocentre channel alone suffices to
+# break the mirror saddle.
+#
+# Watch: smooth_lddt regression > 0.05 → drop α to 0.3; total loss
+# stability (FAPE contribution now in 4-6 range, comparable to
+# alpha_diffusion × diffusion_mse ≈ 4 × 130 = 520, so still small
+# fraction but no longer negligible).
+
+training:
+  alpha_chirality: 0.0
+  alpha_backbone_chirality: 0.0
+  alpha_fape: 0.5
+  fape_clip_distance: 20.0
+  fape_normalize: false
+  fape_use_frame_atoms: false

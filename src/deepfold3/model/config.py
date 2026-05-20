@@ -682,6 +682,15 @@ class TrainingConfig:
     alpha_fape: float = 0.0
     fape_clip_distance: float = 10.0
     fape_normalize: bool = True
+    # K=1 vs K=4 atom set per token. When True (default), FAPE projects
+    # all 4 fape atoms (frame_a, frame_b, frame_c, rep) into every
+    # frame, matching AF2's backbone-FAPE pattern. When False, the
+    # frame-atom slots (0-2) are masked out and only the rep slot
+    # (CB for protein, C1' for nucleic) is projected — same channel
+    # the K=1 predecessor (commit 96bc1ba) used. Featurizer always
+    # emits K=4 features; this flag is a runtime mask, so the same
+    # checkpoint can run either mode without re-featurizing.
+    fape_use_frame_atoms: bool = True
     # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0

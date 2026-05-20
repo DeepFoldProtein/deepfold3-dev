@@ -1590,12 +1590,19 @@ def diffusion_only_loss(
                 pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m.bool()
+            fape_mask_local = features["fape_atom_mask"].bool()
+            if not cfg.fape_use_frame_atoms:
+                # K=1 mode: zero out frame-atom slots (0..2), keep only
+                # the rep slot (3). Lets the same featurizer output run
+                # either K=1 or K=4 without re-emitting features.
+                fape_mask_local = fape_mask_local.clone()
+                fape_mask_local[..., :3] = False
             l_fape = fape_loss(
                 denoised,
                 gt_pos,
                 features["fape_token_index"],
                 features["fape_atom_index"],
-                features["fape_atom_mask"].bool(),
+                fape_mask_local,
                 features["frame_atom_index"],
                 features["frame_token_index"],
                 frm_m,
@@ -1835,12 +1842,16 @@ def training_loss(
                 pair_m = frm_m.unsqueeze(-1) & loss_seq_mask.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m_feat.bool()
+            fape_mask_local = features["fape_atom_mask"].bool()
+            if not cfg.fape_use_frame_atoms:
+                fape_mask_local = fape_mask_local.clone()
+                fape_mask_local[..., :3] = False
             l_fape = fape_loss(
                 denoised,
                 gt_pos,
                 features["fape_token_index"],
                 features["fape_atom_index"],
-                features["fape_atom_mask"].bool(),
+                fape_mask_local,
                 features["frame_atom_index"],
                 features["frame_token_index"],
                 frm_m,
