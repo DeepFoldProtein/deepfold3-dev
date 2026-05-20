@@ -357,6 +357,39 @@ class Featurizer:
         frames_mask = torch.from_numpy(frames_mask_np)
 
         # ------------------------------------------------------------------
+        # FAPE atom set — K=4 atoms per token projected into every frame.
+        # Slots 0..2 = frame atoms (a, b, c); slot 3 = rep atom.
+        # AF2 §4.2.7 backbone FAPE projected (N, CA, C); we add the rep
+        # (CB for protein, C1' for nucleic) on top to retain the local-
+        # stereocentre chirality channel the rep atom already carried.
+        # For tokens where the rep duplicates one of the frame atoms
+        # (GLY: rep=CA=frame[1]; nucleic: rep=C1'=frame[0]; ligand:
+        # rep=self-slot-0=frame[1]'s atom), slot 3 is masked out to
+        # avoid double-counting.
+        # ------------------------------------------------------------------
+        K_FAPE = 4
+        fape_atom_index_np = np.zeros((N, K_FAPE), dtype=np.int64)
+        fape_token_index_np = np.zeros((N, K_FAPE), dtype=np.int64)
+        fape_atom_mask_np = np.zeros((N, K_FAPE), dtype=bool)
+        fape_atom_index_np[:, 0:3] = frame_atom_index
+        fape_token_index_np[:, 0:3] = frame_token_index
+        fape_atom_index_np[:, 3] = token_to_rep_atom
+        fape_token_index_np[:, 3] = np.arange(N, dtype=np.int64)
+        # Per-slot atom presence via ref_mask gather.
+        for k in range(K_FAPE):
+            fape_atom_mask_np[:, k] = ref_mask[
+                fape_token_index_np[:, k], fape_atom_index_np[:, k]
+            ]
+        # Drop rep slot when it duplicates a frame slot (same token + atom).
+        rep_tok = fape_token_index_np[:, 3]
+        rep_atom_slot = fape_atom_index_np[:, 3]
+        for k in range(3):
+            dup = (fape_token_index_np[:, k] == rep_tok) & (
+                fape_atom_index_np[:, k] == rep_atom_slot
+            )
+            fape_atom_mask_np[dup, 3] = False
+
+        # ------------------------------------------------------------------
         # Chirality probe — per-token off-plane atom whose projection on
         # the local (N/CA/C) frame normal disambiguates L vs D (or
         # purine vs pyrimidine attachment, future). ``chirality_target``
@@ -450,6 +483,9 @@ class Featurizer:
             "frame_token_index": torch.from_numpy(frame_token_index),
             "chirality_atom_idx": torch.from_numpy(chirality_atom_idx_np),
             "chirality_target": torch.from_numpy(chirality_target_np),
+            "fape_atom_index": torch.from_numpy(fape_atom_index_np),
+            "fape_token_index": torch.from_numpy(fape_token_index_np),
+            "fape_atom_mask": torch.from_numpy(fape_atom_mask_np),
             "ref_pos": torch.from_numpy(ref_pos),
             "ref_mask": torch.from_numpy(ref_mask),
             "ref_element": torch.from_numpy(ref_element),
