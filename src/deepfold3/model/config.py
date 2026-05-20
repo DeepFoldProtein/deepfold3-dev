@@ -658,6 +658,14 @@ class TrainingConfig:
     # margin-free. The CCD ideal projection is ≈ ±0.95 Å so ``0.5`` flags
     # residues that have collapsed toward the (N, CA, C) plane.
     chirality_margin: float = 0.5
+    # Backbone-trace chirality loss weight — Cα 4-quadruplet pseudo-dihedral
+    # ``sin``-match. Complements ``alpha_chirality`` (which only fixes the
+    # local Cβ stereocentre): empirically, the Cβ loss drove mirror_rate
+    # 38→5 % on ``df3-chiral`` but ``det(V·U^T)`` stayed −1 for every
+    # inference ckpt (backbone helix still mirror). This term targets the
+    # missing gradient on backbone handedness. Off by default; flip on
+    # (e.g. ``1.0``) for stage-1 mirror remediation.
+    alpha_backbone_chirality: float = 0.0
     # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0

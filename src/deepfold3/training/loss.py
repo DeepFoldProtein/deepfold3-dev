@@ -971,6 +971,117 @@ def chirality_loss(
     return loss.to(out_dtype)
 
 
+def _ca_pseudo_dihedral(
+    p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor, p4: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Dihedral angle around the (p2, p3) axis using atan2.
+
+    Returns radians in ``[-π, π]``. Inputs broadcast like
+    ``[..., 3]`` and the angle is reduced over the last dim. Numerically
+    stable for the (rare) case ``|b2| ≈ 0``; otherwise this is the
+    textbook signed dihedral formula.
+    """
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b3 = p4 - p3
+    b2n = b2 / torch.linalg.norm(b2, dim=-1, keepdim=True).clamp(min=eps)
+    n1 = torch.cross(b1, b2, dim=-1)
+    n2 = torch.cross(b2, b3, dim=-1)
+    m1 = torch.cross(n1, b2n, dim=-1)
+    x = (n1 * n2).sum(-1)
+    y = (m1 * n2).sum(-1)
+    return torch.atan2(y, x)
+
+
+def backbone_chirality_loss(
+    pred_pos: torch.Tensor,    # [S, N, M, 3]
+    gt_pos: torch.Tensor,      # [N, M, 3]
+    atom_mask: torch.Tensor,   # [N, M] bool — gt atoms present
+    seq_mask: torch.Tensor,    # [N] bool
+    asym_id: torch.Tensor,     # [N] long
+    mol_type: torch.Tensor,    # [N] int
+    ca_slot: int = 1,
+) -> torch.Tensor:
+    """Backbone-trace chirality via Cα pseudo-dihedral sin matching.
+
+    The Cβ-based :func:`chirality_loss` only fixes the *local*
+    stereocentre — empirically the per-residue mirror_rate dropped from
+    38 % to 5 % over 2,000 steps on ``df3-chiral-25e5-c10-g35`` but the
+    *backbone trace* stayed mirror (``det(V·U^T) = -1.0`` for every
+    inference checkpoint 8600-10500; Cα-pseudo-dihedrals at residues
+    100-108 unchanged). The two chiralities are physically linked
+    (steric clash in the wrong combination) but the link is energetic,
+    not gradient-mediated under our loss menu.
+
+    This term closes that gap: for every four consecutive same-chain
+    protein Cα atoms it matches ``sin(pred_pseudo_dihedral)`` against
+    ``sin(gt_pseudo_dihedral).detach()`` quadratically. ``sin`` weights
+    α-helical residues most heavily (|sin(±50°)| ≈ 0.77) and naturally
+    fades to ~0 for β-strands (``sin(±180°) ≈ 0``) and loops
+    (``sin(near 0) ≈ 0``) — so the gradient targets exactly the
+    handedness-bearing segments without over-constraining ambiguous
+    backbone regions.
+
+    Args:
+        pred_pos: Predicted atom positions ``[S, N, M, 3]``.
+        gt_pos: Ground-truth atom positions ``[N, M, 3]``.
+        atom_mask: GT atom presence ``[N, M]`` bool.
+        seq_mask: Per-token valid mask ``[N]``.
+        asym_id: Per-token chain id ``[N]``; all four Cα of a
+            quadruplet must share it.
+        mol_type: ``[N]`` int; only ``MOL_PROTEIN`` tokens contribute.
+        ca_slot: Atom slot index of CA within each token's dense atom
+            layout. ``1`` for protein (``REF_ATOMS["ALA"] = [N, CA, C, O, CB]``).
+
+    Returns:
+        Scalar quadratic-mismatch loss in the input dtype. Zero when no
+        valid 4-Cα quadruplet exists.
+    """
+    out_dtype = pred_pos.dtype
+    N = pred_pos.shape[1]
+    if N < 4:
+        return pred_pos.new_zeros(())
+
+    is_prot = (mol_type == 0)  # MOL_PROTEIN = 0
+    # ``atom_mask`` may have been scaled by ``loss_weight_mask`` and is no
+    # longer a strict bool; treat any nonzero weight as "atom present".
+    ca_ok = atom_mask[:, ca_slot] > 0
+    valid = seq_mask & is_prot & ca_ok
+    # Same-chain quadruplet mask (all 4 share asym_id).
+    quad_chain_ok = (
+        (asym_id[:-3] == asym_id[1:-2])
+        & (asym_id[1:-2] == asym_id[2:-1])
+        & (asym_id[2:-1] == asym_id[3:])
+    )
+    quad_mask = (
+        valid[:-3] & valid[1:-2] & valid[2:-1] & valid[3:] & quad_chain_ok
+    )  # [N-3]
+    if not bool(quad_mask.any().item()):
+        return pred_pos.new_zeros(())
+
+    with torch.amp.autocast(device_type=pred_pos.device.type, enabled=False):
+        pred_ca = pred_pos.float()[:, :, ca_slot, :]  # [S, N, 3]
+        gt_ca = gt_pos.float()[:, ca_slot, :]          # [N, 3]
+
+        p1, p2, p3, p4 = pred_ca[:, :-3], pred_ca[:, 1:-2], pred_ca[:, 2:-1], pred_ca[:, 3:]
+        g1, g2, g3, g4 = gt_ca[:-3], gt_ca[1:-2], gt_ca[2:-1], gt_ca[3:]
+
+        pred_dih = _ca_pseudo_dihedral(p1, p2, p3, p4)        # [S, N-3]
+        with torch.no_grad():
+            gt_dih = _ca_pseudo_dihedral(g1, g2, g3, g4)      # [N-3]
+
+        sin_pred = torch.sin(pred_dih)
+        sin_gt = torch.sin(gt_dih).unsqueeze(0)                # [1, N-3]
+
+        loss_per = (sin_pred - sin_gt) ** 2                    # [S, N-3]
+        mask = quad_mask.float().unsqueeze(0).expand_as(loss_per)
+        n_valid = mask.sum().clamp(min=1)
+        loss = (loss_per * mask).sum() / n_valid
+
+    return loss.to(out_dtype)
+
+
 @torch.no_grad()
 def chirality_violation_rates(
     pred_pos: torch.Tensor,
@@ -1295,6 +1406,18 @@ def diffusion_only_loss(
             ).items():
                 components[k] = v.detach()
 
+        if cfg.alpha_backbone_chirality > 0 and "mol_type" in features:
+            l_bbchir = backbone_chirality_loss(
+                denoised,
+                gt_pos,
+                atom_mask,
+                features["seq_mask"].bool(),
+                features["asym_id"],
+                features["mol_type"],
+            )
+            components["backbone_chirality"] = l_bbchir.detach()
+            total = total + cfg.alpha_backbone_chirality * l_bbchir
+
     return total, components
 
 
@@ -1486,6 +1609,22 @@ def training_loss(
                     margin=cfg.chirality_margin,
                 )
             )
+
+        # Backbone-trace chirality: complements ``chirality_loss`` —
+        # the local Cβ term cannot move the Cα handedness, see commit
+        # log on ``df3-chiral`` 11CF inference (det(V·U^T) = -1 across
+        # mirror_rate 38→5 % training).
+        if cfg.alpha_backbone_chirality > 0 and "mol_type" in features:
+            l_bbchir = backbone_chirality_loss(
+                denoised,
+                gt_pos,
+                loss_atom_mask,
+                seq_mask.bool(),
+                features["asym_id"],
+                features["mol_type"],
+            )
+            losses["backbone_chirality"] = l_bbchir
+            total = total + cfg.alpha_backbone_chirality * l_bbchir
 
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]
