@@ -39,6 +39,79 @@ STD_AA = {
     "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
 }
 
+THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
+
+def needleman_wunsch(
+    s1: str,
+    s2: str,
+    match: int = 2,
+    mismatch: int = -1,
+    gap: int = -2,
+    include_mismatches: bool = True,
+) -> list[tuple[int, int]]:
+    """Global pairwise alignment via Needleman-Wunsch.
+
+    Returns the list of aligned position pairs ``(i, j)`` where ``s1[i]``
+    sits opposite ``s2[j]`` in the optimal alignment. Gap columns are
+    omitted. If ``include_mismatches`` is ``False``, only positions with
+    identical residues are returned (drop substitutions; keeps only the
+    high-confidence backbone of the alignment).
+
+    Time/space: ``O(n*m)``. For 200-residue proteins this is 40k cells —
+    negligible. Implemented in pure numpy without any external dep.
+    """
+    n, m = len(s1), len(s2)
+    score = np.zeros((n + 1, m + 1), dtype=np.int64)
+    score[:, 0] = np.arange(n + 1) * gap
+    score[0, :] = np.arange(m + 1) * gap
+    # 0 = diagonal (match/mismatch), 1 = up (gap in s2), 2 = left (gap in s1)
+    tb = np.zeros((n + 1, m + 1), dtype=np.int8)
+    tb[1:, 0] = 1
+    tb[0, 1:] = 2
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            diag = score[i - 1, j - 1] + (match if s1[i - 1] == s2[j - 1] else mismatch)
+            up = score[i - 1, j] + gap
+            left = score[i, j - 1] + gap
+            best = diag
+            move = 0
+            if up > best:
+                best = up
+                move = 1
+            if left > best:
+                best = left
+                move = 2
+            score[i, j] = best
+            tb[i, j] = move
+    # Traceback from (n, m) back to (0, 0)
+    pairs: list[tuple[int, int]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i == 0:
+            j -= 1
+            continue
+        if j == 0:
+            i -= 1
+            continue
+        t = tb[i, j]
+        if t == 0:
+            if include_mismatches or s1[i - 1] == s2[j - 1]:
+                pairs.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif t == 1:
+            i -= 1
+        else:
+            j -= 1
+    pairs.reverse()
+    return pairs
+
 
 def read_structure(path: Path) -> gemmi.Structure:
     """Load mmCIF (.cif or .cif.gz) or PDB into a gemmi structure."""
@@ -49,23 +122,63 @@ def read_structure(path: Path) -> gemmi.Structure:
     return gemmi.read_structure(s)
 
 
-def get_ca_with_label(path: Path, chain_id: str = "A") -> list[tuple[int, np.ndarray]]:
-    """Return list of ``(label_seq_id, np.array([x, y, z]))`` for std AA CA atoms."""
+def get_ca_with_label(path: Path, chain_id: str = "A") -> list[tuple[int, str, np.ndarray]]:
+    """Return ``[(label_seq_id, one_letter_code, np.array([x, y, z])), ...]`` for std AA CA atoms."""
     st = read_structure(path)
-    out: list[tuple[int, np.ndarray]] = []
+    out: list[tuple[int, str, np.ndarray]] = []
     for model in st:
         for chain in model:
             if chain.name != chain_id:
                 continue
             for r in chain:
-                if r.name.strip() not in STD_AA:
+                rn = r.name.strip()
+                if rn not in STD_AA:
                     continue
                 ca = r.find_atom("CA", "*")
                 if ca is None:
                     continue
-                out.append((r.label_seq, np.array([ca.pos.x, ca.pos.y, ca.pos.z])))
+                out.append((
+                    r.label_seq,
+                    THREE_TO_ONE[rn],
+                    np.array([ca.pos.x, ca.pos.y, ca.pos.z]),
+                ))
         break
     return out
+
+
+def build_residue_mapping(
+    ref_cas: list[tuple[int, str, np.ndarray]],
+    pred_cas: list[tuple[int, str, np.ndarray]],
+    method: str,
+) -> dict[int, int]:
+    """Return ``{ref_label_seq -> pred_label_seq}`` for aligned positions.
+
+    ``method='label_seq'``: take the intersection of the two
+    ``label_seq_id`` sets. Fast and correct when both files use the
+    same residue numbering scheme (default for our DeepFold3 inference
+    outputs — query.json sequence indexed from ``label_seq=1`` of the
+    full protein).
+
+    ``method='sequence'``: Needleman-Wunsch on the one-letter sequences
+    of the observed CAs. Robust to truncated / re-numbered prediction
+    chains, mutated residues, or chains taken from different SEQRES
+    indexing conventions. Returns matched positions only by default
+    (mismatches dropped — see ``needleman_wunsch(include_mismatches=False)``
+    in code if you need them).
+    """
+    if method == "label_seq":
+        ref_set = {ls for ls, _, _ in ref_cas}
+        pred_set = {ls for ls, _, _ in pred_cas}
+        common = ref_set & pred_set
+        return {ls: ls for ls in common}
+
+    if method == "sequence":
+        ref_seq = "".join(c for _, c, _ in ref_cas)
+        pred_seq = "".join(c for _, c, _ in pred_cas)
+        pairs = needleman_wunsch(ref_seq, pred_seq, include_mismatches=False)
+        return {ref_cas[i][0]: pred_cas[j][0] for i, j in pairs}
+
+    raise ValueError(f"unknown alignment method: {method!r}")
 
 
 def parse_helix_annotations(ref_path: Path) -> list[tuple[int, int]]:
@@ -133,8 +246,15 @@ def compute_helix_signs(coord_map: dict[int, np.ndarray], helices: list[tuple[in
     return out
 
 
-def measure_step(step_dir: Path, ref_map: dict[int, np.ndarray],
-                 ref_helix_signs, helix_min_match: float, n_samples: int):
+def measure_step(
+    step_dir: Path,
+    ref_cas: list[tuple[int, str, np.ndarray]],
+    ref_map: dict[int, np.ndarray],
+    ref_helix_signs,
+    helix_min_match: float,
+    n_samples: int,
+    align_method: str,
+):
     """Aggregate stats for one ``step_N`` directory (n_samples inferences)."""
     proper = 0
     rmsds_p: list[float] = []
@@ -145,29 +265,42 @@ def measure_step(step_dir: Path, ref_map: dict[int, np.ndarray],
         cif = step_dir / f"seed-42_sample-{i}" / "model.cif"
         if not cif.exists():
             continue
-        pred = get_ca_with_label(cif)
-        pred_map = {ls: xyz for ls, xyz in pred}
-        keys = sorted(k for k in ref_map if k in pred_map)
-        if not keys:
+        pred_cas = get_ca_with_label(cif)
+        pred_map = {ls: xyz for ls, _, xyz in pred_cas}
+        # ref_label_seq -> pred_label_seq mapping
+        mapping = build_residue_mapping(ref_cas, pred_cas, align_method)
+        # CA arrays for Kabsch — sorted by ref label_seq for determinism
+        ref_ls_sorted = sorted(mapping.keys())
+        if not ref_ls_sorted:
             continue
-        ra = np.array([ref_map[k] for k in keys])
-        pa = np.array([pred_map[k] for k in keys])
+        ra = np.array([ref_map[ls] for ls in ref_ls_sorted])
+        pa = np.array([pred_map[mapping[ls]] for ls in ref_ls_sorted])
         det, rp, ri = kabsch_det(ra, pa)
         if det > 0:
             proper += 1
             rmsds_p.append(rp)
         else:
             rmsds_m.append(ri)
-        # Per-helix sign match against ref
+        # Per-helix sign match: REF dihedral windows are indexed by REF
+        # label_seq; the matching pred window starts at mapping[ref_ls].
+        # All 4 consecutive REF positions must map to 4 CONSECUTIVE pred
+        # positions (i.e. no gap in the alignment within the window).
         matches_per_helix: list[float] = []
         for (_start, _end), ref_wins in ref_helix_signs.items():
             sample_match = []
             for ii, ref_d in ref_wins:
-                if all(j in pred_map for j in (ii, ii + 1, ii + 2, ii + 3)):
-                    pd = ca_pseudo_dihedral(
-                        pred_map[ii], pred_map[ii + 1], pred_map[ii + 2], pred_map[ii + 3]
-                    )
-                    sample_match.append(np.sign(pd) == np.sign(ref_d))
+                if not all(j in mapping for j in (ii, ii + 1, ii + 2, ii + 3)):
+                    continue
+                p_ls = [mapping[ii + k] for k in range(4)]
+                # Require pred positions to be consecutive — otherwise the
+                # 4-Cα dihedral is across a gap and not interpretable.
+                if any(p_ls[k + 1] - p_ls[k] != 1 for k in range(3)):
+                    continue
+                pd = ca_pseudo_dihedral(
+                    pred_map[p_ls[0]], pred_map[p_ls[1]],
+                    pred_map[p_ls[2]], pred_map[p_ls[3]],
+                )
+                sample_match.append(np.sign(pd) == np.sign(ref_d))
             if sample_match:
                 matches_per_helix.append(sum(sample_match) / len(sample_match))
         if matches_per_helix:
@@ -207,14 +340,20 @@ def main() -> None:
     ap.add_argument("--n-samples", type=int, default=30,
                     help="Samples per ckpt (must match --num-samples used at inference time).")
     ap.add_argument("--chain", default="A", help="Chain to compare. Default: A")
+    ap.add_argument("--align", choices=("label_seq", "sequence"), default="sequence",
+                    help="Residue-correspondence method. 'sequence' runs "
+                         "Needleman-Wunsch on the CA one-letter sequences "
+                         "(robust to renumbering / truncation); 'label_seq' "
+                         "intersects label_seq_id sets (fast, requires "
+                         "consistent numbering). Default: sequence.")
     ap.add_argument("--helix-min-match", type=float, default=0.8,
                     help="Per-helix sign-match threshold for the 'fully consistent' tally.")
     args = ap.parse_args()
 
     ref_cas = get_ca_with_label(args.ref, args.chain)
-    ref_map = {ls: xyz for ls, xyz in ref_cas}
+    ref_map = {ls: xyz for ls, _, xyz in ref_cas}
     helices = parse_helix_annotations(args.ref)
-    print(f"REF: {len(ref_cas)} CA atoms, label_seq {min(ref_map):d}-{max(ref_map):d}")
+    print(f"REF: {len(ref_cas)} CA atoms, label_seq {min(ref_map):d}-{max(ref_map):d}, align={args.align}")
     print(f"REF helices: {helices}")
     ref_helix_signs = compute_helix_signs(ref_map, helices)
     for (s, e), wins in ref_helix_signs.items():
@@ -231,7 +370,8 @@ def main() -> None:
         if not sub.exists():
             print(f"{step:>6} | (missing: {sub})")
             continue
-        r = measure_step(sub, ref_map, ref_helix_signs, args.helix_min_match, args.n_samples)
+        r = measure_step(sub, ref_cas, ref_map, ref_helix_signs,
+                         args.helix_min_match, args.n_samples, args.align)
         if r is None:
             print(f"{step:>6} | (no samples found)")
             continue
