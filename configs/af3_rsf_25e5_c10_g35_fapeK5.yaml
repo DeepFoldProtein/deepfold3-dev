@@ -43,19 +43,27 @@ base: af3_rsf_25e5_c10_g35.yaml
 #     distant; clip=10 would saturate cross-strand error early in
 #     training where strand_partner_O may be 15+ Å mis-placed).
 #
-# Resume strategy: from S3 ckpt 11000. Helix is already learned
-# (F1_H=0.49); we want to *add* strand signal, not relearn. New atom
-# slot enters via featurizer so featurized tensors get a new K dim
-# (4→5) — model+optim state load fine since FAPE doesn't touch any
-# learned parameter (it's a loss-only quantity).
+# Init strategy: from-scratch (random init), matching fapeS3.
+# Considered resume-from-S3-ckpt-11500 but rejected — S3's
+# coil-everywhere prior is baked into SF x average (c_{t+1} ≈ 0.0017
+# at step 11500), and the carbonyl O gradient is asking for a phase
+# change (commit to ψ≈+120° basin) that SF inertia would block for
+# ~580 step before x catches up. From-scratch gives the cleanest
+# 1-knob ablation vs S3 (same setup, atom set NCACO+CB vs NCAC+CB)
+# with no init confound; expected verdict in 200-500 step.
 #
-# Watch milestones:
-#   * step 11500: ``train/fape`` should descend below S3 plateau
-#     (~0.18) within ~1000 step.
-#   * step 13000: 9-target bench SS F1 — F1_β recall should climb
-#     above 0.10 if the carbonyl signal is doing its job.
-#   * step 15000: definitive A/B vs S3 at matched step.
-#     Expectation: F1_β 0.10 → 0.20+, F1_α stable at 0.50+.
+# Watch milestones (matched-step A/B against fapeS3 trajectory):
+#   * step 500-2000: F1_H should track or exceed S3 — the K=4 vs
+#     K=5 difference is +CB removal? no — K=5 is strict superset
+#     of K=4-AF2 (NCACO). vs S3 (NCAC+CB) trades CB-only for full
+#     N/CA/C/O + CB. CB stays; O is added. Helix learning should
+#     be ≥ S3.
+#   * step 5000: F1_β early differentiation. S3 had ~0.05 by 5000;
+#     K5 should be ≥ 0.10 if O carbonyl helps.
+#   * step 8500: same-step A/B vs S3 at S3's matched milestone.
+#     Expectation: F1_β 0.05 → 0.15+, F1_H within ±0.05 of S3 0.30.
+#   * step 11000: matched-step A/B at S3's verdict point.
+#     Expectation: F1_β 0.10 → 0.25+, F1_H comparable to S3 0.49.
 
 training:
   alpha_chirality: 0.0
