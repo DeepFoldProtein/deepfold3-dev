@@ -17,13 +17,15 @@ base: af3_rsf_25e5_c10_g35.yaml
 #     (~7.5× stronger, plus tail captured at all)
 # Overall ~5-10× signal increase concentrated on the tail.
 #
-# K=1 (rep-only) mode: ``fape_use_frame_atoms=false`` masks the three
-# frame-atom slots (N, CA, C) at the loss-time mask. Only the rep
-# atom (CB for protein, C1' for nucleic) is projected. K=4 expansion
-# yielded only +27% descent rate at 300 step with no sample-level
-# effect; K=1 + Option C tests whether raw signal amplification
-# (5-10× per pair) on the CB stereocentre channel alone suffices to
-# break the mirror saddle.
+# K=1 mode: ``fape_atom_set: "CA"`` keeps only slot 1 (= CA for
+# protein) and zeros all other slots at the loss-time mask. K=4/K=5
+# expansion yielded only +27% descent rate at 300 step with no
+# sample-level effect; K=1 + Option C tests whether raw signal
+# amplification (5-10× per pair) on a single backbone channel alone
+# suffices to break the mirror saddle. (NOTE: pre-2026-05-24 this
+# arm used the CB rep atom instead of CA; the new fape_atom_set
+# taxonomy doesn't carry "rep-only" as a named option so this is a
+# slight semantic shift from the original ablation.)
 #
 # Watch: smooth_lddt regression > 0.05 → drop α to 0.3; total loss
 # stability (FAPE contribution now in 4-6 range, comparable to
@@ -36,4 +38,4 @@ training:
   alpha_fape: 0.5
   fape_clip_distance: 20.0
   fape_normalize: false
-  fape_use_frame_atoms: false
+  fape_atom_set: "CA"

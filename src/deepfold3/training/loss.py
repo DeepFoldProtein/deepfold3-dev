@@ -718,6 +718,44 @@ def _tm_score_from_error(
     return per_alignment.max(dim=-1).values.mean()
 
 
+_FAPE_ATOM_SET_SLOTS: dict[str, tuple[int, ...]] = {
+    # Featurizer K=5 layout: 0=N, 1=CA, 2=C, 3=CB (rep), 4=O. Option
+    # names spell out the protein atom set; non-protein tokens take the
+    # corresponding frame-atom slots (e.g. slot 1 = C3' for nucleic).
+    "CA": (1,),                    # K=1 — frame centre only
+    "NCAC+CB": (0, 1, 2, 3),       # K=4 — historical S3 (CB, no O)
+    "NCACO": (0, 1, 2, 4),         # K=4 — AF2 §4.2.7 backbone FAPE
+    "NCACO+CB": (0, 1, 2, 3, 4),   # K=5 — AF2 backbone + CB (current default)
+}
+
+
+def _apply_fape_atom_set_mask(
+    mask: torch.Tensor,  # [N, K] bool
+    atom_set: str,
+) -> torch.Tensor:
+    """Zero per-slot mask entries outside the named atom subset.
+
+    Featurizer always emits K=5 slots; this restricts which contribute
+    per ``cfg.fape_atom_set`` so the same checkpoint can run any option
+    without re-featurising. See :class:`~deepfold3.model.config.TrainingConfig`.
+    """
+    try:
+        keep = _FAPE_ATOM_SET_SLOTS[atom_set]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown fape_atom_set={atom_set!r}; expected one of "
+            f"{sorted(_FAPE_ATOM_SET_SLOTS)}"
+        ) from exc
+    K = mask.shape[-1]
+    if len(keep) == K and all(k < K for k in keep):
+        return mask
+    keep_mask = torch.zeros(K, dtype=torch.bool, device=mask.device)
+    for k in keep:
+        if 0 <= k < K:
+            keep_mask[k] = True
+    return mask & keep_mask
+
+
 def fape_loss(
     pred_pos: torch.Tensor,          # [S, N, M, 3]
     gt_pos: torch.Tensor,            # [N, M, 3]
@@ -743,11 +781,16 @@ def fape_loss(
     optionally divides by ``clip_distance`` for a dimensionless
     ``[0, 1]`` value, then averages per-sample over valid entries.
 
-    K=4 in current featurizer: slots 0..2 are the frame's own (a, b, c)
+    K=5 in current featurizer: slots 0..2 are the frame's own (a, b, c)
     atoms (i.e. (N, CA, C) for protein, (C1', C3', C4') for nucleic),
     slot 3 is the rep atom (CB for protein, C1' for nucleic — when
     the rep duplicates a frame slot, the featurizer masks slot 3 out
-    via ``fape_atom_mask`` to avoid double-counting).
+    via ``fape_atom_mask`` to avoid double-counting), and slot 4 is
+    the backbone carbonyl O (protein only, AF2 §4.2.7 backbone
+    FAPE-equivalent). Slot 4 supervises the C=O direction (i.e. ψ
+    basin commit), which is the defining geometry for β-strand
+    cross-strand H-bond ladders and was the dominant missing signal
+    in the K=4 layout.
 
     Single-rep predecessor (commit 96bc1ba, 2026-05-20) projected only
     the rep atom per token. For helix mirror images the chirality
@@ -1590,13 +1633,9 @@ def diffusion_only_loss(
                 pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m.bool()
-            fape_mask_local = features["fape_atom_mask"].bool()
-            if not cfg.fape_use_frame_atoms:
-                # K=1 mode: zero out frame-atom slots (0..2), keep only
-                # the rep slot (3). Lets the same featurizer output run
-                # either K=1 or K=4 without re-emitting features.
-                fape_mask_local = fape_mask_local.clone()
-                fape_mask_local[..., :3] = False
+            fape_mask_local = _apply_fape_atom_set_mask(
+                features["fape_atom_mask"].bool(), cfg.fape_atom_set
+            )
             l_fape = fape_loss(
                 denoised,
                 gt_pos,
@@ -1842,10 +1881,9 @@ def training_loss(
                 pair_m = frm_m.unsqueeze(-1) & loss_seq_mask.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m_feat.bool()
-            fape_mask_local = features["fape_atom_mask"].bool()
-            if not cfg.fape_use_frame_atoms:
-                fape_mask_local = fape_mask_local.clone()
-                fape_mask_local[..., :3] = False
+            fape_mask_local = _apply_fape_atom_set_mask(
+                features["fape_atom_mask"].bool(), cfg.fape_atom_set
+            )
             l_fape = fape_loss(
                 denoised,
                 gt_pos,

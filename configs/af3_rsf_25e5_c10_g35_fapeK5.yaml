@@ -1,0 +1,66 @@
+base: af3_rsf_25e5_c10_g35.yaml
+
+# `df3-fapeK5-25e5-c10-g35` — S3 + carbonyl O (K=5, NCACO+CB atom set).
+#
+# S3 verdict at step 11000 (9-target bench, n=30/step):
+#   * F1_H (α-helix 8-state): 0.49   — solid helix learning, vs af3spec ~0.05
+#   * F1_α (3-state):         0.53   — 6× advantage over no-FAPE baseline
+#   * F1_β (3-state):         0.10   — flat throughout training
+#   * β recall:               ~0.04  — model rarely emits β at all
+#   * β precision:            ~0.30  — when it does call β, ~30% correct
+#
+# Low β F1 is recall-bound, not precision-bound — the model commits to
+# "coil everywhere except helix". Confusion matrix at step 10500 shows
+# GT-β residues map to coil ~88% / helix ~8% / β ~4%. "Helix eats
+# strand" is a minor effect (~8 pp); the dominant mode is **β never
+# being predicted at all**.
+#
+# Hypothesis: the missing supervision is **carbonyl O direction**.
+#   * β-strand definition = cross-strand backbone H-bond ladder, where
+#     amide N-H ··· O=C alignment between partner strands is the
+#     defining geometry.
+#   * H-bond donor (N): in K=4 FAPE as frame atom — supervised.
+#   * H-bond acceptor (O): not in K=4 FAPE — NOT directly supervised.
+#   * Carbonyl direction is set by ψ (N-CA-C-O dihedral), which only
+#     gets indirect supervision through N_{j+1} placement via peptide
+#     plane planarity. Insufficient gradient for the model to commit
+#     to ψ ≈ +120° (strand basin).
+#
+# Fix: ``fape_atom_set: "NCACO+CB"`` (K=5) — adds slot 4 = backbone O to
+# the projected atom set. AF2's §4.2.7 backbone FAPE used exactly
+# (N, CA, C, O); we now match that and additionally keep CB for the
+# chirality channel S3 needed.
+#
+# Sidechain (CG, OG, etc.) intentionally NOT in FAPE — smooth_lddt
+# covers heavy-atom local distances ≤15 Å, which should be enough
+# for sidechain packing supervision. FAPE's job is the rigid-body
+# frame, smooth_lddt's job is the cloud.
+#
+# Config rationale:
+#   * α=2.0, clip=20, norm=True (unchanged from S3) — proven operating
+#     point. clip=20 retained because strand H-bond supervision needs
+#     long-range pair gradient (partner strand O can be sequence-
+#     distant; clip=10 would saturate cross-strand error early in
+#     training where strand_partner_O may be 15+ Å mis-placed).
+#
+# Resume strategy: from S3 ckpt 11000. Helix is already learned
+# (F1_H=0.49); we want to *add* strand signal, not relearn. New atom
+# slot enters via featurizer so featurized tensors get a new K dim
+# (4→5) — model+optim state load fine since FAPE doesn't touch any
+# learned parameter (it's a loss-only quantity).
+#
+# Watch milestones:
+#   * step 11500: ``train/fape`` should descend below S3 plateau
+#     (~0.18) within ~1000 step.
+#   * step 13000: 9-target bench SS F1 — F1_β recall should climb
+#     above 0.10 if the carbonyl signal is doing its job.
+#   * step 15000: definitive A/B vs S3 at matched step.
+#     Expectation: F1_β 0.10 → 0.20+, F1_α stable at 0.50+.
+
+training:
+  alpha_chirality: 0.0
+  alpha_backbone_chirality: 0.0
+  alpha_fape: 2.0
+  fape_clip_distance: 20.0
+  fape_normalize: true
+  fape_atom_set: "NCACO+CB"

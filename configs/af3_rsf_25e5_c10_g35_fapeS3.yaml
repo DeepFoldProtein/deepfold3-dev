@@ -1,0 +1,57 @@
+base: af3_rsf_25e5_c10_g35.yaml
+
+# `df3-fapeS3-25e5-c10-g35` — Strategy S3: FAPE from step 0.
+#
+# Lessons from late-stage FAPE attempts (8500 step af3spec → various):
+#   * K=1 (α=1, clip=10, norm=T) for 1000 step: trunk learned, sample-level
+#     chirality unchanged (1/5 baseline). Diffusion noise→position
+#     mapping had already committed to mirror attractor.
+#   * K=4 (α=1, clip=10, norm=T) for 400 step: +27% loss descent, same
+#     1/5 chirality. Frame-atom channels too dilute in low-signal regime.
+#   * K=1+C (α=0.5, clip=20, norm=F) for 200 step: rapid FAPE descent
+#     (-3.2% relative / 60 step) but diff_mse +45% regression, mean RMSD
+#     12.64 → 13.03. Strong shock damaged diffusion training.
+#
+# Root cause: 8500 step no-FAPE training baked the mirror basin into the
+# diffusion head's noise→position mapping. Late-stage FAPE must either
+#   (a) gently nudge over many thousand step (slow, costly, uncertain), or
+#   (b) shock the system (we saw the cost).
+#
+# S3 hypothesis: FAPE from step 0 prevents mirror basin formation in the
+# first place. Diffusion head learns chirality-aware noise→position
+# mapping from inception, so no retrofit is needed.
+#
+# Config rationale:
+#   * α=2.0 norm=True clip=20: per-pair max contribution = 2.0 (bounded,
+#     no "too big" worry), per-pair gradient = α/clip = 0.1 (matches
+#     original K=1 magnitude in low-error regime). clip=20 covers err
+#     10-20 Å pairs that clip=10 saturates, important for early training
+#     where most errors are big.
+#   * fape_atom_set="NCAC+CB": K=4 N/CA/C/CB projection — the exact
+#     atom set this arm ran with (pre-2026-05-24 it was the only
+#     option, under the boolean fape_use_frame_atoms flag). Listed
+#     explicitly here so re-running the yaml reproduces the original
+#     run; for adding the carbonyl O signal use fape_strand.yaml
+#     (fape_atom_set="NCACO+CB").
+#   * AF2 used effective ~0.5 raw-Å × pair (= 0.5 grad magnitude); ours
+#     is 0.1 — gentler but constant across 9000 step accumulates.
+#
+# Commit cost: ~2 days × 12 nodes × 8 B200. Largest single experiment
+# attempted so far. Worth it: definitive test of "FAPE-from-start"
+# hypothesis vs the late-stage retrofit approach we've been doing.
+#
+# Watch milestones:
+#   * step 500-1000: 11CF inference baseline. Random init → all proper /
+#     mirror randomly mixed (no committed basin yet).
+#   * step 3000-5000: eval chirality stability. If model is learning
+#     correctly, all 5 samples → proper with mean RMSD descending.
+#   * step 8500: A/B against af3spec (no-FAPE) baseline at same step.
+#     Expected: K=4 from start has lower mean RMSD + 4-5/5 proper.
+
+training:
+  alpha_chirality: 0.0
+  alpha_backbone_chirality: 0.0
+  alpha_fape: 2.0
+  fape_clip_distance: 20.0
+  fape_normalize: true
+  fape_atom_set: "NCAC+CB"

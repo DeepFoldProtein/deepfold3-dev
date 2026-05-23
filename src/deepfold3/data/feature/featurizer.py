@@ -357,17 +357,21 @@ class Featurizer:
         frames_mask = torch.from_numpy(frames_mask_np)
 
         # ------------------------------------------------------------------
-        # FAPE atom set — K=4 atoms per token projected into every frame.
-        # Slots 0..2 = frame atoms (a, b, c); slot 3 = rep atom.
-        # AF2 §4.2.7 backbone FAPE projected (N, CA, C); we add the rep
-        # (CB for protein, C1' for nucleic) on top to retain the local-
+        # FAPE atom set — K=5 atoms per token projected into every frame.
+        # Slots 0..2 = frame atoms (a, b, c); slot 3 = rep atom; slot 4 =
+        # backbone carbonyl O (protein only). AF2 §4.2.7 backbone FAPE
+        # projects (N, CA, C, O); we mirror that and add the rep (CB for
+        # protein, C1' for nucleic) on top to retain the local-
         # stereocentre chirality channel the rep atom already carried.
-        # For tokens where the rep duplicates one of the frame atoms
-        # (GLY: rep=CA=frame[1]; nucleic: rep=C1'=frame[0]; ligand:
-        # rep=self-slot-0=frame[1]'s atom), slot 3 is masked out to
-        # avoid double-counting.
+        # Slot 4 supervises C=O direction (i.e. ψ commit) — the
+        # defining geometry for β-strand H-bond ladders that was
+        # missing in the K=4 layout. For tokens where the rep
+        # duplicates one of the frame atoms (GLY: rep=CA=frame[1];
+        # nucleic: rep=C1'=frame[0]; ligand: rep=self-slot-0=
+        # frame[1]'s atom), slot 3 is masked out to avoid double-
+        # counting. Slot 4 is masked for non-protein tokens.
         # ------------------------------------------------------------------
-        K_FAPE = 4
+        K_FAPE = 5
         fape_atom_index_np = np.zeros((N, K_FAPE), dtype=np.int64)
         fape_token_index_np = np.zeros((N, K_FAPE), dtype=np.int64)
         fape_atom_mask_np = np.zeros((N, K_FAPE), dtype=bool)
@@ -375,11 +379,19 @@ class Featurizer:
         fape_token_index_np[:, 0:3] = frame_token_index
         fape_atom_index_np[:, 3] = token_to_rep_atom
         fape_token_index_np[:, 3] = np.arange(N, dtype=np.int64)
+        # Slot 4: backbone O at REF_ATOMS slot 3 for protein. Ref_mask
+        # gating handles Gly-without-O / missing-atom; we still hard-
+        # mask non-protein tokens since slot index 3 means OP2 (RNA) or
+        # similar non-equivalent atoms for non-protein residues.
+        fape_atom_index_np[:, 4] = 3
+        fape_token_index_np[:, 4] = np.arange(N, dtype=np.int64)
         # Per-slot atom presence via ref_mask gather.
         for k in range(K_FAPE):
             fape_atom_mask_np[:, k] = ref_mask[
                 fape_token_index_np[:, k], fape_atom_index_np[:, k]
             ]
+        is_protein_np = tokens["mol_type"] == const.MOL_PROTEIN
+        fape_atom_mask_np[~is_protein_np, 4] = False
         # Drop rep slot when it duplicates a frame slot (same token + atom).
         rep_tok = fape_token_index_np[:, 3]
         rep_atom_slot = fape_atom_index_np[:, 3]
