@@ -79,36 +79,50 @@ _PDB_STUB_HEADER = (
 )
 
 
-def run_dssp(cif: Path) -> list[tuple[str, str]]:
+def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
     """Run ``mkdssp`` and return ``[(aa_one_letter, ss_code)]`` per residue.
 
-    mkdssp v4 is strict about PDB header sections; gemmi-written PDBs lack
-    several (COMPND, SOURCE, KEYWDS, EXPDTA, AUTHOR) which makes mkdssp
-    silently emit zero residues. We prepend a tiny stub header before
-    handing the file off — content of those records doesn't matter, just
-    their presence.
+    If ``cache`` is True (default), the DSSP text output is written next
+    to the input CIF as ``{cif.stem}.dssp`` and reused on subsequent
+    calls. mkdssp is the slow step (~300 ms / sample); caching makes
+    repeated analyses (e.g. re-plotting with different windows) instant.
+
+    mkdssp v4 is strict about PDB header sections; gemmi-written PDBs
+    lack several (COMPND, SOURCE, KEYWDS, EXPDTA, AUTHOR) which makes
+    mkdssp silently emit zero residues. We prepend a tiny stub header
+    before handing the file off — content of those records doesn't
+    matter, just their presence.
     """
-    import gemmi  # noqa: PLC0415
-    with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tf:
-        pdb_path = Path(tf.name)
-    with tempfile.NamedTemporaryFile(suffix=".dssp", mode="w", delete=False) as tf:
-        out_path = Path(tf.name)
-    try:
-        st = gemmi.read_structure(str(cif))
-        st.write_pdb(str(pdb_path))
-        body = pdb_path.read_text()
-        # Drop any HEADER/COMPND/etc gemmi wrote (keep only ATOM/TER/END)
-        keep_prefixes = ("ATOM", "HETATM", "TER", "END", "MODEL", "ENDMDL")
-        body_atoms = "\n".join(
-            line for line in body.splitlines() if line.startswith(keep_prefixes)
-        ) + "\n"
-        pdb_path.write_text(_PDB_STUB_HEADER + body_atoms)
-        subprocess.run([MKDSSP, str(pdb_path), str(out_path)],
-                       capture_output=True, text=True, check=False)
-        lines = out_path.read_text().splitlines()
-    finally:
-        pdb_path.unlink(missing_ok=True)
-        out_path.unlink(missing_ok=True)
+    cache_path = cif.with_suffix(".dssp")
+    if cache and cache_path.exists() and cache_path.stat().st_size > 0:
+        lines = cache_path.read_text().splitlines()
+    else:
+        import gemmi  # noqa: PLC0415
+        with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tf:
+            pdb_path = Path(tf.name)
+        with tempfile.NamedTemporaryFile(suffix=".dssp", mode="w", delete=False) as tf:
+            out_path = Path(tf.name)
+        try:
+            st = gemmi.read_structure(str(cif))
+            st.write_pdb(str(pdb_path))
+            body = pdb_path.read_text()
+            keep_prefixes = ("ATOM", "HETATM", "TER", "END", "MODEL", "ENDMDL")
+            body_atoms = "\n".join(
+                line for line in body.splitlines() if line.startswith(keep_prefixes)
+            ) + "\n"
+            pdb_path.write_text(_PDB_STUB_HEADER + body_atoms)
+            subprocess.run([MKDSSP, str(pdb_path), str(out_path)],
+                           capture_output=True, text=True, check=False)
+            dssp_text = out_path.read_text()
+            lines = dssp_text.splitlines()
+            if cache:
+                # Atomic write to avoid half-files if interrupted.
+                tmp = cache_path.with_suffix(".dssp.tmp")
+                tmp.write_text(dssp_text)
+                tmp.replace(cache_path)
+        finally:
+            pdb_path.unlink(missing_ok=True)
+            out_path.unlink(missing_ok=True)
     # Find header line "  #  RESIDUE AA STRUCTURE …"; data starts the next line.
     start = next((i for i, line in enumerate(lines)
                   if line.startswith("  #  RESIDUE")), -1)

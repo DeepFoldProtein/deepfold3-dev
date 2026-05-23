@@ -107,46 +107,77 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
     return out
 
 
-def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42):
-    """Aggregate per-class F1 + helix recovery for one ckpt."""
+def _per_sample(cif: Path, ref_res):
+    """Run DSSP + alignment + per-class F1 + helix recovery for one sample.
+
+    Pure function — safe to call from a thread/process pool. Returns the
+    aggregable data, or ``None`` if the sample is unusable.
+    """
+    res = align_and_score(cif, ref_res)
+    if res is None:
+        return None
+    pred_ss, ref_ss, _r, _p = res
+    per_class_8_, m8 = per_class_f1(pred_ss, ref_ss, DSSP_8)
+    pred_3 = [THREE_STATE[c] for c in pred_ss]
+    ref_3 = [THREE_STATE[c] for c in ref_ss]
+    per_class_3_, m3 = per_class_f1(pred_3, ref_3, ("α", "β", "c"))
+    return {
+        "pred_ss": pred_ss,
+        "ref_ss": ref_ss,
+        "n_aligned": len(pred_ss),
+        "per_class_8": per_class_8_,
+        "per_class_3": per_class_3_,
+        "macro_8": m8,
+        "macro_3": m3,
+        "helix_fractions": helix_recovery_fractions(ref_ss, pred_ss),
+    }
+
+
+def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
+                max_workers: int | None = None):
+    """Aggregate per-class F1 + helix recovery for one ckpt.
+
+    Parallelises DSSP + alignment across samples via a thread pool —
+    each call is dominated by ``mkdssp`` subprocess time, which
+    releases the GIL.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     f1_by_class_8 = {c: [] for c in DSSP_8}
     f1_by_class_3 = {c: [] for c in ("α", "β", "c")}
     macro_8 = []
     macro_3 = []
     helix_fractions: list[tuple[int, float]] = []
     counts_pred = Counter()
-    counts_ref_done = False
     counts_ref = Counter()
+    counts_ref_done = False
     n_aligned = 0
-    for i in range(n_samples):
-        cif = step_dir / f"seed-{seed}_sample-{i}" / "model.cif"
-        if not cif.exists():
+
+    cifs = [step_dir / f"seed-{seed}_sample-{i}" / "model.cif" for i in range(n_samples)]
+    cifs = [p for p in cifs if p.exists()]
+    if not cifs:
+        return None
+
+    with ThreadPoolExecutor(max_workers=max_workers or min(len(cifs), 32)) as ex:
+        results = list(ex.map(lambda c: _per_sample(c, ref_res), cifs))
+
+    for r in results:
+        if r is None:
             continue
-        res = align_and_score(cif, ref_res)
-        if res is None:
-            continue
-        pred_ss, ref_ss, _ref_idx, _pred_idx = res
-        n_aligned = len(pred_ss)
-        counts_pred.update(pred_ss)
+        n_aligned = r["n_aligned"]
+        counts_pred.update(r["pred_ss"])
         if not counts_ref_done:
-            counts_ref.update(ref_ss)
+            counts_ref.update(r["ref_ss"])
             counts_ref_done = True
-        # 8-state per-class F1
-        per_class, m8 = per_class_f1(pred_ss, ref_ss, DSSP_8)
-        for c, f in per_class.items():
-            if f == f:  # skip NaN
+        for c, f in r["per_class_8"].items():
+            if f == f:
                 f1_by_class_8[c].append(f)
-        macro_8.append(m8)
-        # 3-state
-        pred_3 = [THREE_STATE[c] for c in pred_ss]
-        ref_3 = [THREE_STATE[c] for c in ref_ss]
-        per_class_3_, m3 = per_class_f1(pred_3, ref_3, ("α", "β", "c"))
-        for c, f in per_class_3_.items():
+        macro_8.append(r["macro_8"])
+        for c, f in r["per_class_3"].items():
             if f == f:
                 f1_by_class_3[c].append(f)
-        macro_3.append(m3)
-        # Helix recovery
-        helix_fractions.extend(helix_recovery_fractions(ref_ss, pred_ss))
+        macro_3.append(r["macro_3"])
+        helix_fractions.extend(r["helix_fractions"])
     if not macro_8:
         return None
     return {
@@ -328,7 +359,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         ax8.plot(steps, f1_8_means[c], marker="o", label=c)
     ax8.set_xlabel("training step")
     ax8.set_ylabel("F1")
-    ax8.legend(fontsize=8, ncol=2)
+    ax8.legend(fontsize=8, ncol=1, loc="center left", bbox_to_anchor=(1.02, 0.5))
     ax8.grid(alpha=0.3)
 
     ax3.set_title("DSSP 3-state F1 (α=H+G+I+P, β=E+B, c=T+S+coil)")
@@ -337,7 +368,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     ax3.plot(steps, macro_3, marker="s", color="black", lw=2, label="macro 3-state")
     ax3.set_xlabel("training step")
     ax3.set_ylabel("F1")
-    ax3.legend(fontsize=8)
+    ax3.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     ax3.grid(alpha=0.3)
 
     fig.tight_layout()
@@ -355,8 +386,11 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     )
     print(f"wrote {prefix}_f1.png / .pdf / .npz")
 
-    # --- (2) Helix recovery histogram per step.
+    # --- (2) Helix recovery histogram per step (3D + 2D ridge).
     if helix_rows:
+        from matplotlib.collections import PolyCollection  # noqa: PLC0415
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401, PLC0415
+
         bins = np.linspace(0.0, 1.0001, 21)  # 20 bins on [0, 1]
         bin_centers = (bins[:-1] + bins[1:]) / 2
         per_step_counts = {}
@@ -364,6 +398,46 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
             recoveries = [r["recovery"] for r in helix_rows if r["step"] == step]
             counts, _ = np.histogram(recoveries, bins=bins)
             per_step_counts[step] = counts.astype(np.int64)
+
+        # 3D ridge / waterfall: one filled curve per step, stacked along Y axis.
+        # This is the OpenFold paper's Fig 4c presentation style — emphasises
+        # the bimodal "all-or-nothing" mass at 0.0 and 1.0 across training.
+        fig3d = plt.figure(figsize=(10, 6))
+        ax3d = fig3d.add_subplot(111, projection="3d")
+        ax3d.set_title("α-helix recovery histogram across training (3D ridge)")
+        verts = []
+        zs = []
+        for step in steps:
+            counts = per_step_counts[step].astype(float)
+            total = counts.sum()
+            if total == 0:
+                pmf = np.zeros_like(counts)
+            else:
+                pmf = counts / total
+            # Build polygon for this step's filled histogram in (x=bin, z=pmf) plane.
+            verts.append([(0.0, 0.0)]
+                         + list(zip(bin_centers, pmf, strict=True))
+                         + [(1.0, 0.0)])
+            zs.append(step)
+        poly = PolyCollection(verts, facecolors=plt.cm.viridis(
+            np.linspace(0, 1, len(steps))), edgecolors="black", linewidths=0.4, alpha=0.85)
+        ax3d.add_collection3d(poly, zs=zs, zdir="y")
+        ax3d.set_xlabel("recovery fraction")
+        ax3d.set_ylabel("training step")
+        ax3d.set_zlabel("probability mass")
+        ax3d.set_xlim(0, 1)
+        ax3d.set_ylim(min(zs), max(zs))
+        # Auto-scale z based on observed max pmf so all curves fit.
+        max_pmf = max((per_step_counts[s].astype(float) / max(per_step_counts[s].sum(), 1)).max()
+                      for s in steps if per_step_counts[s].sum() > 0)
+        ax3d.set_zlim(0, max_pmf * 1.05)
+        ax3d.view_init(elev=25, azim=-65)
+        fig3d.tight_layout()
+        fig3d.savefig(str(prefix) + "_helix3d.png", dpi=140)
+        fig3d.savefig(str(prefix) + "_helix3d.pdf")
+        plt.close(fig3d)
+
+        # Also keep the 2D overlay for quick scanning.
         fig2, ax = plt.subplots(figsize=(8, 5))
         ax.set_title("α-helix recovery histogram by training step")
         for step in steps:
@@ -375,7 +449,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
                     label=f"step {step}  (n={total})")
         ax.set_xlabel("recovery fraction (longest pred-H run / GT helix length)")
         ax.set_ylabel("probability mass")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
         ax.grid(alpha=0.3)
         fig2.tight_layout()
         fig2.savefig(str(prefix) + "_helix.png", dpi=140)
@@ -387,7 +461,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
             bin_centers=bin_centers,
             counts=np.array([per_step_counts[s] for s in steps]),
         )
-        print(f"wrote {prefix}_helix.png / .pdf / .npz")
+        print(f"wrote {prefix}_helix3d.png / .pdf  +  {prefix}_helix.png / .pdf / .npz")
 
 
 if __name__ == "__main__":
