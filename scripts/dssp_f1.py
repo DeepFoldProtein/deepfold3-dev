@@ -116,8 +116,15 @@ def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
             dssp_text = out_path.read_text()
             lines = dssp_text.splitlines()
             if cache:
-                # Atomic write to avoid half-files if interrupted.
-                tmp = cache_path.with_suffix(".dssp.tmp")
+                # Atomic write to avoid half-files if interrupted. PID +
+                # thread-id suffix avoids two writer processes racing on
+                # the same cache path (e.g. two ss_learning runs sharing
+                # a target ref).
+                import os  # noqa: PLC0415
+                import threading
+                tmp = cache_path.with_name(
+                    f"{cache_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                )
                 tmp.write_text(dssp_text)
                 tmp.replace(cache_path)
         finally:
@@ -143,23 +150,46 @@ def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
     return residues
 
 
-def per_class_f1(pred: list[str], gt: list[str], classes: tuple[str, ...]
-                 ) -> tuple[dict[str, float], float]:
-    """Per-class F1 + macro-F1 over the listed classes."""
-    f1s = {}
+def per_class_metrics(pred: list[str], gt: list[str], classes: tuple[str, ...]):
+    """Per-class precision / recall / F1 + macro-F1.
+
+    Returns ``(prec_dict, rec_dict, f1_dict, macro_f1)``. Entries are
+    ``NaN`` for classes absent from both pred and gt (no support).
+    """
+    prec_d: dict[str, float] = {}
+    rec_d: dict[str, float] = {}
+    f1_d: dict[str, float] = {}
     for c in classes:
         tp = sum(1 for p, g in zip(pred, gt, strict=True) if p == c and g == c)
         fp = sum(1 for p, g in zip(pred, gt, strict=True) if p == c and g != c)
         fn = sum(1 for p, g in zip(pred, gt, strict=True) if p != c and g == c)
         if tp + fp == 0 and tp + fn == 0:
-            f1s[c] = float("nan")
+            prec_d[c] = rec_d[c] = f1_d[c] = float("nan")
             continue
         prec = tp / (tp + fp) if tp + fp else 0.0
         rec = tp / (tp + fn) if tp + fn else 0.0
-        f1s[c] = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-    observed = [v for v in f1s.values() if v == v]  # drop NaN
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+        prec_d[c], rec_d[c], f1_d[c] = prec, rec, f1
+    observed = [v for v in f1_d.values() if v == v]
     macro = statistics.mean(observed) if observed else float("nan")
-    return f1s, macro
+    return prec_d, rec_d, f1_d, macro
+
+
+def confusion_matrix(pred: list[str], gt: list[str], classes: tuple[str, ...]
+                     ) -> dict[tuple[str, str], int]:
+    """``{(gt_class, pred_class): count}`` over the aligned positions."""
+    mat: dict[tuple[str, str], int] = {(g, p): 0 for g in classes for p in classes}
+    for p, g in zip(pred, gt, strict=True):
+        if g in classes and p in classes:
+            mat[(g, p)] += 1
+    return mat
+
+
+# Backward-compat shim — older callers expecting only (f1, macro).
+def per_class_f1(pred: list[str], gt: list[str], classes: tuple[str, ...]
+                 ) -> tuple[dict[str, float], float]:
+    _p, _r, f1_d, macro = per_class_metrics(pred, gt, classes)
+    return f1_d, macro
 
 
 def measure_pair(pred_cif: Path, ref_cif: Path) -> dict | None:

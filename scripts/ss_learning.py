@@ -44,7 +44,13 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 from check_chirality import needleman_wunsch  # noqa: E402
-from dssp_f1 import DSSP_8, THREE_STATE, per_class_f1, run_dssp  # noqa: E402
+from dssp_f1 import (  # noqa: E402
+    DSSP_8,
+    THREE_STATE,
+    confusion_matrix,
+    per_class_metrics,
+    run_dssp,
+)
 
 
 def align_and_score(pred_cif: Path, ref_res):
@@ -108,27 +114,26 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
 
 
 def _per_sample(cif: Path, ref_res):
-    """Run DSSP + alignment + per-class F1 + helix recovery for one sample.
-
-    Pure function — safe to call from a thread/process pool. Returns the
-    aggregable data, or ``None`` if the sample is unusable.
+    """Run DSSP + alignment + per-class P/R/F1 + helix recovery + confusion
+    matrix for one sample. Pure function — safe to call from a thread/
+    process pool. Returns ``None`` if the sample is unusable.
     """
     res = align_and_score(cif, ref_res)
     if res is None:
         return None
     pred_ss, ref_ss, _r, _p = res
-    per_class_8_, m8 = per_class_f1(pred_ss, ref_ss, DSSP_8)
+    p_8, r_8, f1_8, m8 = per_class_metrics(pred_ss, ref_ss, DSSP_8)
     pred_3 = [THREE_STATE[c] for c in pred_ss]
     ref_3 = [THREE_STATE[c] for c in ref_ss]
-    per_class_3_, m3 = per_class_f1(pred_3, ref_3, ("α", "β", "c"))
+    p_3, r_3, f1_3, m3 = per_class_metrics(pred_3, ref_3, ("α", "β", "c"))
+    conf_3 = confusion_matrix(pred_3, ref_3, ("α", "β", "c"))
     return {
         "pred_ss": pred_ss,
         "ref_ss": ref_ss,
         "n_aligned": len(pred_ss),
-        "per_class_8": per_class_8_,
-        "per_class_3": per_class_3_,
-        "macro_8": m8,
-        "macro_3": m3,
+        "prec_8": p_8, "rec_8": r_8, "f1_8": f1_8, "macro_8": m8,
+        "prec_3": p_3, "rec_3": r_3, "f1_3": f1_3, "macro_3": m3,
+        "confusion_3": conf_3,
         "helix_fractions": helix_recovery_fractions(ref_ss, pred_ss),
     }
 
@@ -143,10 +148,15 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    f1_by_class_8 = {c: [] for c in DSSP_8}
-    f1_by_class_3 = {c: [] for c in ("α", "β", "c")}
-    macro_8 = []
-    macro_3 = []
+    f1_8 = {c: [] for c in DSSP_8}
+    p_8 = {c: [] for c in DSSP_8}
+    r_8 = {c: [] for c in DSSP_8}
+    f1_3 = {c: [] for c in ("α", "β", "c")}
+    p_3 = {c: [] for c in ("α", "β", "c")}
+    r_3 = {c: [] for c in ("α", "β", "c")}
+    conf_3_total = {(g, p): 0 for g in ("α", "β", "c") for p in ("α", "β", "c")}
+    macro_8: list[float] = []
+    macro_3: list[float] = []
     helix_fractions: list[tuple[int, float]] = []
     counts_pred = Counter()
     counts_ref = Counter()
@@ -157,10 +167,8 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
     cifs = [p for p in cifs if p.exists()]
     if not cifs:
         return None
-
     with ThreadPoolExecutor(max_workers=max_workers or min(len(cifs), 32)) as ex:
         results = list(ex.map(lambda c: _per_sample(c, ref_res), cifs))
-
     for r in results:
         if r is None:
             continue
@@ -169,24 +177,37 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
         if not counts_ref_done:
             counts_ref.update(r["ref_ss"])
             counts_ref_done = True
-        for c, f in r["per_class_8"].items():
-            if f == f:
-                f1_by_class_8[c].append(f)
+        for c in DSSP_8:
+            for store, src in ((f1_8, "f1_8"), (p_8, "prec_8"), (r_8, "rec_8")):
+                v = r[src][c]
+                if v == v:
+                    store[c].append(v)
+        for c in ("α", "β", "c"):
+            for store, src in ((f1_3, "f1_3"), (p_3, "prec_3"), (r_3, "rec_3")):
+                v = r[src][c]
+                if v == v:
+                    store[c].append(v)
+        for k, v in r["confusion_3"].items():
+            conf_3_total[k] += v
         macro_8.append(r["macro_8"])
-        for c, f in r["per_class_3"].items():
-            if f == f:
-                f1_by_class_3[c].append(f)
         macro_3.append(r["macro_3"])
         helix_fractions.extend(r["helix_fractions"])
     if not macro_8:
         return None
+    def mean_or_nan(v):
+        return statistics.mean(v) if v else float("nan")
     return {
         "n_samples": len(macro_8),
         "n_aligned": n_aligned,
         "macro_f1_8": statistics.mean(macro_8),
         "macro_f1_3": statistics.mean(macro_3),
-        "f1_8": {c: (statistics.mean(v) if v else float("nan")) for c, v in f1_by_class_8.items()},
-        "f1_3": {c: (statistics.mean(v) if v else float("nan")) for c, v in f1_by_class_3.items()},
+        "f1_8":   {c: mean_or_nan(v) for c, v in f1_8.items()},
+        "prec_8": {c: mean_or_nan(v) for c, v in p_8.items()},
+        "rec_8":  {c: mean_or_nan(v) for c, v in r_8.items()},
+        "f1_3":   {c: mean_or_nan(v) for c, v in f1_3.items()},
+        "prec_3": {c: mean_or_nan(v) for c, v in p_3.items()},
+        "rec_3":  {c: mean_or_nan(v) for c, v in r_3.items()},
+        "confusion_3": conf_3_total,
         "counts_pred": counts_pred,
         "counts_ref": counts_ref,
         "helix_fractions": helix_fractions,
@@ -275,12 +296,22 @@ def main() -> None:
                 v = r["f1_3"][c]
                 if v == v:
                     agg_f1_3[c].append(v)
-            rows.append({
+            row = {
                 "step": step, "target": pdb, "macro_f1_8": r["macro_f1_8"],
                 "macro_f1_3": r["macro_f1_3"],
-                **{f"f1_{c}": r["f1_8"][c] for c in DSSP_8},
-                **{f"f1_3_{c}": r["f1_3"][c] for c in ("α", "β", "c")},
-            })
+            }
+            for c in DSSP_8:
+                row[f"f1_{c}"] = r["f1_8"][c]
+                row[f"prec_{c}"] = r["prec_8"][c]
+                row[f"rec_{c}"] = r["rec_8"][c]
+            for c in ("α", "β", "c"):
+                row[f"f1_3_{c}"] = r["f1_3"][c]
+                row[f"prec_3_{c}"] = r["prec_3"][c]
+                row[f"rec_3_{c}"] = r["rec_3"][c]
+            # 3x3 confusion matrix (counts) → flat keys
+            for (gt, pred), cnt in r["confusion_3"].items():
+                row[f"conf_gt{gt}_pred{pred}"] = cnt
+            rows.append(row)
             for gt_len, frac in r["helix_fractions"]:
                 helix_rows.append({"step": step, "target": pdb,
                                    "helix_len": gt_len, "recovery": frac})
@@ -299,9 +330,14 @@ def main() -> None:
         print()
 
     if args.out_csv:
-        cols = ["step", "target", "macro_f1_8", "macro_f1_3"] \
-               + [f"f1_{c}" for c in DSSP_8] \
-               + [f"f1_3_{c}" for c in ("α", "β", "c")]
+        cols = ["step", "target", "macro_f1_8", "macro_f1_3"]
+        for c in DSSP_8:
+            cols += [f"f1_{c}", f"prec_{c}", f"rec_{c}"]
+        for c in ("α", "β", "c"):
+            cols += [f"f1_3_{c}", f"prec_3_{c}", f"rec_3_{c}"]
+        for g in ("α", "β", "c"):
+            for p in ("α", "β", "c"):
+                cols.append(f"conf_gt{g}_pred{p}")
         with open(args.out_csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=cols)
             w.writeheader()
@@ -385,6 +421,66 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         macro_3=np.array(macro_3),
     )
     print(f"wrote {prefix}_f1.png / .pdf / .npz")
+
+    # --- (1b) Precision / Recall trajectories for the 3-state α and β.
+    # Diagnoses whether high F1 comes from precision (FP-controlled) or
+    # recall (FN-controlled), and exposes the "helix eats β" pattern
+    # via the confusion matrix entry conf_gtβ_predα / total_GT_β.
+    pr_3 = {c: ([], []) for c in classes_3}  # (prec, rec) lists per step
+    helix_eats_strand = []  # fraction of GT-β predicted as α, per step
+    strand_eats_helix = []  # fraction of GT-α predicted as β, per step
+    for step in steps:
+        per_step = [r for r in rows if r["step"] == step]
+        if not per_step:
+            for c in classes_3:
+                pr_3[c][0].append(float("nan"))
+                pr_3[c][1].append(float("nan"))
+            helix_eats_strand.append(float("nan"))
+            strand_eats_helix.append(float("nan"))
+            continue
+        for c in classes_3:
+            pr_3[c][0].append(np.nanmean([r[f"prec_3_{c}"] for r in per_step]))
+            pr_3[c][1].append(np.nanmean([r[f"rec_3_{c}"] for r in per_step]))
+        # Confusion-matrix-derived "eats" metrics: fraction of GT-β residues
+        # predicted as α across all (target, sample) pairs.
+        beta_total = sum(r["conf_gtβ_predα"] + r["conf_gtβ_predβ"] + r["conf_gtβ_predc"] for r in per_step)
+        alpha_total = sum(r["conf_gtα_predα"] + r["conf_gtα_predβ"] + r["conf_gtα_predc"] for r in per_step)
+        b2a = sum(r["conf_gtβ_predα"] for r in per_step)
+        a2b = sum(r["conf_gtα_predβ"] for r in per_step)
+        helix_eats_strand.append(b2a / beta_total if beta_total else float("nan"))
+        strand_eats_helix.append(a2b / alpha_total if alpha_total else float("nan"))
+    fig_pr, (axp, axr, axe) = plt.subplots(1, 3, figsize=(16, 5))
+    axp.set_title("Precision (3-state)")
+    axr.set_title("Recall (3-state)")
+    for c, color in zip(classes_3, ("tab:red", "tab:blue", "tab:gray"), strict=True):
+        axp.plot(steps, pr_3[c][0], marker="o", color=color, label=c)
+        axr.plot(steps, pr_3[c][1], marker="o", color=color, label=c)
+    for a in (axp, axr):
+        a.set_xlabel("training step")
+        a.set_ylabel("metric")
+        a.grid(alpha=0.3)
+        a.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    axe.set_title("Confusion: GT-β→pred-α (helix eats strand)\nand GT-α→pred-β")
+    axe.plot(steps, helix_eats_strand, marker="o", color="tab:red", label="GT-β predicted as α")
+    axe.plot(steps, strand_eats_helix, marker="s", color="tab:blue", label="GT-α predicted as β")
+    axe.set_xlabel("training step")
+    axe.set_ylabel("fraction of GT class")
+    axe.grid(alpha=0.3)
+    axe.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
+    fig_pr.tight_layout()
+    fig_pr.savefig(str(prefix) + "_pr.png", dpi=140)
+    fig_pr.savefig(str(prefix) + "_pr.pdf")
+    plt.close(fig_pr)
+    np.savez(
+        str(prefix) + "_pr.npz",
+        steps=np.array(steps),
+        classes_3=np.array(classes_3),
+        prec_3=np.array([pr_3[c][0] for c in classes_3]),
+        rec_3=np.array([pr_3[c][1] for c in classes_3]),
+        helix_eats_strand=np.array(helix_eats_strand),
+        strand_eats_helix=np.array(strand_eats_helix),
+    )
+    print(f"wrote {prefix}_pr.png / .pdf / .npz")
 
     # --- (2) Helix recovery histogram per step (3D + 2D ridge).
     if helix_rows:
