@@ -426,7 +426,10 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
                     and r["gdt_ts"] == r["gdt_ts"]]
         gdt_means.append(np.mean(per_step) if per_step else float("nan"))
     if any(v == v for v in gdt_means):
-        ax3.plot(steps, gdt_means, marker="^", color="black", lw=3, label="GDT-TS")
+        # zorder=0 so the F1 class curves sit on top — GDT-TS is the
+        # background reference, not the headline metric here.
+        ax3.plot(steps, gdt_means, marker="^", color="black", lw=3,
+                 zorder=0, label="GDT-TS")
     ax3.set_xlabel("training step")
     ax3.set_ylabel("F1  /  GDT-TS")
     ax3.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
