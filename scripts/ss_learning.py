@@ -51,6 +51,7 @@ from dssp_f1 import (  # noqa: E402
     per_class_metrics,
     run_dssp,
 )
+from gdt_ts import gdt_ts_for_pair  # noqa: E402
 
 
 def align_and_score(pred_cif: Path, ref_res):
@@ -113,10 +114,10 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
     return out
 
 
-def _per_sample(cif: Path, ref_res):
+def _per_sample(cif: Path, ref_res, ref_cif: Path):
     """Run DSSP + alignment + per-class P/R/F1 + helix recovery + confusion
-    matrix for one sample. Pure function — safe to call from a thread/
-    process pool. Returns ``None`` if the sample is unusable.
+    matrix + GDT-TS for one sample. Pure function — safe to call from a
+    thread / process pool. Returns ``None`` if the sample is unusable.
     """
     res = align_and_score(cif, ref_res)
     if res is None:
@@ -127,6 +128,7 @@ def _per_sample(cif: Path, ref_res):
     ref_3 = [THREE_STATE[c] for c in ref_ss]
     p_3, r_3, f1_3, m3 = per_class_metrics(pred_3, ref_3, ("α", "β", "c"))
     conf_3 = confusion_matrix(pred_3, ref_3, ("α", "β", "c"))
+    gdt_ts_v = gdt_ts_for_pair(cif, ref_cif)
     return {
         "pred_ss": pred_ss,
         "ref_ss": ref_ss,
@@ -135,11 +137,12 @@ def _per_sample(cif: Path, ref_res):
         "prec_3": p_3, "rec_3": r_3, "f1_3": f1_3, "macro_3": m3,
         "confusion_3": conf_3,
         "helix_fractions": helix_recovery_fractions(ref_ss, pred_ss),
+        "gdt_ts": gdt_ts_v if (gdt_ts_v is not None) else float("nan"),
     }
 
 
 def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
-                max_workers: int | None = None):
+                max_workers: int | None = None, ref_cif: Path | None = None):
     """Aggregate per-class F1 + helix recovery for one ckpt.
 
     Parallelises DSSP + alignment across samples via a thread pool —
@@ -168,7 +171,8 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
     if not cifs:
         return None
     with ThreadPoolExecutor(max_workers=max_workers or min(len(cifs), 32)) as ex:
-        results = list(ex.map(lambda c: _per_sample(c, ref_res), cifs))
+        results = list(ex.map(lambda c: _per_sample(c, ref_res, ref_cif), cifs))
+    gdt_vals: list[float] = []
     for r in results:
         if r is None:
             continue
@@ -192,6 +196,9 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
         macro_8.append(r["macro_8"])
         macro_3.append(r["macro_3"])
         helix_fractions.extend(r["helix_fractions"])
+        gt = r.get("gdt_ts", float("nan"))
+        if gt == gt:
+            gdt_vals.append(gt)
     if not macro_8:
         return None
     def mean_or_nan(v):
@@ -211,6 +218,7 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
         "counts_pred": counts_pred,
         "counts_ref": counts_ref,
         "helix_fractions": helix_fractions,
+        "gdt_ts": mean_or_nan(gdt_vals),
     }
 
 
@@ -284,7 +292,8 @@ def main() -> None:
             step_dir = infer / args.pattern.format(step=step)
             if not step_dir.exists():
                 continue
-            r = measure_one(step_dir, ref_dssp[pdb], args.n_samples, args.seed)
+            r = measure_one(step_dir, ref_dssp[pdb], args.n_samples, args.seed,
+                            ref_cif=_ref)
             if r is None:
                 continue
             agg_macro.append(r["macro_f1_3"])
@@ -299,6 +308,7 @@ def main() -> None:
             row = {
                 "step": step, "target": pdb, "macro_f1_8": r["macro_f1_8"],
                 "macro_f1_3": r["macro_f1_3"],
+                "gdt_ts": r.get("gdt_ts", float("nan")),
             }
             for c in DSSP_8:
                 row[f"f1_{c}"] = r["f1_8"][c]
@@ -318,6 +328,10 @@ def main() -> None:
         if not agg_macro:
             continue
         print(f"  macro F1 (3st): {statistics.mean(agg_macro):.4f}")
+        gdt_at_step = [r["gdt_ts"] for r in rows
+                       if r["step"] == step and r["gdt_ts"] == r["gdt_ts"]]
+        if gdt_at_step:
+            print(f"  GDT-TS:         {statistics.mean(gdt_at_step):.4f}")
         print("  per-class F1 (8st):")
         for c in DSSP_8:
             if not agg_f1_8[c]:
@@ -401,9 +415,20 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     ax3.set_title("DSSP 3-state F1 (α=H+G+I+P, β=E+B, c=T+S+coil)")
     for c, color in zip(classes_3, ("tab:red", "tab:blue", "tab:gray"), strict=True):
         ax3.plot(steps, f1_3_means[c], marker="o", color=color, label=c)
-    ax3.plot(steps, macro_3, marker="s", color="black", lw=2, label="macro 3-state")
+    ax3.plot(steps, macro_3, marker="s", color="dimgray", lw=1.5, label="macro 3-state")
+    # GDT-TS overlay (target-mean, Kabsch-superposed CA, cutoffs {1,2,4,8} Å).
+    # Plotted as the dominant black curve since it is the structure-accuracy
+    # summary; SS-F1 curves are class-level diagnostics.
+    gdt_means = []
+    for step in steps:
+        per_step = [r["gdt_ts"] for r in rows
+                    if r["step"] == step and "gdt_ts" in r
+                    and r["gdt_ts"] == r["gdt_ts"]]
+        gdt_means.append(np.mean(per_step) if per_step else float("nan"))
+    if any(v == v for v in gdt_means):
+        ax3.plot(steps, gdt_means, marker="^", color="black", lw=3, label="GDT-TS")
     ax3.set_xlabel("training step")
-    ax3.set_ylabel("F1")
+    ax3.set_ylabel("F1  /  GDT-TS")
     ax3.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     ax3.grid(alpha=0.3)
 
@@ -419,6 +444,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         classes_3=np.array(classes_3),
         f1_3=np.array([f1_3_means[c] for c in classes_3]),
         macro_3=np.array(macro_3),
+        gdt_ts=np.array(gdt_means),
     )
     print(f"wrote {prefix}_f1.png / .pdf / .npz")
 
