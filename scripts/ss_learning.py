@@ -35,8 +35,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import os
 import statistics
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -114,11 +117,99 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
     return out
 
 
+# Per-sample metric cache — sidecar ``ss_metrics.json`` next to each
+# ``model.cif``. Bump version when any computation in ``_per_sample``
+# changes (e.g. new metric, different alignment, DSSP version change).
+_SS_METRICS_VERSION = 1
+_SS_METRICS_FILENAME = "ss_metrics.json"
+
+
+def _serialize_metrics(r: dict) -> dict:
+    """``_per_sample`` dict → JSON-friendly form."""
+    return {
+        "_version": _SS_METRICS_VERSION,
+        "pred_ss": "".join(r["pred_ss"]),
+        "ref_ss": "".join(r["ref_ss"]),
+        "n_aligned": r["n_aligned"],
+        "prec_8": r["prec_8"], "rec_8": r["rec_8"], "f1_8": r["f1_8"],
+        "macro_8": r["macro_8"],
+        "prec_3": r["prec_3"], "rec_3": r["rec_3"], "f1_3": r["f1_3"],
+        "macro_3": r["macro_3"],
+        "confusion_3": {f"{g}|{p}": v for (g, p), v in r["confusion_3"].items()},
+        "helix_fractions": [list(t) for t in r["helix_fractions"]],
+        "gdt_ts": r["gdt_ts"],
+    }
+
+
+def _deserialize_metrics(d: dict) -> dict:
+    """JSON form → ``_per_sample`` dict."""
+    return {
+        "pred_ss": list(d["pred_ss"]),
+        "ref_ss": list(d["ref_ss"]),
+        "n_aligned": d["n_aligned"],
+        "prec_8": d["prec_8"], "rec_8": d["rec_8"], "f1_8": d["f1_8"],
+        "macro_8": d["macro_8"],
+        "prec_3": d["prec_3"], "rec_3": d["rec_3"], "f1_3": d["f1_3"],
+        "macro_3": d["macro_3"],
+        "confusion_3": {
+            tuple(k.split("|")): v for k, v in d["confusion_3"].items()
+        },
+        "helix_fractions": [tuple(t) for t in d["helix_fractions"]],
+        "gdt_ts": d["gdt_ts"],
+    }
+
+
+def _read_metric_cache(cif: Path):
+    """Return cached metrics for ``cif`` or ``None`` if absent / stale."""
+    path = cif.parent / _SS_METRICS_FILENAME
+    if not path.exists():
+        return None
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if d.get("_version") != _SS_METRICS_VERSION:
+        return None
+    try:
+        return _deserialize_metrics(d)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _write_metric_cache(cif: Path, r: dict) -> None:
+    """Atomic write of per-sample metrics next to ``cif``. PID + thread-id
+    tmp suffix mirrors the ``.dssp`` cache pattern to avoid clobbering
+    under concurrent writers (e.g. two ss_learning runs sharing a sample
+    dir, or our own ThreadPool firing on the same sample twice)."""
+    path = cif.parent / _SS_METRICS_FILENAME
+    tmp = path.with_name(
+        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    )
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(_serialize_metrics(r), fh)
+        tmp.replace(path)
+    except OSError:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _per_sample(cif: Path, ref_res, ref_cif: Path):
     """Run DSSP + alignment + per-class P/R/F1 + helix recovery + confusion
     matrix + GDT-TS for one sample. Pure function — safe to call from a
     thread / process pool. Returns ``None`` if the sample is unusable.
+
+    Results are memoised in a ``ss_metrics.json`` sidecar next to the
+    sample's ``model.cif``: a hit lets re-runs (e.g. extending the
+    ``--steps`` list incrementally) skip mkdssp + NW + GDT-TS entirely.
     """
+    cached = _read_metric_cache(cif)
+    if cached is not None:
+        return cached
     res = align_and_score(cif, ref_res)
     if res is None:
         return None
@@ -129,7 +220,7 @@ def _per_sample(cif: Path, ref_res, ref_cif: Path):
     p_3, r_3, f1_3, m3 = per_class_metrics(pred_3, ref_3, ("α", "β", "c"))
     conf_3 = confusion_matrix(pred_3, ref_3, ("α", "β", "c"))
     gdt_ts_v = gdt_ts_for_pair(cif, ref_cif)
-    return {
+    r = {
         "pred_ss": pred_ss,
         "ref_ss": ref_ss,
         "n_aligned": len(pred_ss),
@@ -139,6 +230,8 @@ def _per_sample(cif: Path, ref_res, ref_cif: Path):
         "helix_fractions": helix_recovery_fractions(ref_ss, pred_ss),
         "gdt_ts": gdt_ts_v if (gdt_ts_v is not None) else float("nan"),
     }
+    _write_metric_cache(cif, r)
+    return r
 
 
 def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
