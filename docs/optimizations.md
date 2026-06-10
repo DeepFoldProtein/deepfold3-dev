@@ -340,8 +340,19 @@ run should only ever read. `DEEPFOLD3_TRITON_NO_CACHE=1` (below) is a blunt esca
 
 Environment variables:
 
-- `DEEPFOLD3_TRITON_CACHE_DIR`: Override cache directory
-- `DEEPFOLD3_TRITON_NO_CACHE=1`: Disable caching (re-tune every run)
+- `DEEPFOLD3_TRITON_CACHE_DIR`: Override the cache directory (highest precedence).
+- `XDG_CACHE_HOME`: If `DEEPFOLD3_TRITON_CACHE_DIR` is unset, the cache lives under
+  `$XDG_CACHE_HOME/deepfold3-triton` (then falls back to `~/.cache/deepfold3-triton`).
+- `DEEPFOLD3_TRITON_NO_CACHE=1`: Disable caching (re-tune every run).
+
+> **Containers where `$HOME` is ephemeral (e.g. kakao).** The training image runs as a
+> user whose real `$HOME` (`/home/mpiuser`) is *not* the persistent volume — the PVC is
+> mounted at `/home/jovyan`. `Path.home()/.cache` would therefore land the cache on
+> ephemeral per-pod storage, so all 64 ranks would re-autotune and race-write. The cache
+> now honors `XDG_CACHE_HOME` (which the trainjob sets to `/home/jovyan/.cache`), and the
+> trainjob also sets `DEEPFOLD3_TRITON_CACHE_DIR=/home/jovyan/.cache/deepfold3-triton`
+> explicitly. Both point the cache at the shared PVC. Note this is a *different* cache from
+> Triton's own `TRITON_CACHE_DIR` (compiled binaries) — they must each be redirected.
 
 #### Warming the cache for non-B200 GPUs
 
