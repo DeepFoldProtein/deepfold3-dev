@@ -855,6 +855,7 @@ class Trainer:
                     act_rms = {}
                     if (
                         self._act_meter is not None
+                        and self.cfg.act_rms_log_interval > 0
                         and self.state.effective_step
                         % (self.cfg.log_interval * self.cfg.act_rms_log_interval)
                         == 0

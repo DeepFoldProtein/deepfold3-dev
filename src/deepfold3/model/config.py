@@ -808,6 +808,8 @@ class TrainingConfig:
     # gated. ``act_rms_log_interval = 10`` with the default ``log_interval = 1``
     # gives one ρ snapshot per 10 effective steps — sufficient for the
     # slow-dynamic depth profile, and reduces ~960 keys × 10 in WandB cost.
+    # ``<= 0`` skips the act_rms flush entirely (no emission); use
+    # ``log_activation_rms = False`` to also skip attaching/running the meter.
     act_rms_log_interval: int = 1
     uniform_recycle: bool = (
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
