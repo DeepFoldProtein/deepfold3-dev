@@ -518,7 +518,12 @@ def main(
             sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else [max_tokens]
         )
         batch = int(train_cfg.get("batch_size_per_rank", 2))
-        diff_bs = int(train_cfg.get("diffusion_batch_size", 8))
+        # Match training's PER-CHUNK diffusion size, not the full batch. Training
+        # splits diffusion_batch_size into diffusion_chunk_size-sized passes, so
+        # the diffusion kernels only ever see chunk_size samples per call. Warming
+        # the full unchunked batch both OOMs and warms the wrong shape.
+        full_diff = int(train_cfg.get("diffusion_batch_size", 8))
+        diff_bs = min(chunk_size, full_diff) if chunk_size and chunk_size > 0 else full_diff
         recycles = min(2, int(train_cfg.get("max_recycles", 2)))
         compute_conf = float(train_cfg.get("alpha_confidence", 0.0)) > 0
         # Default MSA depth = the fixed pool the trunk subsamples to (model.py).
