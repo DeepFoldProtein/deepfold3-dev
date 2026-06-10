@@ -206,18 +206,26 @@ def compute_ptm(
     pair_mask: torch.Tensor,
     max_error_bin: float = _DEFAULT_CFG.max_error_bin,
     num_bins: int = _DEFAULT_CFG.num_distogram_bins,
+    d0_seq_mask: torch.Tensor | None = None,
 ) -> float:
     """Compute predicted TM-score (pTM) for a single sample.
 
     Args:
         pae_logits: [N, N, num_bins] logits.
-        seq_mask: [N] float mask.
-        pair_mask: [N, N] float mask.
+        seq_mask: [N] float mask gating the per-row alignment + max.
+        pair_mask: [N, N] float mask for the row-wise j normalization.
+        d0_seq_mask: [N] float mask sizing the d0 token count. AF3 sizes d0 on
+            the count of *all valid tokens* (``seq_mask.sum()`` in
+            ``confidence_head._get_tmscore_adjusted_pae``), while the j-sum is
+            normalized over frame-bearing tokens (``pair_mask``). Pass the full
+            token mask here when ``seq_mask``/``pair_mask`` are frame-restricted.
+            Defaults to ``seq_mask`` (frame count) for backward compatibility.
 
     Returns:
         pTM score (scalar).
     """
-    N = int(seq_mask.sum().item())
+    d0_mask = seq_mask if d0_seq_mask is None else d0_seq_mask
+    N = int(d0_mask.sum().item())
     tm_adj = _compute_tm_adjusted_pae(pae_logits, N, max_error_bin, num_bins)
 
     # Normalise row-wise
@@ -238,6 +246,7 @@ def compute_iptm(
     asym_id: torch.Tensor,
     max_error_bin: float = _DEFAULT_CFG.max_error_bin,
     num_bins: int = _DEFAULT_CFG.num_distogram_bins,
+    d0_pair_mask: torch.Tensor | None = None,
 ) -> float:
     """Compute interface predicted TM-score (ipTM) for a single sample.
 
@@ -270,11 +279,16 @@ def compute_iptm(
     if interface_mask.sum() == 0:
         return float("nan")
 
+    # AF3 sizes the per-pair d0 token count on all valid tokens (the seq_mask
+    # pair mask in confidence_head), while the final j-sum is normalized over
+    # frame-bearing tokens (``interface_mask``). ``d0_pair_mask`` carries the
+    # full token pair mask; falls back to ``pair_mask`` for backward compat.
+    count_mask = pair_mask if d0_pair_mask is None else d0_pair_mask
     x = same_chain.float()
-    num_chain_tokens = (x * pair_mask).sum(dim=-1)  # [N]
+    num_chain_tokens = (x * count_mask).sum(dim=-1)  # [N]
     num_interface_tokens = num_chain_tokens.unsqueeze(0) + num_chain_tokens.unsqueeze(-1)  # [N, N]
     num_interface_tokens = num_interface_tokens - x * (num_interface_tokens.long() // 2).float()
-    num_interface_tokens = num_interface_tokens * pair_mask
+    num_interface_tokens = num_interface_tokens * count_mask
 
     tm_adj = _compute_tm_adjusted_pae(pae_logits, num_interface_tokens, max_error_bin, num_bins)
 
@@ -570,10 +584,14 @@ def save_confidences_json(
         pae_sample = pae_full[sample_idx].cpu()
         result["pae"] = [[round(float(v), 2) for v in row] for row in pae_sample]
 
-        # pTM and ipTM (using frames_mask to exclude frameless tokens)
+        # pTM and ipTM: normalize the j-sum over frame-bearing tokens
+        # (tm_mask/tm_pair_mask), but size d0 on all valid tokens (seq_mask/
+        # pair_mask), matching AF3 confidence_head._get_tmscore_adjusted_pae.
         pae_logits_s = output.pae[sample_idx]
-        ptm = compute_ptm(pae_logits_s, tm_mask, tm_pair_mask, max_error_bin, num_bins)
-        iptm = compute_iptm(pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins)
+        ptm = compute_ptm(pae_logits_s, tm_mask, tm_pair_mask, max_error_bin, num_bins, d0_seq_mask=seq_mask)
+        iptm = compute_iptm(
+            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_pair_mask=pair_mask
+        )
     else:
         ptm = 0.0
         iptm = float("nan")
