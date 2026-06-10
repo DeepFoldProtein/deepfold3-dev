@@ -211,32 +211,39 @@ class Featurizer:
             ref_charge[i] = ref_atom_data.charge
             ref_atom_name_chars[i] = ref_atom_data.atom_name_chars
 
-        # Apply random augmentation grouped by ref_space_uid.
-        # For polymer tokens each gets independent augmentation.
-        # For ligand tokens all tokens sharing the same uid get the same rotation+translation.
-        if random_rot:
-            unique_uids = np.unique(ref_space_uid[:, 0])
-            for uid in unique_uids:
-                uid_mask = ref_space_uid[:, 0] == uid
-                uid_indices = np.where(uid_mask)[0]
+        # Reference conformers are centered per ref_space_uid group for BOTH
+        # training and inference (so embed_ref_pos sees the same distribution).
+        # During training the centered coordinates additionally get a random
+        # rotation + translation as data augmentation (shared within a ligand's
+        # ref_space_uid group); at inference we center only.
+        # Polymer tokens each get an independent uid; ligand tokens of one
+        # residue share a uid and thus the same transform.
+        unique_uids = np.unique(ref_space_uid[:, 0])
+        for uid in unique_uids:
+            uid_mask = ref_space_uid[:, 0] == uid
+            uid_indices = np.where(uid_mask)[0]
 
-                # Collect all valid positions across tokens in this group
-                all_valid_pos = []
-                for idx in uid_indices:
-                    valid = ref_mask[idx].astype(bool)
-                    if valid.any():
-                        all_valid_pos.append(ref_pos[idx][valid])
+            # Collect all valid positions across tokens in this group
+            all_valid_pos = []
+            for idx in uid_indices:
+                valid = ref_mask[idx].astype(bool)
+                if valid.any():
+                    all_valid_pos.append(ref_pos[idx][valid])
 
-                if not all_valid_pos:
-                    continue
+            if not all_valid_pos:
+                continue
 
-                all_valid = np.concatenate(all_valid_pos, axis=0)
-                center = all_valid.mean(axis=0)
+            all_valid = np.concatenate(all_valid_pos, axis=0)
+            center = all_valid.mean(axis=0)
+
+            if random_rot:
                 rot = _random_rotation_matrix(rng)
                 translation = rng.standard_normal(3).astype(np.float32)
-
                 for idx in uid_indices:
                     ref_pos[idx] = (ref_pos[idx] - center) @ rot.T + translation
+            else:
+                for idx in uid_indices:
+                    ref_pos[idx] = ref_pos[idx] - center
 
         # ------------------------------------------------------------------
         # MSA features
