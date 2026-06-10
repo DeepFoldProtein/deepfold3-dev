@@ -307,10 +307,36 @@ Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (
   persistent cache and, if a config is present, injects it directly into Triton's internal
   `Autotuner.cache` so the benchmark phase is skipped entirely. This is what makes warmup
   worth running before training.
-- **B200 hardcoded table**: `cache.py:B200_PRETUNED` ships with autotuned configs for every
-  bucket size in `BUCKET_SIZES ≤ 384` × every (M, N, K) shape the model uses. On B200 the
-  table is loaded into `mgr._caches` at decorator-import time, so a fresh-cache machine pays
-  zero autotune cost on first training run.
+- **B200 hardcoded table (legacy fallback, slated for removal)**: `cache.py:B200_PRETUNED`
+  ships autotuned configs for `BUCKET_SIZES ≤ 384` × the model's (M, N, K) shapes, seeded
+  into `mgr._caches` at import so a fresh B200 with an empty cache pays no autotune cost.
+  It is **incomplete** (`_attn_bwd_db` has 0 configs and still sweeps; crops > 384 are not
+  covered) and is ~2,200 lines of hardcoded numbers to maintain. With a **shared/persistent
+  cache + warmup (below)** it is redundant — keep it only until warmup is wired into the job
+  launch, then delete it.
+
+#### Recommended workflow: warmup once, read from a shared cache
+
+This is the canonical path; it makes `B200_PRETUNED` unnecessary.
+
+1. Point `~/.cache/deepfold3-triton/` (or `DEEPFOLD3_TRITON_CACHE_DIR`) at **shared storage**
+   mounted by every node — or bake a warmed cache into the training container image.
+2. Run warmup **once, on a single rank**, with the production config (so the *enabled*
+   kernels and the crop buckets you actually train at are covered):
+
+   ```bash
+   deepfold3 warmup-triton --config configs/initial.yaml
+   ```
+
+3. Every node and every later job then **reads** the persisted configs at startup (lazy
+   load + pre-hook injection, `cache.py:204`) and skips autotuning entirely. The read is a
+   plain JSON load, so it works over NFS/shared FS.
+
+**Caveat — no cache misses during DDP.** Writes happen only on a miss, and many ranks
+missing the *same* shape will write the *same* shared JSON concurrently (the file lock is
+in-process, not cross-node) — a corruption/race risk. So warmup must cover **all** buckets
+you will hit (384 today; also 640/768 if you move to larger crops). After warmup, the DDP
+run should only ever read. `DEEPFOLD3_TRITON_NO_CACHE=1` (below) is a blunt escape hatch.
 
 Environment variables:
 
