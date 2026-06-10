@@ -31,6 +31,27 @@ except ImportError:  # pragma: no cover - triton required on training GPUs
     _HAS_TRITON = False
 
 
+# Dedicated RNG for dropout-mask seeds. Drawing each per-call seed from a private
+# generator (rather than the global default) keeps the ~244 draws/step from
+# perturbing the global CPU RNG stream that the data pipeline and other torch
+# randomness depend on, while still inheriting the per-rank offset that
+# ``seed_everything`` bakes in via ``torch.manual_seed(seed + rank)`` — so
+# ``torch.initial_seed()`` already differs across DDP ranks and masks stay
+# rank-independent. A plain CPU ``randint`` (~2 us) is cheaper than drawing the
+# seed on-GPU (~10 us, kernel-launch bound), so the seed itself is never a
+# bottleneck. Lazily seeded on first use to capture the startup global seed.
+_seed_generator: torch.Generator | None = None
+
+
+def _next_mask_seed() -> int:
+    """Draw a dropout-mask seed from the isolated, rank-aware generator."""
+    global _seed_generator
+    if _seed_generator is None:
+        _seed_generator = torch.Generator(device="cpu")
+        _seed_generator.manual_seed(torch.initial_seed())
+    return int(torch.randint(0, 2**31 - 1, (1,), generator=_seed_generator).item())
+
+
 if _HAS_TRITON:
 
     @triton.jit
@@ -125,7 +146,7 @@ if _HAS_TRITON:
             CD = C * D
             shared_stride = CD if rowwise else (R * D)
 
-            seed = torch.randint(0, 2**31 - 1, (1,), device="cpu").item()
+            seed = _next_mask_seed()
             out = torch.empty_like(x)
             BLOCK = 1024
             grid = ((N_total + BLOCK - 1) // BLOCK,)
