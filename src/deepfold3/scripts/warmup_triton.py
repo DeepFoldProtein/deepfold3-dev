@@ -333,6 +333,110 @@ def warmup_buckets(
     logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
 
 
+def _load_training_overrides(config_path: str | None) -> dict:
+    """Return the ``training`` section of a config (empty dict if none)."""
+    if not config_path:
+        return {}
+    from deepfold3.config_loader import load_config
+
+    return load_config(config_path).get("training", {}) or {}
+
+
+def _synthetic_training_features(n_pad: int, batch: int, n_msa: int, device: torch.device) -> dict:
+    """Batched ``[B, N, ...]`` features (with GT) to drive ``forward_training``.
+
+    Values are random within valid index ranges — only the shapes matter for
+    warmup, so this exactly reproduces the (M, N, K) and kernel specializations
+    the real training step hits at this bucket, without needing real data.
+    """
+    from deepfold3.data import const
+
+    B, N, M, S = batch, n_pad, const.MAX_ATOMS_PER_TOKEN, n_msa
+    g = torch.Generator().manual_seed(0)
+    ref_mask = torch.zeros(B, N, M, dtype=torch.bool)
+    ref_mask[..., :5] = True  # 5 heavy atoms per token
+    arange_bn = torch.arange(N).unsqueeze(0).expand(B, N).contiguous()
+
+    def ri(hi, *shape):
+        return torch.randint(0, hi, shape, generator=g)
+
+    feats = {
+        "res_type": ri(20, B, N),
+        "residue_index": arange_bn.clone(),
+        "token_index": arange_bn.clone(),
+        "asym_id": torch.zeros(B, N, dtype=torch.long),
+        "entity_id": torch.ones(B, N, dtype=torch.long),
+        "sym_id": torch.ones(B, N, dtype=torch.long),
+        "seq_mask": torch.ones(B, N, dtype=torch.bool),
+        "pair_mask": torch.ones(B, N, N, dtype=torch.bool),
+        "ref_pos": torch.randn(B, N, M, 3, generator=g) * ref_mask.unsqueeze(-1).float(),
+        "ref_mask": ref_mask,
+        "ref_element": ri(8, B, N, M) * ref_mask.long(),
+        "ref_charge": torch.zeros(B, N, M),
+        "ref_atom_name_chars": torch.zeros(B, N, M, 4, dtype=torch.long),
+        "msa": ri(22, B, S, N),
+        "msa_mask": torch.ones(B, S, N, dtype=torch.bool),
+        "deletion_matrix": torch.zeros(B, S, N, dtype=torch.long),
+        "profile": torch.zeros(B, N, 31),
+        "deletion_mean": torch.zeros(B, N),
+        "atom_gt_positions": torch.randn(B, N, M, 3, generator=g) * ref_mask.unsqueeze(-1).float(),
+        "atom_gt_mask": ref_mask.clone(),
+        "mol_type": torch.zeros(B, N, dtype=torch.long),
+    }
+    return {k: v.to(device) for k, v in feats.items()}
+
+
+def warmup_real_model(
+    mcfg,
+    buckets: Iterable[int],
+    batch: int,
+    n_msa: int,
+    diffusion_batch_size: int,
+    num_recycles: int,
+    compute_confidence: bool,
+    device: torch.device,
+) -> None:
+    """Warm the cache by driving the real model's ``forward_training`` + backward.
+
+    Guarantees the cached (M, N, K) shapes and kernel specializations exactly
+    match training — no hand-maintained shape list to drift out of sync.
+    """
+    from deepfold3.model.model import DeepFold3
+    from deepfold3.model.triton.cache import CacheManager
+
+    logger.info("Real-model warmup: forward_training + backward at the production shapes")
+    model = DeepFold3(mcfg).to(device)
+    model.train()
+    for n_pad in buckets:
+        logger.info(
+            f"=== real-model: N={n_pad} batch={batch} S_msa={n_msa} "
+            f"S_diff={diffusion_batch_size} recycles={num_recycles} conf={compute_confidence} ==="
+        )
+        feats = _synthetic_training_features(n_pad, batch, n_msa, device)
+        t0 = time.time()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model.forward_training(
+                feats,
+                num_recycles=num_recycles,
+                diffusion_batch_size=diffusion_batch_size,
+                mini_rollout_steps=2,
+                mini_rollout_samples=1,
+                compute_confidence=compute_confidence,
+            )
+        # Drive a backward so the bwd kernels warm too (they have their own keys).
+        loss = sum(
+            v.float().pow(2).mean()
+            for v in out.values()
+            if torch.is_tensor(v) and v.is_floating_point() and v.requires_grad
+        )
+        loss.backward()
+        torch.cuda.synchronize()
+        model.zero_grad(set_to_none=True)
+        logger.info(f"  fwd+bwd N={n_pad} → {time.time() - t0:.1f}s")
+    CacheManager.get().save_all()
+    logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
+
+
 @cli.command(name="warmup-triton")
 @click.option(
     "--config",
@@ -366,25 +470,73 @@ def warmup_buckets(
     ),
 )
 @click.option("--skip-gemm", is_flag=True, help="Skip the layernorm_linear / ada_layernorm_linear kernels.")
+@click.option(
+    "--real-model",
+    is_flag=True,
+    help=(
+        "Warm by driving the real model's forward_training + backward at the "
+        "production shapes (uses --config's max_tokens / batch_size_per_rank / "
+        "diffusion params). Guarantees the cached shapes exactly match training "
+        "— no synthetic-shape-list drift. Default buckets = [max_tokens]."
+    ),
+)
+@click.option(
+    "--msa-depth",
+    type=int,
+    default=None,
+    help=(
+        "MSA rows for --real-model synthetic features. Defaults to the config's "
+        "model.msa_crop_size — the fixed pool the trunk subsamples to — so the "
+        "MSA-track kernels warm at the depth training uses. Lower it if the "
+        "warmup forward OOMs."
+    ),
+)
 @click.option("--device", type=str, default="cuda:0", help="CUDA device to warm on.")
-def main(config_path: str | None, buckets: str | None, batch_sizes: str, skip_gemm: bool, device: str) -> None:
+def main(
+    config_path: str | None,
+    buckets: str | None,
+    batch_sizes: str,
+    skip_gemm: bool,
+    real_model: bool,
+    msa_depth: int | None,
+    device: str,
+) -> None:
     """Pre-populate the persistent Triton autotune cache for our bucket sizes."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if not torch.cuda.is_available():
+        raise click.ClickException("CUDA not available — warmup needs a GPU.")
+    dev = torch.device(device)
+    name = torch.cuda.get_device_name(dev)
+    mcfg, chunk_size = _load_configs(config_path)
+    train_cfg = _load_training_overrides(config_path)
+
+    if real_model:
+        max_tokens = int(train_cfg.get("max_tokens", 384))
+        # Training fixes N = max_tokens (collate fixed_bucket_n), so default to
+        # warming exactly that bucket; --buckets overrides for larger crops.
+        bucket_list = (
+            sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else [max_tokens]
+        )
+        batch = int(train_cfg.get("batch_size_per_rank", 2))
+        diff_bs = int(train_cfg.get("diffusion_batch_size", 8))
+        recycles = min(2, int(train_cfg.get("max_recycles", 2)))
+        compute_conf = float(train_cfg.get("alpha_confidence", 0.0)) > 0
+        # Default MSA depth = the fixed pool the trunk subsamples to (model.py).
+        n_msa = msa_depth if msa_depth is not None else int(getattr(mcfg, "msa_crop_size", 1024) or 1024)
+        logger.info(f"Real-model warmup on {name} for buckets: {bucket_list} (S_msa={n_msa})")
+        t0 = time.time()
+        warmup_real_model(mcfg, bucket_list, batch, n_msa, diff_bs, recycles, compute_conf, dev)
+        logger.info(f"Total warmup time: {time.time() - t0:.1f}s")
+        return
+
     if buckets is None:
         bucket_list = [b for b in BUCKET_SIZES if b <= 384]
     else:
         bucket_list = sorted({int(x) for x in buckets.split(",") if x.strip()})
-
     batch_size_list = sorted({int(x) for x in batch_sizes.split(",") if x.strip()})
 
-    if not torch.cuda.is_available():
-        raise click.ClickException("CUDA not available — warmup needs a GPU.")
-
-    mcfg, chunk_size = _load_configs(config_path)
     shapes = WarmupShapes.from_model_config(mcfg)
     shapes.diffusion_chunk_size = chunk_size
-    dev = torch.device(device)
-    name = torch.cuda.get_device_name(dev)
     logger.info(f"Warming Triton cache on {name} for buckets: {bucket_list}")
     logger.info(f"Batch sizes: {batch_size_list}")
     logger.info(
