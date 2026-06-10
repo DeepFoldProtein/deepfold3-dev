@@ -347,12 +347,22 @@ class AtomPerAtomConditioning(nn.Module):
         num_element_classes: int = 128,
         num_atom_name_chars: int = 64,
         atom_name_length: int = 4,
+        ref_element_zero_index: bool = False,
     ):
         super().__init__()
         c = per_atom_channels
         cp = per_atom_pair_channels
         self.num_element_classes = num_element_classes
         self.num_atom_name_chars = num_atom_name_chars
+        # ``ref_element`` is stored as the raw atomic number Z (one-indexed:
+        # H=1, C=6, ...). DeepFold3 one-hots it at index Z by default, which is
+        # self-consistent for from-scratch training (index 0 is an unused/dead
+        # channel, element 128 is dropped). AF3/Protenix instead one-hot the
+        # zero-indexed periodic-table position (Z-1: H=0, C=5). Set
+        # ``ref_element_zero_index=True`` to match the AF3 convention — required
+        # if loading AF3-converted ``embed_ref_element`` weights, since the
+        # converter copies rows verbatim with no shift.
+        self.ref_element_zero_index = ref_element_zero_index
         self.embed_ref_pos = LinearNoBias(3, c)
         self.embed_ref_mask = LinearNoBias(1, c)
         self.embed_ref_element = LinearNoBias(num_element_classes, c)
@@ -380,7 +390,9 @@ class AtomPerAtomConditioning(nn.Module):
         """Compute per-atom single conditioning ``[B?, N, M, c]``."""
         act = self.embed_ref_pos(ref_pos)
         act = act + self.embed_ref_mask(ref_mask.unsqueeze(-1))
-        elem_1hot = F.one_hot(ref_element, self.num_element_classes).float()
+        # One-index Z by default; subtract 1 for the zero-indexed AF3 convention.
+        elem_idx = (ref_element - 1).clamp(min=0) if self.ref_element_zero_index else ref_element
+        elem_1hot = F.one_hot(elem_idx, self.num_element_classes).float()
         act = act + self.embed_ref_element(elem_1hot)
         act = act + self.embed_ref_charge(torch.arcsinh(ref_charge).unsqueeze(-1))
         name_1hot = F.one_hot(ref_atom_name_chars, self.num_atom_name_chars).float()
@@ -685,6 +697,7 @@ class EvoformerConditioningEncoder(nn.Module):
         num_element_classes: int = 128,
         num_atom_name_chars: int = 64,
         atom_name_length: int = 4,
+        ref_element_zero_index: bool = False,
     ):
         super().__init__()
         c = per_atom_channels
@@ -693,7 +706,9 @@ class EvoformerConditioningEncoder(nn.Module):
         self.Q = Q
         self.K = K
 
-        self.per_atom = AtomPerAtomConditioning(c, cp, num_element_classes, num_atom_name_chars, atom_name_length)
+        self.per_atom = AtomPerAtomConditioning(
+            c, cp, num_element_classes, num_atom_name_chars, atom_name_length, ref_element_zero_index
+        )
 
         # Encoder-specific additional pair conditioning (_1 variants in AF3)
         self.single_to_pair_row_enc = LinearNoBias(c, cp)
@@ -810,6 +825,7 @@ class AtomEncoder(nn.Module):
         num_element_classes: int = 128,
         num_atom_name_chars: int = 64,
         atom_name_length: int = 4,
+        ref_element_zero_index: bool = False,
     ):
         super().__init__()
         c = per_atom_channels
@@ -818,7 +834,9 @@ class AtomEncoder(nn.Module):
         self.Q = Q
         self.K = K
 
-        self.per_atom = AtomPerAtomConditioning(c, cp, num_element_classes, num_atom_name_chars, atom_name_length)
+        self.per_atom = AtomPerAtomConditioning(
+            c, cp, num_element_classes, num_atom_name_chars, atom_name_length, ref_element_zero_index
+        )
 
         # Trunk single conditioning
         # AF3: embed_trunk_single_cond uses final_init (zeros)
