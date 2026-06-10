@@ -205,6 +205,12 @@ def _make_input(M: int, K: int, device: torch.device) -> torch.Tensor:
     return torch.randn(M, K, device=device, dtype=torch.bfloat16, requires_grad=True)
 
 
+def _make_weight(*shape: int, device: torch.device) -> torch.Tensor:
+    """A grad-requiring weight tensor — the now-stateless fused kernels take
+    LN/linear/gate weights as explicit call-time args, so warmup must supply them."""
+    return torch.randn(*shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+
 def _warm_layernorm_linear(n_pad: int, batch: int, shapes: WarmupShapes, device: torch.device) -> None:
     """Drive ``FusedLayerNormLinear`` for every shape we need at this bucket."""
     from deepfold3.model.triton.layernorm_linear import FusedLayerNormLinear
@@ -212,8 +218,14 @@ def _warm_layernorm_linear(n_pad: int, batch: int, shapes: WarmupShapes, device:
     for label, M, N, K in _layernorm_linear_shapes(n_pad, batch, shapes):
 
         def build(M=M, N=N, K=K):
+            # FusedLayerNormLinear is stateless — pass LN scale/bias + the
+            # [K, N] linear weight at call time (see its forward signature).
             module = FusedLayerNormLinear(K, N, has_linear_bias=False).to(device).to(torch.bfloat16)
-            return module, (_make_input(M, K, device),)
+            x = _make_input(M, K, device)
+            ln_weight = _make_weight(K, device=device)
+            ln_bias = _make_weight(K, device=device)
+            linear_weight = _make_weight(K, N, device=device)
+            return module, (x, ln_weight, ln_bias, linear_weight)
 
         _run_warm(f"ln_linear[{label}] M={M} N={N} K={K}", build, device)
 
@@ -225,11 +237,14 @@ def _warm_ada_layernorm_linear(n_pad: int, batch: int, shapes: WarmupShapes, dev
     for label, M, N, K in _ada_layernorm_linear_shapes(n_pad, batch, shapes):
 
         def build(M=M, N=N, K=K):
+            # Stateless: (x, conditioning scale [M,K], conditioning bias [M,K],
+            # [K, N] linear weight).
             module = FusedAdaLayerNormLinear(K, N).to(device).to(torch.bfloat16)
             x = _make_input(M, K, device)
-            scale = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-            bias = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-            return module, (x, scale, bias)
+            scale = _make_weight(M, K, device=device)
+            bias = _make_weight(M, K, device=device)
+            linear_weight = _make_weight(K, N, device=device)
+            return module, (x, scale, bias, linear_weight)
 
         _run_warm(f"ada_ln_linear[{label}] M={M} N={N} K={K}", build, device)
 
@@ -279,8 +294,12 @@ def _warm_dual_gemm(n_pad: int, batch: int, shapes: WarmupShapes, device: torch.
     N = 2 * shapes.c_pair
 
     def build():
-        module = FusedGatedDualGEMM(K, N, bias=False).to(device).to(torch.bfloat16)
-        return module, (_make_input(M, K, device),)
+        # Stateless: (x, w_gate [N, K], w_proj [N, K]) — standard nn.Linear shape.
+        module = FusedGatedDualGEMM(K, N).to(device).to(torch.bfloat16)
+        x = _make_input(M, K, device)
+        w_gate = _make_weight(N, K, device=device)
+        w_proj = _make_weight(N, K, device=device)
+        return module, (x, w_gate, w_proj)
 
     _run_warm(f"dual_gemm[M={M} N={N} K={K}]", build, device)
 
