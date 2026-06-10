@@ -22,15 +22,13 @@ training:
 
   grad_clip_norm: 10.0
   grad_norm_fp64: true
-  grad_norm_log_threshold: 100.0
-  # Per-rank outlier guard: skip the whole step if any rank's pre-clip
-  # grad_norm exceeds this. Clipping from 1e+6~1e+8 to max_norm=10 yields
-  # random noise direction that degrades the update; skipping is cleaner.
-  # 5000 lets the bulk of the heavy-tail (median 1.4k, p90 2.8k observed
-  # post-warmup at peak LR) through clip-to-10 instead of dropping ~25% of
-  # steps; only catastrophic outliers (>5k, ~5% of former skip events) are
-  # still gated.
-  grad_norm_skip_threshold: 5000.0
+  # Both gates disabled (2026-05-18): the previous AF3-spec-fix arm
+  # showed only one skip event in ~3900 steps post-warmup, and the
+  # >100 grad_norm warnings produced noisy log output without
+  # actionable signal. Re-enable only if a catastrophic grad outlier
+  # incident actually corrupts training.
+  grad_norm_log_threshold: 0.0
+  grad_norm_skip_threshold: 0.0
   max_consecutive_nan_skips: 10
   accumulate_grad_batches: 2
   ema_decay: 0.999
@@ -93,9 +91,9 @@ training:
   collective_timeout_s: 600.0
   train_confidence_only: false
 
-  max_steps: 100_000
+  max_steps: 200_000
   seed: 42
-  checkpoint_interval: 100
+  checkpoint_interval: 500
   checkpoint_every_hours: 0.0
   eval_samples: 1024
   eval_interval: 100
@@ -104,7 +102,7 @@ training:
   log_interval: 1
   log_microsteps: false
   uniform_recycle: true
-  max_checkpoints: 500
+  max_checkpoints: 0
   # Always-on per-PF-layer activation RMS sentinel. Logs
   # ``act_rms/pf_in_{single,pair}`` + ``act_rms/pf_{00..47}_{single,pair}``
   # to WandB every ``log_interval`` steps. Compute is two reductions per
@@ -117,7 +115,7 @@ training:
   # step locally so window-averaged values are reported (cleaner than
   # per-step noise). Drops WandB cost ~10× without losing the slow-dynamic
   # depth profile.
-  act_rms_log_interval: 10
+  act_rms_log_interval: 0
 
   auto_resume: false
   load_strict: true
@@ -211,10 +209,16 @@ model:
     # memory; fall back to plain LN+Linear pair-bias until the fused
     # backward can be rewritten with fp32-promoted intermediates.
     use_fused_pair_bias: false
-    use_fused_swiglu: false
-    use_fused_triangle_mul: false
-    use_fused_transition_pair: false
-    use_fused_ln_transpose: false
+    # Enabled: the training-safe pair-scale trio. B200 end-to-end (fwd+bwd,
+    # gradient checkpointing) measured 1.04x @N=384 / 1.09x @N=640 with a ~20%
+    # trunk-activation memory cut (-0.63 GB/8-block @384, -1.76 GB @640).
+    # Numerics validated (tests/triton/test_fused_modules_robustness.py 46/46;
+    # full-model e2e fwd+bwd: 0 non-finite grads). Benefit grows with crop size.
+    # See docs/optimizations.md and scripts/bench_kernels.py.
+    use_fused_swiglu: true
+    use_fused_triangle_mul: true
+    use_fused_transition_pair: true
+    use_fused_ln_transpose: false  # inference-only (column-attn LN+transpose)
     use_tiled_linear: false
     tiled_linear_inference: true
     tiled_opm_chunk: 0
@@ -233,6 +237,10 @@ model:
     fp32_loss: true
     fp32_confidence_head: true
     fp32_distogram_head: true
+    # Wrap EvoformerConditioningEncoder in fp32 autocast (matching OF3
+    # input_embedders.py:127). Default on; ref_pos/offset/distance projections
+    # are bf16-noisy.
+    fp32_evo_cond_encoder: true
     grad_acc_dtype: fp32
     reduce_dtype: fp32
     loss_dtype: fp32
