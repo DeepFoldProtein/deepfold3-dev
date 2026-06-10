@@ -317,8 +317,8 @@ def smooth_lddt_loss(
 
     # Vectorize over cutoffs: [C] tensor
     cutoff_t = pred_pos.new_tensor(cutoffs).reshape(-1, 1, 1, 1)  # [C, 1, 1, 1]
-    # [C, S, A, A] → sigmoid-scored fractions
-    scores = (0.5 * (1.0 + torch.tanh((cutoff_t - dist_diff.unsqueeze(0)) * 5.0)) * pair_mask).sum(dim=(-2, -1))
+    # [C, S, A, A] → sigmoid-scored fractions (AF3 Alg. 27: sigmoid(threshold - |Δd|))
+    scores = (torch.sigmoid(cutoff_t - dist_diff.unsqueeze(0)) * pair_mask).sum(dim=(-2, -1))
     # [C, S] → average over cutoffs → [S]
     lddt_per_sample = scores.sum(dim=0) / (n_pairs * len(cutoffs))
 
