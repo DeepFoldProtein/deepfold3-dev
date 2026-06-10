@@ -70,12 +70,23 @@ def _hash_gpu_info(info: dict[str, Any]) -> str:
 
 
 def _get_cache_dir() -> Path:
-    """Resolve cache directory, creating it if needed."""
+    """Resolve cache directory, creating it if needed.
+
+    Resolution order: ``DEEPFOLD3_TRITON_CACHE_DIR`` → ``XDG_CACHE_HOME`` →
+    ``~/.cache``. Honoring ``XDG_CACHE_HOME`` matters in containers where the
+    image's real ``$HOME`` (e.g. ``/home/mpiuser``) is ephemeral and the
+    persistent volume is mounted elsewhere (e.g. ``/home/jovyan``): the kakao
+    trainjob sets ``XDG_CACHE_HOME=/home/jovyan/.cache`` to redirect every
+    cache onto the shared PVC, and this cache must follow suit or it lands on
+    ephemeral per-pod storage instead of the shared volume.
+    """
     env_dir = os.environ.get("DEEPFOLD3_TRITON_CACHE_DIR")
     if env_dir:
         cache_dir = Path(env_dir)
     else:
-        cache_dir = Path.home() / ".cache" / "deepfold3-triton"
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".cache"
+        cache_dir = base / "deepfold3-triton"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 

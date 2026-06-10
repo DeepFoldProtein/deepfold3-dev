@@ -240,6 +240,12 @@ spec:
         value: "/home/jovyan/.cache/uv/python"
       - name: TRITON_CACHE_DIR
         value: "/home/jovyan/.triton/autotune"
+      - name: DEEPFOLD3_TRITON_CACHE_DIR
+        # deepfold3's autotune-CONFIG cache (block sizes/warps) — a SEPARATE
+        # mechanism from TRITON_CACHE_DIR's compiled-binary cache. Without this
+        # it resolves to Path.home()/.cache = /home/mpiuser/.cache (ephemeral,
+        # per-pod), so all 64 ranks re-autotune and race-write. Pin to the PVC.
+        value: "/home/jovyan/.cache/deepfold3-triton"
       - name: PYTORCH_KERNEL_CACHE_PATH
         # Torch's JIT kernel cache. Default ($HOME/.cache/torch/kernels)
         # resolves to /home/mpiuser/.cache on the ephemeral container FS.
