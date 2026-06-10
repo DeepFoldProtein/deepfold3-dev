@@ -318,11 +318,12 @@ This is the canonical path (it replaced the hardcoded `B200_PRETUNED` table).
 
 1. Point `~/.cache/deepfold3-triton/` (or `DEEPFOLD3_TRITON_CACHE_DIR`) at **shared storage**
    mounted by every node — or bake a warmed cache into the training container image.
-2. Run warmup **once, on a single rank**, with the production config (so the *enabled*
-   kernels and the crop buckets you actually train at are covered):
+2. Run warmup **once, on a single rank**, with `--real-model` (drives the actual model at
+   the production shapes, so every cached `(M, N, K)` and kernel specialization matches
+   training exactly — no synthetic-shape-list drift):
 
    ```bash
-   deepfold3 warmup-triton --config configs/initial.yaml
+   deepfold3 warmup-triton --config configs/initial.yaml --real-model
    ```
 
 3. Every node and every later job then **reads** the persisted configs at startup (lazy
@@ -359,11 +360,30 @@ autotunes the same shapes redundantly and can desync. Warm the cache **on a sing
 before launching DDP training (and point it at the shared/persistent path so all ranks
 reuse it):
 
+There are two modes:
+
+**`--real-model` (recommended).** Builds the actual `DeepFold3` (same `ModelConfig` path as
+`deepfold3 train`) and runs `forward_training` + backward at `fixed_bucket_n` (= `max_tokens`,
+default 384) with `batch_size_per_rank` and the diffusion params read from `--config`. Every
+cached shape and kernel specialization therefore matches training exactly — there is no
+hand-maintained shape list to drift out of sync (the gap that previously left `dual_gemm`
+uncached). It warms the per-chunk diffusion size (`min(diffusion_chunk_size, diffusion_batch_size)`),
+so memory stays near a single training microstep (~70 GB at N=384 / S_msa=1024; ~2 min one-time).
+`--msa-depth` defaults to `model.msa_crop_size`; lower it (or `--buckets`) if the forward OOMs.
+
+```bash
+deepfold3 warmup-triton --config configs/initial.yaml --real-model
+```
+
+**Synthetic (default, lighter).** Drives each fused kernel at hand-enumerated `(M, N, K)`
+shapes without building the model — faster and lower-memory, but the shape list must be kept
+in sync with the model (it can miss shapes/specializations the real run hits):
+
 ```bash
 deepfold3 warmup-triton --config configs/initial.yaml
 ```
 
-The script:
+The synthetic script:
 
 1. Loads channel dimensions from the model config (falls back to defaults).
 2. Iterates over every bucket size in `bucket.BUCKET_SIZES ≤ 384` (pass `--buckets` to add
