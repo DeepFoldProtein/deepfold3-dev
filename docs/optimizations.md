@@ -5,6 +5,62 @@ operations. All Triton kernels are self-contained under `src/deepfold3/model/tri
 
 Optimizations are toggled via `OptimConfig` — each can be independently enabled or disabled.
 
+## B200 End-to-End Benchmark (bf16, 2026-06-10)
+
+The RTX-5090 section below is **forward-only** and does not reflect training, where
+each kernel also runs a backward and is recomputed under gradient checkpointing — so
+a kernel that wins on the forward can be net-neutral or slower in a training step.
+The numbers here are the real training/inference regime on B200, measured with
+`scripts/bench_kernels.py` (8 `PairFormerBlock`s — the trunk component that hosts
+these kernels). **These are the basis for the finalized flags.**
+
+Baseline = fused evo-attention + fused dropout-add on, the four candidates off.
+Speed is ×baseline; memory is Δ vs baseline (8-block trunk peak).
+
+### Training (fwd + bwd, gradient checkpointing)
+
+| Config | N=384 | N=640 | N=768 |
+| --- | --- | --- | --- |
+| baseline | 1.00× / 3.18 GB | 1.00× / 8.72 GB | 1.00× / 12.52 GB |
+| +swiglu | 1.05× / −0.14 | 1.04× / −0.39 | 1.03× / −0.56 |
+| +transition_pair | 1.05× / −0.21 | 1.04× / −0.59 | 1.04× / −0.84 |
+| +triangle_mul | 1.05× / −0.42 | 1.05× / −1.17 | 1.06× / −1.69 |
+| +pair_bias | 1.00× / +0.07 | 1.07× / +0.20 | 1.12× / +0.29 |
+| **+3 safe (no pair_bias)** | **1.04× / −0.63** | **1.09× / −1.76** | **1.09× / −2.54** |
+| +ALL four | 1.01× / −0.56 | 1.17× / −1.56 | 1.25× / −2.25 |
+
+- **Training default = the safe trio (swiglu + transition_pair + triangle_mul)**, enabled
+  in `configs/initial.yaml`: 1.04–1.09× with a ~20% trunk-activation memory cut that
+  grows with crop size. Numerics validated (`tests/triton/test_fused_modules_robustness.py`
+  46/46; full-model e2e fwd+bwd, 0 non-finite grads).
+- **`pair_bias` stays OFF for training.** At N=384 it adds memory for ~0% speed, and its
+  bf16 backward amplifies gradients ~1e11× alongside fused evo-attn (the load-bearing
+  reason — see `configs/initial.yaml`). But it is a large speed lever at big crops
+  (all-four 1.25× @768 vs 1.09×), so **rewriting its fp32-promoted backward is worth
+  ~12–16% throughput if training moves to 640/768 crops.**
+
+### Inference (fwd only)
+
+| Config | N=384 | N=640 | N=768 |
+| --- | --- | --- | --- |
+| baseline | 52.98 ms / 0.9 GB | 164.85 ms / 2.4 GB | 257.34 ms / 3.4 GB |
+| +pair_bias | 41.65 ms (1.27×) | 133.11 ms (1.24×) | 202.77 ms (1.27×) |
+| +3 safe | 46.95 ms (1.13×) | 146.50 ms (1.13×) | 228.21 ms (1.13×) |
+| **+ALL four** | **35.58 ms (1.49×) / 0.7 GB** | **114.78 ms (1.44×) / 1.9 GB** | **173.46 ms (1.48×) / 2.7 GB** |
+
+`OptimConfig.inference()` already enables all four + `ln_transpose` + tiling — confirmed
+optimal (1.44–1.49× and lower memory). With no backward, `pair_bias` is safe and is the
+single biggest inference lever (1.24–1.27× alone).
+
+### fused_dropout_add (default ON)
+
+Per-call it is marginally slower than unfused PyTorch (72 vs 70 µs at the 384 pair shape)
+but never materializes the `[N, N]` mask (~36 GB/step saved across fwd+bwd). The mask seed
+is drawn from a dedicated **rank-aware** generator (`_next_mask_seed`) so the ~244 draws/step
+neither pollute the global CPU RNG stream nor correlate masks across DDP ranks; a CPU draw
+(~2 µs) is cheaper than an on-GPU seed (~10 µs, launch-bound), so the seed is never a
+bottleneck.
+
 ## Benchmark Results (RTX 5090, bf16, 2026-03-16)
 
 ### Winners (enabled by `--optim recommended`)
@@ -129,8 +185,10 @@ deepfold3 inference --json input.json --output out/ --params weights.safetensors
 
 ### Recommended Configuration
 
-- **For inference**: `--optim recommended` — enables EvoAttention (4-9x on pair attention) and torch.compile (1.3-2.7x on TriangleMul + attention). Best speed/simplicity tradeoff.
-- **For training**: `--optim all` — additionally enables FusedTransition for backward pass memory savings on single transitions (C=384).
+See the **B200 End-to-End Benchmark** at the top for the measured training/inference numbers these recommendations come from.
+
+- **For training**: the `optim:` block in `configs/initial.yaml` — fused evo-attention + fused dropout-add + the safe pair-scale trio (`use_fused_swiglu`, `use_fused_transition_pair`, `use_fused_triangle_mul`) + gradient checkpointing. `use_fused_pair_bias` stays **off** (bf16 backward gradient blow-up). Do **not** use `--optim all` for training — it enables `pair_bias` (training hazard) and the single/ada transitions (slower at C=384/768).
+- **For inference**: `--optim inference` (= `OptimConfig.inference()`) — all four pair-scale kernels + `ln_transpose` + tiled pair transitions. 1.44–1.49× over baseline. `pair_bias` is safe here (no backward).
 - **Debugging**: omit `--optim` — pure PyTorch, no compiled graphs, easy to debug.
 
 ## Installation
