@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -272,20 +273,33 @@ class CacheManager:
                 pass
 
         existing[self.gpu_key] = cache_data
-        temp_path = json_path.with_suffix(f".{os.getpid()}.tmp")
+        # Guaranteed-unique temp name. ``os.getpid()`` alone collides across
+        # nodes (separate PID namespaces): on a shared PVC two ranks write the
+        # same ``.{pid}.tmp`` and one's ``os.replace`` then races on a file the
+        # other already consumed (the live "No such file or directory" save
+        # errors under 64-rank DDP). ``mkstemp`` is atomic + unique per writer;
+        # ``os.replace`` stays atomic so concurrent saves are last-writer-wins
+        # rather than erroring. (Warm the cache once before DDP to avoid the
+        # write storm entirely; this only hardens the cold-start path.)
+        temp_path: Path | None = None
         try:
             with _FILE_LOCK:
-                with open(temp_path, "w") as f:
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=str(json_path.parent), prefix=f"{json_path.name}.", suffix=".tmp"
+                )
+                temp_path = Path(tmp_name)
+                with os.fdopen(fd, "w") as f:
                     json.dump(existing, f, indent=2, default=str)
                 os.replace(temp_path, json_path)
             self._dirty.discard(kernel_name)
             logger.debug(f"Saved cache for {kernel_name} to {json_path}")
         except Exception as e:
             logger.warning(f"Failed to save cache for {kernel_name}: {e}")
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def get_config(self, kernel_name: str, input_key: str) -> dict[str, Any] | None:
         """Get cached config for a kernel + input shape."""
