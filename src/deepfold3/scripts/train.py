@@ -362,6 +362,20 @@ def train(
             all_records = [r for r in all_records if r.id not in denied]
             log.info("Exclude list: %d → %d records", before, len(all_records))
 
+    # Drop giant assemblies by total chain count — BEFORE the dataset is built,
+    # so they are never sampled or loaded (bounds per-sample featurisation cost
+    # and the periodic dataloader stalls they cause). Operates on Record
+    # metadata only; no structure/MSA I/O. ``model_cfg.data.max_total_chains``
+    # of 0 disables the filter.
+    max_total_chains = model_cfg.data.max_total_chains
+    if max_total_chains and all_records:
+        before = len(all_records)
+        all_records = [r for r in all_records if len(r.chains) <= max_total_chains]
+        log.info(
+            "max_total_chains=%d: %d → %d records (dropped %d giant assemblies)",
+            max_total_chains, before, len(all_records), before - len(all_records),
+        )
+
     # Train / eval split — two modes by priority:
     #   1. eval_cutoff_date: records released AFTER cutoff → eval set (AF3-style)
     #   2. eval_datasets from config (separate dataset dirs)

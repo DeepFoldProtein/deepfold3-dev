@@ -1048,6 +1048,12 @@ class DataConfig:
     # greedy interface-maximising selection from prepare-time is applied
     # at sampling time.  Set 0 to disable.
     max_chains: int = 20
+    # Drop whole records whose total chain count (polymer + ligand) exceeds
+    # this, BEFORE the dataset is built — they are never sampled or loaded.
+    # Giant assemblies (e.g. 5iwa: 228 chains) cost 5-50× a normal record to
+    # featurise (per-chain MSA load + template parse + MSA profile) and cause
+    # periodic dataloader stalls. 0 = disabled (keep all records).
+    max_total_chains: int = 0
 
 
 @dataclass

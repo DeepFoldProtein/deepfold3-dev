@@ -22,12 +22,9 @@ training:
   skip_load_scheduler: true
   skip_load_step: true
 
-# Architectural flags must match the upstream stage checkpoints loaded via
-# --params (see finetune1_structure_640.yaml header for the full rationale).
 model:
-  pairformer:
-    deepnet_residual_scale: true
-  confidence:
-    deepnet_residual_scale: true
   data:
     max_chains: 50
+    # Last stage: raise the giant-assembly exclusion to 50 total chains
+    # (overrides initial.yaml's 30), mirroring AF3's chain-count schedule.
+    max_total_chains: 50

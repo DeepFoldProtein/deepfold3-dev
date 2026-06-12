@@ -78,7 +78,7 @@ training:
   fused_ce_chunk_n: 32
 
   dtype: bf16
-  num_workers: 8
+  num_workers: 4
   eval_num_workers: 2
   prefetch_factor: 4
   pin_memory: true
@@ -108,14 +108,14 @@ training:
   # to WandB every ``log_interval`` steps. Compute is two reductions per
   # PF block per forward; one packed all_reduce per log boundary. See
   # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
-  log_activation_rms: true
+  log_activation_rms: false
   # Multiplier on ``log_interval`` for the act_rms flush cadence. With
   # ``log_interval=1`` and ``act_rms_log_interval=10`` the meter emits one
   # ρ snapshot per 10 effective steps; the meter still accumulates every
   # step locally so window-averaged values are reported (cleaner than
   # per-step noise). Drops WandB cost ~10× without losing the slow-dynamic
   # depth profile.
-  act_rms_log_interval: 0
+  act_rms_log_interval: 10
 
   auto_resume: false
   load_strict: true
@@ -198,6 +198,11 @@ model:
     interface_crop_weight: 0.4
     interface_distance: 15.0
     template_cutoff_days: 60
+    # Drop records with > this many total chains (polymer + non-polymer) before
+    # the dataset is built (never sampled/loaded) — bounds giant-assembly
+    # featurisation cost / periodic dataloader stalls. 0 = off. Last stage
+    # (finetune3) raises this to 50, mirroring AF3's chain-count schedule.
+    max_total_chains: 30
     max_template_date: "2021-09-30"
     prefer_monomer_templates: true
   optim:
