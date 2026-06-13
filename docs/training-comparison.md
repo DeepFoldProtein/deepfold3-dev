@@ -232,7 +232,7 @@ Config-override-driven stages (no hardcoded presets — use `--config` JSON or `
 | --------------------- | ------------------------------------ | ---------------------------------------------- | ----------------------------------- | --------------------------------------------------- |
 | Format                | Lightning `.ckpt`                    | `{step}.pt`                                    | Lightning `.ckpt`                   | `checkpoint_{step}.pt`                              |
 | Contents              | model + optimizer + scheduler + EMA  | model + optimizer + scheduler + step           | model + optimizer + scheduler + EMA | model + optimizer + scheduler + EMA + step          |
-| Rotation              | `save_top_k` (configurable)          | All kept                                       | Lightning callbacks                 | `max_checkpoints` (default 5, excludes final)       |
+| Rotation              | `save_top_k` (configurable)          | All kept                                       | Lightning callbacks                 | `max_checkpoints` (default 0 = keep all; excludes final/best) |
 | Resume                | `ckpt_path` to `trainer.fit()`       | `load_checkpoint_path` + fine-grained flags    | Lightning `ckpt_path`               | `--resume` flag                                     |
 | Partial load          | via `strict_loading` flag            | `load_strict`, `skip_load_optimizer/scheduler` | Lightning `strict_loading`          | `load_strict`, `skip_load_optimizer/scheduler/step` |
 | Confidence from trunk | Special trunk→confidence weight copy | `load_strict=False` + new params               | Not detailed                        | `load_strict=False` + `skip_load_*` flags           |
@@ -301,7 +301,7 @@ Config-override-driven stages (no hardcoded presets — use `--config` JSON or `
 | No resolution feature            | Added to feature dict from manifest metadata                                                                              |
 | No experiment tracking           | WandB integration (`--wandb project`)                                                                                     |
 | No eval metrics                  | `_evaluate()` runs `forward_training` + `training_loss` with EMA weights                                                  |
-| No checkpoint rotation           | `max_checkpoints` config (default 5)                                                                                      |
+| No checkpoint rotation           | `max_checkpoints` config (default 0 = keep all)                                                                           |
 | No finetune LR schedule          | `CosineAnnealingScheduler` + `build_scheduler()` factory                                                                  |
 | No NaN detection                 | Distributed NaN sync via all-reduce                                                                                       |
 | No multi-dataset training        | `extra_datasets` config + `MultiDatasetSampler` — N datasets with independent data_dir, weight, strategy, is_distillation |

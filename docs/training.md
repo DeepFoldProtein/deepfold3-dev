@@ -118,6 +118,17 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 | Single-repr reg | `alpha_single_reg` (0)             | Magnitude regularizer on trunk single output: mean per-token Σ_c &#124;s&#124;^p / C. Observation-only at α=0.                                                                 |
 | Pair-repr reg   | `alpha_pair_reg` (1e-4)            | Same form on pair output. Controls DistogramHead logit magnitude; prevents late-trajectory distogram destabilization (see [regularization-story.md](regularization-story.md)). |
 
+#### Diagnostic metrics (logged, not in total)
+
+`training_loss` also emits scalars that are logged via `losses[...]` but never added to `total`:
+
+| Key        | Source                              | Description                                                                                                                                                                                                          |
+| ---------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tm_true`  | mini-rollout positions + GT frames  | TM-like global accuracy in [0, 1] computed from the *true* per-frame distance error `‖pred_local − gt_local‖` via the same `1/(1+(d/d0)²)` kernel used for inference pTM. Uses N (effective token count) for `d0`.   |
+| `itm_true` | as above, restricted to cross-chain | Cross-chain TM-like accuracy (`asym_id_i ≠ asym_id_j`). Skipped on single-chain examples (no cross-chain pairs to score).                                                                                            |
+
+Both fire from the mini-rollout (S=1) and are computed under `torch.no_grad()`, so they're available **independent of `alpha_confidence`** — they show up in stage 0/1/2 (when the confidence head forward is gated off) and can be compared directly to inference-time pTM/ipTM. PAE-derived `tm_pred` / `itm_pred` are not currently emitted; `scripts/run_status.py` parses both pairs of keys when present.
+
 ### LR Schedule
 
 Two schedulers available, selected by `finetune_scheduler`:
@@ -314,6 +325,8 @@ deepfold3 train --data-dir /data/pdb --output runs/exp1 \
 
 The primary dataset (`--data-dir`) always uses cluster-weighted sampling when cluster IDs are available. Extra datasets are combined via `ConcatDataset` + `MultiDatasetSampler`, which draws samples from each dataset proportionally to weights.
 
+**Resume-aware sampler state**: both `WeightedClusterSampler` (single-dataset path) and `MultiDatasetSampler` implement `state_dict` / `load_state_dict`, exposing `epoch + sample_idx + seed`. `CheckpointManager.save` snapshots the sampler under `blob["sampler"]`; on resume the iterator fast-forwards past indices already trained on, so within-epoch position is exact (no record duplication). `set_epoch` only resets `sample_idx` when the epoch number actually changes — the trainer's `set_epoch(state.epoch)` at the top of the loop does not clobber a freshly-loaded position. A seed mismatch between yaml and saved state emits a runtime warning (the per-epoch RNG derives from `seed + epoch`).
+
 **Legacy compatibility**: `distillation_data_dir` and `distillation_weight` in `TrainingConfig` still work — they're internally converted to an `extra_datasets` entry.
 
 ### Sequence Clustering
@@ -460,11 +473,15 @@ Checkpoints are saved at configurable intervals (default: every 1000 steps) and 
 - LR scheduler state dict
 - EMA state (if enabled, also excludes fused params)
 - Step counters
-- Config (model + training) — `model_cfg` and `train_cfg` are pickled into the blob and used at inference time to rebuild the model with the exact architecture flags (e.g. `pairformer.deepnet_residual_scale`) that were active at training. See _Configuration persistence_ below.
+- Config (model + training) — `model_cfg` and `train_cfg` are pickled into the blob and used at inference time to rebuild the model with the exact architecture flags (e.g. `pairformer.residual_output_scaling`) that were active at training. See _Configuration persistence_ below.
 
 **Checkpoint rotation**: keeps the `max_checkpoints` most recent checkpoints by modification time. Default is `0`, which disables rotation (all checkpoints are kept). `checkpoint_final.pt` and `checkpoint_best.pt` are always preserved.
 
 Resume training by passing `--resume path/to/checkpoint.pt`.
+
+**LR override on resume**: `optimizer.load_state_dict` and `LambdaLR.load_state_dict` both restore the saved `lr` / `initial_lr` / `base_lrs` verbatim, which silently shadows any `--config` change. The trainer's `[resume]` block detects this and force-overrides `param_groups['lr','initial_lr']` + `scheduler.base_lrs` to the configured value, so `--config new.yaml --resume ...` honors the new lr. Schedule-Free AdamW's accumulator state (`z` buffer, `lr_max`, `weight_sum`) is preserved across the override. A `[resume] LR override: <saved> → <target>` line is logged when this fires.
+
+**Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, scheduler instance attributes (`warmup_steps`, `start_decay_after`, `decay_every`, `decay_factor`, `cosine_max_steps`, `cosine_min_lr_ratio`, `wsds_decay_windows`) — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only; only `lr` is force-overridden. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
 
 **Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
 
@@ -472,7 +489,7 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 ### Configuration persistence
 
-A fresh `ModelConfig()` at inference does **not** match a checkpoint trained with non-default flags (`pairformer.deepnet_residual_scale`, `confidence.deepnet_residual_scale`, layer counts, …). These flags often only change a forward-pass scalar, so `load_state_dict(strict=False)` reports `missing=0, unexpected=0` and the silent failure is a wrong prediction.
+A fresh `ModelConfig()` at inference does **not** match a checkpoint trained with non-default flags (`pairformer.residual_output_scaling`, `pairformer.{single,pair}_transition_residual_gain`, layer counts, …). These flags often only change a forward-pass scalar, so `load_state_dict(strict=False)` reports `missing=0, unexpected=0` and the silent failure is a wrong prediction.
 
 The checkpoint pipeline embeds the architectural `ModelConfig` on both sides of the format:
 

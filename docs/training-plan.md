@@ -275,7 +275,7 @@ if self.wandb:
 
 **What**: Keep only the N most recent checkpoints + the best by eval metric.
 
-**Config**: `TrainingConfig.max_checkpoints: int = 5`
+**Config**: `TrainingConfig.max_checkpoints: int = 0` (0 = keep all)
 
 ### 4.5 Bucket padding in training
 
