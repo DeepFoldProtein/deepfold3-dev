@@ -180,6 +180,9 @@ af3.bin
 /runs/
 /tmp/
 
+# Large optional Triton test fixtures (checkpoints; tests skip when absent)
+tests/triton/_fixtures/*.pt
+
 # Weights & Biases
 wandb/
 

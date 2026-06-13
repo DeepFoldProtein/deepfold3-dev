@@ -78,7 +78,7 @@ training:
   fused_ce_chunk_n: 32
 
   dtype: bf16
-  num_workers: 4
+  num_workers: 8
   eval_num_workers: 2
   prefetch_factor: 4
   pin_memory: true
