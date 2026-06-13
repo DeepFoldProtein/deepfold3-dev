@@ -19,6 +19,7 @@ import gzip
 import json
 import math
 import re
+import textwrap
 import urllib.request
 from pathlib import Path
 
@@ -35,15 +36,19 @@ REP_PROTEIN = "CA"
 REP_NUCLEIC = "C1'"
 
 _NATSORT_RE = re.compile(r"(\d+)")
+_STEP_RE = re.compile(r"step_(\d+)")
 
 
 def _natkey(s: str) -> tuple:
-    return tuple(int(p) if p.isdigit() else p for p in _NATSORT_RE.split(s))
+    # When a path carries `step_NNNN`, sort by that step first so e.g.
+    # `run-A/step_500` and `run-B/step_500` group together regardless of any
+    # other digits in the path. Non-step paths fall back to plain natural sort.
+    step_match = _STEP_RE.search(s)
+    step_priority: tuple = (0, int(step_match.group(1))) if step_match else (1,)
+    return step_priority + tuple(int(p) if p.isdigit() else p for p in _NATSORT_RE.split(s))
 
 
-def _load_predicted_distogram(
-    path: Path, chain_filter: str | None = None
-) -> tuple[np.ndarray, list[str]]:
+def _load_predicted_distogram(path: Path, chain_filter: str | None = None) -> tuple[np.ndarray, list[str]]:
     """Load expected pairwise distance map from a `confidences.json`.
 
     Returns (E[d] [N, N] in Å, chains [N]). When ``chain_filter`` is given,
@@ -53,8 +58,7 @@ def _load_predicted_distogram(
         d = json.load(f)
     if "distogram" not in d or "token_chain_ids" not in d:
         raise ValueError(
-            f"{path} missing keys (need 'distogram' + 'token_chain_ids'); "
-            "regenerate with current deepfold3 inference"
+            f"{path} missing keys (need 'distogram' + 'token_chain_ids'); regenerate with current deepfold3 inference"
         )
     chains_all = np.asarray(d["token_chain_ids"], dtype=str)
     expected = np.asarray(d["distogram"], dtype=np.float64)
@@ -172,6 +176,29 @@ def chain_boundaries(chains: list[str]) -> list[int]:
     return bounds
 
 
+def _fit_title(title: str, max_line_chars: int = 48, max_wrapped_lines: int = 2) -> str:
+    """Wrap or ellipsize each line of a multi-line title so panels stay readable."""
+    out: list[str] = []
+    for line in title.splitlines():
+        if len(line) <= max_line_chars:
+            out.append(line)
+            continue
+        wrapped = textwrap.wrap(line, width=max_line_chars, break_long_words=True, break_on_hyphens=False)
+        if not wrapped:
+            out.append(line[: max_line_chars - 1] + "…")
+            continue
+        if len(wrapped) > max_wrapped_lines:
+            head = wrapped[: max_wrapped_lines - 1]
+            tail = wrapped[max_wrapped_lines - 1].rstrip()
+            if len(tail) >= max_line_chars:
+                tail = tail[: max_line_chars - 1].rstrip() + "…"
+            else:
+                tail = tail + "…"
+            wrapped = head + [tail]
+        out.extend(wrapped)
+    return "\n".join(out)
+
+
 def plot_panel(
     ax: plt.Axes,
     D: np.ndarray,
@@ -187,7 +214,7 @@ def plot_panel(
     for b in chain_boundaries(chains):
         ax.axhline(b - 0.5, color="white", lw=0.6)
         ax.axvline(b - 0.5, color="white", lw=0.6)
-    ax.set_title(title, fontsize=10)
+    ax.set_title(_fit_title(title), fontsize=10)
     ax.set_xlabel("Token index")
     ax.set_ylabel("Token index")
     plt.colorbar(im, ax=ax, shrink=0.82, label="Å")
@@ -247,8 +274,18 @@ def main() -> None:
         "--residual-vs",
         default=None,
         help=(
-            "Reference source (CIF path or RCSB id, optionally `:CHAIN`). When set, every other "
-            "source is rendered as |D - D_ref| instead of the raw distance map."
+            "Reference source (CIF path or RCSB id, optionally `:CHAIN`). Provides the reference for "
+            "MAE computation; in paired sample-dir mode this enables the per-step MAE-vs-step line plot in "
+            "the header. By default the per-step panels remain raw distance maps (annotated with MAE); "
+            "pass --residual-heatmap to render |D - D_ref| as the panel content instead."
+        ),
+    )
+    p.add_argument(
+        "--residual-heatmap",
+        action="store_true",
+        help=(
+            "Render per-step panels as residual heatmaps |D - D_ref| (legacy --residual-vs behaviour). "
+            "Default: raw distance heatmaps with MAE in the title; residual MAEs still surface in the header line plot."
         ),
     )
     p.add_argument(
@@ -366,18 +403,14 @@ def main() -> None:
     # Natural-sort --cif inputs by path so that shell-glob expansions like
     # `step_*/model.cif` (lex order from bash) are reordered to step_2,
     # step_10, step_100. --dir scans are already natural-sorted below.
-    cif_specs = sorted(
-        (_split_chain(c) for c in args.cif + extra_cif), key=lambda s: _natkey(s[0])
-    )
+    cif_specs = sorted((_split_chain(c) for c in args.cif + extra_cif), key=lambda s: _natkey(s[0]))
     for d in args.dir:
         if not d.is_dir():
             p.error(f"--dir not a directory: {d}")
         for found in sorted(d.rglob("model.cif"), key=lambda p: _natkey(str(p))):
             cif_specs.append((str(found), None))
     cif_paths = [Path(base) for base, _ in cif_specs]
-    conf_specs = sorted(
-        (_split_chain(c) for c in args.confidences + extra_conf), key=lambda s: _natkey(s[0])
-    )
+    conf_specs = sorted((_split_chain(c) for c in args.confidences + extra_conf), key=lambda s: _natkey(s[0]))
     conf_paths = [Path(base) for base, _ in conf_specs]
 
     sources: list[tuple[str, Path, str | None]] = []
@@ -402,9 +435,7 @@ def main() -> None:
 
     # Build labels for confidences sources (mirrors --cif common-path stripping).
     conf_sources: list[tuple[str, Path, str | None]] = []
-    conf_common = (
-        Path(__import__("os").path.commonpath([str(p) for p in conf_paths])) if len(conf_paths) > 1 else None
-    )
+    conf_common = Path(__import__("os").path.commonpath([str(p) for p in conf_paths])) if len(conf_paths) > 1 else None
     for path, (_, chain) in zip(conf_paths, conf_specs, strict=True):
         if conf_common is not None and conf_common != Path(path.name):
             try:
@@ -434,9 +465,7 @@ def main() -> None:
         )
         if not ref_chains_full:
             raise ValueError(f"no tokens found for reference {args.residual_vs!r}")
-        ref_D_full = np.linalg.norm(
-            ref_xyz_full[:, None, :] - ref_xyz_full[None, :, :], axis=-1
-        )
+        ref_D_full = np.linalg.norm(ref_xyz_full[:, None, :] - ref_xyz_full[None, :, :], axis=-1)
         ref_label = args.residual_vs if rchain is not None else rpath.name
         print(f"[plot_distogram] residual reference {ref_label}: N={len(ref_chains_full)}")
 
@@ -485,10 +514,7 @@ def main() -> None:
                 native_panel = np.full((S0, S0), np.nan, dtype=np.float64)
                 native_panel[s0 : s0 + L0, s0 : s0 + L0] = ref_D_full[r0 : r0 + L0, r0 : r0 + L0]
                 ref_chains_panel = chains
-                ref_title = (
-                    f"NATIVE {ref_label}\n"
-                    f"src coords  L={L0}/{S0}  trim h/t={s0}/{S0 - s0 - L0}"
-                )
+                ref_title = f"NATIVE {ref_label}\nsrc coords  L={L0}/{S0}  trim h/t={s0}/{S0 - s0 - L0}"
             else:
                 native_panel = ref_D_full
                 ref_chains_panel = ref_chains_full or []
@@ -496,16 +522,24 @@ def main() -> None:
             ref_panel_pending = (ref_title, native_panel, ref_chains_panel, False)
 
         if ref_D_full is not None:
-            # ---- Residual mode ----
+            # ---- Reference-aware mode ----
+            # By default render raw distance panels and annotate the MAE in the title;
+            # the per-step MAE is also stored in ``panel_meta`` so the paired-mode
+            # header line plot picks it up. Pass --residual-heatmap to switch the
+            # panel content to |D - D_ref| (legacy behaviour).
             if xyz.shape[0] == ref_xyz_full.shape[0]:
                 D = np.linalg.norm(xyz[:, None, :] - xyz[None, :, :], axis=-1)
                 R = np.abs(D - ref_D_full)
                 mae = float(R.mean())
-                title = f"|{label} − {ref_label}|\nN={len(chains)}  MAE={mae:.2f} Å"
-                panels.append((title, R, chains, True))
+                if args.residual_heatmap:
+                    title = f"|{label} − {ref_label}|\nN={len(chains)}  MAE={mae:.2f} Å"
+                    panels.append((title, R, chains, True))
+                else:
+                    title = f"{label}\nN={len(chains)}  MAE={mae:.2f} Å"
+                    panels.append((title, D, chains, False))
                 panel_meta.append((src_path, 0, mae))
                 panel_raw[len(panels) - 1] = D
-                print(f"[plot_distogram] {label}: residual MAE={mae:.2f} Å, max={R.max():.2f} Å")
+                print(f"[plot_distogram] {label}: MAE={mae:.2f} Å, max={R.max():.2f} Å")
             elif args.align_sequence and (align := _align_substr(src_seq, ref_seq_full)) is not None:
                 si, ri, L = align
                 S = xyz.shape[0]
@@ -524,20 +558,32 @@ def main() -> None:
                 R[si : si + L, si : si + L] = np.abs(D[si : si + L, si : si + L] - ref_D_a)
                 mae = float(np.nanmean(R))
                 rmax = float(np.nanmax(R))
-                title = (
-                    f"|{label} − {ref_label}|\n"
-                    f"aligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
-                )
-                panels.append((title, R, chains, True))
+                if args.residual_heatmap:
+                    title = (
+                        f"|{label} − {ref_label}|\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
+                    )
+                    panels.append((title, R, chains, True))
+                else:
+                    # Mask trimmed head/tail with NaN so the heatmap visibly
+                    # reflects the alignment (parity with the residual heatmap
+                    # and the embedded NATIVE-ref panel). panel_raw keeps the
+                    # full D for the pred-vs-struct MAE computation.
+                    D_disp = np.full_like(D, np.nan)
+                    D_disp[si : si + L, si : si + L] = D[si : si + L, si : si + L]
+                    title = (
+                        f"{label}\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
+                    )
+                    panels.append((title, D_disp, chains, False))
                 panel_meta.append((src_path, 0, mae))
                 panel_raw[len(panels) - 1] = D
                 per_dir_align[str(src_path.parent)] = (si, ri, L)
-                print(f"[plot_distogram] {label}: residual MAE={mae:.2f} Å, max={rmax:.2f} Å")
+                print(f"[plot_distogram] {label}: MAE={mae:.2f} Å, max={rmax:.2f} Å")
             else:
                 D = np.linalg.norm(xyz[:, None, :] - xyz[None, :, :], axis=-1)
-                msg = (
-                    f"shape {D.shape} vs ref {ref_D_full.shape}; "
-                    + ("substring alignment failed" if args.align_sequence else "pass --align-sequence to attempt alignment")
+                msg = f"shape {D.shape} vs ref {ref_D_full.shape}; " + (
+                    "substring alignment failed"
+                    if args.align_sequence
+                    else "pass --align-sequence to attempt alignment"
                 )
                 print(f"[plot_distogram] {label}: skipping residual ({msg}); showing raw distances instead")
                 panels.append((f"{label}\nN={len(chains)}", D, chains, False))
@@ -576,10 +622,7 @@ def main() -> None:
                     )
                     D_emb = np.full((S, S), np.nan, dtype=np.float64)
                     D_emb[ai : ai + L, ai : ai + L] = D[si : si + L, si : si + L]
-                    title = (
-                        f"{label}\n"
-                        f"anchor coords  L={L}/{S}  trim h/t={si}/{xyz.shape[0] - si - L}"
-                    )
+                    title = f"{label}\nanchor coords  L={L}/{S}  trim h/t={si}/{xyz.shape[0] - si - L}"
                     panels.append((title, D_emb, anchor_chains, False))
                     panel_meta.append((src_path, 0, None))
                     panel_raw[len(panels) - 1] = D
@@ -587,6 +630,11 @@ def main() -> None:
     if ref_panel_pending is not None:
         panels.insert(0, ref_panel_pending)
         panel_meta.insert(0, (None, -1, None))
+        # Shift the integer-keyed panel_raw dict to match the +1 index shift
+        # applied to ``panels``/``panel_meta`` by the insert above. Without
+        # this the pred-vs-structure lookup misaligns and the last cif's
+        # ``D`` is silently missing.
+        panel_raw = {k + 1: v for k, v in panel_raw.items()}
 
     # ---- Predicted distogram panels (from confidences.json) ----
     # E[d] is already in Å (per-token expected distance from softmax over bins).
@@ -606,11 +654,15 @@ def main() -> None:
             if E.shape == ref_D_full.shape:
                 R = np.abs(E - ref_D_full)
                 mae = float(R.mean())
-                title = f"|{label} pred − {ref_label}|\nN={len(chains)}  MAE={mae:.2f} Å"
-                panels.append((title, R, chains, True))
+                if args.residual_heatmap:
+                    title = f"|{label} pred − {ref_label}|\nN={len(chains)}  MAE={mae:.2f} Å"
+                    panels.append((title, R, chains, True))
+                else:
+                    title = f"{label} pred E[d]\nN={len(chains)}  MAE={mae:.2f} Å"
+                    panels.append((title, E, chains, False))
                 panel_meta.append((path, 1, mae))
                 panel_raw[len(panels) - 1] = E
-                print(f"[plot_distogram] {label} (pred): residual MAE={mae:.2f} Å, max={R.max():.2f} Å")
+                print(f"[plot_distogram] {label} (pred): MAE={mae:.2f} Å, max={R.max():.2f} Å")
             elif (align := per_dir_align.get(str(path.parent))) is not None:
                 # Inherit substring alignment from the matching cif in the same sample-dir.
                 si, ri, L = align
@@ -620,14 +672,21 @@ def main() -> None:
                 R[si : si + L, si : si + L] = np.abs(E[si : si + L, si : si + L] - ref_D_a)
                 mae = float(np.nanmean(R))
                 rmax = float(np.nanmax(R))
-                title = (
-                    f"|{label} pred − {ref_label}|\n"
-                    f"aligned L={L}/{S}  trim h/t={si}/{S - si - L}  MAE={mae:.2f} Å"
-                )
-                panels.append((title, R, chains, True))
+                if args.residual_heatmap:
+                    title = f"|{label} pred − {ref_label}|\naligned L={L}/{S}  trim h/t={si}/{S - si - L}  MAE={mae:.2f} Å"
+                    panels.append((title, R, chains, True))
+                else:
+                    # Mask trimmed edges so the heatmap shows the aligned
+                    # region only (matches the cif raw panel + NATIVE ref).
+                    E_disp = np.full_like(E, np.nan)
+                    E_disp[si : si + L, si : si + L] = E[si : si + L, si : si + L]
+                    title = f"{label} pred E[d]\naligned L={L}/{S}  trim h/t={si}/{S - si - L}  MAE={mae:.2f} Å"
+                    panels.append((title, E_disp, chains, False))
                 panel_meta.append((path, 1, mae))
                 panel_raw[len(panels) - 1] = E
-                print(f"[plot_distogram] {label} (pred): residual MAE={mae:.2f} Å, max={rmax:.2f} Å (cif-borrowed alignment)")
+                print(
+                    f"[plot_distogram] {label} (pred): MAE={mae:.2f} Å, max={rmax:.2f} Å (cif-borrowed alignment)"
+                )
             else:
                 print(
                     f"[plot_distogram] {label} (pred): shape {E.shape} vs ref {ref_D_full.shape}; "
@@ -642,39 +701,63 @@ def main() -> None:
             panel_raw[len(panels) - 1] = E
             print(f"[plot_distogram] {label} (pred): {len(chains)} tokens, max E[d] = {E.max():.1f} Å")
 
-    # MAE-vs-step single panel
+    # MAE-vs-step panel with separate lines for cif-derived vs pred (E[d]) MAE.
+    # panel_meta[i] = (src, sub, mae) with sub ∈ {-1: ref, 0: cif, 1: pred}.
     if args.mae_curve:
         if ref_D_full is None:
             p.error("--mae-curve requires --residual-vs")
 
-        residual_panels = [(title, m) for title, m, _, is_r in panels if is_r]
-        if not residual_panels:
+        step_re = re.compile(r"step_(\d+)")
+        cif_xs: list[float] = []
+        cif_ys: list[float] = []
+        pred_xs: list[float] = []
+        pred_ys: list[float] = []
+        for i, (src, sub, mae) in enumerate(panel_meta):
+            if mae is None:
+                continue
+            title = panels[i][0]
+            match = step_re.search(title) or (step_re.search(str(src)) if src else None)
+            if match is None:
+                # Skip panels with no step number (e.g. the residual reference
+                # appearing as its own source with MAE = 0). Avoids a spurious
+                # origin point dragging the y-axis to zero.
+                continue
+            x = float(match.group(1))
+            if sub == 0:
+                cif_xs.append(x)
+                cif_ys.append(mae)
+            elif sub == 1:
+                pred_xs.append(x)
+                pred_ys.append(mae)
+
+        if not (cif_xs or pred_xs):
             p.error("--mae-curve: no residual panels were produced (shape mismatch with reference?)")
 
-        step_re = re.compile(r"step_(\d+)")
-        xs: list[float] = []
-        ys: list[float] = []
-        for idx, (title, M) in enumerate(residual_panels):
-            match = step_re.search(title)
-            xs.append(float(match.group(1)) if match else float(idx))
-            ys.append(float(np.nanmean(M)))
+        def _sorted(xs: list[float], ys: list[float]) -> tuple[list[float], list[float]]:
+            order = sorted(range(len(xs)), key=lambda i: xs[i])
+            return [xs[i] for i in order], [ys[i] for i in order]
 
-        order = sorted(range(len(xs)), key=lambda i: xs[i])
-        xs = [xs[i] for i in order]
-        ys = [ys[i] for i in order]
-
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        ax.plot(xs, ys, marker="o", color="tab:blue")
-        ax.set_xlabel("training step" if step_re.search(residual_panels[0][0]) else "source index")
-        ax.set_ylabel("MAE  |D − D_ref|  (Å)")
+        fig, ax = plt.subplots(figsize=(7.5, 4.5))
+        has_step = bool(cif_xs or pred_xs) and any(step_re.search(t) for t, _, _, is_r in panels if is_r)
+        if cif_xs:
+            cx, cy = _sorted(cif_xs, cif_ys)
+            ax.plot(cx, cy, marker="o", color="tab:blue", label="cif (structure-derived |D − D_ref|)")
+            for x, y in zip(cx, cy, strict=True):
+                ax.annotate(f"{y:.2f}", (x, y), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7, color="tab:blue")
+        if pred_xs:
+            px, py = _sorted(pred_xs, pred_ys)
+            ax.plot(px, py, marker="s", color="tab:orange", label="pred E[d]  |E[d] − D_ref|")
+            for x, y in zip(px, py, strict=True):
+                ax.annotate(f"{y:.2f}", (x, y), textcoords="offset points", xytext=(0, -12), ha="center", fontsize=7, color="tab:orange")
+        ax.set_xlabel("training step" if has_step else "source index")
+        ax.set_ylabel("MAE  (Å)")
         ax.set_title(f"Distogram MAE vs {ref_label}")
         ax.grid(True, alpha=0.3)
-        for x, y in zip(xs, ys, strict=True):
-            ax.annotate(f"{y:.2f}", (x, y), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8)
+        ax.legend(loc="best", fontsize=9)
         fig.tight_layout()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(args.output, dpi=args.dpi, bbox_inches="tight")
-        print(f"[plot_distogram] saved {args.output}")
+        print(f"[plot_distogram] saved {args.output}  (cif n={len(cif_xs)}, pred n={len(pred_xs)})")
         return
 
     # Shared residual vmax (so all residual panels are comparable)
@@ -748,7 +831,7 @@ def main() -> None:
         )
 
         def _make_image_cell(idx: int) -> dict:
-            return {"kind": "image", "panel": panels[idx]}
+            return {"kind": "image", "panel": panels[idx], "span": 1}
 
         # Header row: native + MAE side by side. The "native" cell is the
         # reference panel when --residual-vs+--show-ref are set; when absent
@@ -776,6 +859,7 @@ def main() -> None:
                     ],
                     "ref_label": ref_label,
                     "has_ref": ref_D_full is not None,
+                    "span": 1,  # expanded later to fill the rest of the header row
                 }
             )
         has_header_row = bool(header_cells)
@@ -806,20 +890,21 @@ def main() -> None:
         rows_cells: list[list[dict]] = []
         if has_header_row:
             row = list(header_cells)
-            while len(row) < cols:
-                row.append({"kind": "blank"})
+            # Let the MAE cell span all remaining header columns so the line
+            # plot reads wider than a single image cell.
+            consumed = sum(c.get("span", 1) for c in row if c["kind"] != "mae")
+            for c in row:
+                if c["kind"] == "mae":
+                    c["span"] = max(1, cols - consumed)
+                    break
             rows_cells.append(row)
 
         cur_row: list[dict] = []
         for parent in sorted_parents:
             cif_idx = groups[parent].get(0)
             pred_idx = groups[parent].get(1)
-            cur_row.append(
-                _make_image_cell(cif_idx) if cif_idx is not None else {"kind": "blank"}
-            )
-            cur_row.append(
-                _make_image_cell(pred_idx) if pred_idx is not None else {"kind": "blank"}
-            )
+            cur_row.append(_make_image_cell(cif_idx) if cif_idx is not None else {"kind": "blank", "span": 1})
+            cur_row.append(_make_image_cell(pred_idx) if pred_idx is not None else {"kind": "blank", "span": 1})
             if len(cur_row) >= cols:
                 rows_cells.append(cur_row)
                 cur_row = []
@@ -830,19 +915,24 @@ def main() -> None:
                 cur_row = []
         if cur_row:
             while len(cur_row) < cols:
-                cur_row.append({"kind": "blank"})
+                cur_row.append({"kind": "blank", "span": 1})
             rows_cells.append(cur_row)
 
         n_rows = len(rows_cells)
-        fig, axes = plt.subplots(
-            n_rows, cols, figsize=(4.5 * cols, 4.0 * n_rows), squeeze=False, layout="constrained"
-        )
+        fig = plt.figure(figsize=(4.5 * cols, 4.0 * n_rows), layout="constrained")
+        gs = fig.add_gridspec(n_rows, cols)
         for ri, row in enumerate(rows_cells):
-            for ci, cell in enumerate(row):
-                ax = axes[ri][ci]
+            col = 0
+            for cell in row:
+                span = max(1, int(cell.get("span", 1)))
+                if col >= cols:
+                    break
+                span = min(span, cols - col)
                 if cell["kind"] == "blank":
-                    ax.axis("off")
-                elif cell["kind"] == "image":
+                    col += span
+                    continue
+                ax = fig.add_subplot(gs[ri, col : col + span])
+                if cell["kind"] == "image":
                     title, M, chains, is_residual = cell["panel"]
                     if is_residual:
                         plot_panel(ax, M, chains, title, vmax=residual_vmax, cmap=args.residual_cmap)
@@ -864,6 +954,7 @@ def main() -> None:
                     if drawn_any:
                         ax.legend(fontsize=8, loc="best")
                     ax.grid(True, alpha=0.3)
+                col += span
         if ref_D_full is not None:
             fig.suptitle(
                 f"Residual |D − D_ref| vs {ref_label}  (cap {residual_vmax:.1f} Å, {args.residual_cmap}); "
@@ -883,9 +974,7 @@ def main() -> None:
     n = len(panels)
     cols = max(1, int(math.ceil(math.sqrt(n))))
     rows = int(math.ceil(n / cols))
-    fig, axes = plt.subplots(
-        rows, cols, figsize=(4.5 * cols, 4.0 * rows), squeeze=False, layout="constrained"
-    )
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4.0 * rows), squeeze=False, layout="constrained")
     flat_axes = axes.ravel()
     for ax, (title, M, chains, is_residual) in zip(flat_axes, panels, strict=False):
         if is_residual:

@@ -23,6 +23,14 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 
+# Trainer prints ``Starting training: ...`` at the top of every fresh
+# session (after init / resume). When a run dir survives multiple
+# sessions — JobSet retries, intentional re-launch into the same
+# RUN_NAME, or an aborted attempt that left log lines behind — only the
+# tail belongs to the *current* session, so ``parse_log`` discards
+# everything before the last occurrence of this marker.
+_STARTING_RE = re.compile(r"Starting training:")
+
 # Match a single training step log line. Tolerant to additional fields between
 # the captured ones — every key is matched independently against the line.
 _STEP_RE = re.compile(r"step=(\d+) ")
@@ -42,13 +50,26 @@ _FIELD_RES = {
     "tok_per_s": re.compile(r"\btok/s=([\d.]+)([km]?)"),
     "dt": re.compile(r"\bdt=([\d.]+)s"),
     "eta": re.compile(r"\beta=(\S+)"),
+    # TM-like accuracy/calibration metrics in [0, 1]. ``*_true`` is computed
+    # from the true alignment error (= ground-truth structural accuracy);
+    # ``*_pred`` is the model's PAE-derived self-estimate (= classical pTM).
+    # Cross-chain variants (``itm_*``) only fire on multi-chain inputs. The
+    # ``p`` prefix is dropped so that ``*_true`` / ``*_pred`` distinguishes
+    # ground-truth from prediction without colliding with pTM's "p".
+    "tm_true": re.compile(r"\btm_true=([\d.eE+\-nainf]+)"),
+    "itm_true": re.compile(r"\bitm_true=([\d.eE+\-nainf]+)"),
+    "tm_pred": re.compile(r"\btm_pred=([\d.eE+\-nainf]+)"),
+    "itm_pred": re.compile(r"\bitm_pred=([\d.eE+\-nainf]+)"),
 }
 
 LANDMARK_STEPS = [1, 10, 50, 100, 200, 300, 500, 700, 1000, 1500, 2000, 3000, 5000, 7000, 10000, 15000, 20000]
 LANDMARK_STEPS.sort()
 
-WINDOWS = [(i*500,(i+1)*500) for i in range(100)]
-WINDOWS.sort()
+
+def _windows(size: int, max_step: int = 50000) -> list[tuple[int, int]]:
+    """Return ``[(lo, hi), ...]`` covering [0, max_step) at stride ``size``."""
+    n = max(1, max_step // size + 1)
+    return [(i * size, (i + 1) * size) for i in range(n)]
 
 
 def _parse_float(s: str) -> float:
@@ -70,13 +91,25 @@ def _parse_tok_per_s(match: re.Match[str] | None) -> float | None:
 
 
 def parse_log(path: Path) -> tuple[list[dict], dict[str, str]]:
-    """Return (rows, meta) where rows are per-step dicts and meta has reg-key labels."""
+    """Return (rows, meta) where rows are per-step dicts and meta has reg-key labels.
+
+    Only step lines that follow the *last* ``Starting training:`` marker are
+    returned; lines from prior aborted sessions in the same log file are
+    discarded so that downstream stats reflect the current session's geometry
+    (world_size, batch geometry, lr/clip etc. may have changed).
+    """
     rows: list[dict] = []
     meta: dict[str, str] = {}
     if not path.exists():
         return rows, meta
     with path.open() as f:
         for line in f:
+            if _STARTING_RE.search(line):
+                # New session boundary — discard everything we've accumulated
+                # so far. Hold on to nothing from the prior attempt.
+                rows = []
+                meta = {}
+                continue
             sm = _STEP_RE.search(line)
             if sm is None:
                 continue
@@ -151,10 +184,20 @@ def show_landmark_trajectory(rows: list[dict], meta: dict[str, str], tail: int |
         )
 
 
-def show_grad_norm_windows(rows: list[dict], clip_threshold: float | None = None, tail: int | None = None) -> None:
+def show_grad_norm_windows(
+    rows: list[dict],
+    clip_threshold: float | None = None,
+    tail: int | None = None,
+    window_size: int = 250,
+) -> None:
     rows_per_window = []
-    for lo, hi in WINDOWS:
-        gns = [r["grad_norm"] for r in rows if "grad_norm" in r and lo <= r["step"] < hi and r["grad_norm"] == r["grad_norm"]]
+    max_step = max((r["step"] for r in rows), default=0) + window_size
+    for lo, hi in _windows(window_size, max_step):
+        gns = [
+            r["grad_norm"]
+            for r in rows
+            if "grad_norm" in r and lo <= r["step"] < hi and r["grad_norm"] == r["grad_norm"]
+        ]
         if not gns:
             continue
         rows_per_window.append((lo, hi, gns))
@@ -167,23 +210,80 @@ def show_grad_norm_windows(rows: list[dict], clip_threshold: float | None = None
     if truncated:
         title += f"  [last {tail}; --full for all]"
     print(title)
-    header = f"  {'window':<13} {'n':>5}  {'p50':>7}  {'p90':>8}  {'p99':>9}  {'max':>10}  {'mean':>8}"
+    header = f"  {'window':<13} {'n':>5}  {'p50':>7}  {'p90':>8}  {'p99':>9}  {'max':>10}  {'mean':>8}  {'m/p50':>5}"
     if clip_threshold is not None:
         header += f"  {f'>{int(clip_threshold)}':>6}"
     print(header)
     for lo, hi, gns in rows_per_window:
         gns.sort()
         n = len(gns)
+        median = gns[n // 2]
+        mean = sum(gns) / n
+        ratio = mean / median if median > 0 else float("nan")
         line = (
             f"  {lo:>5}-{hi:<7d} {n:>5d}  "
-            f"{gns[n // 2]:>7.2f}  {gns[9 * n // 10]:>8.2f}  "
+            f"{median:>7.2f}  {gns[9 * n // 10]:>8.2f}  "
             f"{gns[min(n - 1, 99 * n // 100)]:>9.2f}  {gns[-1]:>10.2f}  "
-            f"{sum(gns) / n:>8.2f}"
+            f"{mean:>8.2f}  {ratio:>5.2f}"
         )
         if clip_threshold is not None:
             frac_over = sum(1 for g in gns if g > clip_threshold) / n
             line += f"  {frac_over:>5.1%}"
         print(line)
+
+
+def show_loss_windows(
+    rows: list[dict],
+    meta: dict[str, str],
+    tail: int | None = None,
+    window_size: int = 250,
+) -> None:
+    sk = meta.get("single_reg_key", "single_*")
+    pk = meta.get("pair_reg_key", "pair_*")
+    keys = [
+        ("loss", "loss"),
+        ("diffusion_mse", "diff_mse"),
+        ("distogram", "distogram"),
+        ("smooth_lddt", "smooth_lddt"),
+        ("single_reg", sk),
+        ("pair_reg", pk),
+        ("tm_true", "tm_true"),
+        ("itm_true", "itm_true"),
+        ("tm_pred", "tm_pred"),
+        ("itm_pred", "itm_pred"),
+    ]
+    max_step = max((r["step"] for r in rows), default=0) + window_size
+    windows = _windows(window_size, max_step)
+    for key, label in keys:
+        rows_per_window = []
+        for lo, hi in windows:
+            vals = [r[key] for r in rows if key in r and lo <= r["step"] < hi and r[key] == r[key]]
+            if not vals:
+                continue
+            rows_per_window.append((lo, hi, vals))
+        if not rows_per_window:
+            continue
+        truncated = tail is not None and len(rows_per_window) > tail
+        if truncated:
+            rows_per_window = rows_per_window[-tail:]
+        title = f"\n## {label} distribution by window"
+        if truncated:
+            title += f"  [last {tail}; --full for all]"
+        print(title)
+        print(
+            f"  {'window':<13} {'n':>5}  {'min':>9}  {'p25':>9}  {'p50':>9}  {'p75':>9}  "
+            f"{'p90':>9}  {'p99':>9}  {'max':>10}  {'mean':>9}"
+        )
+        for lo, hi, vals in rows_per_window:
+            vals.sort()
+            n = len(vals)
+            print(
+                f"  {lo:>5}-{hi:<7d} {n:>5d}  "
+                f"{vals[0]:>9.4g}  {vals[n // 4]:>9.4g}  {vals[n // 2]:>9.4g}  "
+                f"{vals[3 * n // 4]:>9.4g}  {vals[9 * n // 10]:>9.4g}  "
+                f"{vals[min(n - 1, 99 * n // 100)]:>9.4g}  {vals[-1]:>10.4g}  "
+                f"{sum(vals) / n:>9.4g}"
+            )
 
 
 def show_recent_speed(rows: list[dict], n_recent: int = 50) -> None:
@@ -196,7 +296,9 @@ def show_recent_speed(rows: list[dict], n_recent: int = 50) -> None:
     print(f"\n## Speed (last {len(recent)} steps)")
     print(f"  dt:     mean={sum(dts) / len(dts):.1f}s  min={min(dts):.1f}s  max={max(dts):.1f}s")
     if tps:
-        print(f"  tok/s:  mean={sum(tps) / len(tps) / 1000:.2f}k  min={min(tps) / 1000:.2f}k  max={max(tps) / 1000:.2f}k")
+        print(
+            f"  tok/s:  mean={sum(tps) / len(tps) / 1000:.2f}k  min={min(tps) / 1000:.2f}k  max={max(tps) / 1000:.2f}k"
+        )
     if "eta" in last:
         print(f"  ETA:    {last['eta']}  (latest line)")
 
@@ -217,18 +319,24 @@ def show_latest(rows: list[dict], meta: dict[str, str]) -> None:
         (sk, "single_reg"),
         (pk, "pair_reg"),
         ("smooth_lddt", "smooth_lddt"),
+        ("tm_true", "tm_true"),
+        ("itm_true", "itm_true"),
+        ("tm_pred", "tm_pred"),
+        ("itm_pred", "itm_pred"),
         ("grad_norm", "grad_norm"),
         ("lr", "lr"),
     ]
     parts = []
-    for label, key in cols:
+    ncols = 5
+    for i, (label, key) in enumerate(cols):
+        end = "\n" if (ncols - i - 1) % ncols == 0 else ""
         v = last.get(key)
         if v is None:
             continue
         if label == "lr":
-            parts.append(f"{label}={v:.2e}")
+            parts.append(f"{label}={v:.2e}{end}")
         else:
-            parts.append(f"{label}={v:.4f}")
+            parts.append(f"{label}={v:.4f}{end}")
     print("  " + "  ".join(parts))
 
 
@@ -260,7 +368,9 @@ def show_baseline_comparison(
     if truncated:
         title += f"  [last {tail}; --full for all]"
     print(title)
-    print(f"  {'step':>6}  {'cur single_rms':>14}  {'base single_rms':>15}  {'cur sm_lddt':>11}  {'base sm_lddt':>12}")
+    print(
+        f"  {'step':>6}  {'cur single_rms':>14}  {'base single_rms':>15}  {'cur smooth_lddt':>11}  {'base smooth_lddt':>12}"
+    )
     for s in common:
         cur = cur_by_step[s]
         base = base_by_step[s]
@@ -280,9 +390,11 @@ def main() -> int:
     p.add_argument("--run-dir", type=Path, help="explicit run directory")
     p.add_argument("--vs", help="baseline run name to compare against")
     p.add_argument("--clip", type=float, default=None, help="clip threshold (annotates >clip column)")
-    p.add_argument("--full", action="store_true", help="show all rows (default: last 10 only)")
+    p.add_argument("--tail", type=int, default=10, help="max rows to show per table (default: 10)")
+    p.add_argument("--full", action="store_true", help="show all rows (overrides --tail)")
+    p.add_argument("-ws", "--window-size", type=int, default=250, help="window size in steps for grad_norm/loss tables (default: 250)")
     args = p.parse_args()
-    tail = None if args.full else 10
+    tail = None if args.full else args.tail
 
     run_dir = resolve_run(args.run, args.run_dir)
     if run_dir is None or not run_dir.exists():
@@ -314,7 +426,8 @@ def main() -> int:
                     break
 
     show_landmark_trajectory(rows, meta, tail=tail)
-    show_grad_norm_windows(rows, clip_threshold=clip, tail=tail)
+    show_grad_norm_windows(rows, clip_threshold=clip, tail=tail, window_size=args.window_size)
+    show_loss_windows(rows, meta, tail=tail, window_size=args.window_size)
     show_recent_speed(rows)
 
     if args.vs:

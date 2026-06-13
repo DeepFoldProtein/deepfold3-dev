@@ -86,32 +86,83 @@ def load_ca_with_seq(path: Path, chain_id: str = "A"):
     return np.asarray(coords, dtype=np.float64), "".join(seq_chars)
 
 
-def kabsch_superimpose(pred: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Return ``pred`` rigidly superimposed onto ``ref`` (least-squares).
+def _kabsch_rt(pred: np.ndarray, ref: np.ndarray):
+    """Return ``(R, t)`` such that ``pred @ R.T + t`` aligns to ``ref``.
 
     Pure proper rotation (determinant +1) — reflection branch flipped.
-    Both inputs ``[N, 3]``; returns ``[N, 3]``.
+    Both inputs ``[N, 3]``.
     """
-    p_center = pred.mean(axis=0)
-    r_center = ref.mean(axis=0)
-    p = pred - p_center
-    r = ref - r_center
-    H = p.T @ r                                       # 3×3
+    p_c = pred.mean(axis=0)
+    r_c = ref.mean(axis=0)
+    H = (pred - p_c).T @ (ref - r_c)
     U, _, Vt = np.linalg.svd(H)
     d = np.sign(np.linalg.det(Vt.T @ U.T))
     D = np.diag([1.0, 1.0, d if d != 0 else 1.0])
-    R = Vt.T @ D @ U.T                                # proper rotation
-    return p @ R.T + r_center
+    R = Vt.T @ D @ U.T
+    t = r_c - R @ p_c
+    return R, t
+
+
+def kabsch_superimpose(pred: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Return ``pred`` rigidly superimposed onto ``ref`` (least-squares)."""
+    R, t = _kabsch_rt(pred, ref)
+    return pred @ R.T + t
+
+
+def _gdt_score_at_cutoff(pred: np.ndarray, ref: np.ndarray,
+                          cutoff: float, seed_len: int = 5,
+                          stride: int = 3, max_iter: int = 20,
+                          min_subset: int = 3) -> float:
+    """LGA-style multi-seed best-fit subset score for one cutoff ``d``.
+
+    For every length-``seed_len`` contiguous-residue seed (sliding with
+    ``stride``), Kabsch-fit the seed, then iteratively grow the subset
+    by adding residues whose superposed Cα–Cα distance ≤ ``cutoff``
+    and refitting, until the subset stabilises. The seed that grows
+    the largest converged subset wins; the score is its size / ``N``.
+
+    Standard LGA uses fragment-based seeding (here: contiguous size-5
+    seeds) precisely because a single Kabsch over all N residues is
+    sensitive to outliers — a few wildly displaced residues drag the
+    centroid and bias every iteration toward a poor alignment. Sliding
+    seeds find the locally-correct subset even when most of the chain
+    is misplaced. Stride 3 / seed 5 keeps runtime ~60 ms / sample
+    (vs. ~1 ms for naive single-init) while matching LGA-style scores.
+    """
+    n = pred.shape[0]
+    if n < seed_len:
+        return 0.0
+    best = 0
+    for start in range(0, n - seed_len + 1, stride):
+        mask = np.zeros(n, dtype=bool)
+        mask[start:start + seed_len] = True
+        for _ in range(max_iter):
+            if mask.sum() < min_subset:
+                break
+            R, t = _kabsch_rt(pred[mask], ref[mask])
+            d = np.linalg.norm(pred @ R.T + t - ref, axis=-1)
+            new_mask = d <= cutoff
+            if new_mask.sum() < min_subset:
+                break
+            if np.array_equal(new_mask, mask):
+                break
+            mask = new_mask
+        if mask.sum() > best:
+            best = int(mask.sum())
+    return float(best / n)
 
 
 def compute_gdt_ts(pred_ca: np.ndarray, ref_ca: np.ndarray,
                    cutoffs: tuple[float, ...] = GDT_TS_CUTOFFS) -> float:
-    """GDT-TS on already-paired Cα arrays. Both ``[N, 3]``."""
+    """LGA-style GDT-TS on already-paired Cα arrays. Both ``[N, 3]``.
+
+    GDT-TS = mean over the four cutoffs ``{1, 2, 4, 8} Å`` of the
+    fraction of residues within that cutoff under the *best-fit
+    subset alignment* for each cutoff (iterative LGA convention).
+    """
     if pred_ca.shape[0] != ref_ca.shape[0] or pred_ca.shape[0] == 0:
         return float("nan")
-    super_pred = kabsch_superimpose(pred_ca, ref_ca)
-    d = np.linalg.norm(super_pred - ref_ca, axis=-1)
-    scores = [(d <= c).mean() for c in cutoffs]
+    scores = [_gdt_score_at_cutoff(pred_ca, ref_ca, c) for c in cutoffs]
     return float(np.mean(scores))
 
 

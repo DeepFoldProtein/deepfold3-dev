@@ -64,16 +64,16 @@ def load_series(src_dir: Path, prefix: str) -> list[tuple[int, dict]]:
 
 def main() -> None:
     src_dir = Path("tmp/spectral")
-    chiral_rows = load_series(src_dir, "chiral")
-    rsf_rows = load_series(src_dir, "rsf")
-    if not (chiral_rows or rsf_rows):
-        print("No spectral files found (expected chiral_step_*.txt / rsf_step_*.txt)")
+    fapeS3_rows = load_series(src_dir, "fapeS3")
+    rsf_rows = []  # load_series(src_dir, "rsf")
+    if not (fapeS3_rows or rsf_rows):
+        print("No spectral files found (expected fapeS3_step_*.txt / rsf_step_*.txt)")
         return
 
-    chiral_steps = [r[0] for r in chiral_rows]
+    fapeS3_steps = [r[0] for r in fapeS3_rows]
     rsf_steps = [r[0] for r in rsf_rows]
-    print(f"Loaded {len(chiral_rows)} chiral (current; +AF3-spec MSA/tmpl fix + chirality hinge): {chiral_steps}")
-    print(f"Loaded {len(rsf_rows)} rsf (prev run, df3-rsf-25e5-c10-g35; no spec fix): {rsf_steps}")
+    print(f"Loaded {len(fapeS3_rows)} fapeS3 (current; +AF3-spec MSA/tmpl fix + fapeS3ity hinge): {fapeS3_steps}")
+    # print(f"Loaded {len(rsf_rows)} rsf (prev run, df3-rsf-25e5-c10-g35; no spec fix): {rsf_steps}")
 
     # Reference model values (from references/ static analysis).
     ref = {
@@ -83,7 +83,7 @@ def main() -> None:
         "Boltz-2": {"pairformer": 67, "diffusion": 78, "msa": 48, "atom_encoder": 36, "template": 30},
     }
     buckets = ["pairformer", "diffusion", "msa", "atom_encoder", "template"]
-    # Architectural notes (current arm = `chiral`: AF3 baseline + refined SF +
+    # Architectural notes (current arm = `fapeS3`: AF3 baseline + refined SF +
     # AF3-spec MSA/template fixes — NO uniros, NO RMSN). All buckets are
     # architecturally comparable with the AF3/PX/Boltz reference lines.
     # Lineage / s035 series may differ — see series-level legend.
@@ -99,11 +99,11 @@ def main() -> None:
                 label="rsf (previous run, df3-rsf-25e5-c10-g35; no spec fix)",
                 linewidth=0.8, markersize=2.5, markeredgewidth=0, alpha=0.7,
             )
-        if chiral_rows:
-            ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in chiral_rows]
+        if fapeS3_rows:
+            ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in fapeS3_rows]
             ax.plot(
-                chiral_steps, ys, marker="o", color="tab:blue",
-                label="chiral (current; +AF3-spec MSA/tmpl fix + chirality hinge α=2)",
+                fapeS3_steps, ys, marker="o", color="tab:blue",
+                label="fapeS3 (current; +AF3-spec MSA/tmpl fix + fapeS3ity hinge α=2)",
                 linewidth=1.0, markersize=2.5, markeredgewidth=0,
             )
         # Reference horizontal lines
@@ -127,17 +127,17 @@ def main() -> None:
     legend_ax.legend(handles, labels, fontsize=9, loc="center", frameon=False)
     fig.suptitle(
         "Bucket-level effective rank p50 evolution\n"
-        "Current arm (chiral) is AF3-architecturally equivalent to AF3/PX/Boltz reference lines.",
+        "Current arm (fapeS3) is AF3-architecturally equivalent to AF3/PX/Boltz reference lines.",
         fontsize=11,
     )
     fig.tight_layout()
-    out = src_dir / "chiral_eff_rank.png"
+    out = src_dir / "fapeS3_eff_rank.png"
     fig.savefig(out, dpi=140, bbox_inches="tight")
     print(f"saved {out}")
 
     # Save CSV for the current arm only.
-    csv_path = src_dir / "chiral_eff_rank.csv"
-    primary_rows = chiral_rows or rsf_rows
+    csv_path = src_dir / "fapeS3_eff_rank.csv"
+    primary_rows = fapeS3_rows or rsf_rows
     with csv_path.open("w") as f:
         w = csv.writer(f)
         w.writerow(["step", *buckets])

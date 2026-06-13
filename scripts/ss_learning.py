@@ -120,7 +120,7 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
 # Per-sample metric cache — sidecar ``ss_metrics.json`` next to each
 # ``model.cif``. Bump version when any computation in ``_per_sample``
 # changes (e.g. new metric, different alignment, DSSP version change).
-_SS_METRICS_VERSION = 1
+_SS_METRICS_VERSION = 2  # v2: gdt_ts switched to LGA-style iterative best-fit subset
 _SS_METRICS_FILENAME = "ss_metrics.json"
 
 
@@ -437,7 +437,7 @@ def main() -> None:
         print()
 
     if args.out_csv:
-        cols = ["step", "target", "macro_f1_8", "macro_f1_3"]
+        cols = ["step", "target", "macro_f1_8", "macro_f1_3", "gdt_ts"]
         for c in DSSP_8:
             cols += [f"f1_{c}", f"prec_{c}", f"rec_{c}"]
         for c in ("α", "β", "c"):
@@ -494,7 +494,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         for c in classes_3:
             f1_3_means[c].append(np.nanmean([r[f"f1_3_{c}"] for r in per_step]))
 
-    fig, (ax8, ax3) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax8, ax3) = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
     ax8.set_title("DSSP 8-state per-class F1")
     for c in classes_8:
         if all(v != v for v in f1_8_means[c]):  # all NaN
@@ -571,7 +571,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         a2b = sum(r["conf_gtα_predβ"] for r in per_step)
         helix_eats_strand.append(b2a / beta_total if beta_total else float("nan"))
         strand_eats_helix.append(a2b / alpha_total if alpha_total else float("nan"))
-    fig_pr, (axp, axr, axe) = plt.subplots(1, 3, figsize=(16, 5))
+    fig_pr, (axp, axr, axe) = plt.subplots(3, 1, figsize=(14, 14), sharex=True)
     axp.set_title("Precision (3-state)")
     axr.set_title("Recall (3-state)")
     for c, color in zip(classes_3, ("tab:red", "tab:blue", "tab:gray"), strict=True):
