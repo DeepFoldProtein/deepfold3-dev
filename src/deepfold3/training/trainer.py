@@ -879,6 +879,16 @@ class Trainer:
                     microstep_compute_time = 0.0
                     data_wait_window = microstep_data_wait
                     microstep_data_wait = 0.0
+                    # data_wait is rank-local, but the DDP step clock is set by
+                    # the SLOWEST rank's fetch (a straggler stalls peers inside
+                    # the gradient all-reduce, where it shows up as ``dt``, not
+                    # ``data_wait``, on the fast ranks). Reduce with MAX across
+                    # ranks so the reported value reflects the worst rank. The
+                    # gate above is identical on all ranks → collective-safe.
+                    if self.dist.is_distributed:
+                        _dw = torch.tensor(data_wait_window, device=self.dist.device)
+                        torch_dist.all_reduce(_dw, op=torch_dist.ReduceOp.MAX)
+                        data_wait_window = _dw.item()
 
                     if self.dist.is_main:
                         grad_norm = (
@@ -889,8 +899,10 @@ class Trainer:
                         # Eval / checkpoint / logging time is intentionally excluded so the
                         # displayed rate/ETA reflect pure training throughput.
                         dt = compute_time_window / max(self.cfg.log_interval, 1)
-                        # Per-effective-step dataloader wait (same denominator as
-                        # ``dt``). Large relative to ``dt`` ⇒ prefetch-starved.
+                        # Per-effective-step dataloader wait, max over ranks (same
+                        # denominator as ``dt``). Near 0 ⇒ prefetch fully hides the
+                        # fetch; large relative to ``dt`` ⇒ prefetch-starved on the
+                        # slowest rank.
                         data_wait = data_wait_window / max(self.cfg.log_interval, 1)
                         # Schedule-Free folds warmup + bias-correction into ``scheduled_lr``;
                         # ``lr`` stays at the configured peak. Prefer the scheduled value so
@@ -926,7 +938,7 @@ class Trainer:
                         parts.append(f"mem={peak_mem_gb:.1f}G")
                         parts.append(f"eta={eta_str}")
                         parts.append(f"dt={dt:.1f}s")
-                        parts.append(f"data_wait={data_wait:.2f}s")
+                        parts.append(f"data_wait={data_wait:.3f}s")
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
 
