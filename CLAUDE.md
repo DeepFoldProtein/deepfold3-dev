@@ -64,6 +64,7 @@ deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8 --max-templates 4 --workers 16
+deepfold3 build-pdb-cache --data-dir /data/training --mmcif-dir /data/pdb/divided --output /data/pdb/cache --workers 64
 deepfold3 scan-mmcif --mmcif-dir ~/deepfold3/pdb/divided --data-dir /data/training --workers 32
 deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx
 deepfold3 enrich-manifest --data-dir /data/training --idx entries.idx --mmcif-cache data/mmcif_meta.json
@@ -164,7 +165,7 @@ src/deepfold3/
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── paths.py          # shard(), structure_path, mask_path, template_path — sharded layout helpers
 │   ├── msa/             # mmseqs2.py (search) + paths.py (unpaired_msa_path, paired_msa_path)
-│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py (parse_a3m + convert_a3m_file_to_npz), templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects)
+│   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py (parse_a3m + convert_a3m_file_to_npz), templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects), pdb_chain_cache.py (PdbChainCache: per-chain template cache, mem LRU + sharded disk)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
 │   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
@@ -185,6 +186,7 @@ src/deepfold3/
 │   ├── __init__.py       # `_LazyGroup` click.Group `cli` — unified entry point (lazy submodule import)
 │   ├── _common.py        # setup_cli_logging(), require_manifest()
 │   ├── build_masks.py    # `deepfold3 build-masks`
+│   ├── build_pdb_cache.py # `deepfold3 build-pdb-cache` (parallel per-chain template cache pre-build)
 │   ├── convert_weights.py  # `deepfold3 convert`
 │   ├── inference.py      # `deepfold3 inference`
 │   ├── inspect_example.py # `deepfold3 inspect-example`
@@ -350,6 +352,9 @@ Training-time template support uses pre-computed per-chain m8 files (MMseqs2 hit
 4. **Template augmentation**: each sample randomly uses 0..max_templates from available hits (uniform). Per-chain dropout randomly drops chain alignments from multimer templates (50% per chain, always keeping ≥1), so the model sees full, partial, or no cross-chain template context.
 5. **Per-template pair mask**: Template embedding uses per-template coverage mask (`pb_mask[i] × pb_mask[j]`) instead of the query's `multichain_mask`. This allows multimer templates to provide cross-chain structural information (interface distances, relative orientations). Monomer templates naturally mask to intra-chain only since they cover a single chain.
 6. **Date cutoff filtering**: Implemented in `dataset.py:_load_monomer_templates` — applies `min(max_template_date, record.released - cutoff_days)` per record (AF3 §2.4: template release ≥ 60 days before example release; distillation max 2018-04-30).
+7. **Per-chain cache (`PdbChainCache`)**: training extracts each template chain's query-independent intermediate (`seqres`, `struct_seq`, residue→atom `lookup`) at most once via a two-tier cache — per-worker memory LRU + hierarchical sharded disk (`{cache}/{shard}/{pdb}/{chain}.npz` + `_done` sentinel) — instead of re-parsing the full template mmCIF with gemmi per hit (the dominant, query-size-independent dataloader-stall cost). Pre-build with `deepfold3 build-pdb-cache --output /data/pdb/cache`; enable at train time via `training.pdb_chain_cache_dir`. `mmcif_dir` is the cold-parse fallback for chains absent from the cache.
+
+**Crop-then-load ordering** (`dataset.py:_load_sample`): tokenization reads only the structure (MSA content is never needed to build `msa_col_idx`), so MSA files and templates are loaded **after** cropping, restricted to the chains that survive the crop. A 228-chain assembly cropped to `max_tokens` loads MSA/templates for the few surviving chains, not all 228 — turning O(all chains) I/O into O(cropped chains). `data/crop/cropper.py:compute_chain_msa_cols` derives the per-chain MSA columns to load from the cropped `msa_col_idx`. Tier-4 diagnostics: per-`__getitem__` phase timing (`slow_sample_log_threshold_s`) + per-step `data_wait_s` (dataloader-wait) logged by the trainer / WandB.
 
 The inference template pipeline (`data/parse/templates.py`) supports per-chain HHR templates and whole-complex JSON templates.
 

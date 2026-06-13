@@ -15,6 +15,33 @@ from deepfold3.data.types import ATOM_DTYPE, BOND_DTYPE, TOKEN_BOND_DTYPE, TOKEN
 from deepfold3.data.types import MSA as MSAType
 
 
+def compute_chain_msa_cols(asym_ids: np.ndarray, msa_col_idx: np.ndarray | None) -> dict[int, np.ndarray]:
+    """Per-chain MSA column indices referenced by a set of tokens.
+
+    Maps each asym_id present in ``asym_ids`` to the deduplicated, order-stable
+    chain-local MSA column indices its tokens reference (via ``msa_col_idx``).
+    Ligand / column-less tokens (``msa_col_idx == -1``) are dropped; chains
+    with no MSA columns are omitted. Returns ``{}`` if ``msa_col_idx`` is None.
+
+    Shared by :class:`Cropper` (to crop loaded MSA) and the training dataset's
+    crop-then-load path (to load+slice only the MSA of surviving chains).
+    """
+    chain_msa_cols: dict[int, np.ndarray] = {}
+    if msa_col_idx is None:
+        return chain_msa_cols
+    asym_ids = np.asarray(asym_ids)
+    for asym_id in {int(a) for a in asym_ids}:
+        mask = asym_ids == asym_id
+        cols = msa_col_idx[mask]
+        cols = cols[cols >= 0]
+        if len(cols) > 0:
+            # Deduplicate (expanded non-standard tokens share a column) while
+            # preserving order via a stable unique.
+            _, idx = np.unique(cols, return_index=True)
+            chain_msa_cols[int(asym_id)] = cols[np.sort(idx)]
+    return chain_msa_cols
+
+
 class Cropper:
     """Crop a Tokenized input to at most max_tokens / max_atoms.
 
@@ -401,18 +428,7 @@ class Cropper:
         chain_msa_cols: dict[int, np.ndarray] = {}
         if data.msa_col_idx is not None:
             # Gather per-chain MSA column indices for the selected tokens.
-            sel_msa_cols = data.msa_col_idx[selected]
-            sel_asym_ids = new_tokens["asym_id"]
-            for asym_id in set(int(a) for a in sel_asym_ids):
-                mask = sel_asym_ids == asym_id
-                cols = sel_msa_cols[mask]
-                # Drop ligand tokens (msa_col_idx == -1)
-                cols = cols[cols >= 0]
-                if len(cols) > 0:
-                    # Deduplicate (expanded tokens share a column) while
-                    # preserving order via a stable unique.
-                    _, idx = np.unique(cols, return_index=True)
-                    chain_msa_cols[asym_id] = cols[np.sort(idx)]
+            chain_msa_cols = compute_chain_msa_cols(new_tokens["asym_id"], data.msa_col_idx[selected])
         else:
             # Legacy fallback: assume 1 token = 1 MSA column (breaks for
             # chains with expanded non-standard residues).

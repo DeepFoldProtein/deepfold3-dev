@@ -196,6 +196,9 @@ def build_dataloaders(
         interface_distance=model_cfg.data.interface_distance,
         max_chains=model_cfg.data.max_chains,
         ccd_cache_path=cfg.ccd_cache_path or None,
+        pdb_chain_cache_dir=cfg.pdb_chain_cache_dir or None,
+        pdb_chain_cache_mem=cfg.pdb_chain_cache_mem,
+        slow_sample_log_threshold_s=cfg.slow_sample_log_threshold_s,
     )
 
     # Keys accepted by OF3Dataset (subset of ds_kwargs).

@@ -767,6 +767,10 @@ class TrainingConfig:
     prefetch_factor: int = 4
     pin_memory: bool = True
     drop_last: bool = True
+    # Tier-4 diagnostic: warn (with per-phase breakdown + chain counts) when a
+    # single ``__getitem__`` exceeds this wall-clock budget, so periodic
+    # step-time spikes can be attributed to specific records. 0 = disabled.
+    slow_sample_log_threshold_s: float = 0.0
 
     # DDP
     find_unused_parameters: bool = False
@@ -869,6 +873,13 @@ class TrainingConfig:
 
     # Templates
     mmcif_dir: str = ""  # PDB mmCIF mirror path; non-empty enables template loading
+    # Per-chain template cache (memory LRU + hierarchical sharded disk). When set,
+    # training-time template extraction reads a cached per-chain slice instead of
+    # re-parsing the full template mmCIF per hit (the dominant dataloader-stall
+    # cost). Pre-build with ``deepfold3 build-pdb-cache``. ``mmcif_dir`` is the
+    # cold-parse fallback for chains absent from the cache. Empty = disabled.
+    pdb_chain_cache_dir: str = ""
+    pdb_chain_cache_mem: int = 512  # max chains held in the per-worker memory LRU
 
     # Unified CCD cache (atoms + ref_pos + automorphisms) on the shared PVC.
     # Non-empty enables ligand atom-permutation loss via ``load_ligand_automorphisms``.

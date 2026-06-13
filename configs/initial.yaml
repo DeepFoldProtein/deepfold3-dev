@@ -83,6 +83,18 @@ training:
   prefetch_factor: 4
   pin_memory: true
   drop_last: true
+  # Per-chain template cache (memory LRU + hierarchical sharded disk). Build
+  # once with `deepfold3 build-pdb-cache --output /data/pdb/cache`; training then
+  # serves each template chain from disk (or the per-worker LRU) instead of
+  # re-parsing the full template mmCIF per hit — the dominant, query-size-
+  # independent dataloader-stall cost. Empty = disabled (cold-parse from mmcif).
+  pdb_chain_cache_dir: /data/pdb/cache
+  pdb_chain_cache_mem: 512
+  # Tier-4 diagnostic: log a per-phase breakdown when a single __getitem__
+  # exceeds this wall-clock. ~16 s ≈ the prefetch-overlap window (workers ×
+  # prefetch_factor × per-step compute) — below it, stalls are hidden by
+  # prefetch, so only samples beyond it actually move the step clock. 0 = off.
+  slow_sample_log_threshold_s: 16.0
   find_unused_parameters: false
   static_graph: true
   bucket_cap_mb: 32

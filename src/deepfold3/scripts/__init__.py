@@ -30,6 +30,7 @@ class _LazyGroup(click.Group):
 
         # Each module uses @cli.command() which registers on import.
         import deepfold3.scripts.build_masks  # noqa: F401
+        import deepfold3.scripts.build_pdb_cache  # noqa: F401
         import deepfold3.scripts.convert_weights  # noqa: F401
         import deepfold3.scripts.inference  # noqa: F401
         import deepfold3.scripts.inference_batch  # noqa: F401

@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import random
+import time
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,11 +20,12 @@ import torch
 import torch.utils.data
 
 from deepfold3.data import const
-from deepfold3.data.crop.cropper import Cropper
+from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
 from deepfold3.data.masking import TokenMask
 from deepfold3.data.msa.paths import paired_msa_path, unpaired_msa_path
+from deepfold3.data.parse.pdb_chain_cache import PdbChainCache, template_features_from_chain
 from deepfold3.data.paths import mask_path, monomer_template_path, structure_path, template_path
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
@@ -136,6 +139,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         name: str = "",
         ccd_cache_path: str | Path | None = None,
         exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
+        pdb_chain_cache_dir: str | Path | None = None,
+        pdb_chain_cache_mem: int = 512,
+        slow_sample_log_threshold_s: float = 0.0,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -221,6 +227,20 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.prefer_monomer_templates = prefer_monomer_templates
         self._has_templates = (self.data_dir / "templates").is_dir()
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
+        # Per-chain template cache (memory LRU + hierarchical sharded disk).
+        # Replaces the per-hit full-mmCIF gemmi parse with a cached per-chain
+        # slice — the dominant, query-size-independent dataloader-stall cost.
+        # ``mmcif_dir`` is the cold-parse fallback; with a fully pre-built cache
+        # (``deepfold3 build-pdb-cache``) parsing never happens at train time.
+        self.pdb_chain_cache = PdbChainCache(
+            cache_dir=pdb_chain_cache_dir,
+            mmcif_dir=self.mmcif_dir,
+            mem_capacity=pdb_chain_cache_mem,
+        )
+        # Tier-4 diagnostics: warn (with phase breakdown) when a single
+        # __getitem__ exceeds this wall-clock budget so periodic step-time
+        # spikes can be attributed to specific records. 0 = disabled.
+        self.slow_sample_log_threshold_s = float(slow_sample_log_threshold_s)
 
     def __len__(self) -> int:
         if self.sampling_rows is not None:
@@ -246,6 +266,10 @@ class TrainingDataset(torch.utils.data.Dataset):
         else:
             record = self.records[idx]
 
+        # Per-phase wall-clock breakdown for Tier-4 slow-sample diagnostics.
+        timing: dict[str, float] = {}
+        _t = time.perf_counter()
+
         # Load structure
         struct_path = structure_path(self.data_dir / "structures", record.id)
         if not struct_path.exists():
@@ -264,58 +288,15 @@ class TrainingDataset(torch.utils.data.Dataset):
                 bonds=structure.bonds,
                 name=structure.name,
             )
+        timing["structure"], _t = time.perf_counter() - _t, time.perf_counter()
 
-        # Load per-chain MSAs (unpaired + optional paired)
-        msa_dir = self.data_dir / "msa"
-        unpaired_msa: dict[int, MSA] = {}
-        paired_msa: dict[int, MSA] = {}
-        for chain_info in record.chains:
-            if chain_info.chain_id in dropped_chain_ids:
-                continue
-            # Unpaired MSA
-            msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
-            if msa_path.exists():
-                try:
-                    msa_obj = MSA.load(msa_path)
-                    if msa_obj.is_empty:
-                        logger.warning("Empty MSA %s (shape %s) — skipping", msa_path, msa_obj.sequences.shape)
-                    else:
-                        unpaired_msa[chain_info.chain_id] = msa_obj
-                except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
-                    logger.warning("Corrupt MSA %s: %s — skipping", msa_path, e)
-
-            # Paired MSA (cross-chain co-evolutionary signal)
-            if chain_info.paired_msa_id is not None:
-                paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
-                if paired_path.exists():
-                    try:
-                        msa_obj = MSA.load(paired_path)
-                        if msa_obj.is_empty:
-                            logger.warning(
-                                "Empty paired MSA %s (shape %s) — skipping", paired_path, msa_obj.sequences.shape
-                            )
-                        else:
-                            paired_msa[chain_info.chain_id] = msa_obj
-                    except (EOFError, ValueError, OSError, zipfile.BadZipFile) as e:
-                        logger.warning("Corrupt paired MSA %s: %s — skipping", paired_path, e)
-
-        inp = Input(structure=structure, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
-
-        # Load templates: prefer per-sequence monomer (AF3 §2.4) when
-        # available, fall back to multimer otherwise.
-        template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
-        if self.mmcif_dir:
-            if self.prefer_monomer_templates and self._has_monomer_templates:
-                template_feats_per_chain = self._load_monomer_templates(record, dropped_chain_ids)
-            elif self._has_templates:
-                tpl_index = template_path(self.data_dir / "templates", record.id)
-                if tpl_index.exists():
-                    # AF3 §2.4 sampling (``k = min(Uniform[0, n_avail],
-                    # max_templates)``) is applied inside
-                    # ``_load_multimer_templates`` from the actual hit count.
-                    template_feats_per_chain = self._load_multimer_templates(record)
-
-        # Tokenize -> attach mask -> crop -> featurize
+        # Tokenize on the structure ALONE (empty MSA). Tokenization never reads
+        # MSA content — it only builds ``msa_col_idx`` from the structure — so
+        # the expensive per-chain MSA load and template parse are deferred until
+        # AFTER cropping, when we know which (few) chains actually survive. For a
+        # giant assembly cropped to ``max_tokens`` this turns O(all chains) I/O
+        # into O(cropped chains), which is the dominant dataloader-stall fix.
+        inp = Input(structure=structure, paired_msa={}, unpaired_msa={})
         tokenized = self.tokenizer.tokenize(inp)
 
         if self._has_masks:
@@ -340,9 +321,52 @@ class TrainingDataset(torch.utils.data.Dataset):
                 tokenized = tokenized.with_mask(TokenMask(channels))
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
+        timing["tokenize_crop"], _t = time.perf_counter() - _t, time.perf_counter()
+
+        # Chains that survived the crop, and the chain-local MSA columns each
+        # references. Only these chains need MSA / templates loaded.
+        surviving_asym = {int(a) for a in tokenized.tokens["asym_id"]}
+        chain_msa_cols = compute_chain_msa_cols(tokenized.tokens["asym_id"], tokenized.msa_col_idx)
+
+        # Load per-chain MSAs (unpaired + optional paired) for surviving chains
+        # only, sliced to the cropped columns at load time.
+        paired_msa, unpaired_msa = self._load_cropped_msa(record, surviving_asym, chain_msa_cols)
+        tokenized = replace(tokenized, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
+        timing["msa"], _t = time.perf_counter() - _t, time.perf_counter()
+
+        # Load templates for surviving chains only: prefer per-sequence monomer
+        # (AF3 §2.4) when available, fall back to multimer otherwise.
+        template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
+        if self.mmcif_dir or self.pdb_chain_cache.cache_dir is not None:
+            if self.prefer_monomer_templates and self._has_monomer_templates:
+                template_feats_per_chain = self._load_monomer_templates(record, surviving_asym, dropped_chain_ids)
+            elif self._has_templates:
+                tpl_index = template_path(self.data_dir / "templates", record.id)
+                if tpl_index.exists():
+                    # AF3 §2.4 sampling (``k = min(Uniform[0, n_avail],
+                    # max_templates)``) is applied inside
+                    # ``_load_multimer_templates`` from the actual hit count.
+                    template_feats_per_chain = self._load_multimer_templates(record, surviving_asym)
+        timing["template"], _t = time.perf_counter() - _t, time.perf_counter()
+
         feats = self.featurizer.process(
             tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
         )
+        timing["featurize"] = time.perf_counter() - _t
+
+        # Tier-4: attribute periodic step-time spikes to specific records.
+        if self.slow_sample_log_threshold_s > 0:
+            total = sum(timing.values())
+            if total >= self.slow_sample_log_threshold_s:
+                breakdown = " ".join(f"{k}={v:.2f}" for k, v in timing.items())
+                logger.warning(
+                    "slow sample %s: %.2fs (%d chains→%d cropped) | %s",
+                    record.id,
+                    total,
+                    len(record.chains),
+                    len(surviving_asym),
+                    breakdown,
+                )
 
         # Add resolution from manifest metadata (enables confidence loss gating)
         if record.structure_info and record.structure_info.resolution is not None:
@@ -360,8 +384,66 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         return feats
 
+    def _load_cropped_msa(
+        self,
+        record: Record,
+        surviving_asym: set[int],
+        chain_msa_cols: dict[int, np.ndarray],
+    ) -> tuple[dict[int, MSA], dict[int, MSA]]:
+        """Load unpaired + paired MSAs for surviving chains, sliced to cropped cols.
+
+        Only chains present in the crop (``surviving_asym``) with at least one
+        retained MSA column (``chain_msa_cols``) are read from disk. Each chain's
+        MSA is column-sliced to exactly the tokens that survived — equivalent to
+        the cropper's former post-load slice, but without ever loading the MSAs
+        of chains the crop discarded.
+        """
+        msa_dir = self.data_dir / "msa"
+        unpaired_msa: dict[int, MSA] = {}
+        paired_msa: dict[int, MSA] = {}
+        for chain_info in record.chains:
+            cid = chain_info.chain_id
+            if cid not in surviving_asym:
+                continue
+            cols = chain_msa_cols.get(cid)
+            if cols is None:
+                continue  # ligand / chain contributes no MSA column to the crop
+            msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
+            if msa_path.exists():
+                m = self._load_msa_sliced(msa_path, cols)
+                if m is not None:
+                    unpaired_msa[cid] = m
+            if chain_info.paired_msa_id is not None:
+                paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
+                if paired_path.exists():
+                    m = self._load_msa_sliced(paired_path, cols)
+                    if m is not None:
+                        paired_msa[cid] = m
+        return paired_msa, unpaired_msa
+
+    @staticmethod
+    def _load_msa_sliced(path: Path, cols: np.ndarray) -> MSA | None:
+        """Load an MSA npz and column-slice it to ``cols`` (cropped columns)."""
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                seqs = data["sequences"]
+                if seqs.shape[0] == 0 or seqs.shape[1] == 0:
+                    logger.warning("Empty MSA %s (shape %s) — skipping", path, seqs.shape)
+                    return None
+                return MSA(
+                    sequences=seqs[:, cols],
+                    mask=data["mask"][:, cols],
+                    deletion_matrix=data["deletion_matrix"][:, cols],
+                )
+        except (EOFError, ValueError, OSError, zipfile.BadZipFile, IndexError) as e:
+            logger.warning("Corrupt MSA %s: %s — skipping", path, e)
+            return None
+
     def _load_monomer_templates(
-        self, record: Record, skip_chain_ids: set[int] | None = None
+        self,
+        record: Record,
+        surviving_asym: set[int],
+        skip_chain_ids: set[int] | None = None,
     ) -> dict[int, list[TemplateFeatures]] | None:
         """Load per-chain monomer template features (AlphaFold 3 §2.4).
 
@@ -380,16 +462,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         """
         import datetime
 
-        from deepfold3.data.parse.templates import (
-            _build_polymer_lookup,
-            _fill_template_features,
-            _get_chain_sequences,
-            _realign_mapping,
-            cigar_to_index_pairs,
-            parse_mmcif_structure,
-            read_pdb_mmcif_local,
-            select_template_chain,
-        )
+        from deepfold3.data.parse.templates import cigar_to_index_pairs
         from deepfold3.data.prepare.template_search import load_monomer_template_hits
 
         templates_root = self.data_dir / "monomer_templates"
@@ -410,6 +483,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         for chain_info in record.chains:
             if not chain_info.valid or chain_info.mol_type != const.MOL_PROTEIN:
                 continue
+            if chain_info.chain_id not in surviving_asym:
+                continue  # crop discarded this chain — skip its template I/O
             if skip_chain_ids and chain_info.chain_id in skip_chain_ids:
                 continue
             tpl_path = monomer_template_path(templates_root, str(chain_info.msa_id))
@@ -440,26 +515,15 @@ class TrainingDataset(torch.utils.data.Dataset):
 
             chain_feats: list[TemplateFeatures] = []
             for hit in sampled:
-                mmcif_text = read_pdb_mmcif_local(hit.template_pdb_id, self.mmcif_dir)
-                if mmcif_text is None:
-                    continue
-                st = parse_mmcif_structure(mmcif_text, label=hit.template_pdb_id)
-                if st is None:
+                ct = self.pdb_chain_cache.get(hit.template_pdb_id, hit.template_chain_id)
+                if ct is None:
                     continue
                 try:
                     query_indices, seqres_indices = cigar_to_index_pairs(hit.cigar, hit.qstart, hit.tstart)
                     if not query_indices:
                         continue
-                    chain = select_template_chain(st, hit.template_chain_id, label=hit.template_pdb_id)
-                    if chain is None:
-                        continue
                     query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
-                    seqres, struct_seq = _get_chain_sequences(st, chain)
-                    mapping = _realign_mapping(seqres, struct_seq, query_to_seqres)
-                    lookup = _build_polymer_lookup(chain, const.MAX_ATOMS_PER_TOKEN)
-                    feats, _ = _fill_template_features(
-                        lookup, mapping, chain_info.num_residues, const.MAX_ATOMS_PER_TOKEN
-                    )
+                    feats = template_features_from_chain(ct, query_to_seqres, chain_info.num_residues)
                 except Exception:
                     logger.debug(
                         "Failed to extract monomer template %s chain %s for %s/%s",
@@ -476,26 +540,21 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         return result if result else None
 
-    def _load_multimer_templates(self, record: Record) -> dict[int, list[TemplateFeatures]] | None:
-        """Load multimer template features from pre-indexed JSON + PDB mmCIF.
+    def _load_multimer_templates(
+        self, record: Record, surviving_asym: set[int]
+    ) -> dict[int, list[TemplateFeatures]] | None:
+        """Load multimer template features from pre-indexed JSON + PdbChainCache.
 
         Sampling follows AF3 §2.4: ``k = min(Uniform[0, n_avail], max_templates)``
         — almost always returns ``max_templates`` when n_avail is large, but
         respects bounds when fewer hits are available.
 
-        Parses each template PDB once and reuses the gemmi Structure across
-        chain alignments to avoid redundant mmCIF parsing.
+        Per-chain features come from the :class:`PdbChainCache` (memory LRU +
+        sharded disk), so a template chain is sliced/parsed at most once across
+        the whole run instead of re-parsing the full template mmCIF per hit.
+        Only alignments onto chains that survived the crop are extracted.
         """
-        from deepfold3.data.parse.templates import (
-            _build_polymer_lookup,
-            _fill_template_features,
-            _get_chain_sequences,
-            _realign_mapping,
-            cigar_to_index_pairs,
-            parse_mmcif_structure,
-            read_pdb_mmcif_local,
-            select_template_chain,
-        )
+        from deepfold3.data.parse.templates import cigar_to_index_pairs
         from deepfold3.data.prepare.template_search import load_template_hits
 
         tpl_path = template_path(self.data_dir / "templates", record.id)
@@ -516,15 +575,6 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         result: dict[int, list[TemplateFeatures]] = {}
         for hit in hits:
-            mmcif_text = read_pdb_mmcif_local(hit.template_pdb_id, self.mmcif_dir)
-            if mmcif_text is None:
-                continue
-
-            # Parse mmCIF once per template PDB
-            st = parse_mmcif_structure(mmcif_text, label=hit.template_pdb_id)
-            if st is None:
-                continue
-
             # Per-chain dropout: randomly drop chain alignments so the model
             # sees partial multimer context.  Always keep at least one chain.
             alignments = hit.chain_alignments
@@ -535,20 +585,17 @@ class TrainingDataset(torch.utils.data.Dataset):
 
             for aln in alignments:
                 chain_info = record.chains[aln.query_chain_idx]
+                if chain_info.chain_id not in surviving_asym:
+                    continue  # crop discarded this chain — skip its template I/O
                 query_indices, seqres_indices = cigar_to_index_pairs(aln.cigar, aln.qstart, aln.tstart)
                 if not query_indices:
                     continue
+                ct = self.pdb_chain_cache.get(hit.template_pdb_id, aln.template_chain_id)
+                if ct is None:
+                    continue
                 try:
-                    chain = select_template_chain(st, aln.template_chain_id, label=hit.template_pdb_id)
-                    if chain is None:
-                        continue
                     query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
-                    seqres, struct_seq = _get_chain_sequences(st, chain)
-                    mapping = _realign_mapping(seqres, struct_seq, query_to_seqres)
-                    lookup = _build_polymer_lookup(chain, const.MAX_ATOMS_PER_TOKEN)
-                    feats, _ = _fill_template_features(
-                        lookup, mapping, chain_info.num_residues, const.MAX_ATOMS_PER_TOKEN
-                    )
+                    feats = template_features_from_chain(ct, query_to_seqres, chain_info.num_residues)
                 except Exception:
                     logger.debug(
                         "Failed to extract template %s chain %s for %s",

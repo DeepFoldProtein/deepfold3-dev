@@ -682,6 +682,13 @@ class Trainer:
         # Pure microstep compute time accumulator (excludes eval / checkpoint /
         # summary-log wall-clock). Flushed at each summary log.
         microstep_compute_time = 0.0
+        # Tier-4: dataloader-wait accumulator — wall-clock blocked on the next
+        # batch (``next(iter)``), i.e. the gap between the end of one loop body
+        # (after eval/checkpoint) and the start of the next microstep. Surfaces
+        # prefetch starvation: when this is non-trivial the dataloader (not
+        # compute) is the per-step bottleneck. Flushed at each summary log.
+        microstep_data_wait = 0.0
+        t_iter_end: float | None = None
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
@@ -728,6 +735,9 @@ class Trainer:
                     break
 
                 t_microstep_start = time.monotonic()
+                # Tier-4: time blocked waiting for this batch (prefetch drained).
+                if t_iter_end is not None:
+                    microstep_data_wait += t_microstep_start - t_iter_end
                 # Non-tensor diagnostic: pop before the forward pass so the
                 # model / ``prepare_features`` never see a string. Threaded
                 # into the optimizer so NaN-skip warnings can name the
@@ -867,6 +877,8 @@ class Trainer:
                     # all ranks stay in sync if the flag ever changes.
                     compute_time_window = microstep_compute_time
                     microstep_compute_time = 0.0
+                    data_wait_window = microstep_data_wait
+                    microstep_data_wait = 0.0
 
                     if self.dist.is_main:
                         grad_norm = (
@@ -877,6 +889,9 @@ class Trainer:
                         # Eval / checkpoint / logging time is intentionally excluded so the
                         # displayed rate/ETA reflect pure training throughput.
                         dt = compute_time_window / max(self.cfg.log_interval, 1)
+                        # Per-effective-step dataloader wait (same denominator as
+                        # ``dt``). Large relative to ``dt`` ⇒ prefetch-starved.
+                        data_wait = data_wait_window / max(self.cfg.log_interval, 1)
                         # Schedule-Free folds warmup + bias-correction into ``scheduled_lr``;
                         # ``lr`` stays at the configured peak. Prefer the scheduled value so
                         # the log/WandB curve reflects what's actually applied.
@@ -911,6 +926,7 @@ class Trainer:
                         parts.append(f"mem={peak_mem_gb:.1f}G")
                         parts.append(f"eta={eta_str}")
                         parts.append(f"dt={dt:.1f}s")
+                        parts.append(f"data_wait={data_wait:.2f}s")
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
 
@@ -923,6 +939,7 @@ class Trainer:
                             dt=dt,
                             tok_per_sec=tok_per_sec,
                             peak_mem_gb=peak_mem_gb,
+                            data_wait=data_wait,
                         )
                         # Per-PF-layer activation RMS — already prefixed
                         # with ``act_rms/``; pass through verbatim so the
@@ -996,6 +1013,11 @@ class Trainer:
                     # runs on every rank (rank-0 write gate is inside).
                     self._save_checkpoint(output_dir / f"checkpoint_{self.state.effective_step}.pt")
                     break
+
+                # Tier-4: end of this iteration's work. The next iteration's
+                # ``t_microstep_start`` minus this marks pure dataloader wait
+                # (eval / checkpoint / logging wall-clock above is excluded).
+                t_iter_end = time.monotonic()
 
             if shutdown.requested:
                 break
