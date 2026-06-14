@@ -692,6 +692,14 @@ class Trainer:
         # compute) is the per-step bottleneck. Flushed at each summary log.
         microstep_data_wait = 0.0
         t_iter_end: float | None = None
+        # Tier-4d: per-microstep CUDA caching-allocator activity (cheap, no
+        # sync — reads cached counters). Non-zero ``retries`` / ``device_alloc``
+        # at a slow step ⇒ allocator fragmentation forced a free-and-retry /
+        # cudaMalloc (a device stall), i.e. the spike is allocator-bound, not a
+        # GPU throttle. Captured at microstep start, delta logged in SLOW_STEP.
+        slow_step_on = cfg.slow_step_log_threshold_s > 0 and torch.cuda.is_available()
+        _retries0 = 0
+        _devalloc0 = 0
         # Tier-4c per-phase walls (set each microstep by ``_training_step`` /
         # the opt-step timer; 0.0 unless ``slow_step_log_threshold_s > 0``).
         self._last_fwd_wall = 0.0
@@ -745,6 +753,11 @@ class Trainer:
                 # Tier-4: time blocked waiting for this batch (prefetch drained).
                 if t_iter_end is not None:
                     microstep_data_wait += t_microstep_start - t_iter_end
+                # Tier-4d: snapshot allocator counters before the microstep.
+                if slow_step_on:
+                    _ms = torch.cuda.memory_stats(self.dist.device)
+                    _retries0 = _ms.get("num_alloc_retries", 0)
+                    _devalloc0 = _ms.get("num_device_alloc", 0)
                 # Non-tensor diagnostic: pop before the forward pass so the
                 # model / ``prepare_features`` never see a string. Threaded
                 # into the optimizer so NaN-skip warnings can name the
@@ -844,10 +857,17 @@ class Trainer:
                     # section between fwd and bwd); bwd = aux backward + grad
                     # all_reduce + opt step. A spiking ``loss`` on one rank ⇒
                     # CPU straggler (chain-perm on that record); all-uniform
-                    # ``bwd`` ⇒ collective/network; spiking ``fwd`` ⇒ compute.
+                    # ``bwd`` ⇒ collective/network; spiking ``fwd`` ⇒ compute or
+                    # (if retries/allocs > 0) allocator-fragmentation stall.
+                    if slow_step_on:
+                        _ms = torch.cuda.memory_stats(self.dist.device)
+                        retries_d = _ms.get("num_alloc_retries", 0) - _retries0
+                        devalloc_d = _ms.get("num_device_alloc", 0) - _devalloc0
+                    else:
+                        retries_d = devalloc_d = -1
                     logger.warning(
                         "SLOW_STEP rank=%d node=%d effstep=%d dt_micro=%.1fs "
-                        "fwd=%.1fs loss=%.1fs bwd=%.1fs records=%s",
+                        "fwd=%.1fs loss=%.1fs bwd=%.1fs retries=%d allocs=%d records=%s",
                         self.dist.rank,
                         self.dist.rank // 8,
                         self.state.effective_step,
@@ -855,6 +875,8 @@ class Trainer:
                         self._last_fwd_wall,
                         self._last_loss_wall,
                         bwd_wall,
+                        retries_d,
+                        devalloc_d,
                         record_ids if record_ids is not None else "?",
                     )
 
