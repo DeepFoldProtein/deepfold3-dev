@@ -10,6 +10,7 @@ instance.
 from __future__ import annotations
 
 import random
+import time
 from collections.abc import Callable
 
 import torch
@@ -104,6 +105,15 @@ def training_step(
         loss_cfg_arg = None
         chunk_size_arg = 0
 
+    # Tier-4c phase timing. Gated on the slow-step diagnostic. The sync after
+    # the forward (and after the loss) is what makes the fwd vs loss-CPU split
+    # clean: without it ``fwd`` is only the async launch and the forward-GPU
+    # drain leaks into the loss section (the chain-perm ``.cpu()`` blocks on
+    # it). The syncs are near-free — the loss's chain-perm already drains the
+    # forward, and nothing overlaps the loss-CPU section on the GPU anyway.
+    _timing = cfg.slow_step_log_threshold_s > 0 and torch.cuda.is_available()
+    t0 = time.monotonic() if _timing else 0.0
+
     with accumulator.chunk_context(chunked_diffusion=chunked):
         # ``model`` is the DDP-wrapped ``_DDPTrainingForward`` (see
         # ``wrap_ddp``), whose ``forward`` routes to
@@ -124,6 +134,9 @@ def training_step(
             loss_cfg=loss_cfg_arg,
             compute_confidence=cfg.alpha_confidence > 0,
         )
+    if _timing:
+        torch.cuda.synchronize(device)
+        t1 = time.monotonic()
 
     # ``training_loss`` assumes unbatched ``[N, ...]`` features — slice
     # per batch element and average (even for B=1, since the batch dim
@@ -145,7 +158,14 @@ def training_step(
                 loss_dict_acc[k] = v
     total_loss = torch.stack(losses_list).mean()
     loss_dict = {k: v / batch_size for k, v in loss_dict_acc.items()}
-    return total_loss, loss_dict, num_recycles
+
+    if _timing:
+        torch.cuda.synchronize(device)
+        fwd_wall = t1 - t0  # forward + chunked-diffusion backward (GPU)
+        loss_wall = time.monotonic() - t1  # loss section: chain-perm CPU + aux-loss GPU
+    else:
+        fwd_wall = loss_wall = 0.0
+    return total_loss, loss_dict, num_recycles, fwd_wall, loss_wall
 
 
 __all__ = ["prepare_features", "scaled_backward", "pick_num_recycles", "training_step"]

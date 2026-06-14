@@ -295,7 +295,7 @@ class Trainer:
         # MUST pass the DDP-wrapped model so that DDP's ``_pre_forward`` runs
         # and primes the reducer for the upcoming backward — otherwise the
         # bucket AllReduce is never scheduled and ranks train independently.
-        total_loss, loss_dict, num_recycles = training_step(
+        total_loss, loss_dict, num_recycles, fwd_wall, loss_wall = training_step(
             self.ddp_model,
             features,
             cfg=self.cfg,
@@ -306,6 +306,9 @@ class Trainer:
             device=self.dist.device,
         )
         self.state.last_num_recycles = num_recycles
+        # Tier-4c phase breakdown (0.0 unless slow_step_log_threshold_s > 0).
+        self._last_fwd_wall = fwd_wall
+        self._last_loss_wall = loss_wall
         return total_loss, loss_dict
 
     def _chunked_diffusion_active(self) -> bool:
@@ -689,6 +692,10 @@ class Trainer:
         # compute) is the per-step bottleneck. Flushed at each summary log.
         microstep_data_wait = 0.0
         t_iter_end: float | None = None
+        # Tier-4c per-phase walls (set each microstep by ``_training_step`` /
+        # the opt-step timer; 0.0 unless ``slow_step_log_threshold_s > 0``).
+        self._last_fwd_wall = 0.0
+        self._last_loss_wall = 0.0
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
@@ -788,7 +795,12 @@ class Trainer:
                 # ``_optimizer_step`` — a single all-reduce per window replaces
                 # one-per-microstep. Backward runs unconditionally here; any
                 # NaN grads are discarded at the boundary before the opt step.
+                _t_bwd = time.monotonic()
                 on_opt_step_boundary = self._optimizer_step(loss, record_ids=record_ids)
+                # Tier-4c: aux backward + gradient all_reduce + opt step (GPU +
+                # collective). With phase timing on, fwd/loss are synced in
+                # training_step so this is the remaining bwd+collective phase.
+                bwd_wall = time.monotonic() - _t_bwd
 
                 # Flush probe row (rank-0 only); pass per-microstep loss
                 # (total + components from ``loss_dict``) so the probe JSONL
@@ -827,12 +839,22 @@ class Trainer:
                 # pathological one stands out. Grep per-rank logs:
                 # ``grep 'SLOW_STEP' logs/*/attempt_*/*/stdout.log``.
                 if cfg.slow_step_log_threshold_s > 0 and dt_micro >= cfg.slow_step_log_threshold_s:
+                    # Phase split (synced in training_step): fwd = forward+diff
+                    # bwd GPU; loss = chain-perm CPU + aux-loss GPU (the CPU
+                    # section between fwd and bwd); bwd = aux backward + grad
+                    # all_reduce + opt step. A spiking ``loss`` on one rank ⇒
+                    # CPU straggler (chain-perm on that record); all-uniform
+                    # ``bwd`` ⇒ collective/network; spiking ``fwd`` ⇒ compute.
                     logger.warning(
-                        "SLOW_STEP rank=%d node=%d effstep=%d dt_micro=%.1fs records=%s",
+                        "SLOW_STEP rank=%d node=%d effstep=%d dt_micro=%.1fs "
+                        "fwd=%.1fs loss=%.1fs bwd=%.1fs records=%s",
                         self.dist.rank,
                         self.dist.rank // 8,
                         self.state.effective_step,
                         dt_micro,
+                        self._last_fwd_wall,
+                        self._last_loss_wall,
+                        bwd_wall,
                         record_ids if record_ids is not None else "?",
                     )
 
