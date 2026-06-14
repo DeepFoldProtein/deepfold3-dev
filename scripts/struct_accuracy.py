@@ -121,6 +121,7 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
         n_per = next((len(v) for v in vals if v), 0)
         ax.set_title(f"{name}  (per-step, n≈{n_per} samples/step)")
         ax.set_ylabel(name)
+        ax.set_ylim(-0.02, 1.02)  # GDT/TM/lDDT all in [0,1] — fixed for absolute comparability
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc="lower right")
     top.set_xlabel("training step")
@@ -141,6 +142,7 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
         ax.set_xlabel("step")
         if j == 0:
             ax.set_ylabel("per-sample distribution")
+        ax.set_ylim(-0.02, 1.02)  # [0,1] score range — comparable across metrics/panels
         ax.tick_params(axis="x", labelrotation=90, labelsize=7)
         ax.grid(alpha=0.3, axis="y")
 

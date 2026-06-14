@@ -544,6 +544,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         ax8.plot(steps, f1_8_means[c], marker="o", label=c)
     ax8.set_xlabel("training step")
     ax8.set_ylabel("F1")
+    ax8.set_ylim(-0.02, 1.02)
     ax8.legend(fontsize=8, ncol=1, loc="center left", bbox_to_anchor=(1.02, 0.5))
     ax8.grid(alpha=0.3)
 
@@ -551,22 +552,18 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     for c, color in zip(classes_3, ("tab:red", "tab:blue", "tab:gray"), strict=True):
         ax3.plot(steps, f1_3_means[c], marker="o", color=color, label=c)
     ax3.plot(steps, macro_3, marker="s", color="dimgray", lw=1.5, label="macro 3-state")
-    # GDT-TS overlay (target-mean, Kabsch-superposed CA, cutoffs {1,2,4,8} Å).
-    # Plotted as the dominant black curve since it is the structure-accuracy
-    # summary; SS-F1 curves are class-level diagnostics.
+    # GDT-TS still computed for the npz (back-compat), but no longer overlaid
+    # here — structure accuracy now lives in {prefix}_struct.png with full
+    # per-sample distribution (mean/median/IQR/box). This panel is pure SS-F1.
     gdt_means = []
     for step in steps:
         per_step = [r["gdt_ts"] for r in rows
                     if r["step"] == step and "gdt_ts" in r
                     and r["gdt_ts"] == r["gdt_ts"]]
         gdt_means.append(np.mean(per_step) if per_step else float("nan"))
-    if any(v == v for v in gdt_means):
-        # zorder=0 so the F1 class curves sit on top — GDT-TS is the
-        # background reference, not the headline metric here.
-        ax3.plot(steps, gdt_means, marker="^", color="black", lw=3,
-                 zorder=0, label="GDT-TS")
     ax3.set_xlabel("training step")
-    ax3.set_ylabel("F1  /  GDT-TS")
+    ax3.set_ylabel("F1")
+    ax3.set_ylim(-0.02, 1.02)
     ax3.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     ax3.grid(alpha=0.3)
 
@@ -622,6 +619,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     for a in (axp, axr):
         a.set_xlabel("training step")
         a.set_ylabel("metric")
+        a.set_ylim(-0.02, 1.02)  # precision / recall in [0,1]
         a.grid(alpha=0.3)
         a.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     axe.set_title("Confusion: GT-β→pred-α (helix eats strand)\nand GT-α→pred-β")
@@ -629,6 +627,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     axe.plot(steps, strand_eats_helix, marker="s", color="tab:blue", label="GT-α predicted as β")
     axe.set_xlabel("training step")
     axe.set_ylabel("fraction of GT class")
+    axe.set_ylim(-0.02, 1.02)  # fractions in [0,1]
     axe.grid(alpha=0.3)
     axe.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))
     fig_pr.tight_layout()
