@@ -819,6 +819,23 @@ class Trainer:
                 dt_micro = time.monotonic() - t_microstep_start
                 microstep_compute_time += dt_micro
 
+                # Tier-4b: per-rank slow-STEP attribution (GPU-side, not loader).
+                # Logs on EVERY rank (no collective) so a data-tied straggler
+                # names its OWN record(s). At a spike step every rank is over
+                # threshold (the all_reduce stalls them all), so the straggler
+                # is identified by inspecting the logged records — the
+                # pathological one stands out. Grep per-rank logs:
+                # ``grep 'SLOW_STEP' logs/*/attempt_*/*/stdout.log``.
+                if cfg.slow_step_log_threshold_s > 0 and dt_micro >= cfg.slow_step_log_threshold_s:
+                    logger.warning(
+                        "SLOW_STEP rank=%d node=%d effstep=%d dt_micro=%.1fs records=%s",
+                        self.dist.rank,
+                        self.dist.rank // 8,
+                        self.state.effective_step,
+                        dt_micro,
+                        record_ids if record_ids is not None else "?",
+                    )
+
                 if cfg.log_microsteps:
                     samples_per_microstep = self.dist.world_size * cfg.batch_size_per_rank
                     samples_per_sec = samples_per_microstep / max(dt_micro, 1e-9)

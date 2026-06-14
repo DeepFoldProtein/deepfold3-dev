@@ -771,6 +771,12 @@ class TrainingConfig:
     # single ``__getitem__`` exceeds this wall-clock budget, so periodic
     # step-time spikes can be attributed to specific records. 0 = disabled.
     slow_sample_log_threshold_s: float = 0.0
+    # Tier-4b diagnostic: warn (PER RANK, no collective) when one rank's
+    # microstep compute (forward+backward+step, incl. all_reduce wait) exceeds
+    # this — so a DATA-TIED GPU-side straggler names its own record(s). Catches
+    # what ``slow_sample_log_threshold_s`` can't (that times only the loader).
+    # Set just above the normal step time (floor ~19s → use ~25). 0 = disabled.
+    slow_step_log_threshold_s: float = 0.0
 
     # DDP
     find_unused_parameters: bool = False

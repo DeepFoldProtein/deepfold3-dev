@@ -95,6 +95,10 @@ training:
   # prefetch_factor × per-step compute) — below it, stalls are hidden by
   # prefetch, so only samples beyond it actually move the step clock. 0 = off.
   slow_sample_log_threshold_s: 16.0
+  # Tier-4b: per-rank GPU-side slow-step warning (names the straggler's record).
+  # Floor ~19s, normal spread to ~22s → 25 catches real spikes with few false
+  # positives. Grep: grep SLOW_STEP runs/<run>/logs/*/attempt_*/*/stdout.log
+  slow_step_log_threshold_s: 25.0
   find_unused_parameters: false
   static_graph: true
   bucket_cap_mb: 32

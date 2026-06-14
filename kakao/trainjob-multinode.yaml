@@ -64,6 +64,8 @@ spec:
       - "-x"
       - TORCH_FR_BUFFER_SIZE
       - "-x"
+      - PYTORCH_CUDA_ALLOC_CONF
+      - "-x"
       - WANDB_API_KEY
       - "-x"
       - JOBSET_NAME
@@ -212,25 +214,35 @@ spec:
       - name: NCCL_P2P_LEVEL
         value: "NVL"
       - name: NCCL_DEBUG
-        # WARN: silence all steady-state INIT/TUNING spam. Flip to INFO only
-        # when debugging comm setup or a new HCA/topology.
+        # WARN: silence steady-state INIT/TUNING spam. Flip to INFO (with
+        # SUBSYS=INIT,NET) only when debugging comm setup. Transport already
+        # confirmed 2026-06-13: all connections NET/IB (mlx5_14..21), zero
+        # NET/Socket fallback (see memory project_fapek5_dt_spike_collective).
         value: "WARN"
       - name: NCCL_DEBUG_SUBSYS
         # INIT = comm setup/timings. TUNING = algo/proto choice per msg size
-        # (logged once per size, no per-collective spam). Use INIT,COLL only
-        # when you actually need the per-AllReduce stream trace.
+        # (logged once per size, no per-collective spam). Use INIT,NET to see
+        # per-connection transport, INIT,COLL for the per-AllReduce trace.
         value: "INIT,TUNING"
       - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
         value: "1"
       - name: TORCH_FR_BUFFER_SIZE
         value: "20000"
+      - name: PYTORCH_CUDA_ALLOC_CONF
+        # expandable_segments: grow CUDA allocations in-place instead of the
+        # default fixed-size segment pool, so caching-allocator fragmentation
+        # doesn't accumulate over a long run. Targets the dt-spike SAWTOOTH:
+        # spike rate climbs 5%→20% over each ~8-day process lifetime then
+        # resets on restart, with GPU peak mem FLAT — the signature of
+        # allocator fragmentation raising cudaMalloc/Free device-sync frequency
+        # without raising peak reserved (see memory
+        # project_fapek5_dt_spike_collective). Compare the next run's
+        # %steps>30s-vs-uptime curve against the sawtooth to confirm.
+        value: "expandable_segments:True"
       - name: PYTHONUNBUFFERED
         value: "1"
       - name: OMP_NUM_THREADS
-        # 12 CPUs per GPU (= per rank): 4 DataLoader workers × OMP=3 threads.
-        # Trainer procs are CUDA-bound so their thread budget is headroom.
-        # 8 ranks × (4 workers × 3 threads) = 96 threads/node = 96 cores exactly.
-        value: "3"
+        value: "2"
       - name: UV_CACHE_DIR
         value: "/home/jovyan/.cache/uv"
       - name: UV_PYTHON_INSTALL_DIR
