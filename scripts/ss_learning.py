@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import os
 import statistics
@@ -315,6 +316,75 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
     }
 
 
+def _process_step(step: int, targets: list, ref_dssp: dict,
+                  n_samples: int, seed: int, pattern: str) -> tuple:
+    """Measure every target at one training ``step``.
+
+    Pure / picklable so it can run in a ``ProcessPoolExecutor`` worker:
+    takes the pre-computed ``ref_dssp`` (one DSSP run per target) and the
+    resolved ``targets`` list, returns ``(step, rows, helix_rows, summary)``.
+    ``summary`` is the human-readable per-step block (printed in step order
+    by the caller, so parallel execution doesn't interleave output).
+    """
+    rows: list[dict] = []
+    helix_rows: list[dict] = []
+    agg_f1_8 = {c: [] for c in DSSP_8}
+    agg_f1_3 = {c: [] for c in ("α", "β", "c")}
+    agg_macro = []
+    for pdb, _ref, infer in targets:
+        step_dir = infer / pattern.format(step=step)
+        if not step_dir.exists():
+            continue
+        r = measure_one(step_dir, ref_dssp[pdb], n_samples, seed, ref_cif=_ref)
+        if r is None:
+            continue
+        agg_macro.append(r["macro_f1_3"])
+        for c in DSSP_8:
+            v = r["f1_8"][c]
+            if v == v:
+                agg_f1_8[c].append(v)
+        for c in ("α", "β", "c"):
+            v = r["f1_3"][c]
+            if v == v:
+                agg_f1_3[c].append(v)
+        row = {
+            "step": step, "target": pdb, "macro_f1_8": r["macro_f1_8"],
+            "macro_f1_3": r["macro_f1_3"],
+            "gdt_ts": r.get("gdt_ts", float("nan")),
+        }
+        for c in DSSP_8:
+            row[f"f1_{c}"] = r["f1_8"][c]
+            row[f"prec_{c}"] = r["prec_8"][c]
+            row[f"rec_{c}"] = r["rec_8"][c]
+        for c in ("α", "β", "c"):
+            row[f"f1_3_{c}"] = r["f1_3"][c]
+            row[f"prec_3_{c}"] = r["prec_3"][c]
+            row[f"rec_3_{c}"] = r["rec_3"][c]
+        # 3x3 confusion matrix (counts) → flat keys
+        for (gt, pred), cnt in r["confusion_3"].items():
+            row[f"conf_gt{gt}_pred{pred}"] = cnt
+        rows.append(row)
+        for gt_len, frac in r["helix_fractions"]:
+            helix_rows.append({"step": step, "target": pdb,
+                               "helix_len": gt_len, "recovery": frac})
+
+    lines = [f"=== step {step} ==="]
+    if agg_macro:
+        lines.append(f"  macro F1 (3st): {statistics.mean(agg_macro):.4f}")
+        gdt_at_step = [rr["gdt_ts"] for rr in rows if rr["gdt_ts"] == rr["gdt_ts"]]
+        if gdt_at_step:
+            lines.append(f"  GDT-TS:         {statistics.mean(gdt_at_step):.4f}")
+        lines.append("  per-class F1 (8st):")
+        for c in DSSP_8:
+            if agg_f1_8[c]:
+                lines.append(f"    {c}: {statistics.mean(agg_f1_8[c]):.4f}  (n_targets={len(agg_f1_8[c])})")
+        lines.append("  per-class F1 (3st):")
+        for c in ("α", "β", "c"):
+            if agg_f1_3[c]:
+                lines.append(f"    {c}: {statistics.mean(agg_f1_3[c]):.4f}")
+    return step, rows, helix_rows, "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     src = ap.add_argument_group("target source (mutually exclusive)")
@@ -330,6 +400,15 @@ def main() -> None:
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Process-pool size for the per-step loop. Steps are "
+                         "independent, so >1 parallelises the whole step list "
+                         "across cores. Best for multi-step / full-history "
+                         "rebuilds (per-sample work is cached → I/O-latency "
+                         "bound; parallel readers overlap the waits). Each "
+                         "worker still runs its own per-sample thread pool, so "
+                         "avoid huge values on fresh (uncached) DSSP runs. "
+                         "Default 1 (sequential, unchanged behaviour).")
     ap.add_argument("--out-csv", type=Path, default=None,
                     help="Per-step / per-class F1 CSV.")
     ap.add_argument("--helix-recovery-csv", type=Path, default=None,
@@ -374,67 +453,30 @@ def main() -> None:
                   f"B={cnt.get('B',0)} P={cnt.get('P',0)} -={cnt.get('-',0)}")
     print()
 
+    # Per-step work is independent → optionally fan out across processes.
+    # Results are collected and replayed in ``args.steps`` order so the CSV
+    # row order and console output stay deterministic regardless of workers.
     rows = []  # for CSV
     helix_rows = []
-    for step in args.steps:
-        print(f"=== step {step} ===")
-        agg_f1_8 = {c: [] for c in DSSP_8}
-        agg_f1_3 = {c: [] for c in ("α", "β", "c")}
-        agg_macro = []
-        for pdb, _ref, infer in targets:
-            step_dir = infer / args.pattern.format(step=step)
-            if not step_dir.exists():
-                continue
-            r = measure_one(step_dir, ref_dssp[pdb], args.n_samples, args.seed,
-                            ref_cif=_ref)
-            if r is None:
-                continue
-            agg_macro.append(r["macro_f1_3"])
-            for c in DSSP_8:
-                v = r["f1_8"][c]
-                if v == v:
-                    agg_f1_8[c].append(v)
-            for c in ("α", "β", "c"):
-                v = r["f1_3"][c]
-                if v == v:
-                    agg_f1_3[c].append(v)
-            row = {
-                "step": step, "target": pdb, "macro_f1_8": r["macro_f1_8"],
-                "macro_f1_3": r["macro_f1_3"],
-                "gdt_ts": r.get("gdt_ts", float("nan")),
-            }
-            for c in DSSP_8:
-                row[f"f1_{c}"] = r["f1_8"][c]
-                row[f"prec_{c}"] = r["prec_8"][c]
-                row[f"rec_{c}"] = r["rec_8"][c]
-            for c in ("α", "β", "c"):
-                row[f"f1_3_{c}"] = r["f1_3"][c]
-                row[f"prec_3_{c}"] = r["prec_3"][c]
-                row[f"rec_3_{c}"] = r["rec_3"][c]
-            # 3x3 confusion matrix (counts) → flat keys
-            for (gt, pred), cnt in r["confusion_3"].items():
-                row[f"conf_gt{gt}_pred{pred}"] = cnt
-            rows.append(row)
-            for gt_len, frac in r["helix_fractions"]:
-                helix_rows.append({"step": step, "target": pdb,
-                                   "helix_len": gt_len, "recovery": frac})
-        if not agg_macro:
-            continue
-        print(f"  macro F1 (3st): {statistics.mean(agg_macro):.4f}")
-        gdt_at_step = [r["gdt_ts"] for r in rows
-                       if r["step"] == step and r["gdt_ts"] == r["gdt_ts"]]
-        if gdt_at_step:
-            print(f"  GDT-TS:         {statistics.mean(gdt_at_step):.4f}")
-        print("  per-class F1 (8st):")
-        for c in DSSP_8:
-            if not agg_f1_8[c]:
-                continue
-            print(f"    {c}: {statistics.mean(agg_f1_8[c]):.4f}  (n_targets={len(agg_f1_8[c])})")
-        print("  per-class F1 (3st):")
-        for c in ("α", "β", "c"):
-            if agg_f1_3[c]:
-                print(f"    {c}: {statistics.mean(agg_f1_3[c]):.4f}")
+    workers = min(max(1, args.workers), len(args.steps))
+    step_fn = functools.partial(
+        _process_step, targets=targets, ref_dssp=ref_dssp,
+        n_samples=args.n_samples, seed=args.seed, pattern=args.pattern)
+    if workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        print(f"(step-parallel: {workers} workers over {len(args.steps)} steps)\n")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            # ex.map preserves input order → deterministic CSV / output.
+            results = list(ex.map(step_fn, args.steps))
+    else:
+        results = [step_fn(step) for step in args.steps]
+
+    for _step, srows, shelix, summary in results:
+        print(summary)
         print()
+        rows.extend(srows)
+        helix_rows.extend(shelix)
 
     if args.out_csv:
         cols = ["step", "target", "macro_f1_8", "macro_f1_3", "gdt_ts"]
