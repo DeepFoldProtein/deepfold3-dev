@@ -187,6 +187,8 @@ class DeepFold3(nn.Module):
         features: dict[str, torch.Tensor],
         num_recycles: int,
         seed: int = 0,
+        msa_precropped: bool = False,
+        crop_offset: int = 0,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run feature building + evoformer trunk with recycling.
 
@@ -327,43 +329,70 @@ class DeepFold3(nn.Module):
         rng = torch.Generator(device="cpu").manual_seed(seed)
         msa_rows_dim = full_msa.dim() - 2  # 0 for [S,N], 1 for [B,S,N]
 
-        # Recycle
-        for recycle_idx in range(num_recycles + 1):
-            # --- Stage 1: subsample to a fixed-size pool of ``crop`` rows ---
-            if S_full <= crop:
-                msa_sub = full_msa
-                msa_mask_sub = full_msa_mask
-                del_sub = full_del_matrix
-            else:
-                perm = torch.randperm(S_full - 1, generator=rng) + 1  # indices 1..S_full-1
-                sel = perm[: crop - 1]
-                idx = torch.cat([torch.zeros(1, dtype=torch.long), sel]).sort().values.to(device)
-                msa_sub = full_msa.index_select(msa_rows_dim, idx)
-                msa_mask_sub = full_msa_mask.index_select(msa_rows_dim, idx)
-                del_sub = full_del_matrix.index_select(msa_rows_dim, idx) if full_del_matrix is not None else None
+        if msa_precropped:
+            # Fail loud on a featurizer/model crop-size mismatch: the slices
+            # below require S_full >= (crop_offset + num_recycles + 1) * crop.
+            # (S_full = n_crops*crop from the featurizer; crop = cfg.msa_crop_size.)
+            need = (crop_offset + num_recycles + 1) * crop
+            if S_full < need:
+                raise ValueError(
+                    f"msa_precropped: MSA pool {S_full} < required {need} "
+                    f"(crop={crop}, crop_offset={crop_offset}, num_recycles={num_recycles}). "
+                    "Featurizer msa_crop_size / n_msa_crops must match the model."
+                )
 
-            # --- Stage 2: AF3 §2.3 random-``k`` mask ---
-            # ``k = Uniform[1, n_full]`` and **at random** ``k`` rows are kept
-            # (always including the query row 0). When ``k >= pool_size``
-            # (≈94% of training steps when n_full=16384, crop=1024) no rows
-            # are masked. When ``k < pool_size`` the kept rows are scattered
-            # at random across the pool — *not* a leading prefix — so we do
-            # not bias toward the closest homologs that Stage 1's sort puts
-            # at low indices. Tensor shape unchanged → DDP static_graph safe.
-            # Matches Protenix ``sample_indices``: ``randperm(n)[:k][:cutoff]``.
-            if self.training:
-                pool_size = msa_sub.shape[msa_rows_dim]
-                k = int(torch.randint(1, S_full + 1, (1,), generator=rng).item())
-                if k < pool_size:
-                    perm_k = torch.randperm(pool_size - 1, generator=rng) + 1
-                    keep = torch.cat(
-                        [torch.zeros(1, dtype=torch.long), perm_k[: k - 1]]
-                    ).to(device)
-                    active = torch.zeros(pool_size, dtype=msa_mask_sub.dtype, device=device)
-                    active[keep] = 1
-                    bcast_shape = [1] * msa_mask_sub.dim()
-                    bcast_shape[msa_rows_dim] = pool_size
-                    msa_mask_sub = msa_mask_sub * active.view(*bcast_shape)
+        # Recycle. ``msa_precropped`` and the resample path differ only in how
+        # this recycle's (msa_sub, msa_mask_sub, del_sub) are selected; the
+        # evoformer call + recycling-buffer update below are shared.
+        for recycle_idx in range(num_recycles + 1):
+            if msa_precropped:
+                # The featurizer pre-built ``[n_crops * crop, N]`` (one crop per
+                # recycle, already subsampled + Stage-2-masked on CPU) so the GPU
+                # MSA shape is constant. Just slice this recycle's crop — no
+                # on-GPU resample. ``crop_offset`` keeps the no_grad warmup pass
+                # (crops 0..num_recycles-1) and the final grad pass (crop
+                # num_recycles) on distinct crops, mirroring the resample path's
+                # seed offset.
+                base = (crop_offset + recycle_idx) * crop
+                msa_sub = full_msa.narrow(msa_rows_dim, base, crop)
+                msa_mask_sub = full_msa_mask.narrow(msa_rows_dim, base, crop)
+                del_sub = full_del_matrix.narrow(msa_rows_dim, base, crop) if full_del_matrix is not None else None
+            else:
+                # --- Stage 1: subsample to a fixed-size pool of ``crop`` rows ---
+                if S_full <= crop:
+                    msa_sub = full_msa
+                    msa_mask_sub = full_msa_mask
+                    del_sub = full_del_matrix
+                else:
+                    perm = torch.randperm(S_full - 1, generator=rng) + 1  # indices 1..S_full-1
+                    sel = perm[: crop - 1]
+                    idx = torch.cat([torch.zeros(1, dtype=torch.long), sel]).sort().values.to(device)
+                    msa_sub = full_msa.index_select(msa_rows_dim, idx)
+                    msa_mask_sub = full_msa_mask.index_select(msa_rows_dim, idx)
+                    del_sub = full_del_matrix.index_select(msa_rows_dim, idx) if full_del_matrix is not None else None
+
+                # --- Stage 2: AF3 §2.3 random-``k`` mask ---
+                # ``k = Uniform[1, n_full]`` and **at random** ``k`` rows are kept
+                # (always including the query row 0). When ``k >= pool_size``
+                # (≈94% of training steps when n_full=16384, crop=1024) no rows
+                # are masked. When ``k < pool_size`` the kept rows are scattered
+                # at random across the pool — *not* a leading prefix — so we do
+                # not bias toward the closest homologs that Stage 1's sort puts
+                # at low indices. Tensor shape unchanged → DDP static_graph safe.
+                # Matches Protenix ``sample_indices``: ``randperm(n)[:k][:cutoff]``.
+                if self.training:
+                    pool_size = msa_sub.shape[msa_rows_dim]
+                    k = int(torch.randint(1, S_full + 1, (1,), generator=rng).item())
+                    if k < pool_size:
+                        perm_k = torch.randperm(pool_size - 1, generator=rng) + 1
+                        keep = torch.cat(
+                            [torch.zeros(1, dtype=torch.long), perm_k[: k - 1]]
+                        ).to(device)
+                        active = torch.zeros(pool_size, dtype=msa_mask_sub.dtype, device=device)
+                        active[keep] = 1
+                        bcast_shape = [1] * msa_mask_sub.dim()
+                        bcast_shape[msa_rows_dim] = pool_size
+                        msa_mask_sub = msa_mask_sub * active.view(*bcast_shape)
 
             # Build MSA features for this recycle [..., S_crop, N, 34]
             msa_feat = self._build_msa_feat_from_tensors(msa_sub, del_sub)
@@ -412,6 +441,7 @@ class DeepFold3(nn.Module):
         backward_fn=None,
         loss_cfg=None,
         compute_confidence: bool = True,
+        msa_precropped: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -463,14 +493,16 @@ class DeepFold3(nn.Module):
         # final grad pass.
         if num_recycles > 0:
             with torch.no_grad():
-                embeddings_det, _, _, _, _ = self.run_evoformer(features, num_recycles - 1, seed=seed)
+                embeddings_det, _, _, _, _ = self.run_evoformer(
+                    features, num_recycles - 1, seed=seed, msa_precropped=msa_precropped, crop_offset=0
+                )
             # Pass warm-start buffers via features for the final (grad-enabled) pass.
             # No .detach() needed — tensors from no_grad() context already lack grad_fn.
             features["_prev_pair"] = embeddings_det["pair"]
             features["_prev_single"] = embeddings_det["single"]
 
         embeddings, rel_feat, target_feat, seq_mask, pair_mask = self.run_evoformer(
-            features, 0, seed=seed + num_recycles
+            features, 0, seed=seed + num_recycles, msa_precropped=msa_precropped, crop_offset=num_recycles
         )
         # Clean up side-channel keys to avoid stale references
         features.pop("_prev_pair", None)

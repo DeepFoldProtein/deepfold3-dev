@@ -133,6 +133,7 @@ def training_step(
             backward_fn=backward_fn,
             loss_cfg=loss_cfg_arg,
             compute_confidence=cfg.alpha_confidence > 0,
+            msa_precropped=cfg.msa_precrop,
         )
     if _timing:
         torch.cuda.synchronize(device)

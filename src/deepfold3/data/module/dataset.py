@@ -142,6 +142,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         pdb_chain_cache_dir: str | Path | None = None,
         pdb_chain_cache_mem: int = 512,
         slow_sample_log_threshold_s: float = 0.0,
+        msa_crop_size: int = 1024,
+        n_msa_crops: int = 0,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -214,7 +216,12 @@ class TrainingDataset(torch.utils.data.Dataset):
                     logger.info("Loaded ligand symmetry cache: %d CCDs (%s)", len(ligand_perm_cache), sidecar)
                 except Exception:
                     logger.warning("Failed to load %s; ligand symmetry disabled", sidecar)
-        self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs, ligand_perm_cache=ligand_perm_cache)
+        self.featurizer = Featurizer(
+            max_msa_seqs=max_msa_seqs,
+            ligand_perm_cache=ligand_perm_cache,
+            msa_crop_size=msa_crop_size,
+            n_msa_crops=n_msa_crops,
+        )
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker
         # under DDP and is unnecessary — kernel dentry cache makes the per-record

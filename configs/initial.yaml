@@ -43,6 +43,12 @@ training:
   max_atoms: 4096
   max_msa_seqs: 16384
   max_recycles: 3
+  # Emit a FIXED [(max_recycles+1)*msa_crop_size, N] MSA crop stack from the
+  # featurizer (one crop per recycle, CPU resample) so the GPU MSA shape is
+  # constant every step — removes the per-step variable MSA allocation that
+  # drives caching-allocator fragmentation (the dt-spike forward-straggler).
+  # profile/deletion_mean still use the full 16384 pool; inference is unchanged.
+  msa_precrop: true
 
   batch_size_per_rank: 2
   diffusion_batch_size: 48

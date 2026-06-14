@@ -40,10 +40,22 @@ class Featurizer:
         max_templates: int = 4,
         ligand_perm_cache: dict[str, list[list[int]]] | None = None,
         include_polymer_backbone_bonds: bool = False,
+        msa_crop_size: int = 1024,
+        n_msa_crops: int = 0,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
         self.max_templates = max_templates
+        # MSA pre-crop (training only). When ``n_msa_crops > 0`` the MSA output
+        # is a FIXED [n_msa_crops * msa_crop_size, N] stack of pre-sampled crops
+        # (CPU resample, mask-aware), one per recycle, so the GPU sees a
+        # constant MSA shape every step (no per-step variable allocation /
+        # caching-allocator fragmentation) and the model just splits it per
+        # recycle instead of resampling. ``profile`` / ``deletion_mean`` are
+        # still computed from the FULL pool before cropping. 0 = legacy
+        # full-pool output (inference path; model resamples on GPU).
+        self.msa_crop_size = msa_crop_size
+        self.n_msa_crops = n_msa_crops
         # Optional CCD-keyed ligand automorphism cache (loaded once per
         # process). When set, the featurizer emits ``ligand_swap_pairs``
         # alongside ``atom_swap_pairs`` so the diffusion loss can apply
@@ -257,6 +269,16 @@ class Featurizer:
         # Deletion mean: raw mean of deletion counts per position [N]
         # AF3 stores the raw mean (arctan transform is applied separately in create_msa_feat).
         deletion_mean = del_matrix_tensor.float().mean(dim=0)  # [N]
+
+        # MSA pre-crop (training): replace the variable-depth pool with a FIXED
+        # [n_msa_crops * msa_crop_size, N] stack of per-recycle crops. profile +
+        # deletion_mean above are already computed from the full pool, so the
+        # crop only affects what the MSA module consumes (the model splits it
+        # per recycle). See ``__init__`` and ``_build_msa_crops``.
+        if self.n_msa_crops > 0:
+            msa_tensor, msa_mask_tensor, del_matrix_tensor = self._build_msa_crops(
+                msa_tensor, msa_mask_tensor, del_matrix_tensor, training=training
+            )
 
         # Frame features drive PAE (AF3 §4.3.2). ``frames_mask`` is set
         # True only for tokens with a well-defined local rigid frame.
@@ -848,6 +870,70 @@ class Featurizer:
             torch.from_numpy(msa_arr.astype(np.int16)),
             torch.from_numpy(mask_arr),
             torch.from_numpy(del_arr.astype(np.int16)),
+        )
+
+    def _build_msa_crops(
+        self,
+        msa: torch.Tensor,  # [S, N] int16
+        mask: torch.Tensor,  # [S, N] bool
+        deln: torch.Tensor,  # [S, N] int16
+        training: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a FIXED ``[n_msa_crops * msa_crop_size, N]`` stack of crops.
+
+        Each crop = the query row 0 + ``crop-1`` non-query rows drawn (disjoint,
+        wrapping when the real pool is smaller) from one fresh permutation;
+        short pools leave the remaining rows masked. The model splits this stack
+        and uses crop ``i`` for recycle ``i`` (no on-GPU resample), so the GPU
+        MSA shape is constant every step. In training an AF3 §2.3 random-``k``
+        mask is applied per crop using the FULL real depth so the masking ratio
+        matches the legacy on-GPU path (``k ~ Uniform[1, S]``; if ``k`` < real
+        rows kept, the surplus non-query rows are masked).
+        """
+        n = self.n_msa_crops
+        crop = self.msa_crop_size
+        msa_np = msa.numpy()
+        mask_np = mask.numpy()
+        deln_np = deln.numpy()
+        S, N = msa_np.shape
+        rng = np.random.default_rng()
+
+        out_msa = np.full((n * crop, N), const.MSA_GAP, dtype=msa_np.dtype)
+        out_mask = np.zeros((n * crop, N), dtype=mask_np.dtype)
+        out_deln = np.zeros((n * crop, N), dtype=deln_np.dtype)
+
+        # Query row 0 heads every crop (rows 0, crop, 2*crop, …) — write once via
+        # a strided broadcast rather than re-copying inside the per-crop loop.
+        out_msa[::crop] = msa_np[0]
+        out_mask[::crop] = mask_np[0]
+        out_deln[::crop] = deln_np[0]
+
+        nonquery = np.arange(1, S)
+        rng.shuffle(nonquery)
+        avail = nonquery.shape[0]  # S - 1
+        fill = min(crop - 1, avail)  # real non-query rows placed per crop
+
+        for c in range(n):
+            base = c * crop
+            if fill > 0:
+                start = (c * fill) % avail
+                sel = nonquery[(np.arange(fill) + start) % avail]
+                rows = slice(base + 1, base + 1 + fill)
+                out_msa[rows] = msa_np[sel]
+                out_mask[rows] = mask_np[sel]
+                out_deln[rows] = deln_np[sel]
+            # AF3 §2.3 random-k mask, per crop, ratio-matched to the legacy path.
+            if training and fill > 0:
+                k = int(rng.integers(1, S + 1))  # Uniform[1, S]
+                n_real = fill + 1  # query + real non-query rows in this crop
+                if k < n_real:
+                    drop = rng.choice(fill, size=n_real - k, replace=False)
+                    out_mask[base + 1 + drop] = False
+
+        return (
+            torch.from_numpy(out_msa),
+            torch.from_numpy(out_mask),
+            torch.from_numpy(out_deln),
         )
 
     def _compute_profile(

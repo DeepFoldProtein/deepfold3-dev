@@ -199,6 +199,12 @@ def build_dataloaders(
         pdb_chain_cache_dir=cfg.pdb_chain_cache_dir or None,
         pdb_chain_cache_mem=cfg.pdb_chain_cache_mem,
         slow_sample_log_threshold_s=cfg.slow_sample_log_threshold_s,
+        # MSA pre-crop: featurizer emits a fixed [(max_recycles+1)*crop, N] MSA
+        # stack so the GPU MSA shape is constant (kills allocator fragmentation).
+        # crop size must match the model's; n_crops covers the max recycles used
+        # by forward_training (training + eval).
+        msa_crop_size=model_cfg.msa_crop_size,
+        n_msa_crops=(cfg.max_recycles + 1) if cfg.msa_precrop else 0,
     )
 
     # Keys accepted by OF3Dataset (subset of ds_kwargs).
@@ -214,6 +220,8 @@ def build_dataloaders(
         "mmcif_dir",
         "max_templates",
         "max_template_date",
+        "msa_crop_size",
+        "n_msa_crops",
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 

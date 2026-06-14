@@ -631,6 +631,14 @@ class TrainingConfig:
     # Total trunk forwards = num_recycles + 1.
     # max_recycles=3 → up to 4 trunk passes (matches AF3 paper).
     max_recycles: int = 3
+    # MSA pre-crop (training/eval forward_training). When True the featurizer
+    # emits a FIXED ``[(max_recycles+1) * msa_crop_size, N]`` stack of one crop
+    # per recycle (CPU resample), so the GPU MSA shape is constant every step —
+    # removes the per-step variable MSA allocation that drives caching-allocator
+    # fragmentation (the dt-spike straggler). ``profile`` / ``deletion_mean``
+    # still use the full pool. Inference (``forward``) keeps the legacy on-GPU
+    # resample. False = legacy variable-depth pool everywhere.
+    msa_precrop: bool = False
 
     # Diffusion training
     diffusion_batch_size: int = 48

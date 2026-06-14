@@ -143,11 +143,15 @@ def run_eval(
                 ):
                     pred = model.forward_training(
                         features,
+                        # ``min(.., max_recycles)`` so the recycle count never
+                        # exceeds the featurizer's crop budget (n=max_recycles+1)
+                        # when msa_precrop is on.
                         num_recycles=min(cfg.max_recycles, 4),
                         diffusion_batch_size=1,
                         mini_rollout_steps=cfg.mini_rollout_steps,
                         mini_rollout_samples=1,
                         seed=0,
+                        msa_precropped=cfg.msa_precrop,
                     )
                     # Slice batch dim (always kept) before loss.
                     # Use actual batch size from the data (not cfg) — the

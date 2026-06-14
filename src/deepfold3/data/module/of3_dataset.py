@@ -353,6 +353,8 @@ class OF3Dataset(torch.utils.data.Dataset):
         max_template_date: str | None = None,
         name: str = "",
         exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
+        msa_crop_size: int = 1024,
+        n_msa_crops: int = 0,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs.
@@ -377,7 +379,11 @@ class OF3Dataset(torch.utils.data.Dataset):
             interface_weight=interface_crop_weight,
             interface_distance=interface_distance,
         )
-        self.featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+        self.featurizer = Featurizer(
+            max_msa_seqs=max_msa_seqs,
+            msa_crop_size=msa_crop_size,
+            n_msa_crops=n_msa_crops,
+        )
 
     def __len__(self) -> int:
         return len(self.records)
