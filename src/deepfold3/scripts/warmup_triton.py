@@ -565,6 +565,14 @@ def main(
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA not available — warmup needs a GPU.")
     dev = torch.device(device)
+    # Pin the current CUDA device to the warmup device. Triton launches kernels
+    # on the *current* device's context, not the input tensor's device, so on a
+    # non-default --device (e.g. cuda:1) an unpinned current device (0) makes the
+    # launcher reject the on-device pointers ("cannot be accessed from Triton
+    # (cpu tensor?)"). This surfaced only across multiple buckets — a single
+    # bucket happened to get the device set as a side effect mid-run.
+    if dev.type == "cuda" and dev.index is not None:
+        torch.cuda.set_device(dev)
     name = torch.cuda.get_device_name(dev)
     mcfg, chunk_size = _load_configs(config_path)
     train_cfg = _load_training_overrides(config_path)
