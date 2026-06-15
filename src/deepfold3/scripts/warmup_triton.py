@@ -386,6 +386,49 @@ def _synthetic_training_features(n_pad: int, batch: int, n_msa: int, device: tor
     return {k: v.to(device) for k, v in feats.items()}
 
 
+def collapse_to_depth_1(mcfg: ModelConfig) -> dict[str, tuple[int, int]]:
+    """Reduce every repeated block stack to a single layer for warmup.
+
+    The Triton autotune cache is keyed by ``(kernel, shape)`` — the layer index
+    is *not* part of the key, and every layer in a given stack shares identical
+    channel dims, hence identical ``(M, N, K)``. So a single layer warms the
+    exact same cache entries as the full stack; the remaining layers are pure
+    redundant fwd/bwd compute. Collapsing every stack to depth 1 warms the
+    identical cache set at a fraction of the memory/time, with no shape coverage
+    lost — and removes the OOM pressure that otherwise forces ``--msa-depth``
+    down at N=384.
+
+    The ``num_blocks``-dependent ``LinearNoBias`` projections (atom transformer
+    ``pair_logits_proj``, diffusion transformer pair-bias proj) change width
+    when their block count drops, but those are plain cuBLAS matmuls — not in
+    the Triton autotune cache — so the warmed shapes are unaffected.
+
+    Returns ``{dotted_field: (orig, new)}`` for logging.
+    """
+    changes: dict[str, tuple[int, int]] = {}
+
+    def set1(name: str, obj: object, attr: str) -> None:
+        orig = getattr(obj, attr)
+        setattr(obj, attr, 1)
+        changes[name] = (orig, 1)
+
+    set1("evoformer.num_layer", mcfg.evoformer, "num_layer")
+    set1("pairformer.num_layer", mcfg.pairformer, "num_layer")
+    set1("confidence.num_layer", mcfg.confidence, "num_layer")
+    set1("template.pairformer.num_layer", mcfg.template.pairformer, "num_layer")
+    set1(
+        "diffusion.atom_cross_att.atom_transformer.num_blocks",
+        mcfg.diffusion.atom_cross_att.atom_transformer,
+        "num_blocks",
+    )
+    # Diffusion transformer asserts num_blocks % super_block_size == 0, so drop
+    # both to 1 (one block, one super-block). Per-block Triton kernels (AdaLN
+    # FFN / attention) are shape-independent of these counts.
+    set1("diffusion.transformer.super_block_size", mcfg.diffusion.transformer, "super_block_size")
+    set1("diffusion.transformer.num_blocks", mcfg.diffusion.transformer, "num_blocks")
+    return changes
+
+
 def warmup_real_model(
     mcfg,
     buckets: Iterable[int],
@@ -399,7 +442,10 @@ def warmup_real_model(
     """Warm the cache by driving the real model's ``forward_training`` + backward.
 
     Guarantees the cached (M, N, K) shapes and kernel specializations exactly
-    match training — no hand-maintained shape list to drift out of sync.
+    match training — no hand-maintained shape list to drift out of sync. ``mcfg``
+    is expected to have been passed through :func:`collapse_to_depth_1` by the
+    caller (the default for ``--real-model``): one layer per stack warms the
+    identical shape-keyed cache entries as the full stack.
     """
     from deepfold3.model.model import DeepFold3
     from deepfold3.model.triton.cache import CacheManager
@@ -477,7 +523,19 @@ def warmup_real_model(
         "Warm by driving the real model's forward_training + backward at the "
         "production shapes (uses --config's max_tokens / batch_size_per_rank / "
         "diffusion params). Guarantees the cached shapes exactly match training "
-        "— no synthetic-shape-list drift. Default buckets = [max_tokens]."
+        "— no synthetic-shape-list drift. Default buckets = [max_tokens]. "
+        "Every repeated block stack is collapsed to depth 1 (shape coverage is "
+        "identical — see --full-depth to disable)."
+    ),
+)
+@click.option(
+    "--full-depth",
+    is_flag=True,
+    help=(
+        "With --real-model, build the full-depth model instead of collapsing "
+        "every block stack to a single layer. The Triton cache is shape-keyed "
+        "so depth-1 warms the identical entries; this flag is only an escape "
+        "hatch and costs ~N× more memory/time for no extra coverage."
     ),
 )
 @click.option(
@@ -498,6 +556,7 @@ def main(
     batch_sizes: str,
     skip_gemm: bool,
     real_model: bool,
+    full_depth: bool,
     msa_depth: int | None,
     device: str,
 ) -> None:
@@ -511,6 +570,13 @@ def main(
     train_cfg = _load_training_overrides(config_path)
 
     if real_model:
+        if full_depth:
+            logger.info("Full-depth real-model warmup (no stack collapse)")
+        else:
+            changes = collapse_to_depth_1(mcfg)
+            logger.info("Shallow warmup — collapsing block stacks to depth 1 (shape coverage identical):")
+            for field_name, (orig, new) in changes.items():
+                logger.info(f"  {field_name}: {orig} → {new}")
         max_tokens = int(train_cfg.get("max_tokens", 384))
         # Training fixes N = max_tokens (collate fixed_bucket_n), so default to
         # warming exactly that bucket; --buckets overrides for larger crops.

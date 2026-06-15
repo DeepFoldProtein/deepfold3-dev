@@ -367,9 +367,18 @@ There are two modes:
 default 384) with `batch_size_per_rank` and the diffusion params read from `--config`. Every
 cached shape and kernel specialization therefore matches training exactly — there is no
 hand-maintained shape list to drift out of sync (the gap that previously left `dual_gemm`
-uncached). It warms the per-chunk diffusion size (`min(diffusion_chunk_size, diffusion_batch_size)`),
-so memory stays near a single training microstep (~70 GB at N=384 / S_msa=1024; ~2 min one-time).
-`--msa-depth` defaults to `model.msa_crop_size`; lower it (or `--buckets`) if the forward OOMs.
+uncached). It warms the per-chunk diffusion size (`min(diffusion_chunk_size, diffusion_batch_size)`).
+
+By default every repeated block stack is **collapsed to depth 1** (`collapse_to_depth_1`):
+PairFormer 48→1, diffusion transformer 24→1, Evoformer / confidence / template / atom
+transformer →1. The Triton autotune cache is keyed by `(kernel, shape)` — the layer index is
+not part of the key and every layer in a stack shares identical channel dims — so one layer
+warms the *identical* set of cache entries as the full stack. Coverage is unchanged; the other
+47 PairFormer layers were pure redundant fwd/bwd. This keeps activation memory at ~a single
+layer (so warming at the production `--msa-depth` no longer OOMs at N=384) and runs in seconds.
+Pass `--full-depth` to build the whole model instead — only an escape hatch; it costs ~N× more
+memory/time for no extra coverage. `--msa-depth` defaults to `model.msa_crop_size`; lower it
+(or `--buckets`) only if the forward still OOMs.
 
 ```bash
 deepfold3 warmup-triton --config configs/initial.yaml --real-model
