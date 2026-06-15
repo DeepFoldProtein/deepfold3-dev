@@ -138,6 +138,13 @@ training:
   # per-step noise). Drops WandB cost ~10× without losing the slow-dynamic
   # depth profile.
   act_rms_log_interval: 10
+  # Diagnostic-only accuracy metrics (no_grad, not in total, O(N²) every step).
+  # tm_true is the expensive frame-expansion metric and pure overhead in stage 1
+  # (alpha_pae=0 → nothing to share with), so it's off here; it auto-enables in
+  # FT3 (alpha_pae>0) where the PAE loss already builds the same error tensor.
+  # distogram_entropy is the cheaper fused calibration readout — kept on.
+  log_tm_true: false
+  log_distogram_entropy: true
 
   auto_resume: false
   load_strict: true

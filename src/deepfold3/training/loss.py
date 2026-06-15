@@ -917,6 +917,31 @@ def fape_loss(
     return loss.to(out_dtype)
 
 
+def frame_aligned_error(
+    pred_rep: torch.Tensor,  # [S, N, 3] representative atoms
+    pred_frames: torch.Tensor,  # [S, N, 3, 3] frame atoms in pred space
+    gt_rep: torch.Tensor,  # [N, 3] representative atoms
+    gt_frames: torch.Tensor,  # [N, 3, 3] frame atoms in GT space
+    angle_threshold: float = 25.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-pair frame-local alignment error + per-frame angle-ok masks.
+
+    Shared by :func:`pae_loss` (CE target) and the ``tm_true`` diagnostic — both
+    project token ``j`` into token ``i``'s local frame for pred and GT and take
+    the L2 distance, then drop frames within ``angle_threshold`` of co-linearity.
+    Computing it once lets FT3 reuse the result instead of running the O(N²)
+    ``express_coordinates_in_frame`` twice.
+
+    Returns ``(error [S, N, N], pred_angle_ok [S, N] bool, gt_angle_ok [N] bool)``.
+    """
+    pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
+    gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
+    error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
+    pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold)  # [S, N]
+    gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold)  # [N]
+    return error, pred_angle_ok, gt_angle_ok
+
+
 def pae_loss(
     logits: torch.Tensor,  # [S, N, N, num_bins]
     pred_rep: torch.Tensor,  # [S, N, 3] representative atoms
@@ -927,6 +952,7 @@ def pae_loss(
     num_bins: int = 64,
     max_error_bin: float = 31.0,
     angle_threshold: float = 25.0,
+    frame_error: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Frame-aligned predicted aligned error (PAE) cross-entropy loss.
 
@@ -942,15 +968,18 @@ def pae_loss(
     ill-defined orientation and would otherwise inject noise into the
     alignment-error supervision.
     """
-    pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
-    gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
-    error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
+    if frame_error is None:
+        error, pred_angle_ok, gt_angle_ok = frame_aligned_error(
+            pred_rep, pred_frames, gt_rep, gt_frames, angle_threshold
+        )
+    else:
+        error, pred_angle_ok, gt_angle_ok = frame_error
 
     bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=logits.device)
     target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
 
-    pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold).float()  # [S, N]
-    gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).float()  # [N]
+    pred_angle_ok = pred_angle_ok.float()  # [S, N]
+    gt_angle_ok = gt_angle_ok.float()  # [N]
     # Gate is on the i-axis (frame-providing token); j is unrestricted.
     mask_s = pae_mask.unsqueeze(0) * pred_angle_ok.unsqueeze(-1) * gt_angle_ok.unsqueeze(0).unsqueeze(-1)  # [S, N, N]
 
@@ -1967,6 +1996,10 @@ def training_loss(
     frame_idx_feat = features.get("frame_atom_index")
     frame_tok_feat = features.get("frame_token_index")
     frames_mask_feat = features.get("frames_mask")
+    # Shared frame-aligned error, computed once here and reused by the PAE loss
+    # below (FT3) — see ``frame_aligned_error``. ``None`` when frames are absent
+    # or both the tm_true metric and PAE are off.
+    shared_frame_error = None
     if (
         (cfg.log_tm_true or cfg.alpha_pae > 0)
         and mini_pos_for_tm is not None
@@ -1984,17 +2017,20 @@ def training_loss(
             gt_frames_atoms_tm = gt_pos[frame_tok_feat, frame_idx_feat]  # [N, 3, 3]
             pred_frames_atoms_tm = mini_pos_for_tm[:, frame_tok_feat, frame_idx_feat]  # [1, N, 3, 3]
 
-            pred_local_tm = express_coordinates_in_frame(pred_rep_tm, pred_frames_atoms_tm)  # [1, N, N, 3]
-            gt_local_tm = express_coordinates_in_frame(gt_rep, gt_frames_atoms_tm)  # [N, N, 3]
-            true_error = (pred_local_tm - gt_local_tm.unsqueeze(0)).norm(dim=-1)  # [1, N, N]
+            true_error, pred_angle_ok_tm, gt_angle_ok_tm = frame_aligned_error(
+                pred_rep_tm, pred_frames_atoms_tm, gt_rep, gt_frames_atoms_tm
+            )
+            shared_frame_error = (true_error, pred_angle_ok_tm, gt_angle_ok_tm)
 
             pair_mask_for_tm = features.get("pair_mask")
             if pair_mask_for_tm is None:
                 pair_mask_for_tm = loss_seq_mask.unsqueeze(1) & loss_seq_mask.unsqueeze(0)
             pae_mask_for_tm = (frames_mask_feat.bool().unsqueeze(-1) & pair_mask_for_tm.bool()).float()
-            pred_angle_ok_tm = _frame_angle_mask(pred_frames_atoms_tm, 25.0).float()  # [1, N]
-            gt_angle_ok_tm = _frame_angle_mask(gt_frames_atoms_tm, 25.0).float()  # [N]
-            mask_s_tm = pae_mask_for_tm.unsqueeze(0) * pred_angle_ok_tm.unsqueeze(-1) * gt_angle_ok_tm.unsqueeze(0).unsqueeze(-1)  # [1, N, N]
+            mask_s_tm = (
+                pae_mask_for_tm.unsqueeze(0)
+                * pred_angle_ok_tm.float().unsqueeze(-1)
+                * gt_angle_ok_tm.float().unsqueeze(0).unsqueeze(-1)
+            )  # [1, N, N]
 
             n_eff_tm = int(loss_seq_mask.sum().item())
             if mask_s_tm.sum() > 0 and n_eff_tm > 0:
@@ -2094,8 +2130,14 @@ def training_loss(
                         # Back-compat for caches produced before §4.3.2 ligand frames:
                         # every frame atom came from the token's own slot layout.
                         frame_tok = torch.arange(N, device=gt_pos.device).unsqueeze(-1).expand(N, 3)
-                    gt_frames_atoms = gt_pos[frame_tok, frame_idx]  # [N, 3, 3]
-                    mini_frames_atoms = mini_pos[:, frame_tok, frame_idx]  # [S, N, 3, 3]
+                    # When the tm_true block already built the frame-aligned error
+                    # (FT3 hits this path), pae_loss reuses it via ``frame_error``
+                    # and the raw frame atoms are unused — skip the gathers.
+                    if shared_frame_error is None:
+                        gt_frames_atoms = gt_pos[frame_tok, frame_idx]  # [N, 3, 3]
+                        mini_frames_atoms = mini_pos[:, frame_tok, frame_idx]  # [S, N, 3, 3]
+                    else:
+                        gt_frames_atoms = mini_frames_atoms = None
 
                     pair_mask_feat = features.get("pair_mask")
                     if pair_mask_feat is None:
@@ -2119,6 +2161,7 @@ def training_loss(
                             gt_frames_atoms,
                             pae_mask,
                             chunk_n=cfg.fused_ce_chunk_n,
+                            frame_error=shared_frame_error,
                         )
                     elif "pae" in pred:
                         l_pae = pae_loss(
@@ -2128,6 +2171,7 @@ def training_loss(
                             gt_rep,
                             gt_frames_atoms,
                             pae_mask,
+                            frame_error=shared_frame_error,
                         )
                     else:
                         l_pae = None

@@ -257,6 +257,7 @@ def pae_loss_fused(
     num_bins: int = 64,
     chunk_n: int = 32,
     angle_threshold: float = 25.0,
+    frame_error: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Frame-aligned PAE CE loss with chunked linear (no symmetrization).
 
@@ -277,18 +278,25 @@ def pae_loss_fused(
         gt_frames: Ground-truth frame atom positions ``[N, 3, 3]``.
         pae_mask: Float mask ``[N, N]`` already AND-combining frames-mask
             and pair-mask (built once by the caller).
+        frame_error: optional precomputed ``(error, pred_angle_ok, gt_angle_ok)``
+            from :func:`deepfold3.training.loss.frame_aligned_error`. When given,
+            the express-in-frame / angle work is skipped (FT3 reuses the same
+            tensor already built for the ``tm_true`` diagnostic).
     """
-    from deepfold3.training.loss import _frame_angle_mask, express_coordinates_in_frame
+    from deepfold3.training.loss import frame_aligned_error
 
-    pred_local = express_coordinates_in_frame(pred_rep, pred_frames)  # [S, N, N, 3]
-    gt_local = express_coordinates_in_frame(gt_rep, gt_frames)  # [N, N, 3]
-    error = (pred_local - gt_local.unsqueeze(0)).norm(dim=-1)  # [S, N, N]
+    if frame_error is None:
+        error, pred_angle_ok, gt_angle_ok = frame_aligned_error(
+            pred_rep, pred_frames, gt_rep, gt_frames, angle_threshold
+        )
+    else:
+        error, pred_angle_ok, gt_angle_ok = frame_error
 
     bin_edges = torch.linspace(0, max_error_bin, num_bins - 1, device=features.device)
     target = torch.bucketize(error, bin_edges).clamp(max=num_bins - 1)
 
-    pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold).to(pae_mask.dtype)
-    gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).to(pae_mask.dtype)
+    pred_angle_ok = pred_angle_ok.to(pae_mask.dtype)
+    gt_angle_ok = gt_angle_ok.to(pae_mask.dtype)
     mask_s = pae_mask.unsqueeze(0) * pred_angle_ok.unsqueeze(-1) * gt_angle_ok.unsqueeze(0).unsqueeze(-1)  # [S, N, N]
 
     return chunked_linear_cross_entropy(
