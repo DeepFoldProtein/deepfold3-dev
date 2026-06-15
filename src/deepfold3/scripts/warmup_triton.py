@@ -142,15 +142,6 @@ def _parse_overrides(override: tuple[str, ...]) -> dict:
     return out
 
 
-def _deep_merge(base: dict, over: dict) -> None:
-    """Recursively merge ``over`` into ``base`` in place."""
-    for k, v in over.items():
-        if isinstance(v, dict) and isinstance(base.get(k), dict):
-            _deep_merge(base[k], v)
-        else:
-            base[k] = v
-
-
 def _load_configs(config_path: str | None, override: tuple[str, ...] = ()) -> tuple[ModelConfig, int, dict, set]:
     """Load a ``ModelConfig`` + training-overrides dict + ``diffusion_chunk_size``.
 
@@ -159,11 +150,11 @@ def _load_configs(config_path: str | None, override: tuple[str, ...] = ()) -> tu
     last element is the set of top-level training keys set via ``--override`` (so
     the caller can honor e.g. an explicit ``max_recycles`` uncapped).
     """
-    from deepfold3.config_loader import load_config
+    from deepfold3.config_loader import deep_merge, load_config
 
     cfg_dict = load_config(config_path) if config_path else {}
     cli_over = _parse_overrides(override)
-    _deep_merge(cfg_dict, cli_over)
+    cfg_dict = deep_merge(cfg_dict, cli_over)
 
     # Validate training override keys against TrainingConfig to catch typos.
     train_cfg = cfg_dict.get("training", {}) or {}
