@@ -129,6 +129,11 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
 
 Both fire from the mini-rollout (S=1) and are computed under `torch.no_grad()`, so they're available **independent of `alpha_confidence`** — they show up in stage 0/1/2 (when the confidence head forward is gated off) and can be compared directly to inference-time pTM/ipTM. PAE-derived `tm_pred` / `itm_pred` are not currently emitted; `scripts/run_status.py` parses both pairs of keys when present.
 
+These diagnostics are O(N²) and run **every step**, so they're individually gateable for throughput:
+
+- `log_tm_true` (default `True`) — `tm_true` / `itm_true`. Suppresses the frame expansion in stages 1–3; **computed regardless when `alpha_pae > 0`** (FT3), since the PAE loss already builds the same `express_coordinates_in_frame` error from the same mini-rollout frames, making `tm_true` ~free on the margin there.
+- `log_distogram_entropy` (default `True`) — `distogram_entropy` (`H(p_θ)` over the `[·, N, N, 64]` distogram softmax). The distogram *loss* is unaffected; only the entropy readout is gated.
+
 ### LR Schedule
 
 Two schedulers available, selected by `finetune_scheduler`:

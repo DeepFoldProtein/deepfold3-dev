@@ -829,6 +829,18 @@ class TrainingConfig:
     # ``<= 0`` skips the act_rms flush entirely (no emission); use
     # ``log_activation_rms = False`` to also skip attaching/running the meter.
     act_rms_log_interval: int = 1
+    # Diagnostic-only accuracy metrics computed inside ``training_loss`` (under
+    # ``no_grad``, not added to ``total``). Both are O(N²) and run every step, so
+    # disable them to recover throughput when they aren't being watched.
+    #   log_tm_true:           tm_true / itm_true from mini-rollout frames
+    #                          (express_coordinates_in_frame → [1, N, N, 3]).
+    #                          Auto-computed whenever ``alpha_pae > 0`` regardless
+    #                          of this flag — the PAE loss already does the same
+    #                          frame expansion, so tm_true is ~free in FT3; the
+    #                          flag only suppresses it in stages 1–3 (no PAE).
+    #   log_distogram_entropy: H(p_θ) of the distogram head ([·, N, N, 64] softmax).
+    log_tm_true: bool = True
+    log_distogram_entropy: bool = True
     uniform_recycle: bool = (
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )

@@ -1926,17 +1926,21 @@ def training_loss(
                 loss_seq_mask,
                 chunk_n=cfg.fused_ce_chunk_n,
             )
-            with torch.no_grad():
-                e_disto = distogram_entropy_fused(
-                    pred["distogram_features"],
-                    pred["distogram_weight"],
-                    loss_seq_mask,
-                    chunk_n=cfg.fused_ce_chunk_n,
-                )
+            e_disto = None
+            if cfg.log_distogram_entropy:
+                with torch.no_grad():
+                    e_disto = distogram_entropy_fused(
+                        pred["distogram_features"],
+                        pred["distogram_weight"],
+                        loss_seq_mask,
+                        chunk_n=cfg.fused_ce_chunk_n,
+                    )
         elif "distogram" in pred:
             l_disto = distogram_loss(pred["distogram"], gt_rep, loss_seq_mask)
-            with torch.no_grad():
-                e_disto = distogram_entropy(pred["distogram"], loss_seq_mask)
+            e_disto = None
+            if cfg.log_distogram_entropy:
+                with torch.no_grad():
+                    e_disto = distogram_entropy(pred["distogram"], loss_seq_mask)
         else:
             l_disto = None
             e_disto = None
@@ -1955,12 +1959,17 @@ def training_loss(
     # is emitted only when the batch contains at least one cross-chain pair
     # (DDP-safe via DistributedAverageMeters' per-key counts + key-set
     # union; single-chain ranks simply don't contribute that key).
+    # Gated by ``cfg.log_tm_true`` to skip the O(N²) frame expansion in stages
+    # 1–3. When ``alpha_pae > 0`` (FT3) it is computed regardless: the PAE loss
+    # already builds the same express_coordinates_in_frame error from the same
+    # mini-rollout frames, so tm_true is ~free on the margin there.
     mini_pos_for_tm = pred.get("mini_rollout_pos")  # [1, N, M, 3] or None
     frame_idx_feat = features.get("frame_atom_index")
     frame_tok_feat = features.get("frame_token_index")
     frames_mask_feat = features.get("frames_mask")
     if (
-        mini_pos_for_tm is not None
+        (cfg.log_tm_true or cfg.alpha_pae > 0)
+        and mini_pos_for_tm is not None
         and frame_idx_feat is not None
         and frames_mask_feat is not None
     ):
