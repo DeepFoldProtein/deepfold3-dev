@@ -53,6 +53,7 @@ import torch
 from deepfold3.model.bucket import BUCKET_SIZES
 from deepfold3.model.config import ModelConfig
 from deepfold3.scripts import cli
+from deepfold3.scripts._common import pin_cuda_device
 
 logger = logging.getLogger(__name__)
 
@@ -618,15 +619,10 @@ def main(
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA not available — warmup needs a GPU.")
-    dev = torch.device(device)
-    # Pin the current CUDA device to the warmup device. Triton launches kernels
-    # on the *current* device's context, not the input tensor's device, so on a
-    # non-default --device (e.g. cuda:1) an unpinned current device (0) makes the
-    # launcher reject the on-device pointers ("cannot be accessed from Triton
-    # (cpu tensor?)"). This surfaced only across multiple buckets — a single
-    # bucket happened to get the device set as a side effect mid-run.
-    if dev.type == "cuda" and dev.index is not None:
-        torch.cuda.set_device(dev)
+    # Pin the current CUDA device so Triton launches kernels on the same device
+    # as the model/features (see pin_cuda_device — non-default --device otherwise
+    # trips "cannot be accessed from Triton (cpu tensor?)").
+    dev = pin_cuda_device(device)
     name = torch.cuda.get_device_name(dev)
     mcfg, chunk_size, train_cfg, explicit_training = _load_configs(config_path, override)
 

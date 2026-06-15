@@ -41,6 +41,7 @@ import click
 import torch
 
 from deepfold3.scripts import cli
+from deepfold3.scripts._common import pin_cuda_device
 
 
 def _select_snapshot(ckpt: dict, choice: str) -> dict:
@@ -230,10 +231,10 @@ def inference(
     # ------------------------------------------------------------------
     # Device
     # ------------------------------------------------------------------
-    if device is None:
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        dev = torch.device(device)
+    # pin_cuda_device also sets the current CUDA device so the fused Triton
+    # kernels launch on the same device as the model/features — a non-default
+    # --device (e.g. cuda:1) otherwise trips "cannot be accessed from Triton".
+    dev = pin_cuda_device(device)
     click.echo(f"[inference] device: {dev}")
 
     # ------------------------------------------------------------------
