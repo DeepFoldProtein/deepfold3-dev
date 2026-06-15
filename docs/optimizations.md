@@ -380,6 +380,14 @@ Pass `--full-depth` to build the whole model instead — only an escape hatch; i
 memory/time for no extra coverage. `--msa-depth` defaults to `model.msa_crop_size`; lower it
 (or `--buckets`) only if the forward still OOMs.
 
+`--override key=value` (same parser as `deepfold3 train` — bare keys → training section, dotted
+for nested) tweaks the shapes/params on top of `--config`, e.g. `--override batch_size_per_rank=1
+--override diffusion_chunk_size=16 --override max_recycles=3 --override model.msa_crop_size=2048`.
+Handy for cache-coverage or timing sweeps; an explicit `max_recycles` is honored uncapped (the
+warming default caps recycles at 2 since they add no new shapes). The warmup pins the current CUDA
+device to `--device` so non-default devices (e.g. `cuda:1`) launch Triton kernels on the right
+context.
+
 ```bash
 deepfold3 warmup-triton --config configs/initial.yaml --real-model
 ```

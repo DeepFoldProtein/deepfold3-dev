@@ -108,26 +108,85 @@ class WarmupShapes:
         )
 
 
-def _load_configs(config_path: str | None) -> tuple[ModelConfig, int]:
-    """Load a ``ModelConfig`` and ``diffusion_chunk_size`` from JSON or YAML.
+def _coerce_scalar(raw: str) -> bool | int | float | str:
+    """Parse a CLI override value string into bool / int / float / str."""
+    low = raw.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    for cast in (int, float):
+        try:
+            return cast(raw)
+        except ValueError:
+            continue
+    return raw
 
-    Returns ``(ModelConfig, chunk_size)`` with defaults when no config is given.
+
+def _parse_overrides(override: tuple[str, ...]) -> dict:
+    """Parse ``--override key=value`` into a nested dict.
+
+    Bare keys land in the ``training`` section (matching ``deepfold3 train``);
+    dotted keys address nested config, e.g. ``model.pairformer.num_layer=4``.
     """
-    mcfg = ModelConfig()
-    chunk_size = 16  # TrainingConfig default
-    if not config_path:
-        return mcfg, chunk_size
+    out: dict = {}
+    for kv in override:
+        if "=" not in kv:
+            raise click.BadParameter(f"Override must be key=value, got: {kv}")
+        key, raw = kv.split("=", 1)
+        parts = key.split(".")
+        if len(parts) == 1:
+            parts = ["training", parts[0]]  # bare key → training section
+        node = out
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = _coerce_scalar(raw)
+    return out
+
+
+def _deep_merge(base: dict, over: dict) -> None:
+    """Recursively merge ``over`` into ``base`` in place."""
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def _load_configs(config_path: str | None, override: tuple[str, ...] = ()) -> tuple[ModelConfig, int, dict, set]:
+    """Load a ``ModelConfig`` + training-overrides dict + ``diffusion_chunk_size``.
+
+    ``--override key=value`` pairs are merged on top of the config file. Returns
+    ``(ModelConfig, chunk_size, training_dict, explicit_training_keys)`` where the
+    last element is the set of top-level training keys set via ``--override`` (so
+    the caller can honor e.g. an explicit ``max_recycles`` uncapped).
+    """
     from deepfold3.config_loader import load_config
 
-    overrides = load_config(config_path)
-    model_overrides = overrides.get("model", {})
+    cfg_dict = load_config(config_path) if config_path else {}
+    cli_over = _parse_overrides(override)
+    _deep_merge(cfg_dict, cli_over)
+
+    # Validate training override keys against TrainingConfig to catch typos.
+    train_cfg = cfg_dict.get("training", {}) or {}
+    if cli_over.get("training"):
+        import dataclasses
+
+        from deepfold3.model.config import TrainingConfig
+
+        valid = {f.name for f in dataclasses.fields(TrainingConfig)}
+        for k in cli_over["training"]:
+            if k not in valid:
+                raise click.BadParameter(f"Unknown training config key: {k}")
+
+    mcfg = ModelConfig()
+    model_overrides = cfg_dict.get("model", {})
     if model_overrides:
         from deepfold3.scripts.train import _apply_overrides
 
         _apply_overrides(mcfg, model_overrides)
-    training_overrides = overrides.get("training", {})
-    chunk_size = training_overrides.get("diffusion_chunk_size", chunk_size)
-    return mcfg, chunk_size
+        mcfg.__post_init__()  # re-mirror precision flags after overrides
+    chunk_size = int(train_cfg.get("diffusion_chunk_size", 16))  # TrainingConfig default
+    explicit_training = set(cli_over.get("training", {}))
+    return mcfg, chunk_size, train_cfg, explicit_training
 
 
 def _layernorm_linear_shapes(n_pad: int, batch: int, s: WarmupShapes) -> list[tuple[str, int, int, int]]:
@@ -331,15 +390,6 @@ def warmup_buckets(
     # Force one final flush so cache JSON is fully written before exit.
     CacheManager.get().save_all()
     logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
-
-
-def _load_training_overrides(config_path: str | None) -> dict:
-    """Return the ``training`` section of a config (empty dict if none)."""
-    if not config_path:
-        return {}
-    from deepfold3.config_loader import load_config
-
-    return load_config(config_path).get("training", {}) or {}
 
 
 def _synthetic_training_features(n_pad: int, batch: int, n_msa: int, device: torch.device) -> dict:
@@ -550,6 +600,18 @@ def warmup_real_model(
     ),
 )
 @click.option("--device", type=str, default="cuda:0", help="CUDA device to warm on.")
+@click.option(
+    "--override",
+    multiple=True,
+    help=(
+        "Override config: key=value, applied on top of --config. Bare keys go to "
+        "the training section (e.g. --override batch_size_per_rank=1 --override "
+        "diffusion_chunk_size=16 --override max_recycles=3); dotted keys address "
+        "nested config (e.g. --override model.msa_crop_size=2048). For --real-model "
+        "timing/coverage sweeps. An explicit max_recycles here is honored uncapped "
+        "(the warming default caps recycles at 2 since they add no new shapes)."
+    ),
+)
 def main(
     config_path: str | None,
     buckets: str | None,
@@ -559,6 +621,7 @@ def main(
     full_depth: bool,
     msa_depth: int | None,
     device: str,
+    override: tuple[str, ...],
 ) -> None:
     """Pre-populate the persistent Triton autotune cache for our bucket sizes."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -574,8 +637,7 @@ def main(
     if dev.type == "cuda" and dev.index is not None:
         torch.cuda.set_device(dev)
     name = torch.cuda.get_device_name(dev)
-    mcfg, chunk_size = _load_configs(config_path)
-    train_cfg = _load_training_overrides(config_path)
+    mcfg, chunk_size, train_cfg, explicit_training = _load_configs(config_path, override)
 
     if real_model:
         if full_depth:
@@ -598,7 +660,11 @@ def main(
         # the full unchunked batch both OOMs and warms the wrong shape.
         full_diff = int(train_cfg.get("diffusion_batch_size", 8))
         diff_bs = min(chunk_size, full_diff) if chunk_size and chunk_size > 0 else full_diff
-        recycles = min(2, int(train_cfg.get("max_recycles", 2)))
+        # Recycles don't add new (kernel, shape) entries (they just repeat the
+        # trunk), so the warming default caps at 2 for speed. An explicit
+        # --override max_recycles=N is honored uncapped — useful for timing.
+        cfg_recycles = int(train_cfg.get("max_recycles", 2))
+        recycles = cfg_recycles if "max_recycles" in explicit_training else min(2, cfg_recycles)
         compute_conf = float(train_cfg.get("alpha_confidence", 0.0)) > 0
         # Default MSA depth = the fixed pool the trunk subsamples to (model.py).
         n_msa = msa_depth if msa_depth is not None else int(getattr(mcfg, "msa_crop_size", 1024) or 1024)
