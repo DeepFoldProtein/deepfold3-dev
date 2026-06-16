@@ -234,7 +234,7 @@ class WeightedClusterSampler(Sampler[int]):
     def __init__(
         self,
         records: list[Record],
-        epoch_size: int = 10000,
+        epoch_size: int = 100_000,
         alpha_prot: float = 3.0,
         alpha_nucl: float = 3.0,
         alpha_lig: float = 1.0,

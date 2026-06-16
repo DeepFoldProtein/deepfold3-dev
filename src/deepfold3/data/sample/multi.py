@@ -39,7 +39,7 @@ class MultiDatasetSampler(Sampler[int]):
     def __init__(
         self,
         dataset_configs: list[dict],
-        epoch_size: int = 10000,
+        epoch_size: int = 100_000,
         num_replicas: int = 1,
         rank: int = 0,
         seed: int = 42,

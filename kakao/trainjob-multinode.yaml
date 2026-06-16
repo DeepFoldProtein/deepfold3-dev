@@ -184,7 +184,6 @@ spec:
           --wandb ${WANDB_PROJECT} \
           --wandb-entity ${WANDB_ENTITY} \
           --override wandb_run_name=${RUN_NAME} \
-          --override epoch_size=100000 \
           ${EXTRA_ARGS}
     env:
       - name: NCCL_IB_DISABLE
