@@ -243,9 +243,11 @@ class WeightedClusterSampler(Sampler[int]):
         num_replicas: int = 1,
         rank: int = 0,
         seed: int = 42,
+        infinite: bool = False,
     ):
         self.records = records
         self.epoch_size = epoch_size
+        self.infinite = infinite
         self.num_replicas = num_replicas
         self.rank = rank
         self.seed = seed
@@ -267,16 +269,43 @@ class WeightedClusterSampler(Sampler[int]):
         )
 
     def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
-        indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
-        shard = indices[self.rank :: self.num_replicas]
-        for i in range(self.sample_idx, len(shard)):
-            self.sample_idx = i + 1
-            yield int(shard[i])
-        # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
-        # state_dict captured after the iterator drained reads as
-        # "epoch fully consumed". ``set_epoch`` resets it on the next
-        # outer-loop tick.
+        if not self.infinite:
+            # Finite epoch (legacy): one epoch_size draw, sharded, resumable.
+            # The trainer recreates this iterator each epoch — at the boundary
+            # the prefetch buffer drains, so the first batch of the new epoch
+            # waits (a ``data_wait`` spike). Use ``infinite=True`` to avoid it.
+            rng = np.random.default_rng(self.seed + self.epoch)
+            indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
+            shard = indices[self.rank :: self.num_replicas]
+            for i in range(self.sample_idx, len(shard)):
+                self.sample_idx = i + 1
+                yield int(shard[i])
+            # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
+            # state_dict captured after the iterator drained reads as
+            # "epoch fully consumed". ``set_epoch`` resets it on the next
+            # outer-loop tick.
+            return
+
+        # Infinite: never raises StopIteration. The trainer creates a single
+        # long-lived iterator and pulls forever, so workers keep prefetching
+        # across "epoch" reseeds with no buffer drain — no epoch-boundary
+        # data_wait spike. Because sampling is with-replacement, an "epoch" is
+        # just an arbitrary ``epoch_size`` chunk; we reseed per chunk for draw
+        # variety and advance ``self.epoch`` purely as a logging / resume
+        # counter. Resume picks up from the seeded ``self.epoch``/``sample_idx``.
+        epoch = self.epoch
+        pos = self.sample_idx
+        while True:
+            rng = np.random.default_rng(self.seed + epoch)
+            indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
+            shard = indices[self.rank :: self.num_replicas]
+            while pos < len(shard):
+                self.epoch = epoch
+                self.sample_idx = pos + 1
+                yield int(shard[pos])
+                pos += 1
+            epoch += 1
+            pos = 0
 
     def __len__(self) -> int:
         return self.epoch_size // self.num_replicas

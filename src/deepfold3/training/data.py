@@ -107,6 +107,7 @@ def build_train_sampler(records: list, train_ds: TrainingDataset, cfg: TrainingC
             num_replicas=dist.world_size,
             rank=dist.rank,
             seed=cfg.seed,
+            infinite=True,  # single long-lived iterator (no epoch-boundary prefetch drain)
         )
         train_ds.sampling_rows = sampler.rows
         return sampler

@@ -749,6 +749,15 @@ class Trainer:
                 if self.state.effective_step >= self.cfg.max_steps:
                     break
 
+                # With an infinite sampler this ``for`` never exhausts, so the
+                # iterator is created once and workers prefetch across epoch
+                # reseeds — no per-epoch iterator recreation / prefetch-drain
+                # data_wait spike. The while-level ``epoch += 1`` below is then
+                # unreachable, so mirror the sampler's self-advancing epoch here
+                # for logging/checkpoint. (Finite/DistributedSampler fallback:
+                # this is a no-op and ``epoch += 1`` still drives the counter.)
+                self.state.epoch = getattr(sampler, "epoch", self.state.epoch)
+
                 t_microstep_start = time.monotonic()
                 # Tier-4: time blocked waiting for this batch (prefetch drained).
                 if t_iter_end is not None:
