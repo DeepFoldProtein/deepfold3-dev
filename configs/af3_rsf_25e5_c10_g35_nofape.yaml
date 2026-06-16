@@ -1,0 +1,24 @@
+base: af3_rsf_25e5_c10_g35.yaml
+
+# `df3-k5nofape-25e5-c10-g35` — continuation of df3-fapeK5 with FAPE disabled
+# for throughput.
+#
+# fapeK5 (alpha_fape=2.0, fape_atom_set NCACO+CB) did its job on β-strand
+# recovery; the K=5 per-token frame expansion + FAPE loss is the dominant
+# per-step cost we shed here. This config bases directly on
+# af3_rsf_25e5_c10_g35 (NOT the _fapeK5 override), so the architecture and
+# optimizer are byte-for-byte identical to fapeK5 while FAPE / chirality
+# default off — a resume from the latest df3-fapek5 checkpoint is drop-in.
+#
+# Diagnostics: tm_true / itm_true are gated off (O(N²) express-in-frame every
+# step; alpha_pae=0 in this stage so nothing shares the cost). distogram_entropy
+# is left on (cheaper fused readout, still watched).
+#
+# Launch (resume from the latest fapeK5 checkpoint):
+#   --config configs/af3_rsf_25e5_c10_g35_nofape.yaml \
+#   --resume runs/df3-fapek5-25e5-c10-g35/checkpoint_<latest>.pt
+# (pass via EXTRA_ARGS; do not edit the kakao trainjob YAML for this.)
+
+training:
+  alpha_fape: 0.0        # was 2.0 in fapeK5 — FAPE off (skips the K=5 frame expansion + loss)
+  log_tm_true: false     # tm_true / itm_true diagnostic off (O(N²) every step)

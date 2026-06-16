@@ -1,4 +1,4 @@
-base: initial.yaml
+base: ../initial.yaml
 
 # Schedule-Free AdamW (Defazio et al. 2024, "The Road Less Scheduled").
 # γ_t = γ · √(1 − β₂^t) · min(1, t/T_warmup)

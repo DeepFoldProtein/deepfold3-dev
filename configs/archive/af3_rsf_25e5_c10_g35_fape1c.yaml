@@ -1,4 +1,4 @@
-base: af3_rsf_25e5_c10_g35.yaml
+base: ../af3_rsf_25e5_c10_g35.yaml
 
 # `df3-fape1c-25e5-c10-g35` — Option C: raw-Å FAPE w/ tail emphasis, K=1.
 #

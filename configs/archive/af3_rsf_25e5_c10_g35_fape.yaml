@@ -1,4 +1,4 @@
-base: af3_rsf_25e5_c10_g35.yaml
+base: ../af3_rsf_25e5_c10_g35.yaml
 
 # `df3-fape-25e5-c10-g35` — replace chirality_loss + backbone_chirality_loss
 # with AF2 §4.2.7 FAPE on the diffusion training output.
