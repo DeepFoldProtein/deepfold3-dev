@@ -1,0 +1,36 @@
+base: af3_rsf.yaml
+
+# `df3-rsf-25e5-c10-g35` — g35 → lr 더 낮춰서 원본 s035 effective 영역.
+#
+# Hypothesis path:
+#   * AF3 default (lr 1.8e-3) → distogram 빠른 회귀 (s017-wd10, ROS)
+#   * lr 9e-4 (C2) → mild 회귀
+#   * lr 4.5e-4 (g35) → 1.99 plateau, 천천히 회귀 시작
+#   * lr 2.5e-4 (이 arm) → 원본 s035 effective per-step update.
+#     Target: distogram 1.80 영역 (s035 step 10k 도달점) descent.
+#
+# Effective per-step update (clip dominant regime):
+#   = lr × clip / grad_norm = 2.5e-4 × 10 / ~30 = 8.3e-5
+#   (g35 0.0002, ROS 0.001, s035 0.00006)
+#
+# Single-knob change vs g35: lr 4.5e-4 → 2.5e-4.
+#
+# 원본 s035와 차이 (이제 lr 동일):
+#   * ROS off (deep layer capacity 복원)
+#   * Refined SF (avg_concentration=200) — our default
+#   * EMA 0.999 — our default
+#
+# Trade-off: 학습 1.8× 느림 vs g35.
+#
+# Abort criteria:
+#   * smooth_lddt > 0.60 sustained past step 1500 → lr 너무 낮음
+#   * distogram 회귀 발생 → 진짜 architectural issue, lr 문제 아님
+
+training:
+  lr: 2.5e-4
+  weight_decay: 0.10
+  grad_clip_norm: 10.0
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.35

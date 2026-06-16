@@ -845,7 +845,7 @@ class TrainingConfig:
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )
     batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
-    epoch_size: int = 10000  # samples per synthetic epoch (sampler reseed cadence + DataLoader length)
+    epoch_size: int = 12_800_000  # sampler reseed-chunk size (infinite sampler: no epoch boundary; epoch is a derived log counter)
     eval_before: bool = False  # run one eval pass before the training loop starts (also fires on resume)
     max_checkpoints: int = 0  # keep N most recent checkpoints (0 = keep all)
     checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)

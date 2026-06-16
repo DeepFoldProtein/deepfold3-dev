@@ -1,0 +1,41 @@
+base: initial.yaml
+
+# `df3-rsf-18e3-w1k` — AF3 default + refined SF + act_meter 진단.
+#
+# v2 (`df3-af3r`)와 동일 hyperparams (lr 1.8e-3, warmup 1000, wd 0,
+# clip 10, lr×clip = 0.018) — 차이는 **act_rms 메터 활성화**.
+# 목적: v2 폭주 메커니즘 (single_l2 5 → 4.6M 등비)을 7-branch ρ로
+# 직접 진단. 어느 branch가 ρ_l > c/√L (≈ 0.14)를 먼저 깨는지 측정.
+#
+# Inherits from initial.yaml:
+#   - lr 1.8e-3, wd 0, warmup 1000, clip 10 (AF3 default)
+#   - log_activation_rms: true (initial.yaml에 enable됨)
+#   - AF3 baseline arch (no RMSN, no uniros)
+#   - EMA 0.999
+#
+# Overrides:
+#   - optimizer_type: schedule_free   (default adamw)
+#   - average_concentration: 200      (refined SF)
+#   - batch_size_per_rank: 3, accumulate: 1 → eff. batch 288
+#
+# v2 reference (registry):
+#   step 1-621, CE 4.17 → 2.144 (step 400 best) → 2.20 (step 600 degrade)
+#   single_l2 5 → 4.6M (geometric)
+#
+# 진단 후보 가설:
+#   * single_transition_residual_gain (s035 era) 발현 패턴이면
+#     → b_single_ffn ρ 폭주가 다른 branch보다 빠름
+#   * attention-driven runaway면
+#     → b_single_attn 또는 b_pair_attn_{row,col} 폭주
+#   * triangle multiplication 문제면
+#     → b_tri_{out,in} 폭주
+#
+# 측정 후 다음 arm에서 branch-targeted intervention (residual scale)
+# 적용.
+
+training:
+  optimizer_type: schedule_free
+  average_concentration: 200.0
+
+  batch_size_per_rank: 3
+  accumulate_grad_batches: 1

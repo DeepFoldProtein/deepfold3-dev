@@ -120,7 +120,6 @@ training:
   eval_samples: 1024
   eval_interval: 100
   eval_before: true
-  epoch_size: 12_800_000
   log_interval: 1
   log_microsteps: false
   uniform_recycle: true
