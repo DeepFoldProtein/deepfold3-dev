@@ -180,6 +180,13 @@ af3.bin
 /runs/
 /tmp/
 
+# bench/ — FoldBench harness: track scripts + README; ignore symlinks,
+# generated inputs, and run outputs (predictions / OST evals / logs / plots).
+bench/ckpts/
+bench/data/
+bench/inputs/
+bench/runs/
+
 # Large optional Triton test fixtures (checkpoints; tests skip when absent)
 tests/triton/_fixtures/*.pt
 
