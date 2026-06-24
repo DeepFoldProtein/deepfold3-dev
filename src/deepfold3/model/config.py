@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Literal
+
+
+def _backfill_dataclass(obj, default) -> None:
+    """Recursively add fields present on a fresh ``default`` but absent on
+    ``obj`` (config schema evolved after ``obj`` was pickled).
+
+    Old checkpoints embed a pickled config from an earlier schema; when a new
+    field is later added to the dataclass (e.g. ``ModelConfig.masked_msa``),
+    unpickling restores the old ``__dict__`` without it and any
+    ``cfg.new_field`` access raises ``AttributeError``. Calling this from
+    ``__setstate__`` migrates every load path (inference, trainer resume,
+    convert, analysis scripts) automatically.
+    """
+    if not dataclasses.is_dataclass(obj):
+        return
+    for f in dataclasses.fields(default):
+        dval = getattr(default, f.name)
+        if not hasattr(obj, f.name):
+            setattr(obj, f.name, dval)
+        elif dataclasses.is_dataclass(dval):
+            _backfill_dataclass(getattr(obj, f.name), dval)
 
 
 @dataclass
@@ -143,6 +165,67 @@ class PairFormerConfig:
                     "scalers force each branch output to unit-RMS, so extra branch-specific "
                     "gains just rescale the block-wide γ — set them to default (None / False)."
                 )
+
+
+@dataclass
+class MaskedMSAConfig:
+    """Masked-MSA (BERT) learning head — a masked-language-model objective on
+    the MSA + a single-query MSA cross-attention enrichment.
+
+    When ``enabled``, a fraction of MSA entries on the gradient (final
+    recycle) pass are corrupted BERT-style before the MSA stack sees them,
+    and a head at the end of the MSA module predicts the original residue
+    identity at every (row, token). The masking distribution is a categorical
+    mixture (``uniform`` / ``profile`` / ``same`` components, remaining mass →
+    the ``MSA_MASK`` token).
+
+    The head reads the final MSA-stack representation ``m`` and the trunk
+    single representation ``s``:
+
+        h_i        = Attn(q = s_i, k/v = m[:, i])        # over MSA rows at token i
+        logits_ri  = Linear(MLP([m_ri, s_i, h_i]))       # per (row r, token i)
+
+    Weights are randomly initialized (AF3 ``linear`` init, not zeros) so the
+    head learns from scratch when warm-started from a structure-only run.
+    The loss weight lives in :attr:`TrainingConfig.alpha_masked_msa`.
+
+    Attributes:
+        enabled: Build + run the head and apply MSA masking when training.
+        replace_fraction: Fraction of valid MSA entries to corrupt (BERT mask
+            rate, 0.15).
+        uniform_prob / profile_prob / same_prob: Categorical replacement
+            mixture weights. Remaining mass (``1 - sum``) goes to the
+            ``MSA_MASK`` token (defaults all 0.1 → 0.7 mask).
+        num_heads / head_dim: Single-query cross-attention shape (q from
+            single, k/v from the MSA column).
+        hidden_dim: MLP hidden width over ``[m_ri, s_i, h_i]``.
+        c_out: Output vocabulary (32 = full DF3 MSA vocab; target ∈ 0..30).
+        out_bias: Add a bias to the output logit projection. Masked-MSA has a
+            strong class prior (gap / UNK / common-residue frequencies); a
+            learnable per-class bias captures it cleanly (zero-init). Set False
+            for a strictly bias-free AF3-style head.
+    """
+
+    enabled: bool = False
+    replace_fraction: float = 0.15
+    uniform_prob: float = 0.1
+    profile_prob: float = 0.1
+    same_prob: float = 0.1
+    num_heads: int = 4
+    head_dim: int = 32
+    hidden_dim: int = 128
+    c_out: int = 32
+    out_bias: bool = True
+
+    def __post_init__(self) -> None:
+        mask_prob = 1.0 - self.uniform_prob - self.profile_prob - self.same_prob
+        if mask_prob < 0.0:
+            raise ValueError(
+                "MaskedMSAConfig: uniform_prob + profile_prob + same_prob must be <= 1 "
+                f"(got {self.uniform_prob + self.profile_prob + self.same_prob})"
+            )
+        if not (0.0 <= self.replace_fraction <= 1.0):
+            raise ValueError(f"MaskedMSAConfig.replace_fraction must be in [0, 1], got {self.replace_fraction}")
 
 
 @dataclass
@@ -652,6 +735,12 @@ class TrainingConfig:
     alpha_confidence: float = 1e-4
     alpha_pae: float = 0.0
     alpha_bond: float = 0.0
+    # Masked-MSA (BERT) cross-entropy weight. Auxiliary self-supervised
+    # objective on the MSA representation; predicts the original residue
+    # identity at masked (row, token) entries. Off by default. Requires
+    # ``ModelConfig.masked_msa.enabled``. Keep it small (our distogram CE is
+    # 0.03) so it nudges the MSA stack without dominating the structure losses.
+    alpha_masked_msa: float = 0.0
     # Chirality quadratic loss weight — AF3-spec deviation. Off by default;
     # turn on (e.g. ``1.0``) to add quadratic-toward-target supervision on
     # the Cβ projection onto the (N/CA/C) frame normal. Provides explicit
@@ -920,6 +1009,12 @@ class TrainingConfig:
     # or via CLI ``--dataset name:path:weight:strategy:distill:format``.
     extra_datasets: list[DatasetConfig] = field(default_factory=list)
 
+    def __setstate__(self, state):
+        # Migrate train configs pickled under an older schema. See
+        # ``_backfill_dataclass``.
+        self.__dict__.update(state)
+        _backfill_dataclass(self, TrainingConfig())
+
     def __post_init__(self):
         """Validate configuration values."""
         if self.warmup_steps < 0:
@@ -1101,6 +1196,7 @@ class ModelConfig:
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
     template: TemplateEmbeddingConfig = field(default_factory=TemplateEmbeddingConfig)
     distogram: DistogramConfig = field(default_factory=DistogramConfig)
+    masked_msa: MaskedMSAConfig = field(default_factory=MaskedMSAConfig)
     data: DataConfig = field(default_factory=DataConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
@@ -1109,6 +1205,12 @@ class ModelConfig:
     # Nmsa = 16384 (the same cap used by the featurizer), so per-recycle
     # subsampling is a no-op when the featurizer already capped.
     msa_crop_size: int = 16_384
+
+    def __setstate__(self, state):
+        # Migrate configs pickled under an older schema (e.g. checkpoints saved
+        # before ``masked_msa`` was added). See ``_backfill_dataclass``.
+        self.__dict__.update(state)
+        _backfill_dataclass(self, ModelConfig())
 
     def __post_init__(self):
         # Mirror the legacy ``DiffusionConfig.skip_amp_sample*`` flags onto the

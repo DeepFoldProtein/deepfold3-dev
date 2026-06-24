@@ -524,5 +524,6 @@ class Evoformer(nn.Module):
         return {
             "pair": pair,
             "single": single,
+            "msa": msa_act,  # final MSA-stack representation [..., S, N, c_msa] (masked-MSA head)
             "target_feat": target_feat,
         }

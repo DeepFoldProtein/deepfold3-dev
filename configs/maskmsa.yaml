@@ -1,0 +1,40 @@
+# Masked-MSA (BERT) learning arm — df3-maskmsa-fk5
+#
+# Adds a BERT-style masked-MSA objective with a single-query
+# MSA cross-attention head on top of the fapeK5 operating point (refined SF,
+# lr 2.5e-4, clip 10, γ 35) — but with FAPE turned OFF (see below) to isolate
+# the masked-MSA effect. Inherits the fapeK5 lineage via `base:` so the
+# warm-start from its 80k checkpoint stays continuous in optimizer / LR
+# schedule / datasets — the architectural delta is the new masked_msa_head.
+#
+# Launch (warm-start weights only; the new head is randomly initialized so the
+# 80k checkpoint is missing those keys → load non-strict for this first launch):
+#
+#   torchrun --nproc_per_node=8 -m deepfold3.scripts.train \
+#       --config configs/maskmsa.yaml \
+#       --output runs/df3-maskmsa-fk5 \
+#       --params runs/df3-fapek5-25e5-c10-g35/checkpoint_80000.pt \
+#       --override load_strict=false \
+#       --wandb deepfold3-stage0
+#
+# `--params` is a weight-only warm-start (fresh optimizer / step 0). Resumes
+# from this arm's own checkpoints (which contain the head) can drop the
+# `--override load_strict=false`.
+base: af3_rsf_25e5_c10_g35_fapeK5.yaml
+
+training:
+  # Small auxiliary weight (~distogram scale) — nudges the MSA stack / single
+  # track without competing with the diffusion structure losses.
+  alpha_masked_msa: 0.03
+  # FAPE off for this arm — isolate the masked-MSA effect. Structure
+  # supervision reverts to diffusion MSE + smooth_lddt + distogram (the
+  # frame-aligned chirality signal learned over fapeK5's 80k steps stays baked
+  # into the warm-started weights). Overrides the inherited fapeK5 alpha_fape=2.
+  alpha_fape: 0.0
+
+model:
+  # Enable the head; masking probabilities + head dims are inherited from
+  # initial.yaml's documented `masked_msa` block (replace_fraction 0.15,
+  # uniform/profile/same 0.1 each → 0.7 MASK; 4 heads × 32, hidden 128, c_out 32).
+  masked_msa:
+    enabled: true

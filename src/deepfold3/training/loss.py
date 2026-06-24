@@ -531,6 +531,35 @@ def distogram_loss(
     return (nll * pair_mask).sum() / n_pairs
 
 
+def masked_msa_loss(
+    logits: torch.Tensor,  # [S, N, C]
+    true_msa: torch.Tensor,  # [S, N] int — original tokens
+    bert_mask: torch.Tensor,  # [S, N] float — 1.0 at corrupted entries
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """BERT-style masked-MSA cross-entropy.
+
+    Per-entry cross-entropy between the predicted logits and the original MSA
+    tokens, masked-averaged over the corrupted (``bert_mask`` = 1) entries.
+
+    Uses ``F.cross_entropy`` (fused fp32 log-softmax + NLL, ``reduction="none"``)
+    rather than an explicit ``log_softmax``+``gather`` — the fused kernel avoids
+    materialising the full ``[S, N, C]`` log-prob tensor (≈50 MB fp32 at
+    S=1024) and has a fused backward. The per-(row, token) ``bert_mask`` can't
+    be expressed via CE's ``weight``/``ignore_index``, so the masked mean is
+    applied here. When no entries are masked the loss is 0 (zero numerator;
+    the ``eps`` floor guards the denominator).
+    """
+    C = logits.shape[-1]
+    nll = F.cross_entropy(
+        logits.float().reshape(-1, C),
+        true_msa.long().reshape(-1),
+        reduction="none",
+    ).reshape(true_msa.shape)  # [S, N]
+    mask = bert_mask.float()
+    return (nll * mask).sum() / mask.sum().clamp_min(eps)
+
+
 @torch.no_grad()
 def distogram_entropy(
     logits: torch.Tensor,  # [N, N, num_bins]
@@ -1978,6 +2007,17 @@ def training_loss(
             total = total + cfg.alpha_distogram * l_disto
         if e_disto is not None:
             losses["distogram_entropy"] = e_disto
+
+    # --- Masked-MSA (BERT) loss (all samples, incl. distillation) ---
+    # Gated on the head having run (``masked_msa_logits`` present ⇔
+    # ``ModelConfig.masked_msa.enabled`` and training). Added unconditionally
+    # at ``alpha_masked_msa`` (× 0 still reaches the head params, keeping DDP
+    # ``static_graph`` happy when the weight is 0). Placed above the
+    # distillation early-return so distillation MSAs contribute too.
+    if "masked_msa_logits" in pred:
+        l_mmsa = masked_msa_loss(pred["masked_msa_logits"], pred["true_msa"], pred["bert_mask"])
+        losses["masked_msa"] = l_mmsa
+        total = total + cfg.alpha_masked_msa * l_mmsa
 
     # --- TM-true / iTM-true (global accuracy from mini-rollout positions) ---
     # Mirrors the pTM kernel but uses the *true* alignment error instead of

@@ -26,6 +26,7 @@ from deepfold3.model.config import DistogramConfig, ModelConfig, OptimConfig
 from deepfold3.model.diffusion import DiffusionHead
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
+from deepfold3.model.masked_msa import MaskedMSAHead, apply_bert_mask
 from deepfold3.model.precision import fp32_scope
 from deepfold3.model.primitives import TRUNCATED_NORMAL_STDDEV_FACTOR, LayerNorm, LinearNoBias
 
@@ -169,6 +170,14 @@ class DeepFold3(nn.Module):
         # Distogram head
         self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head)
 
+        # Masked-MSA (BERT) head — optional self-supervised MSA objective.
+        # Reads the final MSA-stack representation + trunk single repr.
+        self.masked_msa_head = (
+            MaskedMSAHead(cfg.masked_msa, c_msa=ec.msa_channel, c_single=ec.seq_channel)
+            if cfg.masked_msa.enabled
+            else None
+        )
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load state dict.
 
@@ -189,6 +198,7 @@ class DeepFold3(nn.Module):
         seed: int = 0,
         msa_precropped: bool = False,
         crop_offset: int = 0,
+        mask_msa: bool = False,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run feature building + evoformer trunk with recycling.
 
@@ -341,6 +351,14 @@ class DeepFold3(nn.Module):
                     "Featurizer msa_crop_size / n_msa_crops must match the model."
                 )
 
+        # Masked-MSA (BERT) capture — populated on the masked recycle so the
+        # head/loss can supervise reconstruction of the corrupted entries.
+        # ``bert_valid_mask`` is the per-entry validity mask the head uses to
+        # exclude padding / inactive MSA rows from its cross-attention.
+        bert_true_msa: torch.Tensor | None = None
+        bert_mask_cap: torch.Tensor | None = None
+        bert_valid_mask: torch.Tensor | None = None
+
         # Recycle. ``msa_precropped`` and the resample path differ only in how
         # this recycle's (msa_sub, msa_mask_sub, del_sub) are selected; the
         # evoformer call + recycling-buffer update below are shared.
@@ -394,6 +412,24 @@ class DeepFold3(nn.Module):
                         bcast_shape[msa_rows_dim] = pool_size
                         msa_mask_sub = msa_mask_sub * active.view(*bcast_shape)
 
+            # Masked-MSA (BERT) corruption — applied to the gradient pass only
+            # (``mask_msa=True``), before the MSA stack sees the crop. The
+            # original tokens + corruption mask are captured for the head/loss;
+            # the masked tokens are fed in via ``msa_feat`` below.
+            if mask_msa and self.masked_msa_head is not None:
+                mask_gen = torch.Generator(device=device).manual_seed(int(seed) + recycle_idx + 0x5EED)
+                bert_msa, bert_true_msa, bert_mask_cap = apply_bert_mask(
+                    msa_sub,
+                    msa_mask_sub,
+                    features.get("profile"),
+                    self.cfg.masked_msa,
+                    generator=mask_gen,
+                )
+                msa_sub = bert_msa
+                # Validity mask for the head's cross-attention (excludes padding /
+                # inactive rows). Captured before the ``.float()`` below.
+                bert_valid_mask = msa_mask_sub
+
             # Build MSA features for this recycle [..., S_crop, N, 34]
             msa_feat = self._build_msa_feat_from_tensors(msa_sub, del_sub)
             msa_mask = msa_mask_sub.float()
@@ -414,6 +450,13 @@ class DeepFold3(nn.Module):
             if recycle_idx < num_recycles:
                 prev_pair = embeddings["pair"].detach()
                 prev_single = embeddings["single"].detach()
+
+        # Expose the masked-MSA targets alongside the (grad-pass) ``msa``
+        # representation so ``forward_training`` can run the head + loss.
+        if bert_mask_cap is not None:
+            embeddings["true_msa"] = bert_true_msa
+            embeddings["bert_mask"] = bert_mask_cap
+            embeddings["bert_msa_valid_mask"] = bert_valid_mask
 
         return embeddings, rel_feat, target_feat, seq_mask, pair_mask
 
@@ -501,8 +544,16 @@ class DeepFold3(nn.Module):
             features["_prev_pair"] = embeddings_det["pair"]
             features["_prev_single"] = embeddings_det["single"]
 
+        # Masked-MSA (BERT) corruption is applied on this (gradient) pass only,
+        # and only while training (eval runs the head-free clean forward).
+        do_mask_msa = self.masked_msa_head is not None and self.training
         embeddings, rel_feat, target_feat, seq_mask, pair_mask = self.run_evoformer(
-            features, 0, seed=seed + num_recycles, msa_precropped=msa_precropped, crop_offset=num_recycles
+            features,
+            0,
+            seed=seed + num_recycles,
+            msa_precropped=msa_precropped,
+            crop_offset=num_recycles,
+            mask_msa=do_mask_msa,
         )
         # Clean up side-channel keys to avoid stale references
         features.pop("_prev_pair", None)
@@ -515,6 +566,23 @@ class DeepFold3(nn.Module):
         # does not extend the autograd graph; only the loss call does.
         pred["single"] = embeddings["single"]
         pred["pair"] = embeddings["pair"]
+
+        # --- 1b. Masked-MSA (BERT) head ---
+        # Predicts the original residue identity at corrupted MSA entries from
+        # the (attached) final MSA-stack repr + single repr, so the loss trains
+        # the MSA stack + single track. Optionally checkpointed (the head's
+        # [S, N, hidden] activations are large at S=msa_crop_size).
+        if self.masked_msa_head is not None and "bert_mask" in embeddings:
+            msa_valid = embeddings["bert_msa_valid_mask"]
+            if torch.is_grad_enabled() and self.cfg.optim.use_gradient_checkpointing:
+                msa_logits = torch_checkpoint(
+                    self.masked_msa_head, embeddings["msa"], embeddings["single"], msa_valid
+                )
+            else:
+                msa_logits = self.masked_msa_head(embeddings["msa"], embeddings["single"], msa_valid)
+            pred["masked_msa_logits"] = msa_logits
+            pred["true_msa"] = embeddings["true_msa"]
+            pred["bert_mask"] = embeddings["bert_mask"]
 
         # --- 2. Mini-rollout (no gradient) ---
         # Runs before diffusion so the chunked diffusion MSE can read

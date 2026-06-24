@@ -206,6 +206,13 @@ DNA_MSA_ID: dict[str, int] = {
 # Unknown nucleic MSA index
 MSA_UNK_NUCLEIC = 30
 
+# BERT mask token for masked-MSA learning.
+# Index 31 is the only free slot in the 32-class MSA vocabulary (0–30 are all
+# real tokens), so a masked MSA entry is one-hot-encoded into the existing
+# 32-wide ``msa_1hot`` feature without growing the input dimension. It never
+# appears as a prediction target (``true_msa`` only ever holds 0–30).
+MSA_MASK = 31
+
 # Reference atom / structure constants
 
 MAX_ATOMS_PER_TOKEN = 24
