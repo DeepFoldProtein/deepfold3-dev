@@ -1,0 +1,48 @@
+base: af3_rsf_25e5_c10_g35_nofape.yaml
+
+# Stage 1 (AF3-style staged crop ramp): crop 384 → 640, bond loss ON,
+# smooth_lddt OFF. Mirrors configs/finetune1_structure_640.yaml's stage
+# overrides but KEEPS df3v1's optimizer (Schedule-Free AdamW) by chaining
+# the nofape base — the actual df3-25e5-c10-g35 / df3v1 config
+# (alpha_fape=0, FAPE off, SF optimizer), architecture byte-for-byte
+# identical to fapeK5.
+#
+# Resume from a df3v1 checkpoint, e.g.:
+#   deepfold3 train --config configs/stage1_crop640.yaml \
+#       --params runs/df3-25e5-c10-g35/checkpoint_110000.pt --output runs/df3-stage1-crop640
+#
+# Notes:
+# - SF optimizer (inherited) has no external LR schedule, so NO cosine
+#   scheduler here (finetune1's cosine is a no-op under SF). SF keeps its
+#   constant warmup-then-flat LR.
+# - alpha_smooth_lddt: null → smooth_lddt loss skipped (loss.py:1619
+#   `if cfg.alpha_smooth_lddt is not None`). Confirmed OFF.
+# - alpha_bond: 1.0 → polymer–ligand bond loss (verified AF3/OF3-conformant
+#   2026-06-24: observed GT distances, <2.4 Å cutoff, resolved mask). Only
+#   bites on ligand/covalent-mod complexes; protein monomers → bond_loss=0.
+# - skip_load_optimizer/scheduler/step: true → fresh SF state (k=0) at the
+#   stage transition, appropriate for the new crop/loss regime.
+
+training:
+  max_tokens: 640
+  max_atoms: 4096
+  diffusion_batch_size: 32
+  diffusion_chunk_size: 8
+
+  alpha_diffusion: 4.0
+  alpha_distogram: 0.03
+  alpha_confidence: 0.0
+  alpha_pae: 0.0
+  alpha_bond: 1.0
+  alpha_smooth_lddt: null
+
+  load_strict: true
+  skip_load_optimizer: true
+  skip_load_scheduler: true
+  skip_load_step: true
+
+  wandb_project: deepfold3-stage1
+
+model:
+  data:
+    max_chains: 20
