@@ -346,6 +346,7 @@ def build_dataloaders(
             num_replicas=dist.world_size,
             rank=dist.rank,
             seed=cfg.seed,
+            infinite=True,  # single long-lived iterator (no epoch-boundary prefetch drain)
         )
     else:
         if pdb_ds is None:

@@ -32,6 +32,10 @@ class MultiDatasetSampler(Sampler[int]):
         num_replicas: DDP world size.
         rank: DDP rank.
         seed: Random seed.
+        infinite: If ``True`` the iterator never raises ``StopIteration`` —
+            it reseeds and redraws each ``epoch_size`` chunk in place so the
+            trainer keeps a single long-lived iterator and workers prefetch
+            across epoch boundaries (no buffer-drain ``data_wait`` spike).
         weighted_kwargs: Extra kwargs passed to ``WeightedClusterSampler``
             (e.g. ``alpha_prot``, ``beta_chain``).
     """
@@ -43,9 +47,11 @@ class MultiDatasetSampler(Sampler[int]):
         num_replicas: int = 1,
         rank: int = 0,
         seed: int = 42,
+        infinite: bool = False,
         **weighted_kwargs,
     ):
         self.epoch_size = epoch_size
+        self.infinite = infinite
         self.num_replicas = num_replicas
         self.rank = rank
         self.seed = seed
@@ -81,8 +87,14 @@ class MultiDatasetSampler(Sampler[int]):
             else:
                 self._weighted_weights.append(None)
 
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
+    def _draw_shard(self, epoch: int) -> np.ndarray:
+        """Draw one ``epoch_size`` chunk, route per dataset, shuffle, shard by rank.
+
+        Reproducible from ``(seed, epoch)`` alone so resume and the infinite
+        loop both regenerate the same sequence. ``_weighted_weights`` is built
+        once in ``__init__``, so per-chunk cost is just the draws + shuffle.
+        """
+        rng = np.random.default_rng(self.seed + epoch)
 
         # Draw epoch_size samples
         indices = np.empty(self.epoch_size, dtype=np.int64)
@@ -110,14 +122,43 @@ class MultiDatasetSampler(Sampler[int]):
         rng.shuffle(indices)
 
         # Shard by rank
-        shard = indices[self.rank :: self.num_replicas]
-        for i in range(self.sample_idx, len(shard)):
-            self.sample_idx = i + 1
-            yield int(shard[i])
-        # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
-        # state_dict captured after the iterator drained reads as
-        # "epoch fully consumed". ``set_epoch`` resets it on the next
-        # outer-loop tick.
+        return indices[self.rank :: self.num_replicas]
+
+    def __iter__(self):
+        if not self.infinite:
+            # Finite epoch (legacy): the trainer recreates this iterator each
+            # epoch — at the boundary the prefetch buffer drains and the upfront
+            # choice/shuffle runs in the main process, so the first batch waits
+            # (a ``data_wait`` spike). Use ``infinite=True`` to avoid both.
+            shard = self._draw_shard(self.epoch)
+            for i in range(self.sample_idx, len(shard)):
+                self.sample_idx = i + 1
+                yield int(shard[i])
+            # Iterator exhausted — leave ``sample_idx`` at len(shard) so a
+            # state_dict captured after the iterator drained reads as
+            # "epoch fully consumed". ``set_epoch`` resets it on the next
+            # outer-loop tick.
+            return
+
+        # Infinite: never raises StopIteration. The trainer creates a single
+        # long-lived iterator and pulls forever, so workers keep prefetching
+        # across "epoch" reseeds with no buffer drain — no epoch-boundary
+        # data_wait spike. The per-chunk redraw runs in the main process
+        # between chunks but is hidden behind the still-full prefetch queue.
+        # ``self.epoch`` advances purely as a logging / resume counter; resume
+        # picks up from the seeded ``self.epoch`` / ``self.sample_idx``.
+        # Mirrors WeightedClusterSampler's infinite protocol.
+        epoch = self.epoch
+        pos = self.sample_idx
+        while True:
+            shard = self._draw_shard(epoch)
+            while pos < len(shard):
+                self.epoch = epoch
+                self.sample_idx = pos + 1
+                yield int(shard[pos])
+                pos += 1
+            epoch += 1
+            pos = 0
 
     def __len__(self) -> int:
         return self.epoch_size // self.num_replicas
