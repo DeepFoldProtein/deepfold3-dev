@@ -2,9 +2,9 @@ base: initial.yaml
 
 training:
   max_tokens: 768
-  max_atoms: 4096
+  max_atoms: 8192  # 768×10.67 — scaled from 4096 (384-era ~10.67 atoms/tok); 4096 caps protein crops at ~512 tok
   diffusion_batch_size: 32
-  diffusion_chunk_size: 16
+  diffusion_chunk_size: 8
 
   alpha_diffusion: 4.0
   alpha_distogram: 0.03

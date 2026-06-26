@@ -25,7 +25,7 @@ base: af3_rsf_25e5_c10_g35_nofape.yaml
 
 training:
   max_tokens: 640
-  max_atoms: 4096
+  max_atoms: 6912  # 640×10.8 — scaled from 4096 (384-era ~10.67 atoms/tok); 4096 would cap protein crops at ~512 tok (atom budget binds before token budget)
   diffusion_batch_size: 32
   diffusion_chunk_size: 8
 
@@ -37,11 +37,25 @@ training:
   alpha_smooth_lddt: null
 
   load_strict: true
-  skip_load_optimizer: true
-  skip_load_scheduler: true
-  skip_load_step: true
+  # skip_load_* left false (commented) so on kakao preemption the job
+  # RESUMES full state (step + optimizer + warmup) instead of resetting to 0.
+  # The one-time stage transition (fresh optimizer + step 0) comes from
+  # --params (weights-only), NOT these flags. Do NOT re-enable them.
+  # skip_load_optimizer: true
+  # skip_load_scheduler: true
+  # skip_load_step: true
+  
+  # auto_resume: on restart, load the LATEST checkpoint in the output dir
+  # (params_path loads first, then auto_resume overwrites it) so a preempted
+  # job continues from where it stopped rather than from the hardcoded --params.
+  # auto_resume: true
 
   wandb_project: deepfold3-stage1
+  seed: 1398
+  checkpoint_interval: 250
+
+  batch_size_per_rank: 1
+  accumulate_grad_batches: 3
 
 model:
   data:

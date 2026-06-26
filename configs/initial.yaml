@@ -62,6 +62,12 @@ training:
   alpha_confidence: 0.0
   alpha_pae: 0.0
   alpha_bond: 0.0
+  # Masked-MSA (BERT) auxiliary CE weight. Requires
+  # model.masked_msa.enabled. Kept small (~distogram scale) so it nudges the
+  # MSA stack / single track without competing with the structure losses.
+  # OFF in the canonical config (this is a base for the whole af3_rsf / finetune
+  # lineage); enable per-arm — see configs/maskmsa.yaml.
+  alpha_masked_msa: 0.0
   nucleotide_loss_weight: 5.0
   ligand_loss_weight: 10.0
   region_loss_weights: {}
@@ -100,14 +106,14 @@ training:
   # exceeds this wall-clock. ~16 s ≈ the prefetch-overlap window (workers ×
   # prefetch_factor × per-step compute) — below it, stalls are hidden by
   # prefetch, so only samples beyond it actually move the step clock. 0 = off.
-  slow_sample_log_threshold_s: 16.0
+  slow_sample_log_threshold_s: 0.0
   # Tier-4b: per-rank GPU-side slow-step warning (names the straggler's record).
   # Floor ~19s, normal spread to ~22s → 25 catches real spikes with few false
   # positives. Grep: grep SLOW_STEP runs/<run>/logs/*/attempt_*/*/stdout.log
-  slow_step_log_threshold_s: 25.0
+  slow_step_log_threshold_s: 0.0
   find_unused_parameters: false
   static_graph: true
-  bucket_cap_mb: 32
+  bucket_cap_mb: 10
   gradient_as_bucket_view: true
   # NCCL watchdog deadline (also used by ``collective_guard`` to attribute hangs).
   collective_timeout_s: 600.0
@@ -218,6 +224,26 @@ model:
     pairformer:
       num_layer: 2
       pair_dropout: 0.25
+  # Masked-MSA (BERT) learning head + single-query
+  # MSA cross-attention. Corrupts a fraction of MSA entries on the gradient
+  # recycle pass; a head at the end of the MSA module predicts the original
+  # residue identity. Weights are randomly initialized — when warm-starting
+  # from a structure-only checkpoint, load with `--override load_strict=false`
+  # so these new params keep their init. Loss weight = training.alpha_masked_msa.
+  #
+  # OFF here: initial.yaml is the base of the af3_rsf / finetune lineage (deep
+  # base-merge), so enabling it would turn it on for every descendant. The
+  # tunables are documented here; enable it per-arm — see configs/maskmsa.yaml.
+  masked_msa:
+    enabled: false
+    replace_fraction: 0.15  # BERT mask rate
+    uniform_prob: 0.1       # random-aa / profile / same mixture (rest → MASK token)
+    profile_prob: 0.1
+    same_prob: 0.1
+    num_heads: 4
+    head_dim: 32
+    hidden_dim: 128
+    c_out: 32               # full DF3 MSA vocab (const.MSA_VOCAB_SIZE)
   data:
     max_templates: 4
     max_neighborhood: 40
