@@ -72,6 +72,56 @@ $PY bench/scripts/summarize.py --series df3v1 --category monomer_protein
 | `make_pred_ref.py` | prediction tree → FoldBench `prediction_reference.csv` |
 | `eval_ost.py`      | `ost compare-structures` per sample (FoldBench-faithful flags) → mean/oracle LDDT, TM, GDT-TS |
 | `summarize.py`     | per-step + per-fold-class trajectory CSVs and plot |
+| `disto_probe.py`   | per-(target,step) **trunk** distogram recall / distoMed vs **structure** realization — separates "trunk knows the contact" from "sampler builds it" |
+| `disto_traj.py`    | **distoMed trajectory** over checkpoints (2 arms side-by-side) + plot — the trunk β-distance *consolidation gauge* |
+
+## Distogram / trunk-distance probe (`distoMed`)
+
+These two scripts read the **distogram head straight off `confidences.json`** —
+i.e. the trunk (PairFormer) pair-representation's belief about pairwise
+distances, **bypassing the diffusion sampler**. Use them to ask *"does the
+trunk encode the right inter-residue distances?"* independently of whether the
+diffusion head realizes them in 3D.
+
+**Data each sample writes** (`.../seed-<s>_sample-<i>/confidences.json`):
+`distogram` `[N,N]` (expected distance, 64 bins 2.31–21.69 Å → caps ~21.7 Å) and
+`contact_probs` `[N,N]` (P(d < 8 Å)). Both are trunk readouts (one per
+forward, identical across diffusion samples). GT comes from
+`tmp/bench/<target>/_ref.cif`.
+
+**`distoMed`** = median, over a target's true long-range contacts
+(GT **CB–CB** < 8 Å, |seq i−j| ≥ 6 — dominated by β-sheet register / tertiary
+contacts), of the trunk's predicted distance.
+`distoMed ≈ 6–8 Å` → trunk *knows* the sheet; `≈ 13–18 Å` → trunk thinks they're
+far (no opinion). It is **deterministic** (no diffusion noise) so far less
+noisy than TM/GDT; it is a per-target **consolidation gauge**.
+
+> **Rep atom = CB (Gly → CA).** The distogram is trained on CB–CB distances
+> (`featurizer.py` `token_to_rep_atom`, `loss.py` `gt_rep`). Both scripts use CB;
+> **do not use CA** (it silently shifts every number).
+
+```bash
+PY=.venv/bin/python
+# per-checkpoint trunk-vs-sampler breakdown (by seq-sep band lives in disto_probe internals)
+$PY bench/scripts/disto_probe.py <arm> 3000            # ARM, comma-steps optional
+$PY bench/scripts/disto_probe.py df3-stage1-crop640-average 2500,2750,3000
+
+# distoMed trajectory across all step_* checkpoints of two arms → PNG
+$PY bench/scripts/disto_traj.py                         # default: base df3v1 vs crop640
+$PY bench/scripts/disto_traj.py <arm_left> <arm_right>  # → tmp/bench/ss_analysis_full/distoMed_trajectory.png
+```
+
+**Reading it.** `disto_probe` prints `TRUNK recall` (contact_probs > 0.5 on GT
+contacts) and `distoMed` next to `STRUCT recall` (fraction realized in the
+generated CIF): trunk-high / struct-low ⇒ sampler bottleneck; both low ⇒ the
+**trunk** lost the distances. `disto_traj` is the **plateau watch** — while
+distoMed is still descending the trunk β representation is still consolidating;
+flat slope = converged. (This probe is how the stage1-crop640 β-regression was
+diagnosed as a *trunk* distance-rep collapse, band-localized to seq-sep 6–23;
+see `memory/project_stage1_crop640`.)
+
+> Targets are hard-coded to three mainly-β cases (`9EDF`, `9OT9`, `29MW`);
+> edit the `targets=[…]` list in-script to probe others. Arms/steps are CLI args.
 
 ## Conventions / gotchas
 

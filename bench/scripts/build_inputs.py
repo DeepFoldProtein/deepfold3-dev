@@ -58,7 +58,10 @@ INTERFACE_CATEGORIES = {
     "interface_protein_rna",
     "interface_protein_peptide",
 }
-DEFAULT_MAX_TOKENS = {**{c: 384 for c in MONOMER_KIND}, **{c: 768 for c in INTERFACE_CATEGORIES}}
+# monomer_protein standing set is len<=768 (confirmed 2026-06-23); NA monomers
+# stay small (they are short anyway).
+DEFAULT_MAX_TOKENS = {"monomer_protein": 768, "monomer_rna": 384, "monomer_dna": 384,
+                      **{c: 768 for c in INTERFACE_CATEGORIES}}
 
 
 def read_query_sequence(a3m_path: Path) -> str:

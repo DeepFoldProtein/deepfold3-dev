@@ -120,6 +120,7 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
     print(f"[eval] {len(rows)} OST comparisons on {workers} workers ({'interface' if is_interface else 'monomer'}) ...")
     parsed = []
     done = 0
+    n_ost_failed = 0  # OST returned status != SUCCESS (e.g. its chain-mapper crashed)
     interfaces = load_interfaces(category) if is_interface else {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(job, r) for r in rows]
@@ -129,6 +130,8 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
                 d = json.load(open(out))
             except (FileNotFoundError, json.JSONDecodeError):
                 d = {}
+            if d.get("status") != "SUCCESS":
+                n_ost_failed += 1
             if is_interface:
                 for ic1, ic2 in interfaces.get(r["pdb_id"], []):
                     parsed.append({**r, "ic1": ic1, "ic2": ic2, **parse_interface(d, ic1, ic2)})
@@ -166,6 +169,7 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
             succ_mean += int(md >= DOCKQ_SUCCESS)
         summary = {
             "series": series, "step": step, "category": category, "n_interfaces": n,
+            "n_ost_failed": n_ost_failed,
             "success_rate_oracle": round(100 * succ_oracle / n, 2) if n else None,
             "success_rate_mean": round(100 * succ_mean / n, 2) if n else None,
             "mean_dockq": mean(mean_dq), "oracle_dockq": mean(oracle_dq),
@@ -173,7 +177,8 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
         }
         msg = (f"n={n}  succ@0.23 oracle={summary['success_rate_oracle']}% "
                f"mean={summary['success_rate_mean']}%  "
-               f"mean_dockq={summary['mean_dockq']} oracle_dockq={summary['oracle_dockq']}")
+               f"mean_dockq={summary['mean_dockq']} oracle_dockq={summary['oracle_dockq']}  "
+               f"ost_failed={n_ost_failed}")
     else:
         by = {}
         for r in parsed:
@@ -191,9 +196,11 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
                     agg[f"mean_{m}"].append(sum(vals) / len(vals))
                     agg[f"oracle_{m}"].append(max(vals))
         summary = {"series": series, "step": step, "category": category, "n_scored": n,
+                   "n_ost_failed": n_ost_failed,
                    **{k: mean(v) for k, v in agg.items()}}
         msg = (f"n={n}  mean_lddt={summary['mean_lddt']} oracle_lddt={summary['oracle_lddt']}  "
-               f"mean_tm={summary['mean_tm_score']} mean_gdt={summary['mean_gdt_ts']}")
+               f"mean_tm={summary['mean_tm_score']} mean_gdt={summary['mean_gdt_ts']}  "
+               f"ost_failed={n_ost_failed}")
 
     with open(eval_dir / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(summary))
