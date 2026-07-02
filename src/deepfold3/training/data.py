@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # distributed training we ALSO force ``fixed_bucket_n=cfg.max_tokens`` so
 # every rank emits batches of identical N — otherwise each rank picks a
 # local bucket via ``next_bucket(batch_n_max)`` and the rank with the
-# longest crop stalls every per-step collective (the 58 s multi-node tax).
+# longest crop stalls every per-step collective.
 def _make_bucket_collate(max_tokens: int):
     return partial(collate_fn, bucket_pad=True, fixed_bucket_n=max_tokens)
 
