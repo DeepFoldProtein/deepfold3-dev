@@ -705,6 +705,27 @@ class Trainer:
         self._last_fwd_wall = 0.0
         self._last_loss_wall = 0.0
 
+        # Grad-norm window accumulators. ``last_grad_norm`` is a single
+        # opt-step sample, so a bare read at the log boundary drops the
+        # intermediate optimizer steps whenever ``log_interval > 1``. Mirror
+        # the loss meters: accumulate every advanced step and report the
+        # window mean (plus max, which the mean would smooth spikes out of).
+        # On-GPU f64 accumulation keeps this collective- and sync-free until
+        # the ``.item()`` at the (already-synchronized) log boundary.
+        gn_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
+        gn_max = torch.zeros((), device=self.dist.device, dtype=torch.float64)
+        gn_count = 0
+
+        # Per-effective-step dt window min/max. ``dt`` (compute_time_window /
+        # log_interval) is the window MEAN, which hides the burst tail that is
+        # the whole point of watching step time — min ≈ the compute floor,
+        # max ≈ the worst straggler/collective stall in the window. Microsteps
+        # accumulate into ``dt_estep_accum``; the per-effective-step total is
+        # finalized into min/max when the step's sync boundary lands.
+        dt_estep_accum = 0.0
+        dt_min = float("inf")
+        dt_max = 0.0
+
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
         shutdown = ShutdownCoordinator(self.dist)
@@ -824,6 +845,16 @@ class Trainer:
                 # training_step so this is the remaining bwd+collective phase.
                 bwd_wall = time.monotonic() - _t_bwd
 
+                # Accumulate grad norm for window mean/max logging. An advanced
+                # opt step guarantees a finite ``last_grad_norm`` (NaN/Inf steps
+                # skip and leave ``on_opt_step_boundary`` False), so no finite
+                # guard is needed. GPU ops → no per-step CPU sync.
+                if on_opt_step_boundary and self.state.last_grad_norm is not None:
+                    _gn = self.state.last_grad_norm.detach().to(torch.float64)
+                    gn_sum += _gn
+                    gn_max = torch.maximum(gn_max, _gn)
+                    gn_count += 1
+
                 # Flush probe row (rank-0 only); pass per-microstep loss
                 # (total + components from ``loss_dict``) so the probe JSONL
                 # is self-contained — plot scripts don't need to align with
@@ -852,6 +883,16 @@ class Trainer:
                 # into ``microstep_compute_time`` for the effective-step summary log.
                 dt_micro = time.monotonic() - t_microstep_start
                 microstep_compute_time += dt_micro
+
+                # Roll this microstep into the current effective step; on the
+                # sync boundary the accumulated per-effective-step time is the
+                # unit ``dt`` reports, so fold it into the window min/max and
+                # reset for the next effective step.
+                dt_estep_accum += dt_micro
+                if on_opt_step_boundary:
+                    dt_min = min(dt_min, dt_estep_accum)
+                    dt_max = max(dt_max, dt_estep_accum)
+                    dt_estep_accum = 0.0
 
                 # Tier-4b: per-rank slow-STEP attribution (GPU-side, not loader).
                 # Logs on EVERY rank (no collective) so a data-tied straggler
@@ -925,6 +966,30 @@ class Trainer:
                     avg, sums = meters.sync()
                     meters.reset()
 
+                    # Window grad norm: mean matches the loss meters, max keeps
+                    # spike visibility a mean would hide. Computed on all ranks
+                    # for symmetry (two ``.item()`` syncs per window, at the
+                    # meters.sync collective boundary — negligible); only rank 0
+                    # logs. Empty window (all steps skipped) → NaN.
+                    if gn_count > 0:
+                        grad_norm_mean = (gn_sum / gn_count).item()
+                        grad_norm_window_max = gn_max.item()
+                    else:
+                        grad_norm_mean = float("nan")
+                        grad_norm_window_max = float("nan")
+                    gn_sum.zero_()
+                    gn_max.zero_()
+                    gn_count = 0
+
+                    # Snapshot + reset the per-effective-step dt min/max window.
+                    # The log gate requires an opt-step boundary, so at least
+                    # this step was finalized → dt_min is never still +inf; the
+                    # guard is defensive only.
+                    dt_window_min = dt_min if dt_min != float("inf") else float("nan")
+                    dt_window_max = dt_max
+                    dt_min = float("inf")
+                    dt_max = 0.0
+
                     # Per-PF-layer activation RMS — packed all_reduce on every
                     # rank in lockstep with the meters sync above. Gated by
                     # ``act_rms_log_interval`` so the meter can accumulate
@@ -961,9 +1026,7 @@ class Trainer:
                         data_wait_window = _dw.item()
 
                     if self.dist.is_main:
-                        grad_norm = (
-                            self.state.last_grad_norm.item() if self.state.last_grad_norm is not None else float("nan")
-                        )
+                        grad_norm = grad_norm_mean
                         elapsed = time.monotonic() - t0
                         # ``dt`` is per-effective-step compute time (forward+backward+step).
                         # Eval / checkpoint / logging time is intentionally excluded so the
@@ -1000,6 +1063,7 @@ class Trainer:
                             if k != "total":
                                 parts.append(f"{k}={v:.4f}")
                         parts.append(f"grad_norm={grad_norm:.3f}")
+                        parts.append(f"gn_max={grad_norm_window_max:.3f}")
                         parts.append(f"lr={lr:.2e}")
                         if tok_per_sec >= 1000:
                             parts.append(f"tok/s={tok_per_sec / 1000:.1f}k")
@@ -1008,6 +1072,8 @@ class Trainer:
                         parts.append(f"mem={peak_mem_gb:.1f}G")
                         parts.append(f"eta={eta_str}")
                         parts.append(f"dt={dt:.1f}s")
+                        parts.append(f"dt_min={dt_window_min:.1f}s")
+                        parts.append(f"dt_max={dt_window_max:.1f}s")
                         parts.append(f"data_wait={data_wait:.3f}s")
                         parts.append(f"t={elapsed:.0f}s")
                         logger.info(" | ".join(parts))
@@ -1018,7 +1084,10 @@ class Trainer:
                             lr=lr,
                             epoch=self.state.epoch,
                             grad_norm=grad_norm,
+                            grad_norm_max=grad_norm_window_max,
                             dt=dt,
+                            dt_min=dt_window_min,
+                            dt_max=dt_window_max,
                             tok_per_sec=tok_per_sec,
                             peak_mem_gb=peak_mem_gb,
                             data_wait=data_wait,

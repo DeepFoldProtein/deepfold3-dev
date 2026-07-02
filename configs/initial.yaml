@@ -126,7 +126,13 @@ training:
   eval_samples: 1024
   eval_interval: 100
   eval_before: true
-  log_interval: 1
+  # Cadence (in effective steps) of the metrics flush. meters.sync() — an
+  # all_gather_object (key union) + one all_reduce across all ranks — fires
+  # ONLY here, so raising this cuts the per-step collective count directly.
+  # No information is lost: losses accumulate locally every microstep and are
+  # reported as window means; dt / data_wait / tok_per_sec divide by the same
+  # window; grad_norm is logged as window mean + window max. 1 = every step.
+  log_interval: 10
   log_microsteps: false
   uniform_recycle: true
   max_checkpoints: 0

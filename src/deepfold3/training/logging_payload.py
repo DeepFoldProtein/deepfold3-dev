@@ -20,6 +20,9 @@ def build_step_payload(
     tok_per_sec: float,
     peak_mem_gb: float,
     data_wait: float = 0.0,
+    grad_norm_max: float = float("nan"),
+    dt_min: float = float("nan"),
+    dt_max: float = float("nan"),
 ) -> dict[str, float]:
     """Assemble the training-step payload.
 
@@ -32,7 +35,10 @@ def build_step_payload(
     payload["train/lr"] = lr
     payload["train/epoch"] = epoch
     payload["train/grad_norm"] = grad_norm
+    payload["train/grad_norm_max"] = grad_norm_max
     payload["train/step_time_s"] = dt
+    payload["train/step_time_min_s"] = dt_min
+    payload["train/step_time_max_s"] = dt_max
     payload["train/data_wait_s"] = data_wait
     payload["train/tokens_per_sec"] = tok_per_sec
     cuda_avail = torch.cuda.is_available()
