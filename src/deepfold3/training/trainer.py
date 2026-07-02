@@ -51,6 +51,7 @@ from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
 from deepfold3.training.signals import CheckpointRequestHandler, ShutdownCoordinator
 from deepfold3.training.state import TrainState, seed_everything
 from deepfold3.training.step import scaled_backward, training_step
+from deepfold3.training.step_timer import StepTimeMeter
 from deepfold3.training.tracking import StdoutTracker, Tracker, TrackerHub, WandBTracker
 
 # Bucket-padded collation keeps Triton kernel input shapes (and the
@@ -682,9 +683,13 @@ class Trainer:
         meters = DistributedAverageMeters(self.dist.device)
         t0 = time.monotonic()
         t_last_ckpt = t0
-        # Pure microstep compute time accumulator (excludes eval / checkpoint /
-        # summary-log wall-clock). Flushed at each summary log.
-        microstep_compute_time = 0.0
+        # Per-effective-step GPU time via CUDA events (window sum → dt mean /
+        # throughput; per-effective-step min/max → burst tail). Event-timed so
+        # the reported dt no longer relies on an incidental CPU sync to be
+        # accurate; elapsed is read once at the log boundary. Excludes eval /
+        # checkpoint / dataloader wait (bracketed per microstep, after the
+        # fetch). CPU-monotonic fallback when CUDA is unavailable.
+        step_time_meter = StepTimeMeter(self.dist.device)
         # Tier-4: dataloader-wait accumulator — wall-clock blocked on the next
         # batch (``next(iter)``), i.e. the gap between the end of one loop body
         # (after eval/checkpoint) and the start of the next microstep. Surfaces
@@ -715,16 +720,6 @@ class Trainer:
         gn_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
         gn_max = torch.zeros((), device=self.dist.device, dtype=torch.float64)
         gn_count = 0
-
-        # Per-effective-step dt window min/max. ``dt`` (compute_time_window /
-        # log_interval) is the window MEAN, which hides the burst tail that is
-        # the whole point of watching step time — min ≈ the compute floor,
-        # max ≈ the worst straggler/collective stall in the window. Microsteps
-        # accumulate into ``dt_estep_accum``; the per-effective-step total is
-        # finalized into min/max when the step's sync boundary lands.
-        dt_estep_accum = 0.0
-        dt_min = float("inf")
-        dt_max = 0.0
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
@@ -825,6 +820,9 @@ class Trainer:
                 # so they don't contaminate train-window averages.
                 if self._act_meter is not None:
                     self._act_meter.enabled = True
+                # GPU-time bracket start (records on the current CUDA stream,
+                # after the dataloader fetch so inter-microstep wait is out).
+                step_time_meter.start()
                 with torch.autocast(
                     device_type="cuda",
                     dtype=self.cfg.torch_dtype,
@@ -844,6 +842,10 @@ class Trainer:
                 # collective). With phase timing on, fwd/loss are synced in
                 # training_step so this is the remaining bwd+collective phase.
                 bwd_wall = time.monotonic() - _t_bwd
+                # Close the GPU-time bracket (forward → optimizer step). The opt
+                # step already CPU-synced on the gradient all-reduce (NaN
+                # ``.item()`` consensus), so the collective wait is in-bracket.
+                step_time_meter.stop(on_opt_step_boundary)
 
                 # Accumulate grad norm for window mean/max logging. An advanced
                 # opt step guarantees a finite ``last_grad_norm`` (NaN/Inf steps
@@ -877,22 +879,12 @@ class Trainer:
                 loss_dict["_tokens"] = n_tokens
                 meters.update(loss_dict, n=1)
 
-                # Pure microstep compute time (forward + backward + step). Excludes
-                # anything that happens between iterations (eval, checkpoint, summary
-                # log), so rate / ETA stay stable across eval boundaries. Accumulated
-                # into ``microstep_compute_time`` for the effective-step summary log.
+                # CPU wall-clock of the microstep — kept only for the per-step
+                # SLOW_STEP threshold + log_microsteps below, which need an
+                # immediate per-step value. The REPORTED dt / min / max are
+                # event-timed via ``step_time_meter``; this is async-approximate
+                # but adequate for a coarse per-step gate.
                 dt_micro = time.monotonic() - t_microstep_start
-                microstep_compute_time += dt_micro
-
-                # Roll this microstep into the current effective step; on the
-                # sync boundary the accumulated per-effective-step time is the
-                # unit ``dt`` reports, so fold it into the window min/max and
-                # reset for the next effective step.
-                dt_estep_accum += dt_micro
-                if on_opt_step_boundary:
-                    dt_min = min(dt_min, dt_estep_accum)
-                    dt_max = max(dt_max, dt_estep_accum)
-                    dt_estep_accum = 0.0
 
                 # Tier-4b: per-rank slow-STEP attribution (GPU-side, not loader).
                 # Logs on EVERY rank (no collective) so a data-tied straggler
@@ -981,14 +973,12 @@ class Trainer:
                     gn_max.zero_()
                     gn_count = 0
 
-                    # Snapshot + reset the per-effective-step dt min/max window.
-                    # The log gate requires an opt-step boundary, so at least
-                    # this step was finalized → dt_min is never still +inf; the
-                    # guard is defensive only.
-                    dt_window_min = dt_min if dt_min != float("inf") else float("nan")
-                    dt_window_max = dt_max
-                    dt_min = float("inf")
-                    dt_max = 0.0
+                    # Event-timed step time: window sum (→ dt mean / tok-s) plus
+                    # per-effective-step min/max (→ burst tail). ``flush`` issues
+                    # one device sync here; the meters all-reduce above already
+                    # crossed a collective boundary so it's ~free. All ranks
+                    # flush in lockstep (the gate is identical across ranks).
+                    compute_time_window, dt_window_min, dt_window_max = step_time_meter.flush()
 
                     # Per-PF-layer activation RMS — packed all_reduce on every
                     # rank in lockstep with the meters sync above. Gated by
@@ -1008,10 +998,8 @@ class Trainer:
                         act_rms = self._act_meter.flush_to_dict()
                         self._act_meter.reset()
 
-                    # Flush the compute-time accumulator regardless of is_main so
-                    # all ranks stay in sync if the flag ever changes.
-                    compute_time_window = microstep_compute_time
-                    microstep_compute_time = 0.0
+                    # data_wait flush (compute_time_window came from the event
+                    # meter above). Reset on all ranks so the flag can flip.
                     data_wait_window = microstep_data_wait
                     microstep_data_wait = 0.0
                     # data_wait is rank-local, but the DDP step clock is set by
