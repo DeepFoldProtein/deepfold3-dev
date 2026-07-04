@@ -114,9 +114,15 @@ class RefAtomData:
 
 
 def _encode_atom_name(name: str) -> list[int]:
-    """Encode atom name as 4 ints: ord(c)-32 for c in name.ljust(4)[:4]."""
+    """Encode atom name as 4 ints: ord(c)-32 for c in name.ljust(4)[:4].
+
+    Clamped to ``[0, 63]`` so the downstream ``F.one_hot(..., 64)`` in the atom
+    encoder can never index out of bounds. Uppercase names stay < 64 (``ord('Z')
+    - 32 == 58``); any lowercase / high-codepoint char (e.g. a mixed-case ligand
+    atom name) would otherwise produce an index >= 64 and crash the whole batch.
+    """
     padded = name.ljust(4)[:4]
-    return [max(0, ord(c) - 32) for c in padded]
+    return [min(63, max(0, ord(c) - 32)) for c in padded]
 
 
 def decode_atom_name_chars(chars) -> str:
