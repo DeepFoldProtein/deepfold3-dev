@@ -595,6 +595,7 @@ def distogram_loss(
     target = torch.bucketize(dist, breaks)  # [N, N] in [0, num_bins-1]
 
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # drop trivial i==i self-pairs (distance 0 -> bin 0)
     n_pairs = pair_mask.sum().clamp(min=1)
 
     # Compute log_softmax in fp32 for numerical stability
@@ -645,6 +646,7 @@ def distogram_entropy(
     :func:`distogram_loss` so ``CE - entropy = KL(p_θ ‖ p_data)`` is exact.
     """
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # drop trivial i==i self-pairs (distance 0 -> bin 0)
     n_pairs = pair_mask.sum().clamp(min=1)
     log_probs = F.log_softmax(logits.float(), dim=-1)
     entropy = -(log_probs.exp() * log_probs).sum(-1)
@@ -1105,6 +1107,7 @@ def pde_loss(
 ) -> torch.Tensor:
     """Predicted distance error cross-entropy loss."""
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # drop trivial i==i self-pairs (distance 0 -> bin 0)
     gt_dist = torch.cdist(gt_pos, gt_pos)
     pred_dist = torch.cdist(pred_pos, pred_pos)  # [S, N, N]
     error = (pred_dist - gt_dist.unsqueeze(0)).abs()
