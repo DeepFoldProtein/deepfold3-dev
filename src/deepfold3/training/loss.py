@@ -481,10 +481,27 @@ def diffusion_mse_loss(
         # pre-compute an assignment — mainly legacy tests or inference
         # paths without mini-rollout.
         if chain_assign is not None:
-            permuted_chunks = [
-                apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, chain_assign)[0] for s in range(S)
-            ]
+            # ``chain_assign`` is shared across S (SE(3) augmentation preserves
+            # chain identity), so the permuted mask is identical for every
+            # sample. Reorder GT *and its mask* together: without permuting the
+            # mask, slots resolved in the pred chain but not its assigned GT
+            # chain (differentially-resolved homo-oligomer copies) keep
+            # mask=valid over an unresolved (garbage) GT coordinate, so the MSE
+            # scores predictions against garbage. Use the permuted mask below.
+            permuted_chunks = []
+            permuted_mask = atom_mask_bool
+            for s in range(S):
+                new_gt, permuted_mask = apply_chain_permutation_tokens(
+                    gt_pos[s], atom_mask_bool, asym_id, chain_assign
+                )
+                permuted_chunks.append(new_gt)
+            atom_mask = permuted_mask
+            atom_mask_bool = permuted_mask
         else:
+            # Fallback (no mini-rollout assignment): per-sample assignment means
+            # the permuted mask differs per sample; the [N, M] downstream mask
+            # can't represent that, so this legacy/inference path keeps the
+            # original mask (pre-existing behavior).
             permuted_chunks = []
             for s in range(S):
                 assign_s = compute_chain_permutation_tokens(pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id)
