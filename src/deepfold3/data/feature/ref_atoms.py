@@ -111,6 +111,7 @@ class RefAtomData:
     element: np.ndarray  # [max_atoms] int64 — atomic numbers
     charge: np.ndarray  # [max_atoms] float32 — formal charges
     atom_name_chars: np.ndarray  # [max_atoms, 4] int64 — ord(c)-32 encoding
+    atom_names: list[str]  # CCD-canonical atom names, in slot order (len == mask.sum())
 
 
 def _encode_atom_name(name: str) -> list[int]:
@@ -232,6 +233,7 @@ def get_ref_atoms(
         element=element,
         charge=charge,
         atom_name_chars=atom_name_chars,
+        atom_names=[str(a).strip() for a in atom_names[:n]],
     )
 
 

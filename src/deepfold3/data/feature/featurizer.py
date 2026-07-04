@@ -163,6 +163,13 @@ class Featurizer:
         # For polymer: uid = token_idx. For ligand: uid = first token of the ligand residue.
         ref_space_uid = np.zeros((N, M), dtype=np.int64)
 
+        # Maps each stored structure-atom slot j of a token to its CCD-canonical
+        # slot, so ref_* and atom_gt_* agree on which physical atom slot j is.
+        # Default identity (single-atom tokens, and residues whose stored order
+        # already matches CCD); polymer residues with a missing/reordered atom
+        # are remapped by name in the dense branch and reused by the GT loop.
+        atom_slot_remap = np.tile(np.arange(M, dtype=np.int64), (N, 1))
+
         # Pre-compute ligand residue → CCD entry mapping for ref_pos lookup
         _ligand_ccd_cache: dict[str, tuple[list[str], np.ndarray]] = {}
 
@@ -235,14 +242,26 @@ class Featurizer:
                 res_name = _find_res_name(data, atom_idx)
                 ref_atom_data = get_ref_atoms(res_name, mol_type_tok, M)
 
+                # Structure stores present atoms densely (missing atoms simply
+                # absent), while ref_atom_data (positions/mask) is in CCD order.
+                # Place each stored atom at its CCD slot by name so ref_* and the
+                # GT positions line up even when a non-terminal atom is missing
+                # (a residue missing a mid-order atom would otherwise shift every
+                # following slot). Fall back to positional j when the name isn't
+                # in the CCD ref set (no regression for normal residues).
+                name_to_slot = {nm: k for k, nm in enumerate(ref_atom_data.atom_names)}
                 for j in range(min(atom_num, M)):
                     if atom_idx + j < len(data.structure.atoms):
                         atom = data.structure.atoms[atom_idx + j]
                         if bool(atom["is_present"]):
-                            ref_atom_data.element[j] = int(np.clip(atom["element"], 0, 127))
-                            ref_atom_data.charge[j] = float(atom["charge"])
                             aname = atom["name"].decode("ascii", errors="replace").strip()
-                            ref_atom_data.atom_name_chars[j] = _encode_atom_name(aname)
+                            slot = name_to_slot.get(aname, j)
+                            if slot >= M:
+                                slot = j
+                            atom_slot_remap[i, j] = slot
+                            ref_atom_data.element[slot] = int(np.clip(atom["element"], 0, 127))
+                            ref_atom_data.charge[slot] = float(atom["charge"])
+                            ref_atom_data.atom_name_chars[slot] = _encode_atom_name(aname)
 
                 # Polymer: ref_space_uid = token index
                 ref_space_uid[i, :] = i
@@ -603,14 +622,18 @@ class Featurizer:
                             atom_gt_positions[i, 0] = [float(atom["x"]), float(atom["y"]), float(atom["z"])]
                             atom_gt_mask[i, 0] = True
                 else:
-                    # Polymer: multiple atoms per token
+                    # Polymer: multiple atoms per token. Place each stored atom
+                    # at the same CCD slot the ref loop used (atom_slot_remap),
+                    # so GT positions/mask align with ref_pos even when a
+                    # non-terminal atom is missing.
                     for j in range(min(atom_num, M)):
                         a_idx = atom_idx + j
                         if a_idx < len(data.structure.atoms):
                             atom = data.structure.atoms[a_idx]
                             if bool(atom["is_present"]):
-                                atom_gt_positions[i, j] = [float(atom["x"]), float(atom["y"]), float(atom["z"])]
-                                atom_gt_mask[i, j] = True
+                                slot = int(atom_slot_remap[i, j])
+                                atom_gt_positions[i, slot] = [float(atom["x"]), float(atom["y"]), float(atom["z"])]
+                                atom_gt_mask[i, slot] = True
 
             result["atom_gt_positions"] = torch.from_numpy(atom_gt_positions)
             result["atom_gt_mask"] = torch.from_numpy(atom_gt_mask)
