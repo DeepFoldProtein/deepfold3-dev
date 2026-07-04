@@ -819,10 +819,12 @@ def _tm_score_from_error(
         error: per-pair distance, ``[S, N, N]``. Sample dim S is averaged.
         mask: per-pair valid mask in ``[0, 1]``. Padding / co-linear
               frames / cross-chain restriction all enter via this mask.
-        n_eff: per-pair token count used for ``d0``. Use total token count
-               for the global TM (``n_eff = N``); when ``mask`` already
-               restricts to a chain pair, callers should pass the per-pair
-               token count for ipTM-style scaling.
+        n_eff: ``|D|`` — the number of tokens in the TM set ``D``, sizing
+               ``d0`` (AF3 Eq. 18 ``d0(|D|)``). Global for both the full-
+               structure TM and ipTM (``D`` = all tokens): pass the total
+               valid-token count. A scalar, so ``d0`` is one value shared
+               across pairs (matching the fixed ``compute_iptm``); it is NOT a
+               per-chain-pair size.
     """
     clipped = max(int(n_eff), 19)
     d0 = 1.24 * (clipped - 15) ** (1.0 / 3) - 1.8

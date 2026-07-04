@@ -246,29 +246,31 @@ def compute_iptm(
     asym_id: torch.Tensor,
     max_error_bin: float = _DEFAULT_CFG.max_error_bin,
     num_bins: int = _DEFAULT_CFG.num_distogram_bins,
-    d0_pair_mask: torch.Tensor | None = None,
+    d0_seq_mask: torch.Tensor | None = None,
 ) -> float:
     """Compute interface predicted TM-score (ipTM) for a single sample.
 
-    Follows the AlphaFold 3 reference implementation exactly
-    (``confidence_head._get_tmscore_adjusted_pae`` +
-    ``confidences.predicted_tm_score`` with ``interface=True``). The
-    per-pair d0 uses::
+    AF3 §5.9.1 Eq. 18::
 
-        x = same_chain_mask
-        num_chain_tokens[i] = sum_j(x_ij * pair_mask_ij)
-        num_interface_tokens[i, j] = num_chain_tokens[i] + num_chain_tokens[j]
-                                      - x_ij * (num_interface_tokens[i, j] // 2)
+        ipTM(D) = max_{i∈D, has_frame(i)} (1/|D-chain(i)|)
+                    Σ_{j∈D-chain(i)} Σ_b p^{ij}_b / (1 + (Δ_b / d0(|D|))²)
 
-    The ``// 2`` correction folds same-chain pairs back to a single chain
-    size; they are subsequently masked out by the cross-chain pair mask.
-    Retained here for byte-for-byte parity with the AF3 source.
+    where ``D-chain(i)`` excludes tokens in ``i``'s chain. This is the
+    **full-structure** ipTM (``D`` = all tokens), so ``d0`` is sized on
+    ``|D|`` = the total valid-token count — a single **global** d0, identical
+    to pTM's, NOT a per-chain-pair size. (Earlier this used a per-pair
+    ``num_interface_tokens`` d0 that equals Eq. 18 only for two-chain complexes
+    and diverged for >2 chains; also disagreeing with the training-time
+    ``itm_true`` diagnostic, which already uses the global |D|.)
 
     Args:
         pae_logits: [N, N, num_bins] logits.
-        seq_mask: [N] float mask.
-        pair_mask: [N, N] float mask.
+        seq_mask: [N] float mask gating the per-row alignment + max.
+        pair_mask: [N, N] float mask for the row-wise (cross-chain) j-sum.
         asym_id: [N] int chain identifiers.
+        d0_seq_mask: [N] float mask sizing ``|D|`` for d0 (all valid tokens).
+            Defaults to ``seq_mask``; pass the full token mask when
+            ``seq_mask``/``pair_mask`` are frame-restricted (matches pTM).
 
     Returns:
         ipTM score (scalar). NaN if single-chain.
@@ -279,18 +281,11 @@ def compute_iptm(
     if interface_mask.sum() == 0:
         return float("nan")
 
-    # AF3 sizes the per-pair d0 token count on all valid tokens (the seq_mask
-    # pair mask in confidence_head), while the final j-sum is normalized over
-    # frame-bearing tokens (``interface_mask``). ``d0_pair_mask`` carries the
-    # full token pair mask; falls back to ``pair_mask`` for backward compat.
-    count_mask = pair_mask if d0_pair_mask is None else d0_pair_mask
-    x = same_chain.float()
-    num_chain_tokens = (x * count_mask).sum(dim=-1)  # [N]
-    num_interface_tokens = num_chain_tokens.unsqueeze(0) + num_chain_tokens.unsqueeze(-1)  # [N, N]
-    num_interface_tokens = num_interface_tokens - x * (num_interface_tokens.long() // 2).float()
-    num_interface_tokens = num_interface_tokens * count_mask
-
-    tm_adj = _compute_tm_adjusted_pae(pae_logits, num_interface_tokens, max_error_bin, num_bins)
+    # d0(|D|): full-structure ipTM sizes d0 on the total valid-token count
+    # (global, identical to pTM) — Eq. 18, not a per-chain-pair size.
+    d0_mask = seq_mask if d0_seq_mask is None else d0_seq_mask
+    N = int(d0_mask.sum().item())
+    tm_adj = _compute_tm_adjusted_pae(pae_logits, N, max_error_bin, num_bins)
 
     denom = interface_mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     normed_mask = interface_mask / denom
@@ -590,7 +585,7 @@ def save_confidences_json(
         pae_logits_s = output.pae[sample_idx]
         ptm = compute_ptm(pae_logits_s, tm_mask, tm_pair_mask, max_error_bin, num_bins, d0_seq_mask=seq_mask)
         iptm = compute_iptm(
-            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_pair_mask=pair_mask
+            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_seq_mask=seq_mask
         )
     else:
         ptm = 0.0
