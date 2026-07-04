@@ -20,7 +20,7 @@ import torch
 import torch.utils.data
 
 from deepfold3.data import const
-from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols
+from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols, remap_msa_col_idx_to_slice
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
 from deepfold3.data.masking import TokenMask
@@ -364,9 +364,16 @@ class TrainingDataset(torch.utils.data.Dataset):
         chain_msa_cols = compute_chain_msa_cols(tokenized.tokens["asym_id"], tokenized.msa_col_idx)
 
         # Load per-chain MSAs (unpaired + optional paired) for surviving chains
-        # only, sliced to the cropped columns at load time.
+        # only, sliced to the cropped columns at load time. The sliced MSAs are
+        # re-indexed 0..k-1, so ``msa_col_idx`` must be rebased to match or the
+        # featurizer gathers stale (mis-aligned / dropped) columns.
         paired_msa, unpaired_msa = self._load_cropped_msa(record, surviving_asym, chain_msa_cols)
-        tokenized = replace(tokenized, paired_msa=paired_msa, unpaired_msa=unpaired_msa)
+        remapped_col_idx = remap_msa_col_idx_to_slice(
+            tokenized.tokens["asym_id"], tokenized.msa_col_idx, chain_msa_cols
+        )
+        tokenized = replace(
+            tokenized, paired_msa=paired_msa, unpaired_msa=unpaired_msa, msa_col_idx=remapped_col_idx
+        )
         timing["msa"], _t = time.perf_counter() - _t, time.perf_counter()
 
         # Load templates for surviving chains only: prefer per-sequence monomer

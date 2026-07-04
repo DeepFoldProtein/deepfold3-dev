@@ -51,6 +51,40 @@ def compute_chain_msa_cols(asym_ids: np.ndarray, msa_col_idx: np.ndarray | None)
     return chain_msa_cols
 
 
+def remap_msa_col_idx_to_slice(
+    asym_ids: np.ndarray,
+    msa_col_idx: np.ndarray | None,
+    chain_msa_cols: dict[int, np.ndarray],
+) -> np.ndarray | None:
+    """Rebase ``msa_col_idx`` to positions within each chain's column-sliced MSA.
+
+    A crop slices every chain's MSA to ``chain_msa_cols[aid]`` and re-indexes the
+    result to ``0..k-1`` (column *j* of the slice = original column
+    ``chain_msa_cols[aid][j]``). Token references in ``msa_col_idx``, however,
+    still hold the *original* chain-local columns, so a later gather
+    (``msa_data[:, msa_col_idx]``) would index the slice with stale values and
+    silently drop / mis-align columns. This remaps each valid entry to its rank
+    within its chain's ``cols`` so the gather lands on the correct sliced column.
+
+    Ligand / column-less tokens (``-1``) are preserved. Call **exactly once**, at
+    the point the MSA is sliced (the cropper's internal slice, or the training
+    dataset's crop-then-load slice) — it is not idempotent.
+    """
+    if msa_col_idx is None:
+        return None
+    asym_ids = np.asarray(asym_ids)
+    remapped = np.full_like(msa_col_idx, -1)
+    for aid, cols in chain_msa_cols.items():
+        rank = {int(c): j for j, c in enumerate(cols)}
+        sel = (asym_ids == aid) & (msa_col_idx >= 0)
+        if not sel.any():
+            continue
+        remapped[sel] = np.array(
+            [rank.get(int(v), -1) for v in msa_col_idx[sel]], dtype=msa_col_idx.dtype
+        )
+    return remapped
+
+
 class Cropper:
     """Crop a Tokenized input to at most max_tokens / max_atoms.
 
@@ -544,8 +578,16 @@ class Cropper:
                 )
             return cropped
 
-        # Crop msa_col_idx to the selected tokens.
+        # Crop msa_col_idx to the selected tokens. Rebase it to the column-sliced
+        # MSAs *only* when this cropper actually sliced an MSA here (the sliced
+        # MSA is re-indexed 0..k-1 while the raw columns are not). In the training
+        # crop-then-load path the MSA is empty at crop time and gets sliced later
+        # by the dataset, which rebases then — rebasing here would destroy the
+        # original columns the dataset needs to slice from disk (double rebase).
         new_msa_col_idx = data.msa_col_idx[selected] if data.msa_col_idx is not None else None
+        sliced_msa_here = bool(data.paired_msa) or bool(data.unpaired_msa)
+        if new_msa_col_idx is not None and sliced_msa_here:
+            new_msa_col_idx = remap_msa_col_idx_to_slice(new_tokens["asym_id"], new_msa_col_idx, chain_msa_cols)
 
         return Tokenized(
             tokens=new_tokens,
