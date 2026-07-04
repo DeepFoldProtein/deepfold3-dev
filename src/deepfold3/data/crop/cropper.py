@@ -11,7 +11,16 @@ import random
 
 import numpy as np
 
-from deepfold3.data.types import ATOM_DTYPE, BOND_DTYPE, TOKEN_BOND_DTYPE, TOKEN_DTYPE, Structure, Tokenized
+from deepfold3.data.types import (
+    ATOM_DTYPE,
+    BOND_DTYPE,
+    CHAIN_DTYPE,
+    RESIDUE_DTYPE,
+    TOKEN_BOND_DTYPE,
+    TOKEN_DTYPE,
+    Structure,
+    Tokenized,
+)
 from deepfold3.data.types import MSA as MSAType
 
 
@@ -358,6 +367,81 @@ class Cropper:
     # Re-index after crop
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reindex_hierarchy(
+        residues: np.ndarray,
+        chains: np.ndarray,
+        old_to_new_atom: dict[int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Re-index the residue / chain hierarchy to the cropped atom array.
+
+        Cropping slices ``atoms`` and remaps each token's ``atom_idx``, but the
+        residue / chain records also carry ``atom_idx`` / ``res_idx`` offsets
+        into the *original* arrays. Left stale, any post-crop lookup that
+        resolves a residue by atom index (``_find_res_name`` / ``_find_residue``
+        for the ``ref_pos`` reference conformer, and the ligand-swap
+        chain→residue CCD-code lookup) returns the WRONG residue. This rebuilds
+        both levels so the structure is self-consistent with the cropped atoms.
+
+        A residue's kept atoms are contiguous in the cropped array (tokens of a
+        residue are emitted consecutively and the selection is sorted), so an
+        ``(atom_idx, atom_num)`` range is exact. Residues / chains with no kept
+        atoms are dropped; ``res_idx`` in chains is remapped to the new residue
+        positions.
+        """
+        # Residues: keep those with ≥1 kept atom; remap atom range.
+        kept_res_order: list[int] = []
+        new_res_atom_idx: list[int] = []
+        new_res_atom_num: list[int] = []
+        old_to_new_res: dict[int, int] = {}
+        for ridx in range(len(residues)):
+            r_start = int(residues[ridx]["atom_idx"])
+            r_num = int(residues[ridx]["atom_num"])
+            kept = [old_to_new_atom[a] for a in range(r_start, r_start + r_num) if a in old_to_new_atom]
+            if not kept:
+                continue
+            old_to_new_res[ridx] = len(kept_res_order)
+            kept_res_order.append(ridx)
+            new_res_atom_idx.append(min(kept))
+            new_res_atom_num.append(len(kept))
+
+        if kept_res_order:
+            new_residues = residues[kept_res_order].copy()
+            new_residues["atom_idx"] = np.array(new_res_atom_idx, dtype=new_residues["atom_idx"].dtype)
+            new_residues["atom_num"] = np.array(new_res_atom_num, dtype=new_residues["atom_num"].dtype)
+        else:
+            new_residues = np.empty(0, dtype=RESIDUE_DTYPE)
+
+        # Chains: keep those with ≥1 kept residue; remap res range + atom range.
+        kept_chain_order: list[int] = []
+        new_chain_res_idx: list[int] = []
+        new_chain_res_num: list[int] = []
+        new_chain_atom_idx: list[int] = []
+        new_chain_atom_num: list[int] = []
+        for cidx in range(len(chains)):
+            c_start = int(chains[cidx]["res_idx"])
+            c_num = int(chains[cidx]["res_num"])
+            kept_r = [old_to_new_res[r] for r in range(c_start, c_start + c_num) if r in old_to_new_res]
+            if not kept_r:
+                continue
+            kept_chain_order.append(cidx)
+            first_new_res = min(kept_r)
+            new_chain_res_idx.append(first_new_res)
+            new_chain_res_num.append(len(kept_r))
+            new_chain_atom_idx.append(int(new_residues[first_new_res]["atom_idx"]))
+            new_chain_atom_num.append(int(sum(int(new_residues[r]["atom_num"]) for r in kept_r)))
+
+        if kept_chain_order:
+            new_chains = chains[kept_chain_order].copy()
+            new_chains["res_idx"] = np.array(new_chain_res_idx, dtype=new_chains["res_idx"].dtype)
+            new_chains["res_num"] = np.array(new_chain_res_num, dtype=new_chains["res_num"].dtype)
+            new_chains["atom_idx"] = np.array(new_chain_atom_idx, dtype=new_chains["atom_idx"].dtype)
+            new_chains["atom_num"] = np.array(new_chain_atom_num, dtype=new_chains["atom_num"].dtype)
+        else:
+            new_chains = np.empty(0, dtype=CHAIN_DTYPE)
+
+        return new_residues, new_chains
+
     def _reindex(self, data: Tokenized, selected: np.ndarray) -> Tokenized:
         """Build a new Tokenized with only the selected token indices."""
         if len(selected) == 0:
@@ -410,14 +494,21 @@ class Cropper:
                 old_start = int(old_tokens[i]["atom_idx"])
                 new_tokens[i]["atom_idx"] = old_to_new_atom.get(old_start, 0)
         else:
+            old_to_new_atom = {}
             new_atoms = np.empty(0, dtype=ATOM_DTYPE)
 
-        # Build cropped structure (bonds not remapped for now)
+        new_residues, new_chains = self._reindex_hierarchy(
+            data.structure.residues, data.structure.chains, old_to_new_atom
+        )
+
+        # Build cropped structure (bonds not remapped for now). Residues and
+        # chains are re-indexed to stay consistent with the cropped atom array
+        # (see ``_reindex_hierarchy``).
         new_structure = Structure(
             atoms=new_atoms,
             bonds=np.empty(0, dtype=BOND_DTYPE),
-            residues=data.structure.residues,
-            chains=data.structure.chains,
+            residues=new_residues,
+            chains=new_chains,
         )
 
         # Crop paired and unpaired MSA to match selected tokens.
