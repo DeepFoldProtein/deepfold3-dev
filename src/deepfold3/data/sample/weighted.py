@@ -363,12 +363,16 @@ class WeightedEvalSampler(Sampler[int]):
         seed: int = 42,
     ):
         self.n_records = len(records)
-        self.n_samples = min(n_samples, self.n_records)
         self.num_replicas = num_replicas
         self.rank = rank
         self.seed = seed
         self.epoch = 0
         self.weights = compute_cluster_weights(records)
+        # rng.choice(replace=False, p=weights) raises when fewer records have
+        # nonzero weight than the requested count (records with no valid chain
+        # get weight 0 from compute_cluster_weights). Cap at the drawable count.
+        n_nonzero = int((self.weights > 0).sum())
+        self.n_samples = min(n_samples, self.n_records, n_nonzero)
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
