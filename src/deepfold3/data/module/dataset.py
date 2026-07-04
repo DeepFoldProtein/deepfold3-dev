@@ -491,6 +491,32 @@ class TrainingDataset(torch.utils.data.Dataset):
             logger.warning("Corrupt MSA %s: %s — skipping", path, e)
             return None
 
+    def _effective_template_cutoff(self, record: Record) -> str | None:
+        """Effective template release-date cutoff for a record (fail-closed).
+
+        ``min(max_template_date hard cap, per-record bound)``, where the
+        per-record bound is ``released - cutoff_days`` when the query's release
+        date is known, else the configured global ``default_template_cutoff_date``
+        fallback. Returns ``None`` when no cutoff can be established — callers
+        must then fail-closed (drop all hits) so a record with an unknown release
+        date never leaks future-dated templates. Shared by the monomer and
+        multimer template loaders.
+        """
+        import datetime
+
+        cutoff: str | None = self.max_template_date
+        query_release = record.structure_info.released if record.structure_info else None
+        per_record: str | None = self.default_template_cutoff_date
+        if query_release is not None:
+            try:
+                d = datetime.date.fromisoformat(query_release) - datetime.timedelta(days=self.template_cutoff_days)
+                per_record = d.isoformat()
+            except ValueError:
+                pass
+        if per_record is not None:
+            cutoff = per_record if cutoff is None else min(cutoff, per_record)
+        return cutoff
+
     def _load_monomer_templates(
         self,
         record: Record,
@@ -512,31 +538,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         4. Sample ``k = min(Uniform[0, n], max_templates)`` random hits, then
            extract template features from the local PDB mmCIF mirror.
         """
-        import datetime
-
         from deepfold3.data.parse.templates import cigar_to_index_pairs
         from deepfold3.data.prepare.template_search import load_monomer_template_hits
 
         templates_root = self.data_dir / "monomer_templates"
         record_id_upper = record.id.upper()
 
-        # Effective cutoff = min(max_template_date hard cap, per-record bound).
-        # The per-record bound is ``released - cutoff_days`` when the release date
-        # is known, else the configured global fallback. If neither the hard cap
-        # nor any per-record bound can be established, the filter below is
-        # fail-closed (drops every hit) so a record with an unknown release date
-        # never leaks future-dated templates.
-        cutoff: str | None = self.max_template_date
-        query_release = record.structure_info.released if record.structure_info else None
-        per_record: str | None = self.default_template_cutoff_date
-        if query_release is not None:
-            try:
-                d = datetime.date.fromisoformat(query_release) - datetime.timedelta(days=self.template_cutoff_days)
-                per_record = d.isoformat()
-            except ValueError:
-                pass
-        if per_record is not None:
-            cutoff = per_record if cutoff is None else min(cutoff, per_record)
+        # Effective release-date cutoff (fail-closed when unestablished).
+        cutoff = self._effective_template_cutoff(record)
 
         result: dict[int, list[TemplateFeatures]] = {}
         for chain_info in record.chains:
@@ -607,24 +616,18 @@ class TrainingDataset(torch.utils.data.Dataset):
     def _load_multimer_templates(
         self, record: Record, surviving_asym: set[int]
     ) -> dict[int, list[TemplateFeatures]] | None:
-        """Disabled: multimer template loading leaks future-dated templates.
+        """Load multimer template features from pre-indexed JSON + PdbChainCache.
 
-        Unlike the monomer path, this applies no runtime release-date cutoff and
-        trusts prepare-time filtering, which the pre-indexed ``templates/`` JSON
-        never performed — on the patchr_training set ~50% of hits postdate their
-        query beyond the AF3 §2.4 60-day guard (worst case +2000 days). Until a
-        per-record cutoff (``min(max_template_date, released - cutoff_days)``,
-        matching ``_load_monomer_templates``) is applied here at runtime, this
-        path is hard-disabled so it can't silently leak. Use per-sequence
-        ``monomer_templates/`` (which is date-filtered) instead.
+        Applies the **same** runtime release-date cutoff as the monomer path
+        (fail-closed) plus a self-hit drop. This is essential: the pre-indexed
+        ``templates/`` JSON is NOT release-date filtered at prepare time, so
+        without this filter it leaks future-dated templates (measured ~50% of
+        hits postdate the query on patchr_training, worst case +2000 days).
+
+        Sampling follows AF3 §2.4: ``k = min(Uniform[0, n_avail], max_templates)``.
+        Per-chain features come from the :class:`PdbChainCache`; only alignments
+        onto chains that survived the crop are extracted.
         """
-        raise NotImplementedError(
-            "Multimer template loading is disabled: the pre-indexed templates/ hits are not "
-            "release-date filtered and leak future-dated templates (~50% of hits postdate the "
-            "query on patchr_training). Add a runtime date cutoff before re-enabling, or use "
-            "date-filtered monomer_templates/. To train without templates, unset the template "
-            "source (no --mmcif-dir / pdb_chain_cache_dir, or remove templates/)."
-        )
         from deepfold3.data.parse.templates import cigar_to_index_pairs
         from deepfold3.data.prepare.template_search import load_template_hits
 
@@ -634,6 +637,20 @@ class TrainingDataset(torch.utils.data.Dataset):
         except Exception:
             logger.debug("Failed to load template index for %s", record.id)
             return None
+
+        # Runtime date cutoff (fail-closed) + self-hit drop. A hit is kept only
+        # when a cutoff exists and its (max-across-chains) release date is known
+        # and within it — the prepare-time JSON never applied this.
+        cutoff = self._effective_template_cutoff(record)
+        record_id_upper = record.id.upper()
+        hits = [
+            h
+            for h in hits
+            if h.template_pdb_id.upper() != record_id_upper
+            and cutoff is not None
+            and h.release_date is not None
+            and h.release_date <= cutoff
+        ]
 
         n_avail = len(hits)
         if n_avail == 0:
