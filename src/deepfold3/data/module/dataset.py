@@ -607,17 +607,24 @@ class TrainingDataset(torch.utils.data.Dataset):
     def _load_multimer_templates(
         self, record: Record, surviving_asym: set[int]
     ) -> dict[int, list[TemplateFeatures]] | None:
-        """Load multimer template features from pre-indexed JSON + PdbChainCache.
+        """Disabled: multimer template loading leaks future-dated templates.
 
-        Sampling follows AF3 §2.4: ``k = min(Uniform[0, n_avail], max_templates)``
-        — almost always returns ``max_templates`` when n_avail is large, but
-        respects bounds when fewer hits are available.
-
-        Per-chain features come from the :class:`PdbChainCache` (memory LRU +
-        sharded disk), so a template chain is sliced/parsed at most once across
-        the whole run instead of re-parsing the full template mmCIF per hit.
-        Only alignments onto chains that survived the crop are extracted.
+        Unlike the monomer path, this applies no runtime release-date cutoff and
+        trusts prepare-time filtering, which the pre-indexed ``templates/`` JSON
+        never performed — on the patchr_training set ~50% of hits postdate their
+        query beyond the AF3 §2.4 60-day guard (worst case +2000 days). Until a
+        per-record cutoff (``min(max_template_date, released - cutoff_days)``,
+        matching ``_load_monomer_templates``) is applied here at runtime, this
+        path is hard-disabled so it can't silently leak. Use per-sequence
+        ``monomer_templates/`` (which is date-filtered) instead.
         """
+        raise NotImplementedError(
+            "Multimer template loading is disabled: the pre-indexed templates/ hits are not "
+            "release-date filtered and leak future-dated templates (~50% of hits postdate the "
+            "query on patchr_training). Add a runtime date cutoff before re-enabling, or use "
+            "date-filtered monomer_templates/. To train without templates, unset the template "
+            "source (no --mmcif-dir / pdb_chain_cache_dir, or remove templates/)."
+        )
         from deepfold3.data.parse.templates import cigar_to_index_pairs
         from deepfold3.data.prepare.template_search import load_template_hits
 
