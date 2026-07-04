@@ -42,6 +42,12 @@ def _encode_sequence(seq: str, mol_type: int) -> tuple[list[int], list[int]]:
         unk = 20
 
     for ch in seq:
+        if ch == ".":
+            # Insert-state gap (some A3M dialects): no residue and not a match
+            # column, so skip it entirely — it neither consumes a query column
+            # nor counts as a deletion. Was previously uppercase-tested false and
+            # encoded as a spurious UNK match column, shifting the whole row.
+            continue
         if ch.islower():
             # Insertion: increment deletion counter, don't add to match states
             del_count += 1
