@@ -210,23 +210,25 @@ def compute_chain_permutation(
                 )
                 continue
 
-            # linear_sum_assignment does not tolerate rows/cols that are
-            # entirely +inf. Fill any such entries with a large finite
-            # penalty so the solver still runs; the assignment on the
-            # degenerate rows will be arbitrary but is overridden below.
-            finite_mask = np.isfinite(cost)
-            row_ok = finite_mask.any(axis=1)
-            col_ok = finite_mask.any(axis=0)
-            if not (row_ok.all() and col_ok.all()):
-                big = cost[finite_mask].max() * 1e3 + 1.0 if finite_mask.any() else 1.0
-                cost = np.where(finite_mask, cost, big)
+            # Permute only chains resolved on BOTH sides; unresolved chains stay
+            # identity. Running Hungarian over the full matrix could assign a
+            # resolved pred chain onto an empty GT column (big-penalty filled)
+            # while that column's own unresolved row keeps identity, mapping two
+            # pred chains to one GT chain (non-bijective). Restrict to the
+            # resolved set to keep a bijection.
+            valid = [i for i in range(n) if pred_blocks[i] is not None and gt_blocks[i] is not None]
+            if not valid:
+                continue
+            sub = cost[np.ix_(valid, valid)]
+            if not np.isfinite(sub).any():
+                continue
+            if not np.isfinite(sub).all():
+                big = sub[np.isfinite(sub)].max() * 1e3 + 1.0
+                sub = np.where(np.isfinite(sub), sub, big)
 
-            row_ind, col_ind = linear_sum_assignment(cost)
-            for i, j in zip(row_ind, col_ind, strict=True):
-                # Skip unresolved pred chains — keep their identity entry.
-                if not row_ok[i]:
-                    continue
-                assignment[asym_ids[i]] = asym_ids[j]
+            sub_row, sub_col = linear_sum_assignment(sub)
+            for r, c in zip(sub_row, sub_col, strict=True):
+                assignment[asym_ids[valid[r]]] = asym_ids[valid[c]]
 
     return assignment
 
@@ -434,17 +436,27 @@ def compute_chain_permutation_tokens(
             if not np.isfinite(cost).any():
                 continue
 
-            finite_mask = np.isfinite(cost)
-            row_ok = finite_mask.any(axis=1)
-            if not finite_mask.all():
-                big = cost[finite_mask].max() * 1e3 + 1.0
-                cost = np.where(finite_mask, cost, big)
+            # Permute only chains resolved on BOTH sides; unresolved chains
+            # (empty pred/GT block) stay identity. Running Hungarian over the
+            # full matrix lets a resolved pred chain be assigned onto an empty
+            # GT column (filled with a big penalty) while that column's own
+            # unresolved pred row is skipped to identity — two pred chains then
+            # map to one GT chain (non-bijective, one GT chain duplicated and
+            # another dropped). Restricting to the resolved set keeps the
+            # assignment a bijection.
+            valid = [i for i in range(n) if pred_blocks[i] is not None and gt_blocks[i] is not None]
+            if not valid:
+                continue
+            sub = cost[np.ix_(valid, valid)]
+            if not np.isfinite(sub).any():
+                continue
+            if not np.isfinite(sub).all():
+                big = sub[np.isfinite(sub)].max() * 1e3 + 1.0
+                sub = np.where(np.isfinite(sub), sub, big)
 
-            row_ind, col_ind = linear_sum_assignment(cost)
-            for i, j in zip(row_ind, col_ind, strict=True):
-                if not row_ok[i]:
-                    continue
-                assignment[asym_list[i]] = asym_list[j]
+            sub_row, sub_col = linear_sum_assignment(sub)
+            for r, c in zip(sub_row, sub_col, strict=True):
+                assignment[asym_list[valid[r]]] = asym_list[valid[c]]
 
     return assignment
 
