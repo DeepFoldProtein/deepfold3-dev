@@ -793,13 +793,27 @@ def _tm_score_from_error(
 ) -> torch.Tensor:
     """TM-like scalar in [0, 1] from a per-pair distance error tensor.
 
-    Mirrors :func:`deepfold3.io.confidences._compute_tm_adjusted_pae` but
-    operates on the distance directly — i.e. either the *true* alignment
-    error (yielding ``tm_true``) or the PAE-derived expected distance
-    (yielding ``tm_pred``). The 1/(1+(d/d0)²) kernel and row-normalised
-    max-over-alignments aggregation are identical to the inference-time
-    pTM computation, so train-time ``tm_true`` is on the same scale as
-    inference-time pTM and can be compared directly.
+    Shares the d0 sizing (``1.24·(max(n,19)-15)^{1/3}-1.8``), the
+    ``1/(1+(d/d0)²)`` TM kernel, the row-normalised j-sum, and the
+    max-over-alignment-frames aggregation with the inference-time pTM
+    (:func:`deepfold3.io.confidences.compute_ptm`), so its output is on the
+    **same scale** as pTM and is directly comparable.
+
+    It differs from pTM in *what the kernel is applied to*. pTM takes the
+    **expectation of the kernel over the predicted PAE distribution**,
+    ``Σ_b softmax(pae)_b · 1/(1+(center_b/d0)²)``
+    (:func:`~deepfold3.io.confidences._compute_tm_adjusted_pae`), whereas this
+    function applies the kernel to a **single per-pair distance**,
+    ``1/(1+(d/d0)²)``. With ``error`` = the *true* frame-aligned error this
+    yields ``tm_true`` — the deterministic ground-truth TM that pTM estimates;
+    there is no distribution to integrate, so applying the kernel directly is
+    exact.
+
+    Caveat: feeding the PAE-derived **expected** distance ``E[d]`` here (a
+    "tm_pred" shortcut) gives ``f(E[d])``, which is **not** equal to pTM's
+    ``E[f(d)]`` — the kernel is non-linear, so the two differ by a Jensen gap.
+    Match pTM's per-bin expectation if you need to reproduce the inference
+    metric exactly.
 
     Args:
         error: per-pair distance, ``[S, N, N]``. Sample dim S is averaged.
