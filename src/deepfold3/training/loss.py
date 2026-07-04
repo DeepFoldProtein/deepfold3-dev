@@ -819,12 +819,21 @@ def _tm_score_from_error(
         error: per-pair distance, ``[S, N, N]``. Sample dim S is averaged.
         mask: per-pair valid mask in ``[0, 1]``. Padding / co-linear
               frames / cross-chain restriction all enter via this mask.
-        n_eff: ``|D|`` — the number of tokens in the TM set ``D``, sizing
-               ``d0`` (AF3 Eq. 18 ``d0(|D|)``). Global for both the full-
-               structure TM and ipTM (``D`` = all tokens): pass the total
-               valid-token count. A scalar, so ``d0`` is one value shared
-               across pairs (matching the fixed ``compute_iptm``); it is NOT a
-               per-chain-pair size.
+        n_eff: token count sizing ``d0`` (``1.24·(max(n,19)-15)^{1/3}-1.8``).
+               A scalar → one **global** ``d0`` shared across all pairs; callers
+               pass the total valid-token count ``|D|``.
+
+               NOTE — ``itm_true`` vs inference ipTM: ``tm_true`` uses this
+               global ``|D|``, matching AF3's pTM (global d0). The cross-chain
+               ``itm_true`` diagnostic ALSO passes the global ``|D|`` here, but
+               AF3's inference ipTM (:func:`deepfold3.io.confidences.compute_iptm`,
+               which follows the AF3 reference code) sizes its interface d0
+               **per pair** on ``|chain_i| + |chain_j|`` (AF3's own code diverges
+               from its paper Eq. 18 / OpenFold-3, both of which use a global
+               d0). So ``itm_true`` is a **global-d0 approximation** of ipTM, not
+               byte-equivalent — they coincide only for two-chain complexes.
+               Intentional: the per-pair interface d0 is deliberately not
+               threaded into this diagnostic.
     """
     clipped = max(int(n_eff), 19)
     d0 = 1.24 * (clipped - 15) ** (1.0 / 3) - 1.8

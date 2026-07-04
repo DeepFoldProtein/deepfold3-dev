@@ -246,31 +246,36 @@ def compute_iptm(
     asym_id: torch.Tensor,
     max_error_bin: float = _DEFAULT_CFG.max_error_bin,
     num_bins: int = _DEFAULT_CFG.num_distogram_bins,
-    d0_seq_mask: torch.Tensor | None = None,
+    d0_pair_mask: torch.Tensor | None = None,
 ) -> float:
     """Compute interface predicted TM-score (ipTM) for a single sample.
 
-    AF3 §5.9.1 Eq. 18::
+    Follows the AlphaFold 3 **reference code**
+    (``confidence_head._get_tmscore_adjusted_pae``): the interface ``d0`` is
+    sized **per pair** on the two chains' token counts::
 
-        ipTM(D) = max_{i∈D, has_frame(i)} (1/|D-chain(i)|)
-                    Σ_{j∈D-chain(i)} Σ_b p^{ij}_b / (1 + (Δ_b / d0(|D|))²)
+        x = same_chain_mask
+        num_chain_tokens[i] = sum_j(x_ij * pair_mask_ij)
+        num_interface_tokens[i, j] = num_chain_tokens[i] + num_chain_tokens[j]
+                                      - x_ij * (num_interface_tokens[i, j] // 2)
 
-    where ``D-chain(i)`` excludes tokens in ``i``'s chain. This is the
-    **full-structure** ipTM (``D`` = all tokens), so ``d0`` is sized on
-    ``|D|`` = the total valid-token count — a single **global** d0, identical
-    to pTM's, NOT a per-chain-pair size. (Earlier this used a per-pair
-    ``num_interface_tokens`` d0 that equals Eq. 18 only for two-chain complexes
-    and diverged for >2 chains; also disagreeing with the training-time
-    ``itm_true`` diagnostic, which already uses the global |D|.)
+    The ``// 2`` correction folds same-chain pairs back to a single chain size;
+    they are then masked out by the cross-chain pair mask.
+
+    NOTE: AF3's code diverges here from its own paper (SI 5.9.1 Eq. 18, which
+    uses a single global ``d0(|D|)``) and from OpenFold-3 (also global). We
+    follow the **code** for byte-for-byte ipTM parity, per project decision;
+    the training-time ``itm_true`` diagnostic uses the same per-pair d0 so the
+    two stay comparable.
 
     Args:
         pae_logits: [N, N, num_bins] logits.
         seq_mask: [N] float mask gating the per-row alignment + max.
         pair_mask: [N, N] float mask for the row-wise (cross-chain) j-sum.
         asym_id: [N] int chain identifiers.
-        d0_seq_mask: [N] float mask sizing ``|D|`` for d0 (all valid tokens).
-            Defaults to ``seq_mask``; pass the full token mask when
-            ``seq_mask``/``pair_mask`` are frame-restricted (matches pTM).
+        d0_pair_mask: [N, N] pair mask for counting per-chain tokens in the
+            per-pair d0 (AF3 sizes it on all valid tokens). Falls back to
+            ``pair_mask``.
 
     Returns:
         ipTM score (scalar). NaN if single-chain.
@@ -281,11 +286,16 @@ def compute_iptm(
     if interface_mask.sum() == 0:
         return float("nan")
 
-    # d0(|D|): full-structure ipTM sizes d0 on the total valid-token count
-    # (global, identical to pTM) — Eq. 18, not a per-chain-pair size.
-    d0_mask = seq_mask if d0_seq_mask is None else d0_seq_mask
-    N = int(d0_mask.sum().item())
-    tm_adj = _compute_tm_adjusted_pae(pae_logits, N, max_error_bin, num_bins)
+    # Per-pair interface d0 (AF3 reference code): sized on |chain_i| + |chain_j|,
+    # counted over all valid tokens (``d0_pair_mask``).
+    count_mask = pair_mask if d0_pair_mask is None else d0_pair_mask
+    x = same_chain.float()
+    num_chain_tokens = (x * count_mask).sum(dim=-1)  # [N]
+    num_interface_tokens = num_chain_tokens.unsqueeze(0) + num_chain_tokens.unsqueeze(-1)  # [N, N]
+    num_interface_tokens = num_interface_tokens - x * (num_interface_tokens.long() // 2).float()
+    num_interface_tokens = num_interface_tokens * count_mask
+
+    tm_adj = _compute_tm_adjusted_pae(pae_logits, num_interface_tokens, max_error_bin, num_bins)
 
     denom = interface_mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     normed_mask = interface_mask / denom
@@ -585,7 +595,7 @@ def save_confidences_json(
         pae_logits_s = output.pae[sample_idx]
         ptm = compute_ptm(pae_logits_s, tm_mask, tm_pair_mask, max_error_bin, num_bins, d0_seq_mask=seq_mask)
         iptm = compute_iptm(
-            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_seq_mask=seq_mask
+            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_pair_mask=pair_mask
         )
     else:
         ptm = 0.0
