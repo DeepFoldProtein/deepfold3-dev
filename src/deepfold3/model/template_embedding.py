@@ -321,6 +321,7 @@ class SingleTemplateEmbedding(nn.Module):
         template_backbone_frame: torch.Tensor,
         template_backbone_mask: torch.Tensor,
         pair_mask: torch.Tensor,
+        multichain_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Embed a single template.
 
@@ -341,6 +342,11 @@ class SingleTemplateEmbedding(nn.Module):
             template_backbone_frame: [B?, N, 3, 3] backbone rotation matrices.
             template_backbone_mask: [B?, N] backbone frame mask.
             pair_mask: [B?, N, N] padding mask for attention.
+            multichain_mask: [B?, N, N] intra-chain mask (1 for same-chain
+                pairs). When provided, restricts template geometry to
+                block-diagonal (intra-chain) pairs — per-chain templates carry
+                no valid cross-chain frame, so their off-diagonal distances /
+                orientations would be garbage.
 
         Returns:
             Template pair embedding [B?, N, N, num_channels].
@@ -358,7 +364,15 @@ class SingleTemplateEmbedding(nn.Module):
             num_bins=self.embed_dgram.in_features,
         )  # [B?, N, N, dgram_bins]
         # Per-template pair mask: 1 where both tokens are covered by this template.
+        # Restrict to intra-chain (block-diagonal) pairs via multichain_mask:
+        # per-chain templates are placed in each chain's own (different) frame, so
+        # their cross-chain distances / orientations are not real interface
+        # geometry — mask the off-diagonal so only intra-chain template signal
+        # flows. (A whole-complex template would need slot=hit + a common frame
+        # to legitimately carry cross-chain features; that is not built here.)
         pb_mask_2d = template_pseudo_beta_mask.unsqueeze(-1) * template_pseudo_beta_mask.unsqueeze(-2)
+        if multichain_mask is not None:
+            pb_mask_2d = pb_mask_2d * multichain_mask
         dgram = dgram * pb_mask_2d.unsqueeze(-1)
 
         # Unit vectors from backbone frames (ellipsis einsum, batch-friendly)
@@ -367,6 +381,8 @@ class SingleTemplateEmbedding(nn.Module):
             template_pseudo_beta,  # Use CA positions as translations; backbone frames use CA as origin
             template_backbone_mask,
         )
+        if multichain_mask is not None:
+            bb_mask_2d = bb_mask_2d * multichain_mask
 
         # Apply backbone mask to unit vectors
         unit_x = unit_x * bb_mask_2d.unsqueeze(-1)
@@ -447,7 +463,9 @@ class TemplateEmbedding(nn.Module):
             template_backbone_frame: [B?, T, N, 3, 3] backbone rotation matrices.
             template_backbone_mask: [B?, T, N] backbone frame mask.
             pair_mask: [B?, N, N] padding mask for attention.
-            multichain_mask: Unused, kept for backward compatibility.
+            multichain_mask: [B?, N, N] intra-chain mask (1 for same-chain
+                pairs). Restricts template geometry to intra-chain pairs so the
+                (frame-inconsistent) cross-chain off-diagonal is masked out.
 
         Returns:
             Template pair embedding [B?, N, N, pair_channel].
@@ -492,6 +510,7 @@ class TemplateEmbedding(nn.Module):
                 template_backbone_frame=bbf_t,
                 template_backbone_mask=bbm_t,
                 pair_mask=pair_mask,
+                multichain_mask=multichain_mask,
             )
             summed = summed + emb
 
