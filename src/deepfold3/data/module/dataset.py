@@ -368,6 +368,10 @@ class TrainingDataset(torch.utils.data.Dataset):
         # re-indexed 0..k-1, so ``msa_col_idx`` must be rebased to match or the
         # featurizer gathers stale (mis-aligned / dropped) columns.
         paired_msa, unpaired_msa = self._load_cropped_msa(record, surviving_asym, chain_msa_cols)
+        # Original (pre-rebase) chain-local column per token == the per-chain
+        # template array's query index; keep it for correct template placement
+        # before rebasing msa_col_idx for the sliced MSA gather.
+        template_col_idx = tokenized.msa_col_idx
         remapped_col_idx = remap_msa_col_idx_to_slice(
             tokenized.tokens["asym_id"], tokenized.msa_col_idx, chain_msa_cols
         )
@@ -392,7 +396,11 @@ class TrainingDataset(torch.utils.data.Dataset):
         timing["template"], _t = time.perf_counter() - _t, time.perf_counter()
 
         feats = self.featurizer.process(
-            tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
+            tokenized,
+            training=True,
+            random_rot=True,
+            template_feats_per_chain=template_feats_per_chain,
+            template_col_idx=template_col_idx,
         )
         timing["featurize"] = time.perf_counter() - _t
 

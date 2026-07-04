@@ -76,6 +76,7 @@ class Featurizer:
         seed: int | None = None,
         templates: list[TemplateFeatures] | None = None,
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
+        template_col_idx: np.ndarray | None = None,
     ) -> dict[str, torch.Tensor]:
         """Processes tokenized data into a feature dictionary.
 
@@ -86,6 +87,10 @@ class Featurizer:
             seed: Random seed for augmentation reproducibility.
             templates: Flat list of TemplateFeatures (single-chain or whole-complex).
             template_feats_per_chain: Per-chain template features keyed by asym_id.
+            template_col_idx: Per-token *original* chain-local column index (the
+                pre-rebase ``msa_col_idx``), used to place per-chain template rows
+                at the correct query residues after cropping. ``None`` (no crop)
+                falls back to contiguous positional placement.
 
         Returns:
             Dict of tensors with keys:
@@ -670,7 +675,9 @@ class Featurizer:
         # ------------------------------------------------------------------
         # Template features
         # ------------------------------------------------------------------
-        result.update(self._build_template_features(templates, N, tokens, template_feats_per_chain))
+        result.update(
+            self._build_template_features(templates, N, tokens, template_feats_per_chain, template_col_idx)
+        )
 
         # ------------------------------------------------------------------
         # Token mask channels (for loss control)
@@ -1180,6 +1187,7 @@ class Featurizer:
         N: int,
         tokens: np.ndarray | None = None,
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
+        template_col_idx: np.ndarray | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build template feature tensors from TemplateFeatures list.
 
@@ -1204,7 +1212,7 @@ class Featurizer:
             }
 
         if template_feats_per_chain and tokens is not None:
-            return self._build_per_chain_template_features(template_feats_per_chain, tokens, N)
+            return self._build_per_chain_template_features(template_feats_per_chain, tokens, N, template_col_idx)
 
         # Single chain / flat list path (backward compatible)
         return self._build_single_chain_template_features(templates, N)
@@ -1248,6 +1256,7 @@ class Featurizer:
         template_feats_per_chain: dict[int, list[TemplateFeatures]],
         tokens: np.ndarray,
         N: int,
+        template_col_idx: np.ndarray | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build template features with per-chain template population.
 
@@ -1268,17 +1277,31 @@ class Featurizer:
         t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)
         t_frame_mask = np.zeros((T, N), dtype=bool)
 
+        col_idx = None if template_col_idx is None else np.asarray(template_col_idx)
         for asym_id, chain_templates in template_feats_per_chain.items():
             chain_mask = tokens["asym_id"] == asym_id
             chain_pos = np.where(chain_mask)[0]
             if len(chain_pos) == 0:
                 continue
 
+            # Map each surviving token to the template row for its query residue.
+            # ``template_col_idx`` is the token's original chain-local column
+            # (== the template array's 0-based query index). Without it (no crop),
+            # the chain's tokens are contiguous 0..k-1, so a positional range is
+            # the correct chain-local index.
+            if col_idx is not None:
+                local = col_idx[chain_pos]
+            else:
+                local = np.arange(len(chain_pos))
+
             for t, tmpl in enumerate(chain_templates[:T]):
-                L = min(len(tmpl.aatype), len(chain_pos))
-                start = int(chain_pos[0])
+                valid = (local >= 0) & (local < len(tmpl.aatype))
+                dst_pos = chain_pos[valid]
+                src_idx = local[valid]
+                if len(dst_pos) == 0:
+                    continue
                 self._fill_template_slot(
-                    t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, start, L
+                    t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, dst_pos, src_idx
                 )
 
         return {
@@ -1297,21 +1320,25 @@ class Featurizer:
         frame_row: np.ndarray,
         frame_mask_row: np.ndarray,
         tmpl: TemplateFeatures,
-        start: int,
-        length: int,
+        dst_pos: np.ndarray,
+        src_idx: np.ndarray,
     ) -> None:
-        """Fill a slice of template arrays from a single TemplateFeatures."""
-        end = start + length
-        aatype_row[start:end] = tmpl.aatype[:length]
-        pos = tmpl.atom_positions[:length]  # [L, M, 3]
-        mask = tmpl.atom_mask[:length]  # [L, M]
+        """Scatter template rows ``src_idx`` onto query token positions ``dst_pos``.
+
+        ``dst_pos`` and ``src_idx`` are paired element-wise, so this handles both
+        contiguous (no-crop) and non-contiguous (spatial/interface crop) token
+        layouts, placing each template row at its correct query residue.
+        """
+        aatype_row[dst_pos] = tmpl.aatype[src_idx]
+        pos = tmpl.atom_positions[src_idx]  # [L, M, 3]
+        mask = tmpl.atom_mask[src_idx]  # [L, M]
 
         # Pseudo-beta: CB (index 3) for all, CA (index 1) for GLY (type 7)
-        is_gly = tmpl.aatype[:length] == 7
+        is_gly = tmpl.aatype[src_idx] == 7
         cb_pos = pos[:, 3, :]
         ca_pos = pos[:, 1, :]
-        pb_row[start:end] = np.where(is_gly[:, None], ca_pos, cb_pos)
-        pb_mask_row[start:end] = np.where(is_gly, mask[:, 1], mask[:, 3])
+        pb_row[dst_pos] = np.where(is_gly[:, None], ca_pos, cb_pos)
+        pb_mask_row[dst_pos] = np.where(is_gly, mask[:, 1], mask[:, 3])
 
         # Backbone frames from N(0), CA(1), C(2) via Gram-Schmidt
         n_pos = pos[:, 0, :]
@@ -1319,7 +1346,7 @@ class Featurizer:
         c_pos = pos[:, 2, :]
 
         fm = mask[:, 0] & mask[:, 1] & mask[:, 2]
-        frame_mask_row[start:end] = fm
+        frame_mask_row[dst_pos] = fm
 
         eps = 1e-8
         v1 = c_pos - ca
@@ -1331,7 +1358,7 @@ class Featurizer:
         u2_norm = np.linalg.norm(u2, axis=-1, keepdims=True) + eps
         e2 = u2 / u2_norm
         e3 = np.cross(e1, e2)
-        frame_row[start:end] = np.stack([e1, e2, e3], axis=1)
+        frame_row[dst_pos] = np.stack([e1, e2, e3], axis=1)
 
     def _empty_features(self) -> dict[str, torch.Tensor]:
         M = self.max_atoms
