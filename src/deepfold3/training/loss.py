@@ -315,12 +315,14 @@ def smooth_lddt_loss(
     pred_dist = _safe_self_cdist(pred_flat)  # [S, A, A]
     dist_diff = (pred_dist - gt_dist.unsqueeze(0)).abs()  # [S, A, A]
 
-    # Vectorize over cutoffs: [C] tensor
-    cutoff_t = pred_pos.new_tensor(cutoffs).reshape(-1, 1, 1, 1)  # [C, 1, 1, 1]
-    # [C, S, A, A] → sigmoid-scored fractions (AF3 Alg. 27: sigmoid(threshold - |Δd|))
-    scores = (torch.sigmoid(cutoff_t - dist_diff.unsqueeze(0)) * pair_mask).sum(dim=(-2, -1))
-    # [C, S] → average over cutoffs → [S]
-    lddt_per_sample = scores.sum(dim=0) / (n_pairs * len(cutoffs))
+    # Accumulate the sigmoid-scored fraction one cutoff at a time instead of
+    # broadcasting to a [C, S, A, A] intermediate — mathematically identical but
+    # ~C× lower peak memory (AF3 Alg. 27: sigmoid(threshold - |Δd|)).
+    score_sum = pred_pos.new_zeros(S)  # [S]
+    for cutoff in cutoffs:
+        score_sum = score_sum + (torch.sigmoid(cutoff - dist_diff) * pair_mask).sum(dim=(-2, -1))
+    # average over cutoffs → [S]
+    lddt_per_sample = score_sum / (n_pairs * len(cutoffs))
 
     return (1.0 - lddt_per_sample).mean()
 
