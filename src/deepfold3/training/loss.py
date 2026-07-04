@@ -345,9 +345,14 @@ def smooth_lddt_loss(
             N, M = atom_mask.shape
             per_atom_mol_type = mol_type.view(N, 1).expand(N, M).reshape(-1)[flat_mask]  # [A]
             is_nuc = (per_atom_mol_type == 1) | (per_atom_mol_type == 2)
-            nuc_pair = is_nuc.unsqueeze(0) & is_nuc.unsqueeze(1)  # [A, A]
+            # AF3 Alg 27 line 6: the inclusion radius is set by the reference
+            # atom alone (30 A if it is a nucleotide, else 15 A), not by
+            # requiring BOTH atoms to be nucleotides. Key the radius on the
+            # neighbour (column j) atom, matching _compute_per_atom_lddt_batched
+            # (radius_j). The old AND-rule dropped protein/nucleic pairs in the
+            # [15, 30) A band that AF3 includes when the reference is nucleic.
             radius = torch.where(
-                nuc_pair,
+                is_nuc.unsqueeze(0),  # [1, A] -> radius[i, j] depends on atom j
                 gt_dist.new_full((), nucleotide_inclusion_radius),
                 gt_dist.new_full((), inclusion_radius),
             )
