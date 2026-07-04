@@ -316,7 +316,7 @@ def smooth_lddt_loss(
         nucleotide_inclusion_radius: Pair inclusion radius for
             nucleotide-nucleotide pairs.
         min_distance: Minimum GT distance for pair inclusion.
-        mol_type: Per-token molecule type ``[N]`` (0=prot, 1=RNA, 2=DNA,
+        mol_type: Per-token molecule type ``[N]`` (0=prot, 1=DNA, 2=RNA,
             3=ligand). Used to choose the per-pair inclusion radius.
 
     Returns:
@@ -420,7 +420,7 @@ def diffusion_mse_loss(
     atom_mask: torch.Tensor,  # [N, M]
     noise_levels: torch.Tensor,  # [S]
     sigma_data: float = 16.0,
-    mol_type: torch.Tensor | None = None,  # [N] int64 (0=prot, 1=RNA, 2=DNA, 3=ligand)
+    mol_type: torch.Tensor | None = None,  # [N] int64 (0=prot, 1=DNA, 2=RNA, 3=ligand)
     nucleotide_loss_weight: float = 5.0,
     ligand_loss_weight: float = 10.0,
     region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
@@ -541,8 +541,8 @@ def diffusion_mse_loss(
     # which atoms matter (AF3 §3.7.1 eq. 4).
     if mol_type is not None:
         token_weight = torch.ones(mask.shape[0], device=mask.device)
-        token_weight[mol_type == 1] = nucleotide_loss_weight  # RNA
-        token_weight[mol_type == 2] = nucleotide_loss_weight  # DNA
+        token_weight[mol_type == 1] = nucleotide_loss_weight  # DNA (MOL_DNA == 1)
+        token_weight[mol_type == 2] = nucleotide_loss_weight  # RNA (MOL_RNA == 2)
         token_weight[mol_type == 3] = ligand_loss_weight
         weight_2d = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
