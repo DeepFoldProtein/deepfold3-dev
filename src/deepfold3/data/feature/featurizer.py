@@ -189,11 +189,18 @@ class Featurizer:
 
                     # Look up this atom's ideal position from the CCD entry
                     if res_name not in _ligand_ccd_cache:
-                        from deepfold3.data.feature.ref_atoms import _get_ccd_entry
+                        from deepfold3.data.feature import ref_atoms as _rfa
 
-                        entry = _get_ccd_entry(res_name)
+                        entry = _rfa._get_ccd_entry(res_name)
                         if entry is not None:
-                            _ligand_ccd_cache[res_name] = (entry.atom_names, entry.positions)
+                            positions = entry.positions
+                            # AF3 §2.8: prefer ETKDGv3-generated ref_pos when
+                            # cached, matching get_ref_atoms so the single-atom
+                            # path uses the same conformer source as the dense path.
+                            cache = _rfa._REF_POS_CACHE
+                            if cache is not None and res_name in cache and len(cache[res_name]) == len(entry.atom_names):
+                                positions = cache[res_name]
+                            _ligand_ccd_cache[res_name] = (entry.atom_names, positions)
                         else:
                             _ligand_ccd_cache[res_name] = ([], np.zeros((0, 3), dtype=np.float32))
 
@@ -205,12 +212,17 @@ class Featurizer:
                         atom_names_override=[atom_name],
                     )
 
-                    # Set ideal position from CCD if available, else from Structure atoms
+                    # Set ideal position from the CCD ref conformer. When the
+                    # atom name isn't in the CCD entry (e.g. a custom SMILES
+                    # ligand), fall back to the input structure coordinate ONLY
+                    # at inference (a user-provided conformer). In training that
+                    # coordinate is the ground truth, so using it as the
+                    # reference feature would leak the answer; leave the
+                    # (origin-centered) default instead.
                     if atom_name in ccd_names:
                         ccd_idx = ccd_names.index(atom_name)
                         ref_atom_data.positions[0] = ccd_pos[ccd_idx]
-                    else:
-                        # Fall back to positions stored in Structure (from CcdMolecule or mmCIF)
+                    elif not training:
                         ref_atom_data.positions[0] = [
                             float(atom["x"]),
                             float(atom["y"]),
