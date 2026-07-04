@@ -1276,7 +1276,9 @@ class Featurizer:
 
         for t, tmpl in enumerate(templates):
             L = min(len(tmpl.aatype), N)
-            self._fill_template_slot(t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, 0, L)
+            # Single-chain (no crop): template row k → query position k, contiguous.
+            idx = np.arange(L)
+            self._fill_template_slot(t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, idx, idx)
 
         return {
             "template_aatype": torch.from_numpy(t_aatype),
