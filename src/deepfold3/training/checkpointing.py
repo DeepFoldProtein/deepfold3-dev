@@ -284,6 +284,26 @@ class CheckpointManager:
                         "expected False (saver should wrap with optimizer_eval_mode)."
                     )
             optimizer.load_state_dict(opt_state)
+            # Stage-boundary re-warm: rewind SF's x-averaging clock only,
+            # keeping z + v (no preconditioner transient) and k (LR warmup /
+            # bias correction). Must run after load_state_dict (which would
+            # otherwise restore the mature clock) and before ``.train()``.
+            if train_cfg.sf_reset_clock:
+                if hasattr(optimizer, "reset_averaging_clock"):
+                    optimizer.reset_averaging_clock()
+                    rank_zero_info(
+                        "[resume] sf_reset_clock: rewound Schedule-Free x-averaging clock "
+                        "(avg_k/weight_sum/lr_max reset); kept z, v, k."
+                    )
+                else:
+                    rank_zero_warn(
+                        "[resume] sf_reset_clock set but optimizer is not Schedule-Free; ignoring."
+                    )
+        elif train_cfg.sf_reset_clock:
+            rank_zero_info(
+                "[resume] sf_reset_clock ignored: optimizer state not loaded "
+                "(skip_load_optimizer / no optimizer in checkpoint) — clock already fresh."
+            )
         # Schedule-Free was saved with ``train_mode=False`` (live param =
         # x) so ``load_state_dict`` restored the same. Lerp ``p ← y`` from
         # ``(x, z)`` so training resumes at the same gradient point as

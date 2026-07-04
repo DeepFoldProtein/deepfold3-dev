@@ -965,6 +965,14 @@ class TrainingConfig:
     skip_load_optimizer: bool = False
     skip_load_scheduler: bool = False
     skip_load_step: bool = False
+    # Schedule-Free only: on resume, rewind x's averaging clock (avg step
+    # counter + weight_sum/lr_max) so x re-tracks z for the new stage, while
+    # keeping z + v (no preconditioner transient) and k (LR warmup / bias
+    # correction). The SF analog of restarting an LR schedule at a stage
+    # boundary. Applied only when the optimizer state is loaded (moot under
+    # skip_load_optimizer, which already starts a fresh clock). No-op for
+    # AdamW. See docs/training.md § Optimizer.
+    sf_reset_clock: bool = False
 
     # Experiment tracking
     wandb_enabled: bool = False  # explicit on/off; takes precedence over wandb_project

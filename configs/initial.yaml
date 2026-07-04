@@ -162,6 +162,12 @@ training:
   skip_load_optimizer: false
   skip_load_scheduler: false
   skip_load_step: false
+  # Schedule-Free stage-transition knob. When resuming into a new stage
+  # (crop/loss change), true rewinds x's averaging clock so x re-tracks z
+  # for the new objective, while keeping z + v (no preconditioner transient)
+  # and k (LR warmup / bias correction). No-op for AdamW. Default off →
+  # plain full-resume continuation.
+  sf_reset_clock: false
 
   wandb_enabled: true
   wandb_project: deepfold3-stage0

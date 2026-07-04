@@ -496,6 +496,78 @@ class TestAdamWScheduleFree:
             assert torch.equal(optimizer.state[p]["exp_avg_sq"], v)
         assert optimizer.param_groups[0]["k"] == k_before
 
+    def test_avg_k_tracks_k_on_normal_run(self):
+        # avg_k must advance in lockstep with k when never reset, so a fresh
+        # run is bit-for-bit identical to the single-counter implementation.
+        model, optimizer = self._build(lr=1e-2, warmup=5)
+        optimizer.train()
+        for _ in range(12):
+            self._set_grads(model)
+            optimizer.step()
+        g = optimizer.param_groups[0]
+        assert g["avg_k"] == g["k"] == 12
+
+    def test_reset_averaging_clock_rewinds_avg_only(self):
+        from deepfold3.training.schedule_free import AdamWScheduleFree
+
+        model = _simple_model()
+        beta1 = 0.9
+        opt = AdamWScheduleFree(
+            model.parameters(), lr=1e-2, betas=(beta1, 0.95),
+            warmup_steps=1000, average_concentration=200.0,
+        )
+        opt.train()
+        for _ in range(40):
+            self._set_grads(model)
+            opt.step()
+
+        g = opt.param_groups[0]
+        k_mature = g["k"]
+        v_before = [opt.state[p]["exp_avg_sq"].detach().clone() for p in model.parameters()]
+        z_before = [opt.state[p]["z"].detach().clone() for p in model.parameters()]
+
+        opt.reset_averaging_clock()
+        g = opt.param_groups[0]
+        # Averaging clock rewound; k (LR warmup / bias correction) preserved.
+        assert g["avg_k"] == 0
+        assert g["weight_sum"] == 0.0
+        assert g["lr_max"] == -1.0
+        assert g["k"] == k_mature
+        # z and v (second moment) untouched → no preconditioner transient.
+        for p, v in zip(model.parameters(), v_before, strict=True):
+            assert torch.equal(opt.state[p]["exp_avg_sq"], v)
+        for p, z in zip(model.parameters(), z_before, strict=True):
+            assert torch.equal(opt.state[p]["z"], z)
+        # Refined ckp1 = min(1, (1-β₁)·C/(avg_k+1)) re-warms to 1 vs its
+        # matured pre-reset value.
+        ckp1_before = min(1.0, (1 - beta1) * 200.0 / (k_mature + 1))
+        ckp1_after = min(1.0, (1 - beta1) * 200.0 / (g["avg_k"] + 1))
+        assert ckp1_after == 1.0 and ckp1_before < 1.0
+
+    def test_reset_averaging_clock_backward_compatible(self):
+        # A checkpoint saved before ``avg_k`` existed must load and step
+        # without KeyError, initialising avg_k from the mature k.
+        from deepfold3.training.schedule_free import AdamWScheduleFree
+
+        m1 = _simple_model()
+        opt1 = AdamWScheduleFree(m1.parameters(), lr=1e-2, warmup_steps=10)
+        opt1.train()
+        for _ in range(6):
+            self._set_grads(m1)
+            opt1.step()
+        sd = opt1.state_dict()
+        for grp in sd["param_groups"]:
+            grp.pop("avg_k", None)  # simulate a pre-avg_k checkpoint
+
+        m2 = _simple_model()
+        opt2 = AdamWScheduleFree(m2.parameters(), lr=1e-2, warmup_steps=10)
+        opt2.load_state_dict(sd)
+        opt2.train()
+        self._set_grads(m2)
+        opt2.step()  # must not raise
+        g = opt2.param_groups[0]
+        assert g["avg_k"] == g["k"] == 7
+
     def test_build_optimizer_dispatches_schedule_free(self):
         from deepfold3.training.optim import build_optimizer
         from deepfold3.training.schedule_free import AdamWScheduleFree

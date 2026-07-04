@@ -469,6 +469,17 @@ AdamW (or Schedule-Free AdamW when `optimizer_type="schedule_free"`) with **deco
 
 See `_NO_DECAY_NAME_SUBSTRINGS` in `training/optim.py` for the exact pattern list.
 
+### Schedule-Free stage transitions (`sf_reset_clock`)
+
+Schedule-Free AdamW keeps two iterates: the fast `z` (SGD-like step target) and the running average `x` (the deployed/eval weights, saved into the checkpoint). Averaging depth is governed by an internal clock — `x_{t+1} = (1-c_{t+1})·x_t + c_{t+1}·z_{t+1}` with `c_{t+1} = (1-β₁)·C/(avg_k+1)` (refined path). Because SF has **no external LR decay schedule**, this clock is the analog of an LR schedule position: a mature clock means a deep, cold average that barely moves.
+
+On a stage boundary (crop/loss change), a plain full `--resume` continues the clock, so `x` stays frozen in the previous stage's average and adapts to the new objective only over hundreds–thousands of steps. Setting `sf_reset_clock: true` rewinds **only the averaging clock** (`avg_k`, plus the paper-path accumulators `weight_sum` / `lr_max`) so `c` jumps back near 1 and `x` re-tracks `z` for the new stage. It deliberately keeps:
+
+- `z` and `v` (`exp_avg_sq`, second moment) — so there's **no preconditioner transient** (the reason to prefer this over `skip_load_optimizer`, which resets the whole optimizer);
+- `k` — so LR warmup and Adam bias correction (`1 - β₂^{k+1}`) keep running at their mature values rather than re-warming against an already-matured `v`.
+
+The averaging counter `avg_k` advances in lockstep with `k` on a fresh run (identical to a single counter); it diverges only after a reset. Applied on resume only when the optimizer state is actually loaded (moot under `skip_load_optimizer`). No-op for AdamW. Default `false`.
+
 ## Checkpointing
 
 Checkpoints are saved at configurable intervals (default: every 1000 steps) and contain:
@@ -488,7 +499,7 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 **Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, scheduler instance attributes (`warmup_steps`, `start_decay_after`, `decay_every`, `decay_factor`, `cosine_max_steps`, `cosine_min_lr_ratio`, `wsds_decay_windows`) — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only; only `lr` is force-overridden. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
 
-**Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
+**Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`. For Schedule-Free arms, `sf_reset_clock` re-warms `x`'s averaging without discarding the optimizer's curvature state — see _Schedule-Free stage transitions_ above.
 
 **Fused kernel portability**: `DeepFold3.state_dict()` automatically filters out derived fused kernel parameters (identified by `OptimConfig.FUSED_STATE_DICT_MARKERS`). On load, `load_state_dict()` re-syncs fused params from base weights. This means checkpoints saved with fused kernels enabled can be loaded without them, and vice versa.
 
