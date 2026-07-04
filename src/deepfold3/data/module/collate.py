@@ -17,7 +17,14 @@ from __future__ import annotations
 
 import torch
 
+from deepfold3.data.masking import MASK_FIXED, MASK_LOSS_WEIGHT
 from deepfold3.model.bucket import next_bucket, pad_features
+
+# Feature keys whose neutral (no-masking) value is 1.0, not 0.0: zero-filling a
+# sample that lacks these (mixed-dataset batch) would mark it model-generated
+# (mask_fixed) or zero its loss weight (mask_loss_weight), silently dropping its
+# loss. mask_region stays zero-filled (0 == unset -> weight 1.0 in _region_to_weight).
+_ONES_FILL_KEYS = frozenset({f"mask_{MASK_FIXED}", f"mask_{MASK_LOSS_WEIGHT}"})
 
 
 def collate_fn(
@@ -81,15 +88,17 @@ def collate_fn(
             continue
 
         # When a key appears in only some samples (e.g. mask channels from
-        # mixed datasets), fill missing entries with zeros so the batch dim
-        # is consistent and _slice_batch_dict can slice correctly.
+        # mixed datasets), fill missing entries so the batch dim is consistent
+        # and _slice_batch_dict can slice correctly. Loss-weight-like masks fill
+        # with 1.0 (the neutral / no-masking value); everything else with 0.0.
         # Skip scalars (0-dim) that aren't in all samples — zero-filling
         # them changes semantics (e.g. resolution=0.0 vs absent).
         if len(tensors_present) < len(batch):
             ref = tensors_present[0][1]
             if ref.dim() == 0:
                 continue
-            full: list[torch.Tensor] = [torch.zeros_like(ref) for _ in range(len(batch))]
+            fill_like = torch.ones_like if key in _ONES_FILL_KEYS else torch.zeros_like
+            full: list[torch.Tensor] = [fill_like(ref) for _ in range(len(batch))]
             for i, t in tensors_present:
                 full[i] = t
             tensors = full
