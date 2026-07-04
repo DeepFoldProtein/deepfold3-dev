@@ -1179,6 +1179,13 @@ class DataConfig:
     # AF3 uses 2018-04-30 for distillation and the training cutoff for
     # inference; leave None to skip the global cap.
     max_template_date: str | None = None
+    # Global template cutoff (ISO YYYY-MM-DD) used as the per-record bound when
+    # a record has no ``released`` date (so the per-record ``released -
+    # cutoff_days`` guard cannot be computed). Set this to the training split's
+    # date boundary. If neither this nor ``max_template_date`` is set and a
+    # record lacks a release date, template loading is fail-closed (no
+    # templates) rather than leaking future structures.
+    default_template_cutoff_date: str | None = None
     # Prefer per-sequence monomer templates over per-record multimer
     # templates when both directories are present.
     prefer_monomer_templates: bool = True

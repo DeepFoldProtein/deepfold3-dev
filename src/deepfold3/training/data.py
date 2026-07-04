@@ -189,6 +189,7 @@ def build_dataloaders(
         max_templates=model_cfg.data.max_templates,
         template_cutoff_days=model_cfg.data.template_cutoff_days,
         max_template_date=model_cfg.data.max_template_date,
+        default_template_cutoff_date=model_cfg.data.default_template_cutoff_date,
         prefer_monomer_templates=model_cfg.data.prefer_monomer_templates,
         max_neighborhood=model_cfg.data.max_neighborhood,
         contiguous_crop_weight=model_cfg.data.contiguous_crop_weight,

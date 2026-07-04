@@ -128,6 +128,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         max_templates: int = 4,
         template_cutoff_days: int = 60,
         max_template_date: str | None = None,
+        default_template_cutoff_date: str | None = None,
         prefer_monomer_templates: bool = True,
         max_neighborhood: int = 40,
         contiguous_crop_weight: float = 0.2,
@@ -241,6 +242,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_templates = max_templates
         self.template_cutoff_days = template_cutoff_days
         self.max_template_date = max_template_date
+        self.default_template_cutoff_date = default_template_cutoff_date
         self.prefer_monomer_templates = prefer_monomer_templates
         self._has_templates = (self.data_dir / "templates").is_dir()
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
@@ -518,16 +520,23 @@ class TrainingDataset(torch.utils.data.Dataset):
         templates_root = self.data_dir / "monomer_templates"
         record_id_upper = record.id.upper()
 
-        # Effective cutoff = min(max_template_date, record.released - N days)
+        # Effective cutoff = min(max_template_date hard cap, per-record bound).
+        # The per-record bound is ``released - cutoff_days`` when the release date
+        # is known, else the configured global fallback. If neither the hard cap
+        # nor any per-record bound can be established, the filter below is
+        # fail-closed (drops every hit) so a record with an unknown release date
+        # never leaks future-dated templates.
         cutoff: str | None = self.max_template_date
         query_release = record.structure_info.released if record.structure_info else None
+        per_record: str | None = self.default_template_cutoff_date
         if query_release is not None:
             try:
                 d = datetime.date.fromisoformat(query_release) - datetime.timedelta(days=self.template_cutoff_days)
-                query_minus = d.isoformat()
-                cutoff = query_minus if cutoff is None else min(cutoff, query_minus)
+                per_record = d.isoformat()
             except ValueError:
                 pass
+        if per_record is not None:
+            cutoff = per_record if cutoff is None else min(cutoff, per_record)
 
         result: dict[int, list[TemplateFeatures]] = {}
         for chain_info in record.chains:
@@ -546,12 +555,17 @@ class TrainingDataset(torch.utils.data.Dataset):
                 logger.debug("Failed to load monomer template index for %s", chain_info.msa_id)
                 continue
 
-            # Date cutoff (per-record) + drop self-hits
+            # Date cutoff (fail-closed) + drop self-hits. A hit is kept only when
+            # a cutoff exists and the hit's own release date is known and within
+            # it — an unestablished cutoff or an undated hit is dropped, never
+            # leaked.
             filtered = [
                 h
                 for h in hits
                 if h.template_pdb_id.upper() != record_id_upper
-                and (cutoff is None or (h.release_date is not None and h.release_date <= cutoff))
+                and cutoff is not None
+                and h.release_date is not None
+                and h.release_date <= cutoff
             ]
             if not filtered:
                 continue
