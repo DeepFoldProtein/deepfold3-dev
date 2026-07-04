@@ -135,6 +135,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         interface_crop_weight: float = 0.4,
         interface_distance: float = 15.0,
         max_chains: int = 0,
+        atomize_prob: float = 0.0,
+        atomize_source: str = "random",
+        atomize_max_residues: int = 0,
         sampling_rows: list | None = None,
         name: str = "",
         ccd_cache_path: str | Path | None = None,
@@ -161,6 +164,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
         self.max_chains = max_chains
+        # Stochastic atomization (training-only regularizer). Applied after
+        # tokenization and BEFORE cropping so the crop budget accounts for the
+        # per-atom expansion. See ``data/tokenize/atomize.py`` and
+        # ``DataConfig.atomize_*``.
+        self.atomize_prob = float(atomize_prob)
+        self.atomize_source = atomize_source
+        self.atomize_max_residues = int(atomize_max_residues)
         # Pre-compute chain selection for records exceeding max_chains
         # (deterministic per record, no need to recompute each __getitem__).
         self._dropped_chains_cache: dict[str, set[int]] = {}
@@ -326,6 +336,24 @@ class TrainingDataset(torch.utils.data.Dataset):
                 channels = dict(existing.channels)
                 channels[MASK_LOSS_WEIGHT] = arr
                 tokenized = tokenized.with_mask(TokenMask(channels))
+
+        # Stochastic atomization (training regularizer): expand a small random
+        # subset of standard residues into per-atom tokens BEFORE cropping, so
+        # the crop's token budget accounts for the expansion. No-op at
+        # atomize_prob=0 (default). Inference paths never call this.
+        if self.atomize_prob > 0.0:
+            from deepfold3.data.tokenize.atomize import atomize_tokens, select_residues_to_atomize
+
+            atomize_rng = np.random.default_rng()
+            to_atomize = select_residues_to_atomize(
+                tokenized,
+                atomize_rng,
+                prob=self.atomize_prob,
+                source=self.atomize_source,
+                max_residues=self.atomize_max_residues,
+                interface_distance=self.cropper.interface_distance,
+            )
+            tokenized = atomize_tokens(tokenized, to_atomize)
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         timing["tokenize_crop"], _t = time.perf_counter() - _t, time.perf_counter()

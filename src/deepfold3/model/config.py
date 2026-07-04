@@ -1194,6 +1194,25 @@ class DataConfig:
     # featurise (per-chain MSA load + template parse + MSA profile) and cause
     # periodic dataloader stalls. 0 = disabled (keep all records).
     max_total_chains: int = 0
+    # Stochastic atomization (training-only regularizer). With probability
+    # ``atomize_prob`` each *eligible* standard polymer residue is expanded from
+    # a single per-residue token into one token per heavy atom (the same layout
+    # non-standard/modified residues and ligands already use). Inference NEVER
+    # atomizes. This augments the atomized-token code path (which IS exercised
+    # at inference for modified residues / bonded ligands / glycans) and acts as
+    # a mild token-boundary regularizer. Applied BEFORE cropping so the token
+    # budget accounts for the expansion. 0.0 = disabled (default; enable from a
+    # fine-tune stage). See ``data/tokenize/atomize.py``.
+    atomize_prob: float = 0.0
+    # Which residues are eligible for atomization:
+    #   "random"    — every standard polymer residue.
+    #   "interface" — residues within ``interface_distance`` of another chain.
+    #   "region"    — residues whose "region" token-mask channel is ≥ 1 (e.g.
+    #                 CDR labels for Ag-Ab); falls back to none if no region mask.
+    atomize_source: str = "random"
+    # Hard cap on the number of residues atomized per sample (0 = no cap).
+    # Bounds the token-budget blow-up on large interfaces / many-CDR inputs.
+    atomize_max_residues: int = 0
 
 
 @dataclass

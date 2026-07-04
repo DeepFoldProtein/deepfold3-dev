@@ -115,6 +115,25 @@ class Featurizer:
 
         M = self.max_atoms
 
+        # Single-atom polymer tokens: modified/non-standard residues (always) and
+        # stochastically-atomized standard residues (training regularizer). Both
+        # carry ``atom_num == 1`` with a polymer mol_type and are routed through
+        # the ligand-style single-atom path below (ref_pos / gt / rep atom /
+        # frames) instead of the dense-residue path — which fixes the
+        # modified-residue ``ref_pos`` bug (a single-atom token used to receive
+        # the whole residue's reference template) and lets atomized standard
+        # residues keep a valid representative atom (so they stay in the
+        # distogram / confidence masks). Atomized tokens of one residue share a
+        # reference-space uid so their conformer is centered / rotated together.
+        _polymer_mask = np.isin(tokens["mol_type"], (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA))
+        is_atomized = _polymer_mask & (tokens["atom_num"] == 1)
+        atomized_group_first: dict[int, int] = {}
+        if is_atomized.any():
+            _seen_group: dict[tuple[int, int], int] = {}
+            for _i in np.where(is_atomized)[0]:
+                _key = (int(tokens[_i]["asym_id"]), int(tokens[_i]["residue_index"]))
+                atomized_group_first[int(_i)] = _seen_group.setdefault(_key, int(_i))
+
         # ------------------------------------------------------------------
         # Basic token features
         # ------------------------------------------------------------------
@@ -145,8 +164,9 @@ class Featurizer:
         for i, tok in enumerate(tokens):
             mol_type_tok = int(tok["mol_type"])
 
-            if mol_type_tok == const.MOL_NONPOLYMER:
-                # Single atom token: look up CCD residue for ideal positions
+            if mol_type_tok == const.MOL_NONPOLYMER or is_atomized[i]:
+                # Single-atom token (ligand, or modified / atomized polymer
+                # residue): look up the CCD residue for this atom's ideal pos.
                 atom_idx = int(tok["atom_idx"])
                 res_name = _find_res_name(data, atom_idx)
                 if atom_idx < len(data.structure.atoms):
@@ -190,15 +210,20 @@ class Featurizer:
                 else:
                     ref_atom_data = get_ref_atoms("UNK", mol_type_tok, M)
 
-                # ref_space_uid for ligand: first token of the same residue
-                res_info = _find_residue(data, atom_idx)
-                if res_info is not None:
-                    first_atom = int(res_info["atom_idx"])
-                    # Find token index of first atom in this residue
-                    first_tok = _find_token_by_atom_idx(tokens, first_atom)
-                    ref_space_uid[i, :] = first_tok
+                # ref_space_uid groups atoms sharing a reference frame. Atomized
+                # polymer residue → all its atom tokens share one uid (centered /
+                # rotated together). Ligand → first token of the same residue.
+                if is_atomized[i]:
+                    ref_space_uid[i, :] = atomized_group_first.get(i, i)
                 else:
-                    ref_space_uid[i, :] = i
+                    res_info = _find_residue(data, atom_idx)
+                    if res_info is not None:
+                        first_atom = int(res_info["atom_idx"])
+                        # Find token index of first atom in this residue
+                        first_tok = _find_token_by_atom_idx(tokens, first_atom)
+                        ref_space_uid[i, :] = first_tok
+                    else:
+                        ref_space_uid[i, :] = i
             else:
                 atom_idx = int(tok["atom_idx"])
                 atom_num = int(tok["atom_num"])
@@ -320,6 +345,15 @@ class Featurizer:
         for i, tok in enumerate(tokens):
             mt = int(tok["mol_type"])
             rt = int(tok["res_type"])
+            if is_atomized[i]:
+                # Atomized polymer atom: its single atom (slot 0) is the
+                # representative, so the token stays in the distogram /
+                # confidence masks. No local rigid frame (single atom) →
+                # frames_mask stays False (drops it from PAE frames, like a
+                # lone ion). Nearest-neighbour frames could be added later.
+                token_to_rep_atom[i] = 0
+                rep_atom_present[i] = bool(ref_mask[i, 0])
+                continue
             if mt == const.MOL_PROTEIN:
                 if rt == 7:  # GLY
                     token_to_rep_atom[i] = 1  # CA
@@ -421,6 +455,9 @@ class Featurizer:
             ]
         is_protein_np = tokens["mol_type"] == const.MOL_PROTEIN
         fape_atom_mask_np[~is_protein_np, 4] = False
+        # Atomized single-atom tokens have no local frame — drop all FAPE slots
+        # so they don't project a garbage (0,1,2) frame onto other tokens.
+        fape_atom_mask_np[is_atomized] = False
         # Drop rep slot when it duplicates a frame slot (same token + atom).
         rep_tok = fape_token_index_np[:, 3]
         rep_atom_slot = fape_atom_index_np[:, 3]
@@ -553,8 +590,8 @@ class Featurizer:
                 atom_num = int(tok["atom_num"])
                 mol_type_tok = int(tok["mol_type"])
 
-                if mol_type_tok == const.MOL_NONPOLYMER:
-                    # Ligand: single atom per token
+                if mol_type_tok == const.MOL_NONPOLYMER or is_atomized[i]:
+                    # Single atom per token (ligand / atomized polymer atom)
                     if atom_idx < len(data.structure.atoms):
                         atom = data.structure.atoms[atom_idx]
                         if bool(atom["is_present"]):
@@ -579,6 +616,7 @@ class Featurizer:
             # Cheap to compute (microseconds for 12gs); the loss applies the
             # best-of-two swap per (sample, pair).
             from deepfold3.data.symmetry.atom_perms import (
+                compute_atomized_residue_token_swap_pairs,
                 compute_ligand_token_swap_pairs,
                 compute_token_atom_symmetry_pairs,
             )
@@ -591,6 +629,18 @@ class Featurizer:
             # token_b) pairs at slot M=0. Empty when no cache is loaded or
             # the crop has no symmetric ligands.
             ligand_swap_pairs = compute_ligand_token_swap_pairs(data.structure, tokens, self.ligand_perm_cache)
+            # Atomized standard residues (training regularizer) whose side chain
+            # is symmetric (ASP/GLU/ARG/…) also need inter-token swaps — same
+            # (token_a, token_b) slot-0 layout as ligands, so concatenate them
+            # into ``ligand_swap_pairs`` (loss applies both via one path).
+            if is_atomized.any():
+                atomized_swaps = compute_atomized_residue_token_swap_pairs(data.structure, tokens)
+                if len(atomized_swaps) > 0:
+                    ligand_swap_pairs = (
+                        np.concatenate([ligand_swap_pairs, atomized_swaps], axis=0)
+                        if len(ligand_swap_pairs) > 0
+                        else atomized_swaps
+                    )
             result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
             # Bond features for bond violation loss (AF3 §5.3: polymer–ligand

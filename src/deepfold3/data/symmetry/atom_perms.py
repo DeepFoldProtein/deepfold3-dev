@@ -231,6 +231,68 @@ def compute_ligand_token_swap_pairs(
     return np.asarray(pair_list, dtype=np.int32)
 
 
+def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> np.ndarray:
+    """Inter-token symmetry swaps for *atomized* standard residues.
+
+    When a standard residue is stochastically atomized (``atom_num == 1`` per
+    token, polymer ``mol_type``), its side-chain symmetric atoms — e.g. ASP
+    OD1/OD2 — become separate tokens, so the swap is **inter-token** (like
+    ligands) rather than the ``(token, M_a, M_b)`` intra-token form that
+    :func:`compute_token_atom_symmetry_pairs` emits.
+
+    The swap source is the curated :data:`RESIDUE_ATOM_SYMMETRY_GROUPS` table
+    (AF2/AF3 §4.3), **not** the CCD automorphism cache — the latter misses HIS
+    (ND1/CD2 are different elements) and would add spurious O↔OXT swaps that are
+    invalid in a polymer context. Residue identity is read from ``res_type``
+    (atomization keeps the real amino-acid identity), and atom tokens are grouped
+    back into residues by ``(asym_id, residue_index)``.
+
+    Returns a ``[N_pairs, 2]`` int32 array of token-index pairs, applied at slot
+    0 by :func:`apply_ligand_token_swap` (identical layout to ligand swaps).
+    """
+    import numpy as np
+
+    from deepfold3.data import const
+
+    atom_names_bytes = structure.atoms["name"]
+
+    # Group atomized polymer tokens by (asym_id, residue_index).
+    groups: dict[tuple[int, int], list[int]] = {}
+    for i, tok in enumerate(tokens):
+        if int(tok["mol_type"]) == const.MOL_NONPOLYMER:
+            continue
+        if int(tok["atom_num"]) != 1:
+            continue  # not atomized (full residue token) — handled elsewhere
+        key = (int(tok["asym_id"]), int(tok["residue_index"]))
+        groups.setdefault(key, []).append(i)
+
+    pair_list: list[tuple[int, int]] = []
+    for token_indices in groups.values():
+        if len(token_indices) < 2:
+            continue
+        res_type = int(tokens[token_indices[0]]["res_type"])
+        res_name = const.RES_TYPE_INDEX_TO_NAME.get(res_type)
+        if res_name is None or res_name not in RESIDUE_ATOM_SYMMETRY_GROUPS:
+            continue
+        # Local atom-name → token index within this residue.
+        name_to_tok: dict[str, int] = {}
+        for ti in token_indices:
+            a_idx = int(tokens[ti]["atom_idx"])
+            name = atom_names_bytes[a_idx].decode("ascii", errors="replace").strip()
+            name_to_tok[name] = ti
+        atom_names = list(name_to_tok.keys())
+        for a, b in build_residue_symmetry_pairs(res_name, atom_names):
+            # build_residue_symmetry_pairs returns indices into ``atom_names``;
+            # map back through the name to the token index.
+            tok_a = name_to_tok[atom_names[a]]
+            tok_b = name_to_tok[atom_names[b]]
+            pair_list.append((tok_a, tok_b))
+
+    if not pair_list:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.asarray(pair_list, dtype=np.int32)
+
+
 def apply_ligand_token_swap(
     pred_pos: torch.Tensor,  # [..., N, M, 3]
     gt_pos: torch.Tensor,  # [..., N, M, 3]
