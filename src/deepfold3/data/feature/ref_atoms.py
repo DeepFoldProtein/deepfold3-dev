@@ -162,10 +162,19 @@ def get_ref_atoms(
     charge = np.zeros(max_atoms, dtype=np.float32)
     atom_name_chars = np.zeros((max_atoms, 4), dtype=np.int64)
 
-    # OXT is a C-terminal artifact in the CCD monomer definition.
-    # For polymer residues, skip it (only C-terminal should have OXT, and
-    # the model predicts positions without requiring OXT in reference atoms).
-    is_polymer = mol_type in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA)
+    # Leaving atoms present in the CCD monomer definition but removed when a
+    # residue is polymerised: OXT (protein C-terminus) and OP3 / O3P (nucleic
+    # 5'-phosphate). Only the terminal residue would carry them and the model
+    # predicts positions without them, so they are dropped from every reference
+    # conformer — matching AF3 §2.5.4 / OF3 ``MOLECULE_TYPE_TO_LEAVING_ATOMS``.
+    # (Previously only OXT was filtered, so every nucleotide reference kept a
+    # phantom OP3 at slot 0 that no internal-nucleotide GT atom maps to.)
+    if mol_type == const.MOL_PROTEIN:
+        leaving_atoms: tuple[str, ...] = ("OXT",)
+    elif mol_type in (const.MOL_RNA, const.MOL_DNA):
+        leaving_atoms = ("OP3", "O3P")
+    else:
+        leaving_atoms = ()
 
     if atom_names_override is not None:
         # Single atom with given name
@@ -188,13 +197,14 @@ def get_ref_atoms(
                 if len(etkdg_pos) == len(atom_names):
                     ccd_positions = etkdg_pos
 
-            # Filter OXT for polymer residues
-            if is_polymer and "OXT" in atom_names:
-                idx = atom_names.index("OXT")
-                atom_names = atom_names[:idx] + atom_names[idx + 1 :]
-                ccd_positions = np.delete(ccd_positions, idx, axis=0)
-                ccd_elements = ccd_elements[:idx] + ccd_elements[idx + 1 :]
-                ccd_charges = ccd_charges[:idx] + ccd_charges[idx + 1 :]
+            # Drop polymer leaving atoms (OXT / OP3 / O3P) from the reference.
+            for lv in leaving_atoms:
+                if lv in atom_names:
+                    idx = atom_names.index(lv)
+                    atom_names = atom_names[:idx] + atom_names[idx + 1 :]
+                    ccd_positions = np.delete(ccd_positions, idx, axis=0)
+                    ccd_elements = ccd_elements[:idx] + ccd_elements[idx + 1 :]
+                    ccd_charges = ccd_charges[:idx] + ccd_charges[idx + 1 :]
         else:
             # Fall back to hardcoded ideal coordinates from const.py
             canonical_names = const.REF_ATOMS.get(res_name, const.REF_ATOMS.get("UNK", ["CA"]))
