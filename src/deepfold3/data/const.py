@@ -105,6 +105,9 @@ _NONSTANDARD_TO_STANDARD: dict[str, str] = {
     "6MA": "A",
     "7MG": "G",
     "OMG": "G",
+    # Unknown DNA → shared unknown-nucleic class (index 30). Without this,
+    # ``res_name_to_type("DN")`` falls through to 20 (protein UNK).
+    "DN": "N",
 }
 
 # 1-letter protein code → 3-letter code
