@@ -323,13 +323,14 @@ class Featurizer:
         # ------------------------------------------------------------------
         msa_tensor, msa_mask_tensor, del_matrix_tensor = self._build_msa_features(data, tokens, N, rng)
 
-        # Profile: per-position residue frequency [N, 31]
-        # Includes gap class (index 21) to encode coverage, matching AF3.
-        profile = self._compute_profile(msa_tensor, msa_mask_tensor, N)
-
-        # Deletion mean: raw mean of deletion counts per position [N]
-        # AF3 stores the raw mean (arctan transform is applied separately in create_msa_feat).
-        deletion_mean = del_matrix_tensor.float().mean(dim=0)  # [N]
+        # Profile [N, 31] + raw deletion_mean [N], computed PER CHAIN from each
+        # chain's own unpaired MSA (AF3 §2.8 / OF3). Deriving them from the
+        # assembled complex MSA instead would let a shallow chain's cross-chain
+        # gap padding (mask=True, padded to the deepest chain's depth) dilute
+        # its profile toward all-gap and its deletion_mean toward 0 — silent
+        # corruption for MSA-depth-imbalanced heteromers. Includes the gap class
+        # (index 21) to encode coverage, matching AF3.
+        profile, deletion_mean = self._compute_msa_profile_deletion_mean(data, tokens, N)
 
         # MSA pre-crop (training): replace the variable-depth pool with a FIXED
         # [n_msa_crops * msa_crop_size, N] stack of per-recycle crops. profile +
@@ -1032,33 +1033,61 @@ class Featurizer:
             torch.from_numpy(out_deln),
         )
 
-    def _compute_profile(
+    def _compute_msa_profile_deletion_mean(
         self,
-        msa: torch.Tensor,  # [S, N] int
-        msa_mask: torch.Tensor,  # [S, N] bool
+        data: Tokenized,
+        tokens: np.ndarray,
         N: int,
-    ) -> torch.Tensor:
-        """Compute per-position residue frequency profile [N, 31].
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-chain MSA profile ``[N, 31]`` and raw deletion_mean ``[N]``.
 
-        ``profile[n, c] = (Σ_s mask[s,n]·1[msa[s,n]==c]) / Σ_s mask[s,n]`` —
-        the masked per-position class frequency over the first 31 residue
-        classes (0–30).
+        For each chain, the masked per-column class frequency
+        ``profile[col, c] = Σ_s mask·1[msa==c] / Σ_s mask`` (classes 0–30) and
+        the raw ``mean_s deletion`` are computed from that chain's own unpaired
+        MSA — over its *full* depth (before the 16384-row cap, AF3 §2.8) — then
+        scattered to the chain's token columns via ``msa_col_idx``. Ligand /
+        column-less tokens keep a zero profile and zero deletion_mean.
 
-        Accumulates directly into a flat ``[N·31]`` histogram with a single
-        ``index_add_`` rather than materialising the ``[S, N, 31]`` one-hot
-        tensor: the old formulation allocated ~780 MB at S=16384 and dominated
-        featurisation for deep MSAs (~380 ms vs ~28 ms here). Bit-identical
-        result, ~14× faster, ~30× less memory.
+        Computing per chain (rather than over the assembled complex MSA) is what
+        prevents a shallow chain's cross-chain gap padding from diluting these
+        statistics; see the call site.
         """
         C = const.RES_TYPE_COUNT
-        msa_clipped = msa.long().clamp(0, C - 1)  # [S, N]
-        m = msa_mask.to(torch.float32)  # [S, N]
-        # Flat bin index per entry: position n contributes to row n, class c.
-        flat_idx = (torch.arange(N, device=msa.device) * C).unsqueeze(0) + msa_clipped  # [S, N]
-        acc = torch.zeros(N * C, dtype=torch.float32, device=msa.device)
-        acc.index_add_(0, flat_idx.reshape(-1), m.reshape(-1))  # Σ_s mask at (n, msa[s,n])
-        denom = m.sum(0).clamp(min=1.0).unsqueeze(-1)  # [N, 1]
-        return acc.view(N, C) / denom  # [N, 31]
+        profile = np.zeros((N, C), dtype=np.float32)
+        deletion_mean = np.zeros(N, dtype=np.float32)
+
+        for asym_id, msa in data.unpaired_msa.items():
+            aid = int(asym_id)
+            pos = np.where(tokens["asym_id"] == aid)[0]
+            n_rows, n_cols = msa.sequences.shape
+            if len(pos) == 0 or n_rows == 0 or n_cols == 0:
+                continue
+            if data.msa_col_idx is not None:
+                cols = data.msa_col_idx[pos]
+                valid = cols >= 0  # ligand / column-less tokens are -1
+                tok_pos, msa_cols = pos[valid], cols[valid]
+            else:
+                tok_pos, msa_cols = pos, np.arange(len(pos))
+            keep = msa_cols < n_cols
+            tok_pos, msa_cols = tok_pos[keep], msa_cols[keep]
+            if len(tok_pos) == 0:
+                continue
+
+            seqs = np.clip(msa.sequences, 0, C - 1).astype(np.int64)  # [S, n_cols]
+            m = msa.mask.astype(np.float32)  # [S, n_cols]
+            # Flat [n_cols·C] histogram via one scatter-add (matches the old
+            # _compute_profile accumulation, per chain).
+            flat_idx = (np.arange(n_cols) * C)[None, :] + seqs  # [S, n_cols]
+            acc = np.zeros(n_cols * C, dtype=np.float32)
+            np.add.at(acc, flat_idx.reshape(-1), m.reshape(-1))
+            denom = np.clip(m.sum(axis=0), 1.0, None)[:, None]  # [n_cols, 1]
+            col_profile = acc.reshape(n_cols, C) / denom
+            col_del_mean = msa.deletion_matrix.astype(np.float32).mean(axis=0)  # [n_cols]
+
+            profile[tok_pos] = col_profile[msa_cols]
+            deletion_mean[tok_pos] = col_del_mean[msa_cols]
+
+        return torch.from_numpy(profile), torch.from_numpy(deletion_mean)
 
     @staticmethod
     def _build_bond_features(
