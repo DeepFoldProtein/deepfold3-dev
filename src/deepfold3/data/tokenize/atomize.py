@@ -17,8 +17,13 @@ changes — and re-derives ``bonds`` (existing token bonds remapped to the split
 atom tokens + intra-residue connectivity synthesised from the CCD).
 
 Decisions (see project memory ``project_stochastic_atomization_design``):
-  * ``res_type`` keeps the real amino-acid / nucleotide identity (NOT UNK), so
-    MSA / relative-position / symmetry all key off the true residue.
+  * ``res_type`` is set to UNK (20), exactly matching the tokenizer's
+    modified-residue per-atom tokens — so an atomized standard residue is
+    indistinguishable from the atomized-token distribution the model already
+    sees at inference (modified residues / bonded ligands / glycans), which is
+    the whole point of the regularizer. MSA / relative-position key off
+    ``msa_col_idx`` / ``residue_index`` (not ``res_type``); side-chain symmetry
+    reads the real residue name from the structure, not the token.
   * atomized tokens are detected downstream by ``atom_num == 1 & polymer`` — the
     featurizer routes them through its single-atom path.
   * ``residue_index`` is shared across a residue's atom tokens (drives the
@@ -36,6 +41,9 @@ from deepfold3.data.masking import MASK_REGION, TokenMask
 from deepfold3.data.types import TOKEN_BOND_DTYPE, TOKEN_DTYPE, Tokenized
 
 _POLYMER = (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA)
+# Atom tokens carry res_type=UNK, matching the tokenizer's modified-residue
+# per-atom tokens (tokenizer.py: ``res_type = 20`` for non-standard residues).
+_UNK_RES_TYPE = const.RES_TYPE_ORDER["UNK"]
 
 
 @lru_cache(maxsize=512)
@@ -157,37 +165,31 @@ def atomize_tokens(
             old_to_new_single[i] = new_idx
             continue
 
-        # Split this residue into one token per heavy atom.
+        # Split this residue into one token per heavy atom. Each atom token
+        # INHERITS every field of the source residue token — residue_index /
+        # mol_type / asym_id / entity_id / sym_id carry over — and overrides
+        # only the atom-specific fields (res_type→UNK, atom_idx, atom_num,
+        # center) so the token is identical in shape to the tokenizer's
+        # modified-residue per-atom tokens. Built by TOKEN_DTYPE.names so it
+        # stays correct if the dtype is reordered or a field is added; a
+        # positional tuple would silently misplace values on a reorder, and only
+        # the atomized path (the non-atomized branch above is already
+        # name-based) would corrupt. token_idx is renumbered globally below.
         a_start = int(tok["atom_idx"])
         a_num = int(tok["atom_num"])
-        res_id = int(tok["residue_index"])
-        res_type = int(tok["res_type"])  # KEEP real identity
-        mol_type = int(tok["mol_type"])
-        asym_id = int(tok["asym_id"])
-        entity_id = int(tok["entity_id"])
-        sym_id = int(tok["sym_id"])
         for j in range(a_num):
             gi = a_start + j
             atom = atoms[gi]
-            new_idx = len(new_rows)
-            new_rows.append(
-                (
-                    new_idx,  # token_idx (final, sequential)
-                    res_id,  # residue_index — SHARED across the residue's atoms
-                    res_type,
-                    mol_type,
-                    asym_id,
-                    entity_id,
-                    sym_id,
-                    gi,  # atom_idx (global)
-                    1,  # atom_num
-                    float(atom["x"]),
-                    float(atom["y"]),
-                    float(atom["z"]),
-                )
-            )
+            row = {name: tok[name] for name in TOKEN_DTYPE.names}
+            row["res_type"] = _UNK_RES_TYPE  # match modified-residue atom tokens
+            row["atom_idx"] = gi
+            row["atom_num"] = 1
+            row["center_x"] = float(atom["x"])
+            row["center_y"] = float(atom["y"])
+            row["center_z"] = float(atom["z"])
+            new_rows.append(tuple(row[name] for name in TOKEN_DTYPE.names))
             source_map.append(i)
-            old_atom_to_new[(i, j)] = new_idx
+            old_atom_to_new[(i, j)] = len(new_rows) - 1
 
     new_tokens = np.array(new_rows, dtype=TOKEN_DTYPE)
     # token_idx is authoritative-sequential; overwrite (non-atomized rows kept

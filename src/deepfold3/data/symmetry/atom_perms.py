@@ -231,6 +231,20 @@ def compute_ligand_token_swap_pairs(
     return np.asarray(pair_list, dtype=np.int32)
 
 
+def _residue_name_for_atom(structure, atom_idx: int) -> str | None:
+    """Name of the residue whose atom range contains ``atom_idx`` (else None).
+
+    Linear scan over ``structure.residues`` — used only for the few atomized
+    residues per sample, so O(residues) per group is fine. Robust to a
+    partially-cropped residue (the surviving atoms still fall in the range).
+    """
+    for res in structure.residues:
+        start = int(res["atom_idx"])
+        if start <= atom_idx < start + int(res["atom_num"]):
+            return res["name"].decode("ascii", errors="replace").strip()
+    return None
+
+
 def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> np.ndarray:
     """Inter-token symmetry swaps for *atomized* standard residues.
 
@@ -243,9 +257,10 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
     The swap source is the curated :data:`RESIDUE_ATOM_SYMMETRY_GROUPS` table
     (AF2/AF3 §4.3), **not** the CCD automorphism cache — the latter misses HIS
     (ND1/CD2 are different elements) and would add spurious O↔OXT swaps that are
-    invalid in a polymer context. Residue identity is read from ``res_type``
-    (atomization keeps the real amino-acid identity), and atom tokens are grouped
-    back into residues by ``(asym_id, residue_index)``.
+    invalid in a polymer context. Residue identity is read from the **structure**
+    (atomized tokens carry ``res_type == UNK``, matching modified residues, so
+    the token no longer names the residue), and atom tokens are grouped back
+    into residues by ``(asym_id, residue_index)``.
 
     Returns a ``[N_pairs, 2]`` int32 array of token-index pairs, applied at slot
     0 by :func:`apply_ligand_token_swap` (identical layout to ligand swaps).
@@ -270,8 +285,10 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
     for token_indices in groups.values():
         if len(token_indices) < 2:
             continue
-        res_type = int(tokens[token_indices[0]]["res_type"])
-        res_name = const.RES_TYPE_INDEX_TO_NAME.get(res_type)
+        # Real residue identity from the structure — the token res_type is UNK
+        # for atomized tokens (matching modified residues), so read the name via
+        # the group's first atom index.
+        res_name = _residue_name_for_atom(structure, int(tokens[token_indices[0]]["atom_idx"]))
         if res_name is None or res_name not in RESIDUE_ATOM_SYMMETRY_GROUPS:
             continue
         # Local atom-name → token index within this residue.

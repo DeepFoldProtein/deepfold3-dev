@@ -346,7 +346,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         if self.atomize_prob > 0.0:
             from deepfold3.data.tokenize.atomize import atomize_tokens, select_residues_to_atomize
 
-            atomize_rng = np.random.default_rng()
+            # Seed from the worker's torch seed (reseeded per-epoch by the
+            # DataLoader) mixed with the sample idx: still varies per sample and
+            # per epoch, but is reproducible under a fixed global seed
+            # (determinism mode). A bare ``default_rng()`` draws OS entropy and
+            # bypasses torch/global seeding entirely, so it can never be
+            # reproduced. (Crop is independently stochastic and unseeded here.)
+            atomize_rng = np.random.default_rng([torch.initial_seed(), idx])
             to_atomize = select_residues_to_atomize(
                 tokenized,
                 atomize_rng,

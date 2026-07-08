@@ -5,7 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from deepfold3.data.crop.cropper import Cropper
+from deepfold3.data.crop.cropper import (
+    Cropper,
+    compute_chain_msa_cols,
+    remap_msa_col_idx_to_slice,
+)
 from deepfold3.data.types import (
     ATOM_DTYPE,
     BOND_DTYPE,
@@ -441,3 +445,57 @@ def test_reindex_invariants():
         an = int(t["atom_num"])
         assert 0 <= a0 <= len(out.structure.atoms)
         assert a0 + an <= len(out.structure.atoms)
+
+
+# ---------------------------------------------------------------------------
+# MSA remap CONTENT invariant (BUG-A regression)
+#
+# test_reindex_invariants above only checks MSA *shapes*. The bug that shipped
+# and was fixed (commit 6e75dbe) was a content mis-alignment: after a crop
+# slices each chain's MSA to its surviving columns and re-indexes them 0..k-1,
+# the token->column map (``msa_col_idx``) still held the ORIGINAL columns, so
+# the featurizer gathered stale / dropped columns. These tests pin the value
+# invariant a shape check can never catch.
+# ---------------------------------------------------------------------------
+
+
+def test_remap_msa_col_idx_gather_invariant():
+    """Sliced-MSA gather at the remapped index == full-MSA gather at the
+    original column, for every token — the exact invariant BUG A violated.
+
+    Uses non-contiguous, non-zero-start columns per chain (the spatial /
+    interface crop case): impossible to get right by positional slicing.
+    """
+    asym = np.array([0, 0, 0, 1, 1])
+    # Surviving tokens reference these ORIGINAL chain-local columns (out of
+    # order, not starting at 0). Chain 0 full width 10, chain 1 full width 6.
+    msa_col_idx = np.array([5, 2, 8, 3, 0])
+    # Distinct value per (chain, column) so any mis-gather is detectable.
+    full = {
+        0: np.array([[100 + c for c in range(10)]]),
+        1: np.array([[200 + c for c in range(6)]]),
+    }
+
+    chain_cols = compute_chain_msa_cols(asym, msa_col_idx)
+    # What _load_msa_sliced / the cropper's _crop_msa_dict do: slice each
+    # chain's MSA to its surviving columns, implicitly re-indexed 0..k-1.
+    sliced = {aid: full[aid][:, cols] for aid, cols in chain_cols.items()}
+    remapped = remap_msa_col_idx_to_slice(asym, msa_col_idx, chain_cols)
+
+    assert (remapped >= 0).all()  # no valid token collapsed to a gap
+    for tok in range(len(asym)):
+        aid = int(asym[tok])
+        got = sliced[aid][0, remapped[tok]]
+        want = full[aid][0, msa_col_idx[tok]]
+        assert got == want, f"token {tok}: sliced gather {got} != full gather {want}"
+
+
+def test_remap_msa_col_idx_preserves_ligand_gaps():
+    """Ligand / column-less tokens (-1) stay -1 through the remap."""
+    asym = np.array([0, 0, 0])
+    msa_col_idx = np.array([7, -1, 3])
+    chain_cols = compute_chain_msa_cols(asym, msa_col_idx)
+    remapped = remap_msa_col_idx_to_slice(asym, msa_col_idx, chain_cols)
+    assert int(remapped[1]) == -1
+    # 7 and 3 rebase to their rank within the sorted-by-first-occurrence cols.
+    assert int(remapped[0]) == 0 and int(remapped[2]) == 1

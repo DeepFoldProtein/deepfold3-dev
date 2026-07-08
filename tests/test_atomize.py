@@ -85,8 +85,10 @@ def test_atomize_expands_selected_residue():
     assert len(out.tokens) == 9
     asp = out.tokens[1:]
     assert np.all(asp["atom_num"] == 1)
-    # res_type keeps the real ASP identity (not UNK)
-    assert np.all(asp["res_type"] == const.RES_TYPE_ORDER["ASP"])
+    # res_type is UNK for atom tokens — identical to the tokenizer's
+    # modified-residue per-atom tokens (the atomized-token distribution the
+    # model sees at inference). Real identity lives in the structure/residues.
+    assert np.all(asp["res_type"] == const.RES_TYPE_ORDER["UNK"])
     # residue_index shared across the residue's atom tokens
     assert len(np.unique(asp["residue_index"])) == 1
     assert asp[0]["residue_index"] == 2
@@ -327,3 +329,54 @@ def test_full_pipeline_atomize_then_crop_then_featurize():
     feats = Featurizer(max_msa_seqs=8).process(cropped, training=True, random_rot=True)
     assert feats["res_type"].shape[0] == len(cropped.tokens)
     assert bool(feats["seq_mask"].all())
+
+
+# ---------------------------------------------------------------------------
+# Inter-token symmetry emitter CONTENT + crop-safety
+# ---------------------------------------------------------------------------
+
+
+def _tok_index_by_atom_name(tokenized, name: str) -> int:
+    """Token index whose single atom is called ``name`` (atomized residue)."""
+    atom_names = tokenized.structure.atoms["name"]
+    for i, t in enumerate(tokenized.tokens):
+        if atom_names[int(t["atom_idx"])].decode("ascii", errors="replace").strip() == name:
+            return i
+    raise AssertionError(f"no token for atom {name!r}")
+
+
+def test_atomized_symmetry_pairs_asp_od1_od2():
+    """Atomizing ASP emits exactly the OD1<->OD2 inter-token swap pair.
+
+    The atom tokens carry res_type=UNK, so the emitter must recover the ASP
+    identity from the structure (via residue_index / atom range) to key the
+    symmetry table — this pins that structure-based lookup.
+    """
+    tok = _tokenize(_build_ala_asp_structure())
+    out = atomize_tokens(tok, np.array([1]))  # atomize ASP
+    # Precondition: atom tokens are UNK (real identity only in the structure).
+    assert np.all(out.tokens[1:]["res_type"] == const.RES_TYPE_ORDER["UNK"])
+    pairs = compute_atomized_residue_token_swap_pairs(out.structure, out.tokens)
+
+    assert len(pairs) == 1
+    od1 = _tok_index_by_atom_name(out, "OD1")
+    od2 = _tok_index_by_atom_name(out, "OD2")
+    assert {int(pairs[0][0]), int(pairs[0][1])} == {od1, od2}
+
+
+def test_atomized_symmetry_pair_dropped_when_crop_removes_one_atom():
+    """Crop-safety: if a crop keeps only one of the two symmetric atoms, no
+    swap is emitted (the pair would be invalid). Guards the name-based grouping
+    against a partial residue after a spatial/interface crop."""
+    tok = _tokenize(_build_ala_asp_structure())
+    out = atomize_tokens(tok, np.array([1]))
+    od2 = _tok_index_by_atom_name(out, "OD2")
+    kept = np.array([i for i in range(len(out.tokens)) if i != od2])
+
+    cropped = Cropper()._reindex(out, kept)
+    # OD1 survived, OD2 dropped.
+    assert any(
+        cropped.structure.atoms[int(t["atom_idx"])]["name"].decode().strip() == "OD1" for t in cropped.tokens
+    )
+    pairs = compute_atomized_residue_token_swap_pairs(cropped.structure, cropped.tokens)
+    assert len(pairs) == 0
