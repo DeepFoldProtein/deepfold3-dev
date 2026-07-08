@@ -62,6 +62,13 @@ class Tokenizer:
                     atom_idx = int(res["atom_idx"])
                     atom_num = int(res["atom_num"])
                     is_standard = bool(res["is_standard"])
+                    # Standard nucleotides (res_type 22-30) are always a single
+                    # token, regardless of a stored ``is_standard`` that may be
+                    # stale from a prepare run whose ``res_type < 20`` rule wrongly
+                    # atomised them — so existing NPZs are fixed without a
+                    # re-prepare. (New prepares store the corrected flag.)
+                    if 22 <= res_type <= 30:
+                        is_standard = True
 
                     if is_standard:
                         # Standard residue: one token per residue

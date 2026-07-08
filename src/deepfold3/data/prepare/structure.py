@@ -461,7 +461,11 @@ def process_mmcif(
                 except Exception:
                     res_id = res_offset + len(chain_res_data)
 
-                is_standard = mol_type != const.MOL_NONPOLYMER and res_type < 20
+                # Standard (single-token) polymer residues are the canonical
+                # amino acids (0-19) and nucleotides (22-30, incl. unknown N/DN).
+                # Only res_type 20 (UNK protein / modified residue) is atomized.
+                # NB: ``res_type < 20`` wrongly atomised every nucleotide (22-29).
+                is_standard = mol_type != const.MOL_NONPOLYMER and res_type != 20
                 res_atom_start = atom_offset + len(chain_atom_data)
                 res_atom_count = 0
 

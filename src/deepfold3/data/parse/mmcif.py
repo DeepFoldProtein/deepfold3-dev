@@ -150,7 +150,10 @@ def parse_mmcif(path: Path) -> Structure:
                 except Exception:
                     res_id = res_idx_global
 
-                is_standard = mol_type != const.MOL_NONPOLYMER and res_type < 20
+                # Canonical amino acids (0-19) and nucleotides (22-30) are
+                # single-token; only res_type 20 (UNK / modified) is atomized.
+                # ``res_type < 20`` wrongly atomised every nucleotide (22-29).
+                is_standard = mol_type != const.MOL_NONPOLYMER and res_type != 20
                 res_atom_start = atom_idx_global
                 res_atom_count = 0
 
