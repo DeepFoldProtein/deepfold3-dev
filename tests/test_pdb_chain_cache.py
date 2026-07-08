@@ -101,10 +101,11 @@ def test_template_features_from_chain_shapes():
     assert feats.aatype.shape == (10,)
     assert feats.atom_positions.shape == (10, A, 3)
     assert feats.atom_mask.shape == (10, A)
-    # mapped positions carry the chain's aatype; the rest stay unset (20)
+    # mapped positions carry the chain's aatype; uncovered positions read as GAP
+    # (AF3 §2.8 — a template that doesn't cover a query position is a gap, not UNK).
     for qi in (0, 1, 2):
         assert feats.aatype[qi] == ct.lookup[qi][0]
-    assert feats.aatype[5] == 20
+    assert feats.aatype[5] == const.MSA_GAP
 
 
 def test_compute_chain_msa_cols_basic():
