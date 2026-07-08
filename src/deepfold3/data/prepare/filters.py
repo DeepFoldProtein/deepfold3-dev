@@ -211,6 +211,7 @@ def filter_consecutive_ca(
     residues = _get_chain_residues(structure, chain_info)
 
     ca_coords = []
+    ca_res_ids = []
     for res in residues:
         if not res["is_present"] or res["atom_num"] == 0:
             continue
@@ -222,14 +223,21 @@ def filter_consecutive_ca(
             name = atom["name"].decode("ascii", errors="replace").strip()
             if name == "CA":
                 ca_coords.append([float(atom["x"]), float(atom["y"]), float(atom["z"])])
+                ca_res_ids.append(int(res["res_id"]))
                 break
 
     if len(ca_coords) < 2:
         return True
 
     ca = np.array(ca_coords)
+    res_ids = np.array(ca_res_ids)
     dists = np.linalg.norm(ca[1:] - ca[:-1], axis=1)
-    return bool(np.all(dists <= max_dist))
+    # Only test *sequence-adjacent* residues (res_id diff == 1). A large CA-CA
+    # gap across an unmodeled internal loop (e.g. res 50 → 101) is a missing
+    # region, not broken backbone geometry, and must not reject the chain
+    # (AF3 §2.5.4 masks numbering discontinuities).
+    adjacent = (res_ids[1:] - res_ids[:-1]) == 1
+    return bool(np.all(dists[adjacent] <= max_dist))
 
 
 def filter_clashing_chains(
@@ -240,11 +248,11 @@ def filter_clashing_chains(
 ) -> set[int]:
     """Find chains with >freq_threshold fraction of atoms clashing.
 
-    Uses AF3 §2.5.4 iterative 3-level tie-breaking: at each step remove
-    the single worst chain by (1) clash fraction, (2) number of clashing
-    atoms, (3) chain_id (highest removed first).  Clash counts are
-    recomputed after each removal since removing one chain can reduce
-    clashes for its neighbours.
+    A chain clashes when more than ``freq_threshold`` of its atoms lie within
+    ``dist_threshold`` of another chain (AF3 §2.5.4). At each step the single
+    worst chain is removed, tie-broken by (1) clash fraction, (2) fewer total
+    atoms, (3) larger chain_id. Clashing-atom sets are recomputed after each
+    removal since removing one chain can un-clash its neighbours.
 
     Returns set of chain_ids (asym_id) that should be marked invalid.
     """
@@ -275,24 +283,30 @@ def filter_clashing_chains(
     while True:
         chain_ids = sorted(remaining)
 
-        # Compute per-chain clash counts against all other remaining chains
-        clash_count: dict[int, int] = {cid: 0 for cid in chain_ids}
+        # AF3 §2.5.4: a chain clashes if >30% of ITS atoms lie within 1.7 Å of
+        # another chain. Count the *unique clashing atoms* of each chain (a true
+        # ≤1 fraction), not the number of within-threshold atom pairs — the pair
+        # count double-counts (added to both chains) and routinely exceeds the
+        # atom count, over-removing chains.
+        clash_atoms: dict[int, set[int]] = {cid: set() for cid in chain_ids}
         for i, c1 in enumerate(chain_ids):
             for c2 in chain_ids[i + 1 :]:
-                n_clash = trees[c1].count_neighbors(trees[c2], dist_threshold)
-                if n_clash > 0:
-                    clash_count[c1] += n_clash
-                    clash_count[c2] += n_clash
+                nbr = trees[c1].query_ball_tree(trees[c2], dist_threshold)
+                for a1, matches in enumerate(nbr):
+                    if matches:
+                        clash_atoms[c1].add(a1)
+                        clash_atoms[c2].update(matches)
 
-        # Find the single worst chain above threshold
+        # Remove the single worst chain above threshold. Tie-break (AF3): higher
+        # clash fraction, then fewer total atoms, then larger chain id.
         worst_cid = None
-        worst_key = (-1.0, -1, -1)  # (clash_frac, clash_count, chain_id)
+        worst_key = (-1.0, 0, -1)  # (clash_frac, -atom_count, chain_id)
         for cid in chain_ids:
             if atom_count[cid] == 0:
                 continue
-            frac = clash_count[cid] / atom_count[cid]
+            frac = len(clash_atoms[cid]) / atom_count[cid]
             if frac > freq_threshold:
-                key = (frac, clash_count[cid], cid)
+                key = (frac, -atom_count[cid], cid)
                 if key > worst_key:
                     worst_key = key
                     worst_cid = cid
