@@ -406,19 +406,30 @@ class Featurizer:
                 if ref_mask[i, 0] and ref_mask[i, 1] and ref_mask[i, 2]:
                     frames_mask_np[i] = True
             elif mt in (const.MOL_RNA, const.MOL_DNA):
-                c1_idx = c3_idx = c4_idx = -1
+                # Representative (pseudo-beta) atom for the distogram + confidence
+                # rep-atom geometry is the base atom C4 (purine A/G/DA/DG) or C2
+                # (pyrimidine C/U/DC/DT), per AF3 §4.4 (``RES_DISTO_ATOM``) —
+                # NOT the ribose C1'. C1' remains the token *center* / frame
+                # atom. Unknown nucleic (N/DN) and missing-base cases fall back
+                # to C1'.
+                disto_name = const.RES_DISTO_ATOM.get(const.RES_TYPE_INDEX_TO_NAME.get(rt, ""), "C1'")
+                rep_idx = c1_idx = c3_idx = c4_idx = -1
                 for j in range(M):
                     if not ref_mask[i, j]:
                         continue
                     name = decode_atom_name_chars(ref_atom_name_chars[i, j])
+                    if name == disto_name:
+                        rep_idx = j
                     if name == "C1'":
                         c1_idx = j
                     elif name == "C3'":
                         c3_idx = j
                     elif name == "C4'":
                         c4_idx = j
-                if c1_idx >= 0:
-                    token_to_rep_atom[i] = c1_idx
+                if rep_idx < 0:
+                    rep_idx = c1_idx  # base atom missing → ribose C1'
+                if rep_idx >= 0:
+                    token_to_rep_atom[i] = rep_idx
                     rep_atom_present[i] = True
                 if c1_idx >= 0 and c3_idx >= 0 and c4_idx >= 0:
                     frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
