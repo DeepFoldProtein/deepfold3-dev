@@ -1312,7 +1312,11 @@ class Featurizer:
             }
 
         T = len(templates)
-        t_aatype = np.zeros((T, N), dtype=np.int64)
+        # Uncovered query positions get the GAP class (AF3 §2.8 / OF3), not ALA
+        # (np.zeros): the template aatype stream is not coverage-masked, so an
+        # ALA-everywhere one-hot would leak a spurious residue signal into
+        # embed_aatype_row/col over off-template regions.
+        t_aatype = np.full((T, N), const.MSA_GAP, dtype=np.int64)
         t_pb = np.zeros((T, N, 3), dtype=np.float32)
         t_pb_mask = np.zeros((T, N), dtype=bool)
         t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)
@@ -1352,7 +1356,10 @@ class Featurizer:
                 "template_backbone_frame": torch.zeros((0, N, 3, 3)),
                 "template_backbone_mask": torch.zeros((0, N), dtype=torch.bool),
             }
-        t_aatype = np.zeros((T, N), dtype=np.int64)
+        # Uncovered query positions → GAP class (see _build_single_chain_...):
+        # chains without a template, and crop-away positions, must read as gap,
+        # not ALA, in the (un-coverage-masked) template aatype stream.
+        t_aatype = np.full((T, N), const.MSA_GAP, dtype=np.int64)
         t_pb = np.zeros((T, N, 3), dtype=np.float32)
         t_pb_mask = np.zeros((T, N), dtype=bool)
         t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)

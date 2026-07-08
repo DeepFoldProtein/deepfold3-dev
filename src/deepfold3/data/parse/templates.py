@@ -71,10 +71,12 @@ def empty_template_features(num_tokens: int, max_atoms: int = const.MAX_ATOMS_PE
         max_atoms: Maximum atoms per token.
 
     Returns:
-        TemplateFeatures with all-zero arrays and UNK aatype.
+        TemplateFeatures with all-zero arrays and GAP aatype.
     """
     return TemplateFeatures(
-        aatype=np.full(num_tokens, 20, dtype=np.int64),  # UNK
+        # Uncovered query positions are GAP (index 21), not UNK/ALA — AF3 §2.8
+        # feeds the gap class where a template does not cover the query.
+        aatype=np.full(num_tokens, const.MSA_GAP, dtype=np.int64),
         atom_positions=np.zeros((num_tokens, max_atoms, 3), dtype=np.float32),
         atom_mask=np.zeros((num_tokens, max_atoms), dtype=bool),
     )
@@ -247,7 +249,10 @@ def extract_from_index_pairs(
     for residue in target_chain:
         residue_lookup[residue.label_seq] = _extract_residue_features(residue, max_atoms)
 
-    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    # GAP (21) at query positions the alignment does not cover; matched
+    # positions below overwrite with the actual template residue type (an UNK
+    # template residue stays 20, distinct from an uncovered gap).
+    aatype_arr = np.full(query_length, const.MSA_GAP, dtype=np.int64)
     pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
     mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
 
@@ -580,7 +585,10 @@ def _fill_template_features(
     Returns:
         ``(TemplateFeatures, matched_count)``.
     """
-    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    # GAP (21) at query positions the alignment does not cover; matched
+    # positions below overwrite with the actual template residue type (an UNK
+    # template residue stays 20, distinct from an uncovered gap).
+    aatype_arr = np.full(query_length, const.MSA_GAP, dtype=np.int64)
     pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
     mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
 
@@ -698,8 +706,8 @@ def extract_template_features(
     for residue in target_chain:
         residue_lookup[residue.seqid.num] = _extract_residue_features(residue, max_atoms)
 
-    # Align to query tokens
-    aatype_arr = np.full(N, 20, dtype=np.int64)
+    # Align to query tokens — uncovered positions read as GAP (21), not UNK.
+    aatype_arr = np.full(N, const.MSA_GAP, dtype=np.int64)
     pos_arr = np.zeros((N, max_atoms, 3), dtype=np.float32)
     mask_arr = np.zeros((N, max_atoms), dtype=bool)
 
@@ -1031,7 +1039,10 @@ def extract_template_features_from_structure(
         residue_lookup[ri] = (aatype, positions, mask)
 
     # Align to query tokens
-    aatype_arr = np.full(query_length, 20, dtype=np.int64)
+    # GAP (21) at query positions the alignment does not cover; matched
+    # positions below overwrite with the actual template residue type (an UNK
+    # template residue stays 20, distinct from an uncovered gap).
+    aatype_arr = np.full(query_length, const.MSA_GAP, dtype=np.int64)
     pos_arr = np.zeros((query_length, max_atoms, 3), dtype=np.float32)
     mask_arr = np.zeros((query_length, max_atoms), dtype=bool)
 
