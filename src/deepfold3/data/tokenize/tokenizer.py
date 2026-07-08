@@ -18,6 +18,17 @@ from deepfold3.data.types import (
 )
 
 
+def _token_row(**fields: object) -> tuple:
+    """Build a ``TOKEN_DTYPE`` row from named fields, ordered by the dtype.
+
+    Name-based (matching :mod:`deepfold3.data.tokenize.atomize`) so a positional
+    tuple can never silently misplace values when a ``TOKEN_DTYPE`` field is
+    added or reordered — a missing field raises ``KeyError`` instead. Every field
+    must be supplied.
+    """
+    return tuple(fields[name] for name in TOKEN_DTYPE.names)
+
+
 class Tokenizer:
     """Convert an Input (structure + MSA) to a Tokenized object."""
 
@@ -81,20 +92,20 @@ class Tokenizer:
                         )
 
                         tokens_list.append(
-                            (
-                                token_idx,
-                                res_id,
-                                res_type,
-                                mol_type,
-                                asym_id,
-                                entity_id,
-                                sym_id,
-                                atom_idx,
-                                atom_num,
-                                cx,
-                                cy,
-                                cz,
-                                0,  # atom_in_res: whole-residue token
+                            _token_row(
+                                token_idx=token_idx,
+                                residue_index=res_id,
+                                res_type=res_type,
+                                mol_type=mol_type,
+                                asym_id=asym_id,
+                                entity_id=entity_id,
+                                sym_id=sym_id,
+                                atom_idx=atom_idx,
+                                atom_num=atom_num,
+                                center_x=cx,
+                                center_y=cy,
+                                center_z=cz,
+                                atom_in_res=0,  # whole-residue token
                             )
                         )
                         msa_col_list.append(chain_msa_col)
@@ -115,20 +126,20 @@ class Tokenizer:
                             cz = float(atom["z"])
 
                             tokens_list.append(
-                                (
-                                    token_idx,
-                                    res_id,
-                                    20,  # res_type = UNK for per-atom tokens
-                                    mol_type,
-                                    asym_id,
-                                    entity_id,
-                                    sym_id,
-                                    global_ai,
-                                    1,  # atom_num = 1
-                                    cx,
-                                    cy,
-                                    cz,
-                                    ai,  # atom_in_res: local atom index within residue
+                                _token_row(
+                                    token_idx=token_idx,
+                                    residue_index=res_id,
+                                    res_type=20,  # UNK for per-atom tokens
+                                    mol_type=mol_type,
+                                    asym_id=asym_id,
+                                    entity_id=entity_id,
+                                    sym_id=sym_id,
+                                    atom_idx=global_ai,
+                                    atom_num=1,
+                                    center_x=cx,
+                                    center_y=cy,
+                                    center_z=cz,
+                                    atom_in_res=ai,  # local atom index within residue
                                 )
                             )
                             msa_col_list.append(chain_msa_col)
@@ -155,20 +166,20 @@ class Tokenizer:
                         local_atom_idx = global_ai - ligand_atom_start
 
                         tokens_list.append(
-                            (
-                                token_idx,
-                                res_id,  # residue_index = res_id (shared across the ligand's atoms)
-                                20,  # res_type = UNK
-                                mol_type,
-                                asym_id,
-                                entity_id,
-                                sym_id,
-                                global_ai,  # atom_idx = global atom index
-                                1,  # atom_num = 1 (each token = 1 atom)
-                                cx,
-                                cy,
-                                cz,
-                                local_atom_idx,  # atom_in_res: CCD-local atom index (keys ligand symmetry)
+                            _token_row(
+                                token_idx=token_idx,
+                                residue_index=res_id,  # shared across the ligand's atoms
+                                res_type=20,  # UNK
+                                mol_type=mol_type,
+                                asym_id=asym_id,
+                                entity_id=entity_id,
+                                sym_id=sym_id,
+                                atom_idx=global_ai,  # global atom index
+                                atom_num=1,  # each token = 1 atom
+                                center_x=cx,
+                                center_y=cy,
+                                center_z=cz,
+                                atom_in_res=local_atom_idx,  # CCD-local atom index (keys ligand symmetry)
                             )
                         )
                         msa_col_list.append(-1)  # ligands have no MSA column
