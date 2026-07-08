@@ -89,6 +89,7 @@ DIM1_KEYS = {
     "deletion_matrix",
     "template_aatype",
     "template_pseudo_beta",
+    "template_ca",
     "template_pseudo_beta_mask",
     "template_backbone_frame",
     "template_backbone_mask",
