@@ -315,6 +315,10 @@ class DeepFold3(nn.Module):
             template_kwargs["template_pseudo_beta_mask"] = features["template_pseudo_beta_mask"].float()
             template_kwargs["template_backbone_frame"] = features["template_backbone_frame"].float()
             template_kwargs["template_backbone_mask"] = features["template_backbone_mask"].float()
+            # CA positions for the unit-vector feature (AF3 §2.8); absent on
+            # legacy cached features → embedding falls back to pseudo-beta.
+            if "template_ca" in features:
+                template_kwargs["template_ca"] = features["template_ca"].float()
 
         # Bond matrix: polymer-ligand and ligand-ligand covalent bonds [..., N, N, 1]
         bond_matrix = features.get("bond_matrix")

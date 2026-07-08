@@ -1284,6 +1284,7 @@ class Featurizer:
         if not templates and not template_feats_per_chain:
             return {
                 "template_aatype": torch.zeros(0, N, dtype=torch.int64),
+                "template_ca": torch.zeros(0, N, 3),
                 "template_pseudo_beta": torch.zeros(0, N, 3),
                 "template_pseudo_beta_mask": torch.zeros(0, N, dtype=torch.bool),
                 "template_backbone_frame": torch.zeros(0, N, 3, 3),
@@ -1305,6 +1306,7 @@ class Featurizer:
         if not templates:
             return {
                 "template_aatype": torch.zeros(0, N, dtype=torch.int64),
+                "template_ca": torch.zeros(0, N, 3),
                 "template_pseudo_beta": torch.zeros(0, N, 3),
                 "template_pseudo_beta_mask": torch.zeros(0, N, dtype=torch.bool),
                 "template_backbone_frame": torch.zeros(0, N, 3, 3),
@@ -1321,14 +1323,18 @@ class Featurizer:
         t_pb_mask = np.zeros((T, N), dtype=bool)
         t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)
         t_frame_mask = np.zeros((T, N), dtype=bool)
+        t_ca = np.zeros((T, N, 3), dtype=np.float32)  # CA = unit-vector frame origin
 
         for t, tmpl in enumerate(templates):
             L = min(len(tmpl.aatype), N)
             # Single-chain (no crop): template row k → query position k, contiguous.
             idx = np.arange(L)
-            self._fill_template_slot(t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, idx, idx)
+            self._fill_template_slot(
+                t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, idx, idx, ca_row=t_ca[t]
+            )
 
         return {
+            "template_ca": torch.from_numpy(t_ca),
             "template_aatype": torch.from_numpy(t_aatype),
             "template_pseudo_beta": torch.from_numpy(t_pb),
             "template_pseudo_beta_mask": torch.from_numpy(t_pb_mask),
@@ -1351,6 +1357,7 @@ class Featurizer:
         if T == 0:
             return {
                 "template_aatype": torch.zeros((0, N), dtype=torch.long),
+                "template_ca": torch.zeros((0, N, 3)),
                 "template_pseudo_beta": torch.zeros((0, N, 3)),
                 "template_pseudo_beta_mask": torch.zeros((0, N), dtype=torch.bool),
                 "template_backbone_frame": torch.zeros((0, N, 3, 3)),
@@ -1364,6 +1371,7 @@ class Featurizer:
         t_pb_mask = np.zeros((T, N), dtype=bool)
         t_frame = np.zeros((T, N, 3, 3), dtype=np.float32)
         t_frame_mask = np.zeros((T, N), dtype=bool)
+        t_ca = np.zeros((T, N, 3), dtype=np.float32)  # CA = unit-vector frame origin
 
         col_idx = None if template_col_idx is None else np.asarray(template_col_idx)
         for asym_id, chain_templates in template_feats_per_chain.items():
@@ -1389,10 +1397,11 @@ class Featurizer:
                 if len(dst_pos) == 0:
                     continue
                 self._fill_template_slot(
-                    t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, dst_pos, src_idx
+                    t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, dst_pos, src_idx, ca_row=t_ca[t]
                 )
 
         return {
+            "template_ca": torch.from_numpy(t_ca),
             "template_aatype": torch.from_numpy(t_aatype),
             "template_pseudo_beta": torch.from_numpy(t_pb),
             "template_pseudo_beta_mask": torch.from_numpy(t_pb_mask),
@@ -1410,6 +1419,7 @@ class Featurizer:
         tmpl: TemplateFeatures,
         dst_pos: np.ndarray,
         src_idx: np.ndarray,
+        ca_row: np.ndarray | None = None,
     ) -> None:
         """Scatter template rows ``src_idx`` onto query token positions ``dst_pos``.
 
@@ -1432,6 +1442,11 @@ class Featurizer:
         n_pos = pos[:, 0, :]
         ca = pos[:, 1, :]
         c_pos = pos[:, 2, :]
+
+        # CA is the frame origin; the template unit-vector feature is the
+        # displacement of CA (not CB) in each residue's local frame (AF3 §2.8).
+        if ca_row is not None:
+            ca_row[dst_pos] = ca
 
         fm = mask[:, 0] & mask[:, 1] & mask[:, 2]
         frame_mask_row[dst_pos] = fm
@@ -1479,6 +1494,7 @@ class Featurizer:
             "profile": torch.zeros(0, const.RES_TYPE_COUNT),
             "deletion_mean": torch.zeros(0),
             "template_aatype": torch.zeros(0, 0, dtype=torch.int64),
+            "template_ca": torch.zeros(0, 0, 3),
             "template_pseudo_beta": torch.zeros(0, 0, 3),
             "template_pseudo_beta_mask": torch.zeros(0, 0, dtype=torch.bool),
             "template_backbone_frame": torch.zeros(0, 0, 3, 3),

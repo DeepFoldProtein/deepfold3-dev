@@ -443,6 +443,7 @@ class Evoformer(nn.Module):
         template_backbone_frame: torch.Tensor | None = None,  # [T, N, 3, 3]
         template_backbone_mask: torch.Tensor | None = None,  # [T, N]
         multichain_mask: torch.Tensor | None = None,  # [N, N]
+        template_ca: torch.Tensor | None = None,  # [T, N, 3]
     ) -> dict[str, torch.Tensor]:
         # Build initial pair activations (negative indices work for both batched/unbatched)
         left = self.left_single(target_feat).unsqueeze(-2)  # [..., N, 1, c_pair]
@@ -480,6 +481,7 @@ class Evoformer(nn.Module):
                     template_backbone_mask=template_backbone_mask,
                     pair_mask=pair_mask,
                     multichain_mask=multichain_mask,
+                    template_ca=template_ca,
                 )
 
         # Initial single activations

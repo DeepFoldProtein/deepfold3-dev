@@ -322,6 +322,7 @@ class SingleTemplateEmbedding(nn.Module):
         template_backbone_mask: torch.Tensor,
         pair_mask: torch.Tensor,
         multichain_mask: torch.Tensor | None = None,
+        template_ca: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Embed a single template.
 
@@ -375,10 +376,15 @@ class SingleTemplateEmbedding(nn.Module):
             pb_mask_2d = pb_mask_2d * multichain_mask
         dgram = dgram * pb_mask_2d.unsqueeze(-1)
 
-        # Unit vectors from backbone frames (ellipsis einsum, batch-friendly)
+        # Unit vectors from backbone frames (ellipsis einsum, batch-friendly).
+        # AF3 §2.8: the template unit-vector feature is the displacement of the
+        # CA atom (not the CB pseudo-beta) in each residue's local frame. Use
+        # the CA positions carried by ``template_ca``; fall back to pseudo-beta
+        # only for legacy callers that don't supply it.
+        unit_vec_points = template_ca if template_ca is not None else template_pseudo_beta
         unit_x, unit_y, unit_z, bb_mask_2d = _unit_vectors_from_frames(
             template_backbone_frame,
-            template_pseudo_beta,  # Use CA positions as translations; backbone frames use CA as origin
+            unit_vec_points,
             template_backbone_mask,
         )
         if multichain_mask is not None:
@@ -448,6 +454,7 @@ class TemplateEmbedding(nn.Module):
         template_backbone_mask: torch.Tensor,
         pair_mask: torch.Tensor,
         multichain_mask: torch.Tensor | None = None,
+        template_ca: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Embed T templates and produce pair-space embedding.
 
@@ -495,12 +502,14 @@ class TemplateEmbedding(nn.Module):
                 pbm_t = template_pseudo_beta_mask[:, t]
                 bbf_t = template_backbone_frame[:, t]
                 bbm_t = template_backbone_mask[:, t]
+                ca_t = template_ca[:, t] if template_ca is not None else None
             else:
                 aatype_t = template_aatype[t]
                 pb_t = template_pseudo_beta[t]
                 pbm_t = template_pseudo_beta_mask[t]
                 bbf_t = template_backbone_frame[t]
                 bbm_t = template_backbone_mask[t]
+                ca_t = template_ca[t] if template_ca is not None else None
 
             emb = self.single_template_emb(
                 query_pair=query_pair,
@@ -511,6 +520,7 @@ class TemplateEmbedding(nn.Module):
                 template_backbone_mask=bbm_t,
                 pair_mask=pair_mask,
                 multichain_mask=multichain_mask,
+                template_ca=ca_t,
             )
             summed = summed + emb
 
