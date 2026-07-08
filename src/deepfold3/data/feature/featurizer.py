@@ -132,12 +132,20 @@ class Featurizer:
         # reference-space uid so their conformer is centered / rotated together.
         _polymer_mask = np.isin(tokens["mol_type"], (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA))
         is_atomized = _polymer_mask & (tokens["atom_num"] == 1)
-        atomized_group_first: dict[int, int] = {}
-        if is_atomized.any():
+        # Per-residue reference-space grouping for EVERY single-atom token —
+        # atomized polymer residues AND ligand atoms alike. All atom tokens of
+        # one residue share a ref_space_uid so their conformer is centered /
+        # rotated as a unit. Keyed by (asym_id, residue_index): now that ligand
+        # atom tokens carry residue_index = res_id (as atomized residues always
+        # have), the one grouping serves both, replacing the ligand-specific
+        # structure lookup. First surviving token of a group is its uid.
+        single_atom_group_first: dict[int, int] = {}
+        _single_atom = tokens["atom_num"] == 1
+        if _single_atom.any():
             _seen_group: dict[tuple[int, int], int] = {}
-            for _i in np.where(is_atomized)[0]:
+            for _i in np.where(_single_atom)[0]:
                 _key = (int(tokens[_i]["asym_id"]), int(tokens[_i]["residue_index"]))
-                atomized_group_first[int(_i)] = _seen_group.setdefault(_key, int(_i))
+                single_atom_group_first[int(_i)] = _seen_group.setdefault(_key, int(_i))
 
         # ------------------------------------------------------------------
         # Basic token features
@@ -234,20 +242,10 @@ class Featurizer:
                 else:
                     ref_atom_data = get_ref_atoms("UNK", mol_type_tok, M)
 
-                # ref_space_uid groups atoms sharing a reference frame. Atomized
-                # polymer residue → all its atom tokens share one uid (centered /
-                # rotated together). Ligand → first token of the same residue.
-                if is_atomized[i]:
-                    ref_space_uid[i, :] = atomized_group_first.get(i, i)
-                else:
-                    res_info = _find_residue(data, atom_idx)
-                    if res_info is not None:
-                        first_atom = int(res_info["atom_idx"])
-                        # Find token index of first atom in this residue
-                        first_tok = _find_token_by_atom_idx(tokens, first_atom)
-                        ref_space_uid[i, :] = first_tok
-                    else:
-                        ref_space_uid[i, :] = i
+                # ref_space_uid groups atoms sharing a reference frame: every
+                # single-atom token of one residue (atomized polymer OR ligand)
+                # shares one uid so its conformer is centered / rotated together.
+                ref_space_uid[i, :] = single_atom_group_first.get(i, i)
             else:
                 atom_idx = int(tok["atom_idx"])
                 atom_num = int(tok["atom_num"])
@@ -1548,19 +1546,3 @@ def _find_res_name(data: Tokenized, atom_idx: int) -> str:
     return "UNK"
 
 
-def _find_residue(data: Tokenized, atom_idx: int) -> np.void | None:
-    """Find the residue record containing the given atom index."""
-    for res in data.structure.residues:
-        start = int(res["atom_idx"])
-        end = start + int(res["atom_num"])
-        if start <= atom_idx < end:
-            return res
-    return None
-
-
-def _find_token_by_atom_idx(tokens: np.ndarray, atom_idx: int) -> int:
-    """Find the token index that starts at the given atom index."""
-    matches = np.where(tokens["atom_idx"] == atom_idx)[0]
-    if len(matches) > 0:
-        return int(matches[0])
-    return 0
