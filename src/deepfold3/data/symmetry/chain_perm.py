@@ -8,18 +8,20 @@ such perfectly-correct predictions and inject spurious gradients into
 the training loop.
 
 This module computes the optimal ground-truth-to-prediction chain
-assignment following AlphaFold 3 §4.2: chains are grouped by
-``entity_id``, and each group is permuted independently by solving a
-linear assignment problem on a per-pair distance cost matrix. Entity
-groups of size 1 are passed through unchanged.
+assignment following AlphaFold-Multimer / AlphaFold 3 §4.2: chains are
+grouped by ``entity_id``, a single global rigid frame is fitted from an
+anchor chain, and each predicted chain is greedily matched to the
+spatially nearest ground-truth chain of the same entity. A per-pair
+Kabsch cost is *not* used — it removes the global rotation and so scores
+only internal shape (near-identical, hence ambiguous, for symmetric
+copies), which cannot resolve the spatial correspondence the permutation
+exists for. Entity groups of size 1 are passed through unchanged.
 
-Heteromers (e.g. A2B2) are handled naturally because the assignment is
-solved one entity at a time — the permutation over the A copies is
-independent of the permutation over the B copies.
+Heteromers (e.g. A2B2) are handled naturally: the anchor's global frame
+plus the per-entity greedy match assign each entity's copies independently.
 
 Clean-room implementation; no third-party permutation code is
-reproduced. Only :func:`scipy.optimize.linear_sum_assignment` and
-standard numpy/torch primitives are used.
+reproduced. Only standard numpy/torch primitives are used.
 """
 
 from __future__ import annotations
@@ -34,20 +36,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _kabsch_rmsd_np(p: np.ndarray, q: np.ndarray) -> float:
-    """Squared RMSD of ``q`` optimally aligned onto ``p`` (Kabsch 1976).
+def _kabsch_transform_np(p: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rigid transform ``(R, t)`` mapping ``p`` onto ``q`` (Kabsch 1976).
 
-    Both inputs are ``[K, 3]`` float64 numpy arrays with matching row
-    order — the ``k``-th row of ``q`` is the correspondence of the
-    ``k``-th row of ``p``. Uses the textbook Kabsch SVD construction
-    with a determinant-sign flip to guard against reflections. Returns
-    the **squared** RMSD as a Python float.
-
-    Implemented with numpy rather than torch because LAPACK's 3×3 SVD
-    has much lower per-call overhead via numpy than through
-    ``torch.linalg.svd`` (~10× faster for a 200-atom pair), which
-    matters because this is called inside a nested Python loop over
-    chain pairs.
+    Both inputs are ``[K, 3]`` float64 arrays with matching row order.
+    Returns ``R`` ``[3, 3]`` and ``t`` ``[3]`` such that ``R @ p_k + t ≈ q_k``,
+    with a determinant-sign flip guarding against reflections. numpy (not
+    torch) because LAPACK's 3×3 SVD has far lower per-call overhead.
     """
     import numpy as np
 
@@ -56,19 +51,115 @@ def _kabsch_rmsd_np(p: np.ndarray, q: np.ndarray) -> float:
     p_c = p - p_mean
     q_c = q - q_mean
 
-    # 3×3 cross-covariance. Order chosen so R maps q_c → p_c.
-    h = q_c.T @ p_c
+    # 3×3 cross-covariance; order chosen so R maps p_c → q_c.
+    h = p_c.T @ q_c
     u, _s, vt = np.linalg.svd(h)
-
-    # Reflection fix: ensure det(R) = +1.
     d = np.sign(np.linalg.det(vt.T @ u.T))
-    diag = np.eye(3, dtype=p.dtype)
+    diag = np.eye(3, dtype=np.float64)
     diag[2, 2] = d
     r = vt.T @ diag @ u.T
+    t = q_mean - r @ p_mean
+    return r, t
 
-    q_aligned = q_c @ r.T + p_mean
-    diff = p - q_aligned
-    return float((diff * diff).sum() / p.shape[0])
+
+def _anchor_greedy_assignment(
+    order: list[int],
+    ent_of: dict[int, int],
+    cen_pred: dict[int, np.ndarray | None],
+    cen_gt: dict[int, np.ndarray | None],
+    at_pred: dict[int, np.ndarray],
+    at_gt: dict[int, np.ndarray],
+    res: dict[int, np.ndarray],
+) -> dict[int, int]:
+    """AF-Multimer anchor-based greedy chain assignment (AF3 §4.2).
+
+    Unlike a per-pair Kabsch cost (which removes the global rotation and so
+    scores *internal shape* similarity — near-zero and ambiguous for
+    identical chains), this fits a **single global frame** from an anchor
+    chain and then greedily matches each predicted chain to the spatially
+    nearest ground-truth chain of the same entity. Spatial position — the
+    thing the permutation must resolve — drives the assignment.
+
+    Algorithm:
+      1. Anchor entity = the entity with the fewest resolved chains (least
+         ambiguous), tie-broken toward more resolved atoms; ``gt_anchor`` =
+         its most-resolved chain.
+      2. For each predicted chain of the anchor entity (the candidate global
+         frames), Kabsch-align it onto ``gt_anchor``, apply that transform to
+         every predicted chain centroid, and greedily assign each predicted
+         chain to the nearest unused GT chain of its entity.
+      3. Keep the frame with the smallest total matched squared distance.
+
+    Per-chain inputs are keyed by chain id: ``cen_*`` are resolved-atom
+    centroids (``None`` if fully unresolved); ``at_*`` / ``res`` are the
+    per-chain resolved-atom coordinate blocks + boolean mask used only for
+    the anchor Kabsch (chains of one entity share their atom layout, so the
+    anchor pair's blocks line up row-for-row).
+    """
+    from collections import defaultdict
+
+    import numpy as np
+
+    assignment = {a: a for a in order}
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for a in order:
+        groups[ent_of[a]].append(a)
+    if not any(len(v) > 1 for v in groups.values()):
+        return assignment  # no symmetric copies → nothing to permute
+
+    resolved_chains = [a for a in order if cen_pred.get(a) is not None and cen_gt.get(a) is not None]
+    if len(resolved_chains) < 2:
+        return assignment
+
+    ent_res: dict[int, list[int]] = defaultdict(list)
+    for a in resolved_chains:
+        ent_res[ent_of[a]].append(a)
+    natoms = {a: int(res[a].sum()) for a in resolved_chains}
+
+    anchor_entity = min(
+        ent_res.keys(),
+        key=lambda e: (len(ent_res[e]), -max(natoms[a] for a in ent_res[e])),
+    )
+    gt_anchor = max(ent_res[anchor_entity], key=lambda a: natoms[a])
+    # Candidate global frames: predicted chains of the anchor entity whose
+    # atom layout matches gt_anchor's (row-for-row Kabsch correspondence).
+    candidates = [a for a in ent_res[anchor_entity] if res[a].shape[0] == res[gt_anchor].shape[0]]
+    if not candidates:
+        return assignment
+
+    best: dict[int, int] | None = None
+    best_score = np.inf
+    for pa in candidates:
+        both = res[pa] & res[gt_anchor]
+        if int(both.sum()) < 3:
+            continue
+        r_mat, t_vec = _kabsch_transform_np(at_pred[pa][both], at_gt[gt_anchor][both])
+        trial = {a: a for a in order}
+        score = 0.0
+        for chs in groups.values():
+            gt_avail = [c for c in chs if cen_gt.get(c) is not None]
+            used: set[int] = set()
+            for pc in [c for c in chs if cen_pred.get(c) is not None]:
+                pt = r_mat @ cen_pred[pc] + t_vec
+                best_d: float | None = None
+                best_g: int | None = None
+                for gc in gt_avail:
+                    if gc in used:
+                        continue
+                    d = float(((pt - cen_gt[gc]) ** 2).sum())
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_g = gc
+                if best_g is not None:
+                    used.add(best_g)
+                    trial[pc] = best_g
+                    score += best_d
+        if score < best_score:
+            best_score = score
+            best = trial
+
+    return best if best is not None else assignment
 
 
 def compute_chain_permutation(
@@ -79,23 +170,15 @@ def compute_chain_permutation(
 ) -> dict[int, int]:
     """Find the optimal pred-to-GT chain mapping for a multimer.
 
-    Chains are grouped by ``entity_id``. For each entity group with
-    more than one copy, an ``N×N`` cost matrix is built where
-    ``cost[i, j]`` is the squared per-atom RMSD of GT chain ``j``
-    optimally aligned (Kabsch 1976) onto pred chain ``i`` over the
-    resolved heavy atoms. Pairs whose chain lengths differ (should not
-    happen when ``entity_id`` is derived from the sequence, but handled
-    defensively) are masked to ``+inf``. The optimal assignment is then
-    obtained from :func:`scipy.optimize.linear_sum_assignment`.
-
-    The Kabsch-aligned RMSD cost (AlphaFold 3 §4.2) is necessary for
-    symmetric oligomers (C4, D2, ...) whose chain centroids coincide
-    near the symmetry axis: a centroid-distance surrogate collapses to
-    a near-zero, nearly-constant matrix and the Hungarian solver
-    returns an arbitrary assignment. Fitting a per-pair rotation lets
-    the cost distinguish chains that differ only by rotation. Pairs
-    with fewer than three resolved atoms (where Kabsch is degenerate)
-    or where the SVD fails fall back to the squared centroid distance.
+    Flat atom-layout adapter around :func:`_anchor_greedy_assignment`
+    (AF-Multimer / AF3 §4.2): chains are grouped by ``entity_id``, a
+    single global rigid frame is fitted from an anchor chain, and each
+    predicted chain is greedily matched to the spatially nearest GT chain
+    of the same entity over resolved heavy atoms. This resolves the
+    spatial correspondence between symmetric copies — which a
+    rotation-invariant per-pair Kabsch cost cannot, since it collapses to
+    a near-constant matrix for identical chains and yields an arbitrary
+    assignment.
 
     Parameters
     ----------
@@ -121,116 +204,38 @@ def compute_chain_permutation(
     """
     import numpy as np
     import torch
-    from scipy.optimize import linear_sum_assignment
-
-    assignment: dict[int, int] = {}
 
     if len(chains) == 0:
-        return assignment
+        return {}
 
-    # Default: identity (caller can rely on every pred asym_id being present).
-    for row in chains:
-        assignment[int(row["asym_id"])] = int(row["asym_id"])
-
-    # Group by entity_id.
-    entity_ids = np.asarray(chains["entity_id"])
-    unique_entities = np.unique(entity_ids)
+    order: list[int] = [int(r["asym_id"]) for r in chains]
+    ent_of: dict[int, int] = {int(r["asym_id"]): int(r["entity_id"]) for r in chains}
+    cen_pred: dict[int, np.ndarray | None] = {}
+    cen_gt: dict[int, np.ndarray | None] = {}
+    at_pred: dict[int, np.ndarray] = {}
+    at_gt: dict[int, np.ndarray] = {}
+    res: dict[int, np.ndarray] = {}
 
     with torch.no_grad():
-        for entity_id in unique_entities:
-            group_mask = entity_ids == entity_id
-            group_rows = chains[group_mask]
-            n = len(group_rows)
-            if n <= 1:
+        for row in chains:
+            a = int(row["asym_id"])
+            start = int(row["atom_idx"])
+            num = int(row["atom_num"])
+            end = start + num
+            m = gt_mask[start:end].detach().cpu().numpy().astype(bool) if num > 0 else np.zeros(0, dtype=bool)
+            if num == 0 or not m.any():
+                cen_pred[a] = None
+                cen_gt[a] = None
                 continue
+            pf = pred_coords[start:end].detach().cpu().numpy().astype(np.float64, copy=False)
+            gf = gt_coords[start:end].detach().cpu().numpy().astype(np.float64, copy=False)
+            at_pred[a] = pf
+            at_gt[a] = gf
+            res[a] = m
+            cen_pred[a] = pf[m].mean(axis=0)
+            cen_gt[a] = gf[m].mean(axis=0)
 
-            asym_ids = [int(r["asym_id"]) for r in group_rows]
-            atom_starts = [int(r["atom_idx"]) for r in group_rows]
-            atom_nums = [int(r["atom_num"]) for r in group_rows]
-
-            # Pre-extract per-chain resolved pred/GT atom blocks.
-            pred_blocks: list[torch.Tensor | None] = []
-            gt_blocks: list[torch.Tensor | None] = []
-            pred_centroids: list[torch.Tensor | None] = []
-            gt_centroids: list[torch.Tensor | None] = []
-            for start, num in zip(atom_starts, atom_nums, strict=True):
-                end = start + num
-                m = gt_mask[start:end]
-                if num == 0 or not bool(m.any()):
-                    pred_blocks.append(None)
-                    gt_blocks.append(None)
-                    pred_centroids.append(None)
-                    gt_centroids.append(None)
-                    continue
-                p_block = pred_coords[start:end][m]
-                g_block = gt_coords[start:end][m]
-                pred_blocks.append(p_block)
-                gt_blocks.append(g_block)
-                pred_centroids.append(p_block.mean(dim=0))
-                gt_centroids.append(g_block.mean(dim=0))
-
-            inf = float("inf")
-            cost = np.full((n, n), inf, dtype=np.float64)
-            for i in range(n):
-                if pred_blocks[i] is None:
-                    continue
-                for j in range(n):
-                    if gt_blocks[j] is None:
-                        continue
-                    # Defensive length check — same entity should imply same
-                    # length, but we drop mismatches rather than crash.
-                    if atom_nums[i] != atom_nums[j]:
-                        continue
-                    p_block = pred_blocks[i]
-                    g_block = gt_blocks[j]
-                    # Kabsch needs matching correspondences: resolved-atom
-                    # sets must also agree. If not, fall back to centroid.
-                    if p_block.shape[0] != g_block.shape[0]:
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-                        continue
-                    if p_block.shape[0] < 3:
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-                        continue
-                    try:
-                        p_np = p_block.detach().cpu().numpy().astype(np.float64, copy=False)
-                        g_np = g_block.detach().cpu().numpy().astype(np.float64, copy=False)
-                        cost[i, j] = _kabsch_rmsd_np(p_np, g_np)
-                    except Exception as exc:  # pragma: no cover - SVD failure is rare
-                        logger.debug("chain_perm: Kabsch fallback i=%d j=%d: %s", i, j, exc)
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-
-            if not np.isfinite(cost).any():
-                # Entire group is unresolved — fall back to identity.
-                logger.debug(
-                    "chain_perm: entity_id=%s has no resolvable pairs; using identity mapping",
-                    entity_id,
-                )
-                continue
-
-            # Permute only chains resolved on BOTH sides; unresolved chains stay
-            # identity. Running Hungarian over the full matrix could assign a
-            # resolved pred chain onto an empty GT column (big-penalty filled)
-            # while that column's own unresolved row keeps identity, mapping two
-            # pred chains to one GT chain (non-bijective). Restrict to the
-            # resolved set to keep a bijection.
-            valid = [i for i in range(n) if pred_blocks[i] is not None and gt_blocks[i] is not None]
-            if not valid:
-                continue
-            sub = cost[np.ix_(valid, valid)]
-            if not np.isfinite(sub).any():
-                continue
-            if not np.isfinite(sub).all():
-                big = sub[np.isfinite(sub)].max() * 1e3 + 1.0
-                sub = np.where(np.isfinite(sub), sub, big)
-
-            sub_row, sub_col = linear_sum_assignment(sub)
-            for r, c in zip(sub_row, sub_col, strict=True):
-                assignment[asym_ids[valid[r]]] = asym_ids[valid[c]]
-
-    return assignment
+    return _anchor_greedy_assignment(order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res)
 
 
 def apply_chain_permutation(
@@ -325,24 +330,20 @@ def compute_chain_permutation_tokens(
     """Token-layout version of :func:`compute_chain_permutation`.
 
     Operates on the per-token ``[N, M, 3]`` layout used by the diffusion
-    loss. Tokens are grouped by ``asym_id`` (each chain is one group of
-    contiguous tokens) and chains are grouped into permutation classes
-    by ``entity_id``. For each entity class with multiple chains, the
-    optimal pred → GT chain assignment is computed via Hungarian on a
-    squared per-atom RMSD cost matrix obtained by Kabsch (1976)
-    alignment of each candidate GT chain onto each pred chain over
-    their resolved heavy atoms. Chains whose token counts disagree
-    (e.g. cropped on different boundaries) are left in place since the
-    token-by-token correspondence isn't well defined. Pairs with fewer
-    than three resolved atoms, or where the SVD fails, fall back to
-    the squared centroid distance.
+    loss. Tokens are grouped by ``asym_id`` (each chain is one group) and
+    chains into permutation classes by ``entity_id``. The pred → GT chain
+    assignment is resolved by :func:`_anchor_greedy_assignment` — the
+    AF-Multimer anchor-based greedy algorithm (AF3 §4.2): a single global
+    frame is fitted from an anchor chain and each predicted chain is matched
+    to the spatially nearest GT chain of the same entity. This resolves the
+    spatial correspondence between symmetric copies that a per-pair Kabsch
+    cost (rotation-invariant, hence blind to position) cannot.
 
-    Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in
-    singleton entity classes or for length-mismatched groups.
+    Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in singleton
+    entity classes or when no valid anchor frame exists.
     """
     import numpy as np
     import torch
-    from scipy.optimize import linear_sum_assignment
 
     asym_ids_np = asym_id.detach().cpu().numpy()
     entity_ids_np = entity_id.detach().cpu().numpy()
@@ -356,109 +357,33 @@ def compute_chain_permutation_tokens(
         seen.add(a)
         chain_order.append(int(a))
 
-    chain_token_indices: dict[int, np.ndarray] = {}
-    chain_entity: dict[int, int] = {}
-    for asym in chain_order:
-        idx = np.where(asym_ids_np == asym)[0]
-        chain_token_indices[asym] = idx
-        chain_entity[asym] = int(entity_ids_np[idx[0]])
-
-    assignment: dict[int, int] = {a: a for a in chain_order}
-
-    # Group by entity_id
-    entity_to_chains: dict[int, list[int]] = {}
-    for asym in chain_order:
-        entity_to_chains.setdefault(chain_entity[asym], []).append(asym)
+    ent_of: dict[int, int] = {}
+    cen_pred: dict[int, np.ndarray | None] = {}
+    cen_gt: dict[int, np.ndarray | None] = {}
+    at_pred: dict[int, np.ndarray] = {}
+    at_gt: dict[int, np.ndarray] = {}
+    res: dict[int, np.ndarray] = {}
 
     with torch.no_grad():
-        for asym_list in entity_to_chains.values():
-            n = len(asym_list)
-            if n <= 1:
+        for asym in chain_order:
+            idx = np.where(asym_ids_np == asym)[0]
+            ent_of[asym] = int(entity_ids_np[idx[0]])
+            tok_idx = torch.as_tensor(idx, dtype=torch.long, device=pred_pos.device)
+            # Flatten (token × atom) so chains of one entity share a row layout.
+            m = atom_mask[tok_idx].reshape(-1).detach().cpu().numpy().astype(bool)  # [T*M]
+            if not m.any():
+                cen_pred[asym] = None
+                cen_gt[asym] = None
                 continue
+            pf = pred_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
+            gf = gt_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
+            at_pred[asym] = pf
+            at_gt[asym] = gf
+            res[asym] = m
+            cen_pred[asym] = pf[m].mean(axis=0)
+            cen_gt[asym] = gf[m].mean(axis=0)
 
-            # Per-chain resolved atom blocks over (token × atom) pairs.
-            pred_blocks: list[torch.Tensor | None] = []
-            gt_blocks: list[torch.Tensor | None] = []
-            pred_centroids: list[torch.Tensor | None] = []
-            gt_centroids: list[torch.Tensor | None] = []
-            token_counts: list[int] = []
-            for asym in asym_list:
-                tok_idx = torch.as_tensor(chain_token_indices[asym], dtype=torch.long, device=pred_pos.device)
-                token_counts.append(int(tok_idx.numel()))
-                m = atom_mask[tok_idx]  # [n_tok, M] bool
-                if not m.any():
-                    pred_blocks.append(None)
-                    gt_blocks.append(None)
-                    pred_centroids.append(None)
-                    gt_centroids.append(None)
-                    continue
-                # Flatten (token × atom) → [K, 3] over resolved atoms only.
-                pred_flat = pred_pos[tok_idx][m]  # [K, 3]
-                gt_flat = gt_pos[tok_idx][m]  # [K, 3]
-                pred_blocks.append(pred_flat)
-                gt_blocks.append(gt_flat)
-                pred_centroids.append(pred_flat.mean(dim=0))
-                gt_centroids.append(gt_flat.mean(dim=0))
-
-            inf = float("inf")
-            cost = np.full((n, n), inf, dtype=np.float64)
-            for i in range(n):
-                if pred_blocks[i] is None:
-                    continue
-                for j in range(n):
-                    if gt_blocks[j] is None:
-                        continue
-                    if token_counts[i] != token_counts[j]:
-                        continue
-                    p_block = pred_blocks[i]
-                    g_block = gt_blocks[j]
-                    # Kabsch needs matching correspondences. The mask is
-                    # shared between pred and GT in this code path, so
-                    # the two blocks are always the same length; guard
-                    # anyway and fall back to centroid distance.
-                    if p_block.shape[0] != g_block.shape[0]:
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-                        continue
-                    if p_block.shape[0] < 3:
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-                        continue
-                    try:
-                        p_np = p_block.detach().cpu().numpy().astype(np.float64, copy=False)
-                        g_np = g_block.detach().cpu().numpy().astype(np.float64, copy=False)
-                        cost[i, j] = _kabsch_rmsd_np(p_np, g_np)
-                    except Exception as exc:  # pragma: no cover - SVD failure is rare
-                        logger.debug("chain_perm_tokens: Kabsch fallback i=%d j=%d: %s", i, j, exc)
-                        diff = pred_centroids[i] - gt_centroids[j]
-                        cost[i, j] = float((diff * diff).sum().item())
-
-            if not np.isfinite(cost).any():
-                continue
-
-            # Permute only chains resolved on BOTH sides; unresolved chains
-            # (empty pred/GT block) stay identity. Running Hungarian over the
-            # full matrix lets a resolved pred chain be assigned onto an empty
-            # GT column (filled with a big penalty) while that column's own
-            # unresolved pred row is skipped to identity — two pred chains then
-            # map to one GT chain (non-bijective, one GT chain duplicated and
-            # another dropped). Restricting to the resolved set keeps the
-            # assignment a bijection.
-            valid = [i for i in range(n) if pred_blocks[i] is not None and gt_blocks[i] is not None]
-            if not valid:
-                continue
-            sub = cost[np.ix_(valid, valid)]
-            if not np.isfinite(sub).any():
-                continue
-            if not np.isfinite(sub).all():
-                big = sub[np.isfinite(sub)].max() * 1e3 + 1.0
-                sub = np.where(np.isfinite(sub), sub, big)
-
-            sub_row, sub_col = linear_sum_assignment(sub)
-            for r, c in zip(sub_row, sub_col, strict=True):
-                assignment[asym_list[valid[r]]] = asym_list[valid[c]]
-
-    return assignment
+    return _anchor_greedy_assignment(chain_order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res)
 
 
 def apply_chain_permutation_tokens(
