@@ -170,8 +170,9 @@ def compute_ligand_token_swap_pairs(
     automorphism group from ``ligand_perm_cache`` (the JSON dict produced
     by ``deepfold3 build-ccd-cache --automorphisms``), extract the involution pairs
     from each automorphism, and map them back to current token indices
-    via ``token['residue_index']`` — which the tokenizer sets to the
-    local-within-ligand atom index, so the mapping survives cropping.
+    via ``token['atom_in_res']`` — the crop-robust CCD-local atom index the
+    tokenizer stamps on each ligand atom token (``residue_index`` now holds
+    res_id, so the automorphism key is decoupled from it).
 
     Returns a ``[N_pairs, 3]`` int32 array of ``(token_a, token_b, group_id)``
     triples. ``group_id`` is unique per emitted pair, so ligand swaps are
@@ -198,7 +199,7 @@ def compute_ligand_token_swap_pairs(
         if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
             continue
         asym = int(tok["asym_id"])
-        local_atom_idx = int(tok["residue_index"])
+        local_atom_idx = int(tok["atom_in_res"])
         ligand_groups.setdefault(asym, {})[local_atom_idx] = i
 
     if not ligand_groups:

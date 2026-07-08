@@ -184,6 +184,7 @@ def atomize_tokens(
             row["res_type"] = _UNK_RES_TYPE  # match modified-residue atom tokens
             row["atom_idx"] = gi
             row["atom_num"] = 1
+            row["atom_in_res"] = j  # local atom index (residue_index stays res_id)
             row["center_x"] = float(atom["x"])
             row["center_y"] = float(atom["y"])
             row["center_z"] = float(atom["z"])

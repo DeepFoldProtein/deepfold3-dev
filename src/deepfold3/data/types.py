@@ -67,7 +67,10 @@ CHAIN_DTYPE = np.dtype(
 TOKEN_DTYPE = np.dtype(
     [
         ("token_idx", np.int32),  # sequential token index
-        ("residue_index", np.int32),  # original PDB residue number (or atom index for ligands)
+        # Original PDB residue number (res_id), shared by ALL per-atom tokens of
+        # one residue (ligands + atomized), so the relative-position encoding
+        # treats intra-residue atom pairs as same-residue (AF3 §2.8).
+        ("residue_index", np.int32),
         ("res_type", np.int16),  # index in RES_TYPE_ORDER
         ("mol_type", np.int8),
         ("asym_id", np.int32),
@@ -78,6 +81,10 @@ TOKEN_DTYPE = np.dtype(
         ("center_x", np.float32),  # representative atom x (for cropping)
         ("center_y", np.float32),
         ("center_z", np.float32),
+        # Crop-robust local atom index within the residue (0 for whole-residue
+        # tokens). Keys the ligand CCD-automorphism → surviving-token map in the
+        # symmetry code, decoupled from ``residue_index`` (which holds res_id).
+        ("atom_in_res", np.int32),
     ]
 )
 

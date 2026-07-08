@@ -94,6 +94,7 @@ class Tokenizer:
                                 cx,
                                 cy,
                                 cz,
+                                0,  # atom_in_res: whole-residue token
                             )
                         )
                         msa_col_list.append(chain_msa_col)
@@ -127,6 +128,7 @@ class Tokenizer:
                                     cx,
                                     cy,
                                     cz,
+                                    ai,  # atom_in_res: local atom index within residue
                                 )
                             )
                             msa_col_list.append(chain_msa_col)
@@ -142,6 +144,7 @@ class Tokenizer:
                     res = structure.residues[ri]
                     atom_idx_start = int(res["atom_idx"])
                     atom_num = int(res["atom_num"])
+                    res_id = int(res["res_id"])
 
                     for ai in range(atom_num):
                         global_ai = atom_idx_start + ai
@@ -154,7 +157,7 @@ class Tokenizer:
                         tokens_list.append(
                             (
                                 token_idx,
-                                local_atom_idx,  # residue_index = atom index within ligand
+                                res_id,  # residue_index = res_id (shared across the ligand's atoms)
                                 20,  # res_type = UNK
                                 mol_type,
                                 asym_id,
@@ -165,6 +168,7 @@ class Tokenizer:
                                 cx,
                                 cy,
                                 cz,
+                                local_atom_idx,  # atom_in_res: CCD-local atom index (keys ligand symmetry)
                             )
                         )
                         msa_col_list.append(-1)  # ligands have no MSA column
