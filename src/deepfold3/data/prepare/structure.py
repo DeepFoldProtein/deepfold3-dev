@@ -420,6 +420,9 @@ def process_mmcif(
     # which corresponds to the parent chain (not the subchain) after assembly expansion.
     atom_lookup: dict[tuple[str, int, str], int] = {}
 
+    # AF3 §2.5.4 removes crystallization aids only from X-ray structures.
+    _is_xray = bool(metadata.method and "x-ray" in metadata.method)
+
     for chain in model:
         # Get subchains as ResidueSpan objects (works for both raw and assembly models)
         subchain_spans = chain.subchains()
@@ -455,6 +458,20 @@ def process_mmcif(
                     continue
 
                 res_name = res.name[:5]
+
+                # AF3 §2.5.4: drop crystallization aids (buffer/cryo/precipitant
+                # ligands) from X-ray structures — not part of the assembly.
+                if _is_xray and mol_type == const.MOL_NONPOLYMER and res_name.strip() in const.CRYSTALLIZATION_AIDS:
+                    continue
+
+                # AF3 §2.1: canonicalise selenomethionine to methionine so the
+                # stored residue name, CCD atom set and reference conformer
+                # (hence ref_element) are MET's — not MSE's out-of-distribution
+                # Se. (get_res_type already maps MSE→MET; this fixes the rest.)
+                _is_mse = res_name.strip() == "MSE"
+                if _is_mse:
+                    res_name = "MET"
+
                 res_type = const.get_res_type(res.name, mol_type)
                 try:
                     res_id = res.seqid.num
@@ -472,23 +489,55 @@ def process_mmcif(
                 # CCD valid atom names for this residue (if cache provided)
                 _ccd_valid = ccd_atom_names.get(res_name.strip()) if ccd_atom_names is not None else None
 
+                # Alternate locations: keep only the highest-occupancy conformer
+                # per atom name (AF3 §2.5.4). Without this both altloc A and B are
+                # emitted as duplicate same-named atoms, and the featurizer's
+                # name-keyed GT gather overwrites with whichever is processed last
+                # (usually the minor conformer) — supervising on the wrong pose.
+                _alt_best: dict[str, tuple[float, str]] = {}
+                for _a in res:
+                    _alt = _a.altloc
+                    if _alt in ("", "\x00", " "):
+                        continue
+                    _nm = _a.name.strip()
+                    _occ = float(_a.occ)
+                    if _nm not in _alt_best or _occ > _alt_best[_nm][0]:
+                        _alt_best[_nm] = (_occ, _alt)
+
                 for atom in res:
                     if atom.element in (_ELEMENT_H, _ELEMENT_D):
                         continue
 
+                    atom_name_stripped = atom.name.strip()
+
+                    # Keep only the chosen altloc conformer for this atom name.
+                    _alt = atom.altloc
+                    if _alt not in ("", "\x00", " ") and _alt_best.get(atom_name_stripped, (0.0, _alt))[1] != _alt:
+                        continue
+
+                    # MSE→MET: the selenium SE is stored as sulfur SD (see above),
+                    # so the CCD-atom check, stored name and element all use the
+                    # canonical MET atom. The ORIGINAL name still keys the
+                    # leaving-atom / bond lookups (CIF connections name it SE).
+                    if _is_mse and atom_name_stripped == "SE":
+                        eff_name = "SD"
+                        element = const.element_name_to_int("S")
+                    else:
+                        eff_name = atom_name_stripped
+                        element = const.element_name_to_int(atom.element.name)
+
                     # AF3 §2.5.4: filter atoms not in CCD dictionary
-                    if _ccd_valid is not None and atom.name.strip() not in _ccd_valid:
+                    if _ccd_valid is not None and eff_name not in _ccd_valid:
                         continue
 
                     # AF3 §2.5.4: remove leaving atoms from covalent bond partners
                     # Key uses (chain.name, res_id) = (auth_asym_id, auth_seq_id)
-                    if _leaving_atoms and (chain.name, res_id, atom.name.strip()) in _leaving_atoms:
+                    if _leaving_atoms and (chain.name, res_id, atom_name_stripped) in _leaving_atoms:
                         continue
 
                     pos = atom.pos
-                    element = const.element_name_to_int(atom.element.name)
                     charge = float(atom.charge) if hasattr(atom, "charge") else 0.0
-                    atom_name = atom.name[:4].ljust(4)
+                    atom_name = eff_name[:4].ljust(4)
                     b_factor = float(atom.b_iso) if hasattr(atom, "b_iso") else 0.0
 
                     chain_atom_data.append(

@@ -66,6 +66,13 @@ RES_TYPE_INDEX_TO_NAME: dict[int, str] = {v: k for k, v in RES_TYPE_ORDER.items(
 # MSA gap token (matches ``"-"`` in RES_TYPE_ORDER)
 MSA_GAP = 21
 
+# Crystallization aids removed from X-ray structures (AF3 §2.5.4, SI Table 9).
+# Buffer / cryo / precipitant ligands that are not part of the biological
+# assembly and would otherwise appear as spurious NONPOLYMER tokens.
+CRYSTALLIZATION_AIDS: frozenset[str] = frozenset(
+    {"SO4", "GOL", "EDO", "PO4", "ACT", "PEG", "DMS", "TRS", "PGE", "PG4", "FMT", "EPE", "MPD", "MES", "CD", "IOD"}
+)
+
 # Non-standard / alternate names that map to a standard residue
 _NONSTANDARD_TO_STANDARD: dict[str, str] = {
     "MSE": "MET",  # selenomethionine
