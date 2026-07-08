@@ -514,25 +514,6 @@ def diffusion_mse_loss(
                 permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
 
-    # Atom / ligand permutation use ``mini_rollout_pos`` (AF3 §4.3:
-    # decisions come from the multi-step mini-rollout) when available,
-    # falling back to the per-sample single-step ``pred_pos`` only when
-    # the caller didn't stage a mini-rollout reference.
-    if atom_perm_pred is not None:
-        atom_ref = atom_perm_pred.unsqueeze(0).expand_as(pred_pos)
-    else:
-        atom_ref = pred_pos
-
-    if atom_swap_pairs is not None and len(atom_swap_pairs) > 0:
-        from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
-
-        gt_pos = apply_token_atom_permutation(atom_ref, gt_pos, atom_mask.bool(), atom_swap_pairs)
-
-    if ligand_swap_pairs is not None and len(ligand_swap_pairs) > 0:
-        from deepfold3.data.symmetry.atom_perms import apply_ligand_token_swap
-
-        gt_pos = apply_ligand_token_swap(atom_ref, gt_pos, atom_mask.bool(), ligand_swap_pairs)
-
     mask = atom_mask.float()  # [N, M]
 
     # Build per-atom loss weight: molecule-type upweighting (DNA/RNA 5×, ligand 10×)
@@ -550,7 +531,13 @@ def diffusion_mse_loss(
     if region_weights is not None:
         weight_2d = weight_2d * region_weights.unsqueeze(-1)  # [N, M]
 
-    # AF3 §3.7.1 eq. 2: rigidly align GT onto pred per sample before MSE.
+    # AF3 §3.7.1 eq. 2: rigidly align GT onto pred per sample. This MUST run
+    # BEFORE the symmetric-atom resolution below: a swap decision compares
+    # |pred_a - gt_a|² vs |pred_a - gt_b|², whose sign is (pred_a-pred_b)·
+    # (gt_a-gt_b). Across the arbitrary SE(3) augmentation gap that dot product
+    # flips freely, so deciding swaps in the unaligned frame is dominated by
+    # global misorientation rather than the ~1-2 Å local symmetry. Aligning
+    # first puts pred and GT in a common frame so the local comparison is valid.
     # Alignment output is detached — gradients flow through pred only.
     if apply_rigid_align:
         S = pred_pos.shape[0]
@@ -559,6 +546,20 @@ def diffusion_mse_loss(
         w_flat = weight_2d.reshape(-1)  # [N*M]
         gt_flat = weighted_rigid_align(gt_flat, pred_flat, w_flat)
         gt_pos = gt_flat.reshape_as(pred_pos)
+
+    # Symmetric-atom / ligand resolution in the aligned frame (AF3 §4.3). The
+    # decision is per diffusion sample against that sample's prediction; the
+    # mini-rollout ``atom_perm_pred`` staging is retained only for the shared
+    # chain assignment above (where it feeds ``chain_assign``).
+    if atom_swap_pairs is not None and len(atom_swap_pairs) > 0:
+        from deepfold3.data.symmetry.atom_perms import apply_token_atom_permutation
+
+        gt_pos = apply_token_atom_permutation(pred_pos, gt_pos, atom_mask.bool(), atom_swap_pairs)
+
+    if ligand_swap_pairs is not None and len(ligand_swap_pairs) > 0:
+        from deepfold3.data.symmetry.atom_perms import apply_ligand_token_swap
+
+        gt_pos = apply_ligand_token_swap(pred_pos, gt_pos, atom_mask.bool(), ligand_swap_pairs)
 
     weight_mask = weight_2d.unsqueeze(-1)  # [N, M, 1]
     # AF3 §5.3 eq. 3 / OF3 ``mse_loss`` / Protenix ``MSELoss``: divide by

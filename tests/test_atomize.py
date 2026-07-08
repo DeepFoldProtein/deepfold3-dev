@@ -141,8 +141,9 @@ def test_symmetry_emitter_pairs_asp_carboxyl_oxygens():
     out = atomize_tokens(tok, np.array([1]))
     pairs = compute_atomized_residue_token_swap_pairs(out.structure, out.tokens)
     assert len(pairs) == 1
-    # The pair must be OD1 / OD2 token indices.
-    names = {out.structure.atoms[int(out.tokens[t]["atom_idx"])]["name"].decode().strip() for t in pairs[0]}
+    assert pairs.shape[1] == 3  # (token_a, token_b, group_id)
+    # The first two columns are the OD1 / OD2 token indices (col 2 is the group).
+    names = {out.structure.atoms[int(out.tokens[t]["atom_idx"])]["name"].decode().strip() for t in pairs[0][:2]}
     assert names == {"OD1", "OD2"}
 
 

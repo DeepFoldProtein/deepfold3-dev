@@ -173,18 +173,23 @@ def compute_ligand_token_swap_pairs(
     via ``token['residue_index']`` — which the tokenizer sets to the
     local-within-ligand atom index, so the mapping survives cropping.
 
-    Returns a ``[N_pairs, 2]`` int32 array of token index pairs.
-    Multi-cycle automorphisms (e.g. benzene's 6-fold rotation) are
-    decomposed into their pairwise involution components and
-    deduplicated; this captures the common O/N/C "swap" symmetries
-    without the full group machinery.
+    Returns a ``[N_pairs, 3]`` int32 array of ``(token_a, token_b, group_id)``
+    triples. ``group_id`` is unique per emitted pair, so ligand swaps are
+    decided independently — but the pairs of a ligand are first reduced to a
+    **valid matching** (no atom in two pairs), which removes the previous
+    hazard of applying overlapping transpositions (e.g. ``(1,2)`` and
+    ``(1,3)`` pulled from two different automorphisms) that swap one atom
+    twice into an invalid combination. Only involution (2-cycle) components
+    are used; odd cycles (e.g. a 3-fold rotation) cannot be expressed as
+    simultaneous swaps and are skipped — the identity is a safe fallback.
     """
     import numpy as np
 
     from deepfold3.data import const
 
+    empty = np.empty((0, 3), dtype=np.int32)
     if not ligand_perm_cache:
-        return np.empty((0, 2), dtype=np.int32)
+        return empty
 
     # Group cropped ligand tokens by asym_id; each group is one ligand
     # chain (= one residue under our prepare pipeline).
@@ -197,13 +202,14 @@ def compute_ligand_token_swap_pairs(
         ligand_groups.setdefault(asym, {})[local_atom_idx] = i
 
     if not ligand_groups:
-        return np.empty((0, 2), dtype=np.int32)
+        return empty
 
     # asym_id -> CCD code via the structure.chains/residues lookup
     chains = structure.chains
     residues = structure.residues
 
-    pair_list: list[tuple[int, int]] = []
+    pair_list: list[tuple[int, int, int]] = []
+    group_id = 0
     for asym, local_to_token in ligand_groups.items():
         chain_rows = chains[chains["asym_id"] == asym]
         if len(chain_rows) == 0:
@@ -220,14 +226,22 @@ def compute_ligand_token_swap_pairs(
             for i, j in enumerate(perm):
                 if j > i and 0 <= j < len(perm) and perm[j] == i:
                     pair_set.add((i, j))
-        for local_a, local_b in pair_set:
+        # Reduce to a valid matching: greedily keep pairs whose atoms haven't
+        # already been claimed, so no atom is swapped by two pairs at once.
+        used_local: set[int] = set()
+        for local_a, local_b in sorted(pair_set):
+            if local_a in used_local or local_b in used_local:
+                continue
             tok_a = local_to_token.get(local_a)
             tok_b = local_to_token.get(local_b)
             if tok_a is not None and tok_b is not None:
-                pair_list.append((tok_a, tok_b))
+                used_local.add(local_a)
+                used_local.add(local_b)
+                pair_list.append((tok_a, tok_b, group_id))
+                group_id += 1
 
     if not pair_list:
-        return np.empty((0, 2), dtype=np.int32)
+        return empty
     return np.asarray(pair_list, dtype=np.int32)
 
 
@@ -262,8 +276,11 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
     the token no longer names the residue), and atom tokens are grouped back
     into residues by ``(asym_id, residue_index)``.
 
-    Returns a ``[N_pairs, 2]`` int32 array of token-index pairs, applied at slot
-    0 by :func:`apply_ligand_token_swap` (identical layout to ligand swaps).
+    Returns a ``[N_pairs, 3]`` int32 array of ``(token_a, token_b, group_id)``
+    triples, applied at slot 0 by :func:`apply_ligand_token_swap`. All pairs of
+    one residue share a ``group_id`` so a symmetric ring (PHE/TYR/HIS: CD and CE
+    pairs are separate tokens once atomized) flips *as a unit* rather than
+    permitting a half-flip.
     """
     import numpy as np
 
@@ -281,7 +298,8 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
         key = (int(tok["asym_id"]), int(tok["residue_index"]))
         groups.setdefault(key, []).append(i)
 
-    pair_list: list[tuple[int, int]] = []
+    pair_list: list[tuple[int, int, int]] = []
+    group_id = 0
     for token_indices in groups.values():
         if len(token_indices) < 2:
             continue
@@ -298,15 +316,19 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
             name = atom_names_bytes[a_idx].decode("ascii", errors="replace").strip()
             name_to_tok[name] = ti
         atom_names = list(name_to_tok.keys())
+        emitted = False
         for a, b in build_residue_symmetry_pairs(res_name, atom_names):
             # build_residue_symmetry_pairs returns indices into ``atom_names``;
             # map back through the name to the token index.
             tok_a = name_to_tok[atom_names[a]]
             tok_b = name_to_tok[atom_names[b]]
-            pair_list.append((tok_a, tok_b))
+            pair_list.append((tok_a, tok_b, group_id))
+            emitted = True
+        if emitted:
+            group_id += 1
 
     if not pair_list:
-        return np.empty((0, 2), dtype=np.int32)
+        return np.empty((0, 3), dtype=np.int32)
     return np.asarray(pair_list, dtype=np.int32)
 
 
@@ -314,13 +336,18 @@ def apply_ligand_token_swap(
     pred_pos: torch.Tensor,  # [..., N, M, 3]
     gt_pos: torch.Tensor,  # [..., N, M, 3]
     atom_mask: torch.Tensor,  # [N, M] bool
-    swap_pairs: np.ndarray | torch.Tensor,  # [N_pairs, 2] token index pairs
+    swap_pairs: np.ndarray | torch.Tensor,  # [N_pairs, 2] or [N_pairs, 3] (a, b, group)
 ) -> torch.Tensor:
-    """Apply best-of-two ligand atom swaps in the token-atom layout.
+    """Apply best-of-two inter-token atom swaps in the token-atom layout.
 
-    Ligand atoms live at slot ``M=0`` of their own token, so the swap
-    is over (``token_a``, ``token_b``) row-pairs at position 0. Decisions
-    are made independently per leading dimension and per pair.
+    Ligand / atomized-residue atoms live at slot ``M=0`` of their own token,
+    so a swap is a (``token_a``, ``token_b``) row-pair at position 0. Pairs
+    that share a **group id** (optional third column) are decided *jointly* —
+    the whole group swaps or not. This lets an atomized PHE/TYR/HIS ring flip
+    as a unit (its CD/CE pairs are separate tokens, so per-pair decisions
+    would allow a chemically-impossible half-flip). A 2-column input is
+    treated as one pair per group (independent), matching the legacy path.
+    Decisions are per leading dimension and made in the caller's aligned frame.
     """
     import torch
 
@@ -332,11 +359,19 @@ def apply_ligand_token_swap(
     else:
         pairs = swap_pairs.to(dtype=torch.long, device=gt_pos.device)
 
+    # Drop collate zero-padding self-pairs (a == b) up front — padded rows are
+    # (0, 0, 0) and must not join real group 0 or scatter over token 0's swap.
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    if pairs.numel() == 0:
+        return gt_pos.detach()
+
     permuted = gt_pos.clone()
     a_idx = pairs[:, 0]
     b_idx = pairs[:, 1]
+    # Group id: explicit 3rd column, else each pair is its own group.
+    group = pairs[:, 2] if pairs.shape[1] >= 3 else torch.arange(pairs.shape[0], device=pairs.device)
 
-    pair_mask = atom_mask[a_idx, 0] & atom_mask[b_idx, 0]
+    pair_mask = atom_mask[a_idx, 0] & atom_mask[b_idx, 0]  # [P]
     if not pair_mask.any():
         return permuted.detach()
 
@@ -347,7 +382,18 @@ def apply_ligand_token_swap(
 
     identity_cost = (pred_a - gt_a).pow(2).sum(dim=-1) + (pred_b - gt_b).pow(2).sum(dim=-1)
     swapped_cost = (pred_a - gt_b).pow(2).sum(dim=-1) + (pred_b - gt_a).pow(2).sum(dim=-1)
-    do_swap = pair_mask & (swapped_cost < identity_cost)
+
+    valid = pair_mask.to(identity_cost.dtype)
+    identity_cost = identity_cost * valid
+    swapped_cost = swapped_cost * valid
+
+    # Sum per group and decide the group jointly.
+    _uniq, inv = torch.unique(group, return_inverse=True)
+    ng = int(_uniq.numel())
+    lead = identity_cost.shape[:-1]
+    id_g = torch.zeros(*lead, ng, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(-1, inv, identity_cost)
+    sw_g = torch.zeros(*lead, ng, dtype=swapped_cost.dtype, device=swapped_cost.device).index_add_(-1, inv, swapped_cost)
+    do_swap = (sw_g < id_g).index_select(-1, inv) & pair_mask
 
     if not do_swap.any():
         return permuted.detach()
@@ -368,10 +414,14 @@ def apply_token_atom_permutation(
 ) -> torch.Tensor:
     """Per-token best-swap atom permutation in the ``[..., N, M, 3]`` layout.
 
-    For each ``(token, a, b)`` triple, computes the per-pair squared
-    distance under both orderings and picks the one with the lower cost.
-    Decisions are made independently per leading dimension (so each
-    diffusion sample's per-rotation augmented GT picks its own swap).
+    The swap decision is made **jointly over all pairs of a token** (each
+    token = one residue = one symmetry group): the cost of every pair is
+    summed and the whole group is swapped or not. This is what keeps a
+    PHE/TYR/HIS ring flipping *as a unit* (CD1↔CD2 and CE1↔CE2 together) —
+    deciding the pairs independently would permit a chemically-impossible
+    half-flip (swap CD but not CE). Decisions are made independently per
+    leading dimension (each augmented diffusion sample picks its own swap)
+    and, per finding, in the rigid-aligned frame set up by the caller.
 
     Returns a tensor with the same shape as ``gt_pos``, detached.
     """
@@ -385,13 +435,19 @@ def apply_token_atom_permutation(
     else:
         pairs = swap_pairs.to(dtype=torch.long, device=gt_pos.device)
 
+    # Drop collate zero-padding self-pairs (a == b) up front so they neither
+    # join a real group's cost nor scatter over a genuine swap.
+    pairs = pairs[pairs[:, 1] != pairs[:, 2]]
+    if pairs.numel() == 0:
+        return gt_pos.detach()
+
     permuted = gt_pos.clone()
 
     tok_idx = pairs[:, 0]
     a_idx = pairs[:, 1]
     b_idx = pairs[:, 2]
 
-    pair_mask = atom_mask[tok_idx, a_idx] & atom_mask[tok_idx, b_idx]
+    pair_mask = atom_mask[tok_idx, a_idx] & atom_mask[tok_idx, b_idx]  # [P]
     if not pair_mask.any():
         return permuted.detach()
 
@@ -404,12 +460,22 @@ def apply_token_atom_permutation(
     identity_cost = (pred_a - gt_a).pow(2).sum(dim=-1) + (pred_b - gt_b).pow(2).sum(dim=-1)
     swapped_cost = (pred_a - gt_b).pow(2).sum(dim=-1) + (pred_b - gt_a).pow(2).sum(dim=-1)
 
-    do_swap = pair_mask & (swapped_cost < identity_cost)  # [..., P]
+    # Zero masked pairs so a partially-resolved residue decides on its
+    # resolved pairs only (0 == 0 contributes nothing to the group cost).
+    valid = pair_mask.to(identity_cost.dtype)  # [P]
+    identity_cost = identity_cost * valid
+    swapped_cost = swapped_cost * valid
+
+    # Sum costs per group (token) and decide the whole group together.
+    uniq_tok, inv = torch.unique(tok_idx, return_inverse=True)  # inv: [P] → group id
+    g = uniq_tok.numel()
+    lead = identity_cost.shape[:-1]
+    id_g = torch.zeros(*lead, g, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(-1, inv, identity_cost)
+    sw_g = torch.zeros(*lead, g, dtype=swapped_cost.dtype, device=swapped_cost.device).index_add_(-1, inv, swapped_cost)
+    do_swap = (sw_g < id_g).index_select(-1, inv) & pair_mask  # [..., P]
     if not do_swap.any():
         return permuted.detach()
 
-    # For swapped pairs, write the swapped values back. Vectorise per-pair
-    # by gathering the (a, b) values and using ``torch.where`` to pick.
     new_a = torch.where(do_swap.unsqueeze(-1), gt_b, gt_a)
     new_b = torch.where(do_swap.unsqueeze(-1), gt_a, gt_b)
 
