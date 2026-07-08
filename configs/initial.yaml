@@ -182,6 +182,8 @@ datasets:
     format: df3
     cutoff_date: "2021-09-30"
     exclude_loss_mol_types: []
+    # Multi-chain PDB assemblies: keep all three AF3 §2.7 crop strategies.
+    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
@@ -189,6 +191,9 @@ datasets:
     strategy: uniform
     is_distillation: true
     format: of3
+    # Single-chain: interface crop always degrades to spatial, so route its
+    # mass to spatial instead of wasting crop attempts on a missing interface.
+    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
 
   - name: short_monomers
     data_dir: /data/distillation/short_monomers/preprocessed
@@ -196,6 +201,7 @@ datasets:
     strategy: uniform
     is_distillation: true
     format: of3
+    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
 
 eval_datasets:
   - name: patchr_eval
@@ -248,14 +254,14 @@ model:
   # tunables are documented here; enable it per-arm — see configs/maskmsa.yaml.
   masked_msa:
     enabled: false
-    replace_fraction: 0.15  # BERT mask rate
-    uniform_prob: 0.1       # random-aa / profile / same mixture (rest → MASK token)
+    replace_fraction: 0.15 # BERT mask rate
+    uniform_prob: 0.1 # random-aa / profile / same mixture (rest → MASK token)
     profile_prob: 0.1
     same_prob: 0.1
     num_heads: 4
     head_dim: 32
     hidden_dim: 128
-    c_out: 32               # full DF3 MSA vocab (const.MSA_VOCAB_SIZE)
+    c_out: 32 # full DF3 MSA vocab (const.MSA_VOCAB_SIZE)
   data:
     max_templates: 4
     max_neighborhood: 40
@@ -289,7 +295,7 @@ model:
     use_fused_swiglu: true
     use_fused_triangle_mul: true
     use_fused_transition_pair: true
-    use_fused_ln_transpose: false  # inference-only (column-attn LN+transpose)
+    use_fused_ln_transpose: false # inference-only (column-attn LN+transpose)
     use_tiled_linear: false
     tiled_linear_inference: true
     tiled_opm_chunk: 0

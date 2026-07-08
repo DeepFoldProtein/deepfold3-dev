@@ -88,13 +88,18 @@ def remap_msa_col_idx_to_slice(
 class Cropper:
     """Crop a Tokenized input to at most max_tokens / max_atoms.
 
-    Three crop strategies (Protenix-style weights):
-      1. Contiguous (20%): pick a chain, walk sequentially.
-      2. Spatial (40%): pick a random seed token, expand by 3D proximity.
-      3. Interface-seeded spatial (40%): seed from interface tokens (within
+    The crop *strategy* is sampled from the per-dataset crop weights
+    (AF3 §2.7), independently of the sampler anchor:
+      1. Contiguous: pick a chain, walk sequentially.
+      2. Spatial: pick a seed token, expand by 3D proximity.
+      3. Interface-seeded spatial: seed from interface tokens (within
          ``interface_distance`` of another chain), then expand spatially.
 
-    When no interface tokens exist, interface crop falls back to spatial.
+    The sampler anchor (a weighted chain or interface) biases *seeding* only
+    — a chain anchor becomes the contiguous chain / spatial seed pool, an
+    interface anchor restricts interface seeds — but never dictates the
+    strategy. When no interface tokens exist, interface crop falls back to
+    spatial.
     """
 
     def __init__(
@@ -173,30 +178,51 @@ class Cropper:
         total_resolved = int(token_resolved.sum())
         attempts = self.max_attempts if total_resolved >= self.min_resolved else 1
 
+        # Derive seed hints from the sampler anchor. AF3 §2.7 samples the crop
+        # *strategy* independently from the per-dataset crop weights and uses
+        # the weighted chain/interface only to *seed* a spatial/interface crop
+        # — it never dictates the strategy. So the anchor biases seeding only.
+        # A legacy explicit ``chain_id`` still forces a contiguous crop.
+        anchor_chain: int | None = None
+        anchor_iface: tuple[int, int] | None = None
+        force_contiguous_chain: int | None = None
+        if chain_id is not None:
+            force_contiguous_chain = int(chain_id)
+            anchor_chain = int(chain_id)
+        elif anchor is not None:
+            kind, a, b = anchor
+            if kind == "chain":
+                anchor_chain = int(a)
+            elif kind == "interface":
+                anchor_iface = (int(a), int(b))
+                anchor_chain = int(a)
+
         cand = None
         for attempt in range(attempts):
             attempt_rng = random.Random(rng.random()) if attempt > 0 else rng
 
-            if chain_id is not None:
-                cand = self._contiguous_crop(tokens, max_tokens, max_atoms, chain_id, attempt_rng)
-            elif anchor is not None:
-                kind, a, b = anchor
-                if kind == "chain":
-                    cand = self._contiguous_crop(tokens, max_tokens, max_atoms, a, attempt_rng)
-                elif kind == "interface":
-                    cand = self._interface_spatial_crop(
-                        tokens, max_tokens, max_atoms, attempt_rng, anchor_chains=(a, b)
-                    )
-                else:
-                    cand = self._spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
-            else:
-                r = attempt_rng.random()
-                if r < self.contiguous_weight:
-                    cand = self._contiguous_crop(tokens, max_tokens, max_atoms, None, attempt_rng)
-                elif r < self.contiguous_weight + self.interface_weight:
-                    cand = self._interface_spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
-                else:
-                    cand = self._spatial_crop(tokens, max_tokens, max_atoms, attempt_rng)
+            strategy = "contiguous" if force_contiguous_chain is not None else self._sample_strategy(attempt_rng)
+
+            if strategy == "contiguous":
+                cand = self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, attempt_rng)
+            elif strategy == "interface":
+                cand = self._interface_spatial_crop(
+                    tokens,
+                    max_tokens,
+                    max_atoms,
+                    attempt_rng,
+                    token_resolved=token_resolved,
+                    anchor_chains=anchor_iface,
+                )
+            else:  # spatial
+                cand = self._spatial_crop(
+                    tokens,
+                    max_tokens,
+                    max_atoms,
+                    attempt_rng,
+                    token_resolved=token_resolved,
+                    anchor_chain=anchor_chain,
+                )
 
             if int(token_resolved[cand].sum()) >= self.min_resolved:
                 break
@@ -205,6 +231,56 @@ class Cropper:
         # last-attempt fallback (used when ``total_resolved < min_resolved``,
         # or when no attempt cleared the bar).
         return self._reindex(data, cand)
+
+    # ------------------------------------------------------------------
+    # Strategy / seed selection
+    # ------------------------------------------------------------------
+
+    def _sample_strategy(self, rng: random.Random) -> str:
+        """Sample a crop strategy from the (unnormalized) crop weights.
+
+        AF3 §2.7 draws the crop method independently of the seed
+        chain/interface. The cumulative order (contiguous, interface,
+        spatial) matches the legacy anchor-free branch.
+        """
+        total = self.contiguous_weight + self.spatial_weight + self.interface_weight
+        if total <= 0:
+            return "contiguous"
+        r = rng.random() * total
+        if r < self.contiguous_weight:
+            return "contiguous"
+        if r < self.contiguous_weight + self.interface_weight:
+            return "interface"
+        return "spatial"
+
+    @staticmethod
+    def _seed_pool(
+        tokens: np.ndarray,
+        valid: np.ndarray,
+        token_resolved: np.ndarray | None,
+        anchor_chain: int | None,
+    ) -> list[int]:
+        """Candidate seed token indices for a spatial crop.
+
+        Narrows to the tightest non-empty pool in priority order:
+        resolved ∧ anchor-chain → resolved → valid-center → all tokens.
+        Seeding on a resolved token in the sampler's preferred chain matches
+        AF3 §2.7 (crop seeded on the weighted chain) and avoids seeding on a
+        missing-coordinate token that was collapsed onto the centroid.
+        """
+        base = valid.copy()
+        if token_resolved is not None:
+            r = base & token_resolved
+            if r.any():
+                base = r
+        if anchor_chain is not None:
+            a = base & (tokens["asym_id"] == anchor_chain)
+            if a.any():
+                base = a
+        idx = np.where(base)[0]
+        if len(idx) == 0:
+            idx = np.arange(len(tokens))
+        return idx.tolist()
 
     # ------------------------------------------------------------------
     # Contiguous cropping
@@ -257,13 +333,20 @@ class Cropper:
         max_tokens: int,
         max_atoms: int,
         rng: random.Random,
+        token_resolved: np.ndarray | None = None,
+        anchor_chain: int | None = None,
     ) -> np.ndarray:
-        """Return selected token indices (sorted) for spatial cropping."""
+        """Return selected token indices (sorted) for spatial cropping.
+
+        The seed token is drawn from ``_seed_pool`` (resolved tokens in the
+        ``anchor_chain`` when available), so the crop is centred on the
+        sampler's preferred chain rather than a uniformly random token.
+        """
         try:
             from scipy.spatial import KDTree
         except ImportError:
             # Fall back to contiguous
-            return self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
+            return self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, rng)
 
         coords = np.stack(
             [
@@ -277,13 +360,13 @@ class Cropper:
         # Replace zeros (missing coords) with centroid
         valid = ~np.all(coords == 0.0, axis=1)
         if valid.sum() == 0:
-            return self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
+            return self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, rng)
 
         centroid = coords[valid].mean(axis=0)
         coords[~valid] = centroid
 
-        # Pick a seed token
-        seed_idx = rng.randint(0, len(tokens) - 1)
+        # Pick a seed token from the preferred (resolved, anchor-chain) pool
+        seed_idx = rng.choice(self._seed_pool(tokens, valid, token_resolved, anchor_chain))
         seed_coord = coords[seed_idx : seed_idx + 1]
 
         tree = KDTree(coords)
@@ -314,6 +397,7 @@ class Cropper:
         max_atoms: int,
         rng: random.Random,
         anchor_chains: tuple[int, int] | None = None,
+        token_resolved: np.ndarray | None = None,
     ) -> np.ndarray:
         """Spatial crop seeded from interface tokens (near another chain).
 
@@ -328,7 +412,7 @@ class Cropper:
         try:
             from scipy.spatial import KDTree
         except ImportError:
-            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
         coords = np.stack(
             [
@@ -341,10 +425,21 @@ class Cropper:
 
         valid = ~np.all(coords == 0.0, axis=1)
         if valid.sum() < 2:
-            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
         centroid = coords[valid].mean(axis=0)
         coords[~valid] = centroid
+
+        # Only resolved tokens are eligible interface seeds (an unresolved
+        # token collapsed onto the centroid must never seed a crop, and two
+        # such tokens from different chains sit at distance 0 → a false
+        # interface). ``valid`` already excludes centre-less tokens; intersect
+        # with ``token_resolved`` when available for the stricter guarantee.
+        seed_eligible = valid.copy()
+        if token_resolved is not None:
+            r = seed_eligible & token_resolved
+            if r.any():
+                seed_eligible = r
 
         # Find interface tokens: tokens within interface_distance of another chain.
         # When ``anchor_chains`` is given, only count tokens of those two
@@ -357,26 +452,28 @@ class Cropper:
         if anchor_chains is not None:
             a, b = anchor_chains
             for i in range(len(tokens)):
-                if not valid[i]:
+                if not seed_eligible[i]:
                     continue
                 if asym_ids[i] not in (a, b):
                     continue
                 neighbors = tree.query_ball_point(coords[i], self.interface_distance)
                 other = b if asym_ids[i] == a else a
-                if any(asym_ids[j] == other for j in neighbors):
+                # ``valid[j]`` guards against a centroid-collapsed unresolved
+                # neighbour faking a zero-distance cross-chain contact.
+                if any(asym_ids[j] == other and valid[j] for j in neighbors):
                     interface_indices.append(i)
         else:
             for i in range(len(tokens)):
-                if not valid[i]:
+                if not seed_eligible[i]:
                     continue
                 neighbors = tree.query_ball_point(coords[i], self.interface_distance)
                 for j in neighbors:
-                    if asym_ids[j] != asym_ids[i]:
+                    if asym_ids[j] != asym_ids[i] and valid[j]:
                         interface_indices.append(i)
                         break
 
         if not interface_indices:
-            return self._spatial_crop(tokens, max_tokens, max_atoms, rng)
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
         # Pick seed from interface tokens, then expand spatially
         seed_idx = rng.choice(interface_indices)

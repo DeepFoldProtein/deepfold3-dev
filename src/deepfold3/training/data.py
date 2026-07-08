@@ -247,6 +247,29 @@ def build_dataloaders(
         # Return a copy so cutoff filtering doesn't mutate the cache.
         return list(record_cache[key])
 
+    def _with_crop_weights(base: dict, spec) -> dict:
+        """Apply a spec's per-dataset ``crop_weights`` over the global kwargs.
+
+        AF3 §2.7 samples the crop strategy per example; letting each dataset
+        override the contiguous/spatial/interface weights lets (e.g.) a
+        monomer set drop wasted interface crops. Missing keys inherit the
+        global ``data.*_crop_weight`` defaults already in ``base``.
+        """
+        cw = getattr(spec, "crop_weights", None)
+        if not cw:
+            return base
+        out = dict(base)
+        key_map = {
+            "contiguous": "contiguous_crop_weight",
+            "spatial": "spatial_crop_weight",
+            "interface": "interface_crop_weight",
+        }
+        for k, v in cw.items():
+            if k not in key_map:
+                raise ValueError(f"dataset {spec.name!r}: unknown crop_weights key {k!r} (use {list(key_map)})")
+            out[key_map[k]] = float(v)
+        return out
+
     def load_from_spec(spec, *, keep_after: bool, preloaded_records=None):
         recs = preloaded_records if preloaded_records is not None else discover(spec.data_dir, spec.format)
         if spec.cutoff_date:
@@ -262,7 +285,7 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
-                **of3_kwargs,
+                **_with_crop_weights(of3_kwargs, spec),
             )
         else:
             ds = TrainingDataset(
@@ -271,7 +294,7 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
-                **ds_kwargs,
+                **_with_crop_weights(ds_kwargs, spec),
             )
         return ds, recs
 

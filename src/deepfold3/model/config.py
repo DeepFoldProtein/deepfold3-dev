@@ -570,6 +570,13 @@ class DatasetConfig:
             ``mol_type`` array (1.0 elsewhere, 0.0 on excluded mol_types).
             Default empty = no exclusion. Common use: PATCHR distillation
             sets ``[3]`` (``MOL_NONPOLYMER``) to drop inpainted ligand poses.
+        crop_weights: Optional per-dataset crop-strategy weights, e.g.
+            ``{"contiguous": 0.2, "spatial": 0.8, "interface": 0.0}``. Keys are
+            any subset of ``contiguous`` / ``spatial`` / ``interface``; missing
+            keys inherit the global ``data.*_crop_weight`` defaults. Lets a
+            monomer distillation set skip (wasted) interface crops while a
+            multi-chain PDB set keeps them (AF3 §2.7 samples the strategy
+            per example). ``None`` = use the global weights.
     """
 
     name: str = ""
@@ -580,6 +587,7 @@ class DatasetConfig:
     format: str = "df3"
     cutoff_date: str = ""
     exclude_loss_mol_types: list[int] = field(default_factory=list)
+    crop_weights: dict[str, float] | None = None
 
 
 @dataclass
