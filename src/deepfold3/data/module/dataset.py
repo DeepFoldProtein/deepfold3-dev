@@ -45,6 +45,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# TEMPORARILY DISABLED (2026-07-08): loading disk-stored per-token masks
+# (masks/{id}.npz: "fixed" / "region"). They were built under the previous
+# tokenization; after nucleotides became single tokens (res_type != 20) the
+# per-token count changed, so a stored mask's length no longer matches the
+# current tokens — it misaligns and crashes the loss (fixed_mask.expand_as),
+# and even where lengths coincide the per-token content maps to the OLD
+# token↔residue layout (cropping cannot fix this). Skip loading them until they
+# are rebuilt with `deepfold3 build-masks`. The synthesized loss-weight channel
+# (derived from the current tokens) is unaffected and still applied.
+_DISK_TOKEN_MASKS_ENABLED = False
+
 # Essential feature keys that every sample must contain for the model forward
 # pass and loss computation to produce a valid gradient.
 _REQUIRED_KEYS = {"res_type", "seq_mask", "atom_gt_positions", "atom_gt_mask", "msa", "msa_mask"}
@@ -318,7 +329,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         inp = Input(structure=structure, paired_msa={}, unpaired_msa={})
         tokenized = self.tokenizer.tokenize(inp)
 
-        if self._has_masks:
+        # Skip disk-stored masks even when present — see _DISK_TOKEN_MASKS_ENABLED.
+        if _DISK_TOKEN_MASKS_ENABLED and self._has_masks:
             mp = mask_path(self.data_dir / "masks", record.id)
             if mp.exists():
                 tokenized = tokenized.with_mask(TokenMask.load(str(mp)))
