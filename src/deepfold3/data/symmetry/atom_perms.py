@@ -301,9 +301,11 @@ def apply_ligand_token_permutation(
     m = atom_mask[dst, 0] & atom_mask[src, 0]  # [R] bool
 
     # Identity-relative per-row cost: ‖pred_dst - gt_src‖² - ‖pred_dst - gt_dst‖².
-    pred_dst = pred_pos[..., dst, 0, :]  # [..., R, 3]
-    gt_src = gt_pos[..., src, 0, :]
-    gt_dst = gt_pos[..., dst, 0, :]
+    # Detached — this only *decides* the permutation (a discrete argmin); the
+    # returned GT is detached too, so no gradient should flow through the cost.
+    pred_dst = pred_pos[..., dst, 0, :].detach()  # [..., R, 3]
+    gt_src = gt_pos[..., src, 0, :].detach()
+    gt_dst = gt_pos[..., dst, 0, :].detach()
     delta = ((pred_dst - gt_src).pow(2).sum(dim=-1) - (pred_dst - gt_dst).pow(2).sum(dim=-1)) * m.to(pred_dst.dtype)
 
     # Group rows by (ligand, perm).
