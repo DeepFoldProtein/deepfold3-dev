@@ -2417,6 +2417,10 @@ def training_loss(
             pair_mask_for_tm = features.get("pair_mask")
             if pair_mask_for_tm is None:
                 pair_mask_for_tm = loss_seq_mask.unsqueeze(1) & loss_seq_mask.unsqueeze(0)
+            # Gate on GT rep-atom presence (consistent with the distogram / PAE /
+            # PDE losses) so materialized unresolved residues (item 4b, whose rep
+            # atom is (0,0,0)) don't leak into the tm_true / itm_true diagnostic.
+            pair_mask_for_tm = pair_mask_for_tm.bool() & rep_present.unsqueeze(0) & rep_present.unsqueeze(1)
             pae_mask_for_tm = (frames_mask_feat.bool().unsqueeze(-1) & pair_mask_for_tm.bool()).float()
             mask_s_tm = (
                 pae_mask_for_tm.unsqueeze(0)
@@ -2424,7 +2428,7 @@ def training_loss(
                 * gt_angle_ok_tm.float().unsqueeze(0).unsqueeze(-1)
             )  # [1, N, N]
 
-            n_eff_tm = int(loss_seq_mask.sum().item())
+            n_eff_tm = int(rep_seq_mask.sum().item())
             if mask_s_tm.sum() > 0 and n_eff_tm > 0:
                 losses["tm_true"] = _tm_score_from_error(true_error, mask_s_tm, n_eff_tm)
                 asym_id_for_tm = features.get("asym_id")
