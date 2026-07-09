@@ -844,15 +844,15 @@ class TrainingConfig:
     # AF3; disable for A/B against the DF3 pre-alignment baseline.
     use_rigid_align: bool = True
 
-    # Share the *atom/ligand-level* symmetry resolution (intra-residue swaps +
-    # ligand automorphism) with the non-MSE GT losses (smooth-lDDT, distogram,
-    # …), decided once from the mini-rollout. The chain permutation is always
-    # shared; this second-order part is opt-in because the local (~1-2 Å) swap
-    # is decided against the mini-rollout but applied to losses scoring a
-    # different prediction (denoised / trunk), so it can jitter those targets
-    # and inflate grad-norm. Default off — the diffusion MSE already resolves
-    # atom/ligand symmetry per noise sample.
-    share_atom_ligand_symmetry: bool = False
+    # AF3 §4.2 resolves the whole permutation (chain + atom/ligand) ONCE from the
+    # mini-rollout and shares it with every GT-based loss, including the noised GT
+    # for the diffusion MSE. We follow that: chain + atom/ligand are resolved from
+    # the mini-rollout and applied to the shared GT (all losses) and, by default,
+    # to the MSE's augmented GT too. Set this True to instead resolve the MSE's
+    # atom/ligand symmetry per noise sample (argmin vs each denoised sample —
+    # a slightly tighter MSE, but it disagrees with the other losses' mini-rollout
+    # labelling and can inflate grad-norm; see the shared-permutation notes).
+    diffusion_mse_per_sample_symmetry: bool = False
 
     # Region-based loss weighting (region_id → weight multiplier, e.g. {3: 5.0} for CDR-H3)
     region_loss_weights: dict[int, float] = field(default_factory=dict)

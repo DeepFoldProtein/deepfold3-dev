@@ -424,29 +424,27 @@ def chain_perm_from_mini_rollout(
     )
 
 
-def resolve_shared_gt_atom_symmetry(
-    pred: dict[str, torch.Tensor],
+def resolve_gt_atom_symmetry(
+    ref: torch.Tensor,  # [..., N, M, 3] — reference prediction (mini-rollout), matching gt's leading dims
     features: dict[str, torch.Tensor],
-    gt_pos: torch.Tensor,  # [N, M, 3] — shared (already chain-permuted) GT
+    gt: torch.Tensor,  # [..., N, M, 3] — GT to relabel (gt_pos [N,M,3] or gt_aug [S,N,M,3])
     atom_mask: torch.Tensor,  # [N, M] bool — GT resolved mask
 ) -> torch.Tensor:
-    """Resolve intra-residue / ligand atom symmetry on the shared GT (AF3 §4.2).
+    """Resolve intra-residue / ligand atom symmetry against a reference (AF3 §4.2).
 
-    OF3 resolves the whole permutation (chain + atom + ligand) once from the
-    mini-rollout and shares it with every GT-based loss. The chain part is
-    handled by the caller; this adds the per-atom part: it aligns the rollout
-    onto the GT (global Kabsch, so the local symmetric-atom decision is made in
-    a common frame) and applies the same atom / ligand permutation ops the
-    diffusion MSE uses, relabelling GT's symmetric atoms (ASP OD1/OD2, PHE ring,
-    PO4 oxygens, …) to match the prediction. Benefits the per-atom GT losses
-    (smooth-lDDT, pLDDT, exp_resolved) and ligand-sensitive distogram — and
-    monomers too (symmetric side chains need no chain perm). The diffusion MSE
-    keeps its own per-noise-sample resolution. No-op when the rollout or the
-    symmetry tables are absent.
+    AF3 §4.2: after the chain permutation, resolve atom-naming ambiguities within
+    each chemical component (ASP OD1/OD2, PHE ring, PO4 oxygens, nucleic OP1/OP2,
+    ligand automorphisms) by permuting the GT to minimal RMSD to **the
+    prediction** — the mini-rollout — and this one resolution is shared by every
+    GT-based loss (diffusion, confidence, …). This aligns ``ref`` onto ``gt``
+    (Kabsch weighted by the representative/token-center atoms only — CA / C1' are
+    non-symmetric and anchor a stable frame; an all-atom weight would let the
+    symmetric atoms being resolved skew their own alignment) and applies the same
+    atom / ligand permutation ops. Works for either the un-augmented GT
+    (``[N,M,3]``) or the per-sample augmented GT (``[S,N,M,3]``); ``ref`` must
+    share ``gt``'s leading dims (broadcast the single mini-rollout across S).
+    No-op when the symmetry tables are absent.
     """
-    mini = pred.get("mini_rollout_pos")
-    if mini is None:
-        return gt_pos
     atom_swap = features.get("atom_swap_pairs")
     lig_swap = features.get("ligand_swap_pairs")
     lig_perms = features.get("ligand_perms")
@@ -454,7 +452,7 @@ def resolve_shared_gt_atom_symmetry(
     has_lswap = lig_swap is not None and len(lig_swap) > 0
     has_lperm = lig_perms is not None and len(lig_perms) > 0
     if not (has_atom or has_lswap or has_lperm):
-        return gt_pos
+        return gt
 
     from deepfold3.data.symmetry.atom_perms import (
         apply_ligand_token_permutation,
@@ -462,29 +460,33 @@ def resolve_shared_gt_atom_symmetry(
         apply_token_atom_permutation,
     )
 
-    n, m = gt_pos.shape[0], gt_pos.shape[1]
-    # Align the rollout onto the (chain-permuted) GT before deciding the local
-    # symmetric-atom swaps (OF3 Kabsch-aligns pred→GT first). Weight the Kabsch
-    # by the **representative (token-center) atoms only** — CA / C1' are not
-    # symmetric, so they anchor a stable frame; weighting by all atoms lets the
-    # symmetric atoms being resolved skew the very alignment used to resolve them.
+    n, m = gt.shape[-3], gt.shape[-2]
+    lead = gt.shape[:-3]
+    b = 1
+    for d in lead:
+        b *= d
+    gt_b = gt.reshape(b, n, m, 3)
+    ref_b = ref.reshape(b, n, m, 3)
+
     rep_idx = features.get("token_to_rep_atom")
     if rep_idx is not None:
-        w2d = torch.zeros(n, m, device=gt_pos.device, dtype=gt_pos.dtype)
-        w2d[torch.arange(n, device=gt_pos.device), rep_idx.to(gt_pos.device)] = 1.0
-        w = (w2d.bool() & atom_mask).reshape(-1).to(gt_pos.dtype)
+        w2d = torch.zeros(n, m, device=gt.device, dtype=gt.dtype)
+        w2d[torch.arange(n, device=gt.device), rep_idx.to(gt.device)] = 1.0
+        w = (w2d.bool() & atom_mask).reshape(-1).to(gt.dtype)
     else:
-        w = atom_mask.reshape(-1).to(gt_pos.dtype)
-    mref = weighted_rigid_align(mini[0].reshape(1, -1, 3), gt_pos.reshape(1, -1, 3), w).reshape(1, n, m, 3)
-    mask_b = atom_mask.bool()
-    gt = gt_pos.unsqueeze(0)  # [1, N, M, 3]
-    if has_atom:
-        gt = apply_token_atom_permutation(mref, gt, mask_b, atom_swap)
-    if has_lswap:
-        gt = apply_ligand_token_swap(mref, gt, mask_b, lig_swap)
-    if has_lperm:
-        gt = apply_ligand_token_permutation(mref, gt, mask_b, lig_perms)
-    return gt[0]
+        w = atom_mask.reshape(-1).to(gt.dtype)
+
+    with torch.no_grad():
+        mref = weighted_rigid_align(ref_b.reshape(b, -1, 3).detach(), gt_b.reshape(b, -1, 3), w).reshape(b, n, m, 3)
+        mask_b = atom_mask.bool()
+        out = gt_b
+        if has_atom:
+            out = apply_token_atom_permutation(mref, out, mask_b, atom_swap)
+        if has_lswap:
+            out = apply_ligand_token_swap(mref, out, mask_b, lig_swap)
+        if has_lperm:
+            out = apply_ligand_token_permutation(mref, out, mask_b, lig_perms)
+    return out.reshape(*lead, n, m, 3)
 
 
 def diffusion_mse_loss(
@@ -1790,13 +1792,13 @@ def diffusion_only_loss(
         seq_mask = seq_mask & c_keep
         gt_aug = gt_aug.index_select(-3, c_index)
 
-    # Opt-in (cfg.share_atom_ligand_symmetry): also resolve intra-residue /
-    # ligand atom symmetry on the shared GT (from the mini-rollout) so
-    # smooth-lDDT sees the symmetry-corrected GT. Off by default — the diffusion
-    # MSE still resolves it per noise sample on gt_aug, and the shared version
-    # can jitter these losses' targets (see the config flag doc).
-    if cfg.share_atom_ligand_symmetry:
-        gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
+    # AF3 §4.2: resolve intra-residue / ligand atom symmetry ONCE from the
+    # mini-rollout, applied to the shared (un-augmented) GT that smooth-lDDT /
+    # FAPE score. The same resolution goes onto the MSE's augmented GT below, so
+    # every loss uses one consistent labelling.
+    mini_ref = pred.get("mini_rollout_pos")
+    if mini_ref is not None:
+        gt_pos = resolve_gt_atom_symmetry(mini_ref[0], features, gt_pos, atom_mask)
 
     region_label = features.get(f"mask_{MASK_REGION}")
     region_weights: torch.Tensor | None = None
@@ -1821,9 +1823,23 @@ def diffusion_only_loss(
     total = gt_pos.new_zeros(())
 
     if cfg.alpha_diffusion > 0:
-        # GT already chain-permuted above → diffusion MSE skips its own chain
-        # perm (no ``asym_id``) and only resolves the per-sample atom/ligand
-        # symmetry + rigid align.
+        # Atom/ligand symmetry (AF3 §4.2). Default: resolve the augmented GT once
+        # from the mini-rollout (same labelling as the shared GT above) and pass
+        # no swap tables to the MSE. Opt-in: resolve per noise sample inside the
+        # MSE (argmin vs each denoised sample). GT is already chain-permuted, so
+        # the MSE skips its own chain perm (no ``asym_id``).
+        if cfg.diffusion_mse_per_sample_symmetry:
+            mse_kwargs = dict(
+                atom_swap_pairs=features.get("atom_swap_pairs"),
+                ligand_swap_pairs=features.get("ligand_swap_pairs"),
+                ligand_perms=features.get("ligand_perms"),
+            )
+        else:
+            if mini_ref is not None:
+                gt_aug = resolve_gt_atom_symmetry(
+                    mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, atom_mask
+                )
+            mse_kwargs = {}
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
@@ -1833,10 +1849,8 @@ def diffusion_only_loss(
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
             ligand_loss_weight=cfg.ligand_loss_weight,
             region_weights=region_weights,
-            atom_swap_pairs=features.get("atom_swap_pairs"),
-            ligand_swap_pairs=features.get("ligand_swap_pairs"),
-            ligand_perms=features.get("ligand_perms"),
             apply_rigid_align=cfg.use_rigid_align,
+            **mse_kwargs,
         )
         components["diffusion_mse"] = l_mse.detach()
 
@@ -1980,13 +1994,14 @@ def training_loss(
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         gt_seq_mask = seq_mask & c_keep
 
-    # Opt-in (cfg.share_atom_ligand_symmetry): also resolve intra-residue /
-    # ligand atom symmetry on the shared GT (from the mini-rollout), so the
-    # per-atom GT losses (smooth-lDDT, pLDDT, exp_resolved) and the
-    # ligand-sensitive distogram (gt_rep) score against the symmetry-corrected
-    # GT. Off by default (can jitter targets — see the config flag doc).
-    if cfg.share_atom_ligand_symmetry:
-        gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
+    # AF3 §4.2: resolve intra-residue / ligand atom symmetry ONCE from the
+    # mini-rollout, applied to the shared GT so the per-atom GT losses
+    # (smooth-lDDT, pLDDT, exp_resolved) and the ligand-sensitive distogram /
+    # tm_true (gt_rep) score against the symmetry-corrected GT. Same labelling
+    # as the diffusion MSE (below / in diffusion_only_loss).
+    mini_ref = pred.get("mini_rollout_pos")
+    if mini_ref is not None:
+        gt_pos = resolve_gt_atom_symmetry(mini_ref[0], features, gt_pos, atom_mask)
 
     losses: dict[str, torch.Tensor] = {}
     # Anchor total to the distogram prediction (pair features or logits)
@@ -2083,12 +2098,26 @@ def training_loss(
         gt_aug = pred["gt_augmented"]  # [S, N, M, 3]
         noise_levels = pred["noise_levels"]  # [S]
 
-        # GT already chain-permuted above → permute the augmented GT the same
-        # way and skip the diffusion MSE's own chain perm (no ``asym_id``); it
-        # only resolves the per-sample atom/ligand symmetry + rigid align.
+        # GT already chain-permuted above → permute the augmented GT the same way
+        # and skip the diffusion MSE's own chain perm (no ``asym_id``).
         if c_index is not None:
             gt_aug = gt_aug.index_select(-3, c_index)
 
+        # Atom/ligand symmetry (AF3 §4.2): default resolves gt_aug once from the
+        # mini-rollout (same labelling as the shared GT); opt-in resolves per
+        # noise sample inside the MSE.
+        if cfg.diffusion_mse_per_sample_symmetry:
+            mse_kwargs = dict(
+                atom_swap_pairs=features.get("atom_swap_pairs"),
+                ligand_swap_pairs=features.get("ligand_swap_pairs"),
+                ligand_perms=features.get("ligand_perms"),
+            )
+        else:
+            if mini_ref is not None:
+                gt_aug = resolve_gt_atom_symmetry(
+                    mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, loss_atom_mask
+                )
+            mse_kwargs = {}
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
@@ -2098,10 +2127,8 @@ def training_loss(
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
             ligand_loss_weight=cfg.ligand_loss_weight,
             region_weights=region_weights,
-            atom_swap_pairs=features.get("atom_swap_pairs"),
-            ligand_swap_pairs=features.get("ligand_swap_pairs"),
-            ligand_perms=features.get("ligand_perms"),
             apply_rigid_align=cfg.use_rigid_align,
+            **mse_kwargs,
         )
         losses["diffusion_mse"] = l_mse
 
