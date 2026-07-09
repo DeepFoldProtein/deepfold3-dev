@@ -153,6 +153,7 @@ class DeepFold3(nn.Module):
             num_element_classes=dc.atom_cross_att.num_element_classes,
             num_atom_name_chars=dc.atom_cross_att.num_atom_name_chars,
             atom_name_length=dc.atom_cross_att.atom_name_length,
+            ref_element_zero_index=dc.atom_cross_att.ref_element_zero_index,
         )
 
         # Evoformer trunk (with optional template embedding)

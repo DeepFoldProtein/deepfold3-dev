@@ -48,6 +48,12 @@ class AtomCrossAttConfig:
     num_element_classes: int = 128  # element one-hot vocabulary size
     num_atom_name_chars: int = 64  # atom name character vocabulary size
     atom_name_length: int = 4  # characters per atom name
+    # ``ref_element`` indexing convention for the element one-hot. False (default):
+    # one-hot the raw atomic number Z (H=1, C=6, ...) — index 0 is a dead channel,
+    # self-consistent for from-scratch training. True: one-hot the zero-indexed
+    # periodic-table position (Z-1: H=0, C=5), the AF3/Protenix convention —
+    # required when loading AF3-converted ``embed_ref_element`` weights.
+    ref_element_zero_index: bool = False
 
 
 @dataclass

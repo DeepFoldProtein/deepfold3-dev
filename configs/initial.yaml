@@ -232,6 +232,13 @@ model:
     p_std: 1.5
     skip_amp_sample: true
     skip_amp_sample_training: true
+    atom_cross_att:
+      # Element one-hot indexing. false (default): one-hot the raw atomic number
+      # Z (H=1, C=6, ...) — index 0 is a dead channel, self-consistent for
+      # from-scratch training. true: zero-indexed periodic-table position
+      # (Z-1: H=0, C=5), the AF3/Protenix convention — set true only when
+      # warm-starting from AF3-converted embed_ref_element weights.
+      ref_element_zero_index: false
   confidence:
     num_layer: 4
     num_plddt_bins: 50

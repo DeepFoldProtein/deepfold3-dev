@@ -648,6 +648,7 @@ class DiffusionHead(nn.Module):
             num_element_classes=cfg.atom_cross_att.num_element_classes,
             num_atom_name_chars=cfg.atom_cross_att.num_atom_name_chars,
             atom_name_length=cfg.atom_cross_att.atom_name_length,
+            ref_element_zero_index=cfg.atom_cross_att.ref_element_zero_index,
         )
 
         # Project trunk single to diffusion act (scale-only LN + no-bias projection)
