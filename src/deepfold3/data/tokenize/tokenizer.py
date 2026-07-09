@@ -18,6 +18,80 @@ from deepfold3.data.types import (
 )
 
 
+def _find_modified_residues(structure) -> set[int]:
+    """Residue indices that are covalently modified (→ atomize per-atom).
+
+    Mirrors OF3 ``tokenization.find_modified_residue_atom_ids`` (AF3 §2.6): a
+    canonical/standard polymer residue is treated as *modified* — and therefore
+    tokenized per-atom instead of as a single residue token — when it has a
+    covalent bond to a *different* residue that is NOT the standard polymer
+    backbone link (peptide C–N for protein, phosphodiester P / O3' / O5' for
+    nucleic acids).
+
+    Restricted to bonds whose partner is a NON-POLYMER (ligand / glycan): a
+    standard residue is atomized when covalently attached to a ligand (e.g. an
+    N-glycosylated ASN bonded to a NAG), but a polymer–polymer non-backbone link
+    (disulfide, isopeptide crosslink) atomizes neither residue. OF3 reaches the
+    same result by stripping such polymer–polymer links in ``prefilter_bonds``
+    *before* this check (``cleanup_structure_of3``); requiring a non-polymer
+    partner here makes the outcome identical whether or not the stored bonds were
+    prefiltered — so existing (un-re-prepared) NPZs, whose ``_struct_conn``
+    disulfides are still present, are NOT suddenly atomized at load time. The
+    peptide / phosphodiester backbone-atom exemption is kept for exact OF3 parity.
+
+    Returns:
+        Set of indices into ``structure.residues``.
+    """
+    residues = structure.residues
+    atoms = structure.atoms
+    bonds = structure.bonds
+    if len(bonds) == 0 or len(residues) == 0:
+        return set()
+
+    n_atoms = len(atoms)
+    atom_res = np.full(n_atoms, -1, dtype=np.int64)
+    for ri, res in enumerate(residues):
+        s = int(res["atom_idx"])
+        c = int(res["atom_num"])
+        atom_res[s : s + c] = ri
+
+    # Per-atom polymer flag (from the owning chain's mol_type) so a modification
+    # bond can be required to have exactly one non-polymer (ligand) endpoint.
+    atom_is_polymer = np.zeros(n_atoms, dtype=bool)
+    for ch in structure.chains:
+        s = int(ch["atom_idx"])
+        c = int(ch["atom_num"])
+        if int(ch["mol_type"]) in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA):
+            atom_is_polymer[s : s + c] = True
+
+    modified: set[int] = set()
+    for bond in bonds:
+        a1 = int(bond["atom_1"])
+        a2 = int(bond["atom_2"])
+        if not (0 <= a1 < n_atoms and 0 <= a2 < n_atoms):
+            continue
+        r1 = int(atom_res[a1])
+        r2 = int(atom_res[a2])
+        if r1 < 0 or r2 < 0 or r1 == r2:
+            continue  # intra-residue (or unmapped) bond → not a modification
+        n1 = atoms[a1]["name"].decode("ascii", errors="replace").strip()
+        n2 = atoms[a2]["name"].decode("ascii", errors="replace").strip()
+        is_peptide = n1 in const.PEPTIDE_BOND_ATOMS and n2 in const.PEPTIDE_BOND_ATOMS
+        is_phospho = n1 in const.PHOSPHODIESTER_BOND_ATOMS and n2 in const.PHOSPHODIESTER_BOND_ATOMS
+        if is_peptide or is_phospho:
+            continue  # standard backbone link → not a modification
+        # Atomize only the standard polymer residue attached to a NON-POLYMER
+        # partner. Polymer–polymer (disulfide/crosslink) and ligand–ligand bonds
+        # do not mark a standard residue as modified.
+        p1 = bool(atom_is_polymer[a1])
+        p2 = bool(atom_is_polymer[a2])
+        if p1 and not p2:
+            modified.add(r1)
+        elif p2 and not p1:
+            modified.add(r2)
+    return modified
+
+
 def _token_row(**fields: object) -> tuple:
     """Build a ``TOKEN_DTYPE`` row from named fields, ordered by the dtype.
 
@@ -55,6 +129,11 @@ class Tokenizer:
         # Global atom index → (token_idx, local_atom_within_token)
         atom_to_token: dict[int, tuple[int, int]] = {}
 
+        # AF3 §2.6: standard polymer residues that are covalently modified
+        # (non-backbone inter-residue bond, e.g. glycosylation) are atomized
+        # per-atom rather than kept as a single residue token.
+        modified_res = _find_modified_residues(structure)
+
         for chain in structure.chains:
             mol_type = int(chain["mol_type"])
             asym_id = int(chain["asym_id"])
@@ -86,6 +165,12 @@ class Tokenizer:
                     # re-prepare. (New prepares store the corrected flag.)
                     if 22 <= res_type <= 30:
                         is_standard = True
+
+                    # AF3 §2.6: a covalently-modified standard residue is
+                    # atomized (routed to the per-atom path below), even though
+                    # its name/res_type is canonical.
+                    if ri in modified_res:
+                        is_standard = False
 
                     if is_standard:
                         # Standard residue: one token per residue
@@ -245,7 +330,11 @@ def _get_center_coords(
 ) -> tuple[float, float, float]:
     """Get center atom coordinates for a residue.
 
-    Falls back to first atom if named center atom is not found.
+    Only *present* (resolved) atoms are considered: a materialised unresolved
+    atom (``is_present=False``, coords 0) must never be chosen as the token
+    center, or a residue whose CA/C1' is unresolved would get a spurious
+    (0, 0, 0) center. Falls back to the first present atom, then to the origin
+    for a fully-unresolved residue.
     """
     if atom_num == 0:
         return 0.0, 0.0, 0.0
@@ -254,11 +343,17 @@ def _get_center_coords(
 
     if center_atom_name is not None:
         for i in range(atom_num):
-            name = atoms[atom_idx + i]["name"].decode("ascii", errors="replace").strip()
+            a = atoms[atom_idx + i]
+            if not bool(a["is_present"]):
+                continue
+            name = a["name"].decode("ascii", errors="replace").strip()
             if name == center_atom_name:
-                a = atoms[atom_idx + i]
                 return float(a["x"]), float(a["y"]), float(a["z"])
 
-    # Fallback: first atom
-    a = atoms[atom_idx]
-    return float(a["x"]), float(a["y"]), float(a["z"])
+    # Fallback: first present atom
+    for i in range(atom_num):
+        a = atoms[atom_idx + i]
+        if bool(a["is_present"]):
+            return float(a["x"]), float(a["y"]), float(a["z"])
+
+    return 0.0, 0.0, 0.0
