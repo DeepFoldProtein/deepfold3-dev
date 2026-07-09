@@ -14,6 +14,7 @@ Two levels of filtering:
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 
 import numpy as np
@@ -321,47 +322,213 @@ def filter_clashing_chains(
     return invalid
 
 
-def select_interface_chains(
-    record: Record,
-    max_polymer_chains: int = 20,
-) -> set[int]:
-    """If >max_polymer_chains polymer chains, greedily keep those maximising interfaces.
+def _chain_resolved_coords(structure: Structure) -> dict[int, np.ndarray]:
+    """Map each chain's asym_id → (K, 3) array of its resolved-atom coords.
 
-    AF3 §2.5.4: when a structure has more than 20 polymer chains, select
-    the 20 that maximise the number of cross-chain interfaces.  Uses a
-    greedy algorithm: repeatedly pick the chain that adds the most new
-    interfaces with already-selected chains.
-
-    Returns set of chain_ids (asym_ids) to mark invalid (the ones NOT kept).
+    Uses the chain's contiguous ``[atom_idx, atom_idx + atom_num)`` slice of the
+    atom array and keeps only ``is_present`` atoms (unresolved / missing-coord
+    atoms are dropped so they can't seed false zero-distance contacts). Chains
+    with no resolved atoms map to an empty ``(0, 3)`` array.
     """
-    polymer_chains = [ci for ci in record.chains if ci.valid and ci.mol_type != const.MOL_NONPOLYMER]
-    if len(polymer_chains) <= max_polymer_chains:
+    atoms = structure.atoms
+    out: dict[int, np.ndarray] = {}
+    for ch in structure.chains:
+        aid = int(ch["asym_id"])
+        a0 = int(ch["atom_idx"])
+        an = int(ch["atom_num"])
+        if an <= 0:
+            out[aid] = np.empty((0, 3), dtype=np.float64)
+            continue
+        sl = atoms[a0 : a0 + an]
+        m = sl["is_present"]
+        if not m.any():
+            out[aid] = np.empty((0, 3), dtype=np.float64)
+            continue
+        out[aid] = np.column_stack([sl["x"][m], sl["y"][m], sl["z"][m]]).astype(np.float64)
+    return out
+
+
+def _interface_coords(coords_a: np.ndarray, coords_b: np.ndarray, distance: float) -> np.ndarray:
+    """Resolved atoms of chains a/b that lie within ``distance`` of the other chain.
+
+    Mirrors OF3 ``get_interface_atoms`` restricted to the preferred chain pair:
+    returns the union of a-atoms near b and b-atoms near a. Empty ``(0, 3)`` if
+    there is no contact (or scipy is unavailable).
+    """
+    if len(coords_a) == 0 or len(coords_b) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        return np.empty((0, 3), dtype=np.float64)
+    tree_a, tree_b = KDTree(coords_a), KDTree(coords_b)
+    a_near = [i for i, nbrs in enumerate(tree_a.query_ball_tree(tree_b, distance)) if nbrs]
+    b_near = [i for i, nbrs in enumerate(tree_b.query_ball_tree(tree_a, distance)) if nbrs]
+    parts: list[np.ndarray] = []
+    if a_near:
+        parts.append(coords_a[a_near])
+    if b_near:
+        parts.append(coords_b[b_near])
+    return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.float64)
+
+
+def _pick_reference_atom(
+    coords_by_chain: dict[int, np.ndarray],
+    preferred: list[int],
+    anchor_iface: tuple[int, int] | None,
+    interface_distance: float,
+    nonligand_ids: list[int],
+    rng: random.Random,
+) -> np.ndarray | None:
+    """Random resolved reference atom, biased to the preferred chain/interface.
+
+    Mirrors OF3 ``get_resolved_and_preferred_token_center_atoms`` +
+    ``get_interface_atoms``: draw a random resolved atom from the preferred
+    interface subregion if an interface anchor is given, otherwise from the
+    preferred chain(s); fall back to all non-ligand resolved atoms when the
+    preferred region has none. Returns ``None`` only if nothing is resolved.
+    """
+    # Interface anchor: prefer the contact subregion between the two chains.
+    if anchor_iface is not None:
+        ca = coords_by_chain.get(anchor_iface[0], np.empty((0, 3)))
+        cb = coords_by_chain.get(anchor_iface[1], np.empty((0, 3)))
+        iface = _interface_coords(ca, cb, interface_distance)
+        if len(iface) > 0:
+            return iface[rng.randrange(len(iface))]
+
+    pool_ids = preferred if preferred else nonligand_ids
+    parts = [coords_by_chain[a] for a in pool_ids if len(coords_by_chain.get(a, np.empty((0, 3)))) > 0]
+    if not parts:
+        # Nothing resolved in the preferred region → any resolved atom anywhere.
+        parts = [c for c in coords_by_chain.values() if len(c) > 0]
+        if not parts:
+            return None
+    allc = np.concatenate(parts)
+    return allc[rng.randrange(len(allc))]
+
+
+def _reinclude_ligands(
+    coords_by_chain: dict[int, np.ndarray],
+    ligand_ids: list[int],
+    kept: set[int],
+    distance: float,
+) -> set[int]:
+    """Ligand chains with any resolved atom within ``distance`` of a kept chain.
+
+    Mirrors OF3 ``crop_chainwise`` step 10 (``ligand_inclusion_distance``): re-add
+    ligands proximal to the retained chains regardless of the chain limit.
+    """
+    if not ligand_ids:
+        return set()
+    kept_parts = [coords_by_chain[a] for a in kept if len(coords_by_chain.get(a, np.empty((0, 3)))) > 0]
+    if not kept_parts:
+        return set()
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        return set()
+    tree = KDTree(np.concatenate(kept_parts))
+    out: set[int] = set()
+    for lid in ligand_ids:
+        lc = coords_by_chain.get(lid, np.empty((0, 3)))
+        if len(lc) == 0:
+            continue
+        if any(len(n) > 0 for n in tree.query_ball_point(lc, distance)):
+            out.add(lid)
+    return out
+
+
+def select_interface_chains(
+    structure: Structure,
+    anchor: tuple[str, int, int] | None = None,
+    max_chains: int = 20,
+    interface_distance: float = 15.0,
+    ligand_inclusion_distance: float = 5.0,
+    rng: random.Random | None = None,
+) -> set[int]:
+    """Spatial chain "pre-crop" for large assemblies (AF3 §2.5.4 / OF3 ``crop_chainwise``).
+
+    When a structure has more than ``max_chains`` *effective* (non-ligand)
+    chains, keep the ``max_chains`` spatially-closest chains around a random
+    reference atom drawn from the sampled ``anchor`` (preferred chain or
+    interface), then re-include any ligand within ``ligand_inclusion_distance``
+    of a kept chain. The preferred chain/interface is *always* kept — this fixes
+    the prior greedy-interface pre-crop, which was anchor-independent and could
+    drop the very chain/interface the sampler drew.
+
+    Unlike the previous metadata-only greedy selector, this operates on the
+    resolved atom geometry and the drawn anchor (so it must run per sample, not
+    once per record). Chains with no resolved atoms are never selected as
+    "closest" (matching OF3, which ranks only resolved token-center atoms) but
+    an anchor chain is still force-kept.
+
+    Parameters mirror OF3 ``crop_chainwise``. ``anchor`` is
+    ``(kind, anchor_a, anchor_b)`` from the weighted sampler:
+    ``kind="chain"`` → preferred chain ``anchor_a``; ``kind="interface"`` →
+    preferred interface ``(anchor_a, anchor_b)``.
+
+    Returns the set of asym_ids to **KEEP**. When the assembly is already within
+    the chain limit, every chain is kept.
+
+    Adaptation notes vs OF3:
+      * DF3 ranks by minimum distance to any *resolved atom* of a chain rather
+        than to its token-center atom; for chain-proximity ranking this is
+        essentially equivalent (interfaces are defined by close contacts) and
+        avoids re-tokenizing the full assembly just to pre-crop it.
+      * Ligand re-inclusion uses resolved atoms (OF3 uses the raw atom array);
+        this prevents unresolved (zero-coord) atoms from faking contacts.
+    """
+    if rng is None:
+        rng = random.Random()
+
+    chains = structure.chains
+    if len(chains) == 0:
         return set()
 
-    polymer_ids = {ci.chain_id for ci in polymer_chains}
+    all_ids = [int(c["asym_id"]) for c in chains]
+    mol_type = {int(c["asym_id"]): int(c["mol_type"]) for c in chains}
+    ligand_ids = [aid for aid in all_ids if mol_type[aid] == const.MOL_NONPOLYMER]
+    nonligand_ids = [aid for aid in all_ids if mol_type[aid] != const.MOL_NONPOLYMER]
 
-    # Build adjacency from interfaces: chain_id → set of neighbouring chain_ids
-    neighbours: dict[int, set[int]] = {cid: set() for cid in polymer_ids}
-    for iface in record.interfaces:
-        if not iface.valid:
-            continue
-        c1, c2 = iface.chain_1, iface.chain_2
-        if c1 in polymer_ids and c2 in polymer_ids:
-            neighbours[c1].add(c2)
-            neighbours[c2].add(c1)
+    # Only pre-crop when there are too many *effective* (non-ligand) chains.
+    if len(nonligand_ids) <= max_chains:
+        return set(all_ids)
 
-    # Greedy selection: start with the chain having most interfaces, then
-    # iteratively pick the chain that adds the most new interfaces to the
-    # selected set.
-    selected: set[int] = set()
-    remaining = set(polymer_ids)
+    coords_by_chain = _chain_resolved_coords(structure)
 
-    for _ in range(min(max_polymer_chains, len(polymer_ids))):
-        best_cid = max(remaining, key=lambda c: len(neighbours[c] & selected) if selected else len(neighbours[c]))
-        selected.add(best_cid)
-        remaining.discard(best_cid)
+    # Preferred chain / interface from the sampler anchor.
+    preferred: list[int] = []
+    anchor_iface: tuple[int, int] | None = None
+    if anchor is not None:
+        kind, a, b = anchor
+        if kind == "chain":
+            preferred = [int(a)]
+        elif kind == "interface":
+            preferred = [int(a), int(b)]
+            anchor_iface = (int(a), int(b))
 
-    return polymer_ids - selected
+    ref = _pick_reference_atom(coords_by_chain, preferred, anchor_iface, interface_distance, nonligand_ids, rng)
+
+    if ref is None:
+        # No resolved atoms at all — cannot rank spatially; keep the first
+        # ``max_chains`` non-ligand chains plus the (force-kept) preferred set.
+        kept = set(nonligand_ids[:max_chains]) | set(preferred)
+    else:
+        # Rank non-ligand chains by minimum resolved-atom distance to the
+        # reference atom; unresolved chains are not ranking candidates.
+        dist_by_chain: dict[int, float] = {}
+        for aid in nonligand_ids:
+            cc = coords_by_chain.get(aid)
+            if cc is None or len(cc) == 0:
+                continue
+            dist_by_chain[aid] = float(np.min(np.linalg.norm(cc - ref, axis=1)))
+        ranked = sorted(dist_by_chain, key=lambda a: dist_by_chain[a])
+        kept = set(ranked[:max_chains]) | set(preferred)
+
+    # Re-include proximal ligands (never counted toward the chain limit).
+    kept |= _reinclude_ligands(coords_by_chain, ligand_ids, kept, ligand_inclusion_distance)
+
+    return kept
 
 
 def filter_structure_metadata(
@@ -473,10 +640,11 @@ def filter_structure(
                     )
                     ci.valid = False
 
-    # NOTE: chain selection (>20 polymer chains → keep 20 maximising interfaces)
-    # is NOT applied here.  It belongs at training time (sampler/dataset) because
-    # the limit varies by stage (initial=20, fine-tune=larger).
-    # Use select_interface_chains() from this module at load time.
+    # NOTE: large-assembly chain "pre-crop" (>max_chains effective chains →
+    # keep the spatially-closest max_chains around the sampled anchor) is NOT
+    # applied here. It belongs at training time (sampler/dataset) because it is
+    # anchor- and geometry-dependent and the limit varies by stage (initial=20,
+    # fine-tune=larger). Use select_interface_chains() from this module per sample.
 
     # Mark interfaces invalid if either chain is invalid
     valid_chain_ids = {ci.chain_id for ci in record.chains if ci.valid}
