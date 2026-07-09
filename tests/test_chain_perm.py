@@ -211,3 +211,146 @@ def test_apply_sym_index_reorders_and_masks_off_no_counterpart():
     # pred chain 1 sym 0..2 pull GT chain 0 (x≈0..2).
     assert torch.allclose(new_gt[4:7, 0, 0], torch.tensor([0.0, 1, 2]))
     assert new_mask[4, 0] and new_mask[5, 0] and new_mask[6, 0]
+
+
+# ---------------------------------------------------------------------------
+# item 11: covalently-connected components permute as whole units (AF3 §4.2 /
+# OF3 assign_mol_symmetry_ids). A protein + its bonded glycan is one unit; two
+# symmetric glycosylated copies match as ``{protein, glycan}`` molecules, never
+# as an independent protein swap crossed with an independent glycan swap.
+# ---------------------------------------------------------------------------
+
+import numpy as np  # noqa: E402
+
+from deepfold3.data.symmetry.chain_perm import _inter_chain_bonds_from_structure  # noqa: E402
+from deepfold3.data.symmetry.mol_labels import (  # noqa: E402
+    assign_component_symmetry_classes,
+    connected_chain_components,
+)
+
+
+def test_connected_components_and_singleton_fallback():
+    # Two glycosylated units: chains 0/1 bonded, chains 2/3 bonded.
+    comps, comp_of = connected_chain_components([0, 1, 2, 3], [(0, 1), (2, 3)])
+    assert comps == [(0, 1), (2, 3)]
+    assert comp_of == {0: 0, 1: 0, 2: 1, 3: 1}
+
+    # No inter-chain bonds → every chain is its own singleton component (today's
+    # behaviour), independent of bond-argument form.
+    for bonds in (None, []):
+        comps, comp_of = connected_chain_components([0, 1, 2, 3], bonds)
+        assert comps == [(0,), (1,), (2,), (3,)]
+        assert comp_of == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_symmetry_classes_group_isomorphic_glyco_units():
+    # protein(entity 0)+glycan(entity 1) unit, twice → one symmetry class.
+    ent = {0: 0, 1: 1, 2: 0, 3: 1}
+    comps = [(0, 1), (2, 3)]
+    cls = assign_component_symmetry_classes(comps, ent, [(0, 1), (2, 3)])
+    assert cls[0] == cls[1]  # the two glyco-units are one permutation class
+
+    # A bonded 2-chain unit is NOT the same class as a lone protein chain.
+    ent2 = {0: 0, 1: 1, 2: 0}
+    comps2, _ = connected_chain_components([0, 1, 2], [(0, 1)])
+    assert comps2 == [(0, 1), (2,)]
+    cls2 = assign_component_symmetry_classes(comps2, ent2, [(0, 1)])
+    assert cls2[0] != cls2[1]
+
+
+def test_singleton_symmetry_classes_reduce_to_entity_id():
+    # With no bonds, isomorphism of singletons == entity equality (today's path).
+    comps, _ = connected_chain_components([0, 1], None)
+    assert assign_component_symmetry_classes(comps, {0: 0, 1: 0}, None)[0] == assign_component_symmetry_classes(
+        comps, {0: 0, 1: 0}, None
+    )[1]
+    same_ent = assign_component_symmetry_classes(comps, {0: 5, 1: 5}, None)
+    assert same_ent[0] == same_ent[1]
+    diff_ent = assign_component_symmetry_classes(comps, {0: 0, 1: 1}, None)
+    assert diff_ent[0] != diff_ent[1]
+
+
+def _glycosylated_homodimer(M: int = 1):
+    """Two symmetric protein+glycan units; the prediction keeps both proteins in
+    their GT positions but SWAPS the two glycans in space (each glycan lands on
+    the *other* unit's glycan spot).
+
+    Ground truth (rep-atom x): protein A @ 0,1,2 with glycan A @ 20; protein B @
+    50,51,52 with glycan B @ 70. The correct, covalent-unit-preserving mapping
+    is the identity — glycan A stays bonded to protein A — even though pred
+    glycan A sits where GT glycan B is. An entity-only permutation instead
+    relabels glycan A → glycan B (the spatial nearest of the same entity),
+    breaking the covalent unit and rewarding the mis-placed glycan.
+    """
+    N = 8  # protA:0,1,2  glyA:3  protB:4,5,6  glyB:7
+    gt = torch.zeros(N, M, 3)
+    pred = torch.zeros(N, M, 3)
+    gt[:, 0, 0] = torch.tensor([0.0, 1, 2, 20, 50, 51, 52, 70])
+    pred[:, 0, 0] = torch.tensor([0.0, 1, 2, 70, 50, 51, 52, 20])  # proteins fixed; glycans swapped
+    atom_mask = torch.zeros(N, M, dtype=torch.bool)
+    atom_mask[:, 0] = True
+    asym_id = torch.tensor([0, 0, 0, 1, 2, 2, 2, 3])
+    entity_id = torch.tensor([0, 0, 0, 1, 0, 0, 0, 1])  # proteins entity 0, glycans entity 1
+    token_to_rep_atom = torch.zeros(N, dtype=torch.long)
+    mol_type = torch.tensor(
+        [const.MOL_PROTEIN] * 3 + [const.MOL_NONPOLYMER] + [const.MOL_PROTEIN] * 3 + [const.MOL_NONPOLYMER]
+    )
+    seq_mask = torch.ones(N, dtype=torch.bool)
+    return pred, gt, atom_mask, asym_id, entity_id, token_to_rep_atom, mol_type, seq_mask
+
+
+def test_glycan_unit_permutes_with_protein_when_bonded():
+    pred, gt, mask, asym, ent, rep, mol, seq = _glycosylated_homodimer()
+    assign = compute_chain_permutation_tokens(
+        pred,
+        gt,
+        mask,
+        asym,
+        ent,
+        token_to_rep_atom=rep,
+        mol_type=mol,
+        seq_mask=seq,
+        inter_chain_bonds=[(0, 1), (2, 3)],
+    )
+    # Covalent unit stays intact: glycan A (asym 1) keeps its bond to protein A.
+    assert assign == {0: 0, 1: 1, 2: 2, 3: 3}
+
+
+def test_glycan_swaps_independently_without_bonds():
+    """The entity-only path (no inter-chain bonds) breaks the covalent unit —
+    documents exactly the divergence the component grouping fixes."""
+    pred, gt, mask, asym, ent, rep, mol, seq = _glycosylated_homodimer()
+    assign = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq
+    )
+    # Proteins map to themselves but glycans get relabelled across the units.
+    assert assign == {0: 0, 1: 3, 2: 2, 3: 1}
+
+
+def test_no_bonds_is_identical_to_default():
+    """Passing ``inter_chain_bonds=None`` must equal omitting it (common path)."""
+    pred, gt, mask, asym, ent, rep, mol, seq = _homodimer_swapped()
+    a_default = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq
+    )
+    a_none = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq, inter_chain_bonds=None
+    )
+    assert a_default == a_none == {0: 1, 1: 0}
+
+
+def test_inter_chain_bonds_from_structure_maps_atoms_to_chains():
+    from deepfold3.data.types import BOND_DTYPE, CHAIN_DTYPE
+
+    chains = np.zeros(2, dtype=CHAIN_DTYPE)
+    chains["asym_id"] = [0, 1]
+    chains["atom_idx"] = [0, 10]
+    chains["atom_num"] = [10, 5]
+    bonds = np.zeros(2, dtype=BOND_DTYPE)
+    bonds["atom_1"] = [3, 2]  # bond 0: atom 3 (chain 0) ↔ atom 12 (chain 1); bond 1: intra-chain 0
+    bonds["atom_2"] = [12, 5]
+    out = _inter_chain_bonds_from_structure(chains, bonds)
+    assert out == [(0, 1, 3, 2)]  # only the inter-chain bond; rel indices 3 and 12−10=2
+
+    # No bonds → None (singleton-component / entity-only path).
+    assert _inter_chain_bonds_from_structure(chains, np.empty(0, dtype=BOND_DTYPE)) is None
