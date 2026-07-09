@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 # swap groups. Each swap group is itself a list of pairs ``(a, b)``
 # meaning "swap atoms a and b". Multiple pairs in one group are applied
 # *together* (e.g. PHE flips CD1↔CD2 *and* CE1↔CE2 simultaneously).
-RESIDUE_ATOM_SYMMETRY_GROUPS: Final[dict[str, list[list[tuple[str, str]]]]] = {
+_PROTEIN_ATOM_SYMMETRY: Final[dict[str, list[list[tuple[str, str]]]]] = {
     "ASP": [[("OD1", "OD2")]],
     "GLU": [[("OE1", "OE2")]],
     "ARG": [[("NH1", "NH2")]],
@@ -53,6 +53,20 @@ RESIDUE_ATOM_SYMMETRY_GROUPS: Final[dict[str, list[list[tuple[str, str]]]]] = {
     "HIS": [[("ND1", "CD2"), ("CE1", "NE2")]],
     "LEU": [[("CD1", "CD2")]],
     "VAL": [[("CG1", "CG2")]],
+}
+
+# Nucleic acids: the two non-bridging phosphate oxygens (OP1/OP2, older name
+# O1P/O2P) are chemically equivalent → a true 180° symmetry, like ASP OD1/OD2.
+# Both naming conventions live in one group; only the pair actually present in a
+# given residue resolves (``build_residue_symmetry_pairs`` skips absent atoms),
+# so the effective swap is whichever exists. (The rare 5'-terminal free
+# phosphate's third oxygen OP3 gives a 3-fold group we don't model here — a
+# minor gap vs a full automorphism.)
+_NUCLEIC_PHOSPHATE_SYMMETRY: list[list[tuple[str, str]]] = [[("OP1", "OP2"), ("O1P", "O2P")]]
+
+RESIDUE_ATOM_SYMMETRY_GROUPS: Final[dict[str, list[list[tuple[str, str]]]]] = {
+    **_PROTEIN_ATOM_SYMMETRY,
+    **{res: _NUCLEIC_PHOSPHATE_SYMMETRY for res in ("A", "G", "C", "U", "DA", "DG", "DC", "DT")},
 }
 
 
