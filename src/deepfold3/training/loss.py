@@ -1790,10 +1790,13 @@ def diffusion_only_loss(
         seq_mask = seq_mask & c_keep
         gt_aug = gt_aug.index_select(-3, c_index)
 
-    # Also resolve intra-residue / ligand atom symmetry on the shared GT (from
-    # the mini-rollout) so smooth-lDDT sees the symmetry-corrected GT — the
-    # diffusion MSE still resolves it per noise sample on gt_aug.
-    gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
+    # Opt-in (cfg.share_atom_ligand_symmetry): also resolve intra-residue /
+    # ligand atom symmetry on the shared GT (from the mini-rollout) so
+    # smooth-lDDT sees the symmetry-corrected GT. Off by default — the diffusion
+    # MSE still resolves it per noise sample on gt_aug, and the shared version
+    # can jitter these losses' targets (see the config flag doc).
+    if cfg.share_atom_ligand_symmetry:
+        gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
 
     region_label = features.get(f"mask_{MASK_REGION}")
     region_weights: torch.Tensor | None = None
@@ -1977,11 +1980,13 @@ def training_loss(
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         gt_seq_mask = seq_mask & c_keep
 
-    # Also resolve intra-residue / ligand atom symmetry on the shared GT (from
-    # the mini-rollout), so the per-atom GT losses (smooth-lDDT, pLDDT,
-    # exp_resolved) and the ligand-sensitive distogram (gt_rep) score against
-    # the symmetry-corrected GT. Applies to monomers too (symmetric side chains).
-    gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
+    # Opt-in (cfg.share_atom_ligand_symmetry): also resolve intra-residue /
+    # ligand atom symmetry on the shared GT (from the mini-rollout), so the
+    # per-atom GT losses (smooth-lDDT, pLDDT, exp_resolved) and the
+    # ligand-sensitive distogram (gt_rep) score against the symmetry-corrected
+    # GT. Off by default (can jitter targets — see the config flag doc).
+    if cfg.share_atom_ligand_symmetry:
+        gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
 
     losses: dict[str, torch.Tensor] = {}
     # Anchor total to the distogram prediction (pair features or logits)

@@ -139,6 +139,45 @@ def test_shared_gt_resolves_symmetric_side_chain_atoms():
     assert torch.allclose(resolved[0, :4], gt[0, :4])
 
 
+def test_share_atom_ligand_symmetry_flag_gates_the_loss():
+    """cfg.share_atom_ligand_symmetry toggles whether smooth-lDDT sees the
+    atom-level symmetry-corrected GT. A monomer ASP with OD1/OD2 swapped in the
+    prediction: flag ON relabels the shared GT (lower smooth-lDDT), flag OFF
+    leaves it (higher)."""
+    N, M = 1, 6
+    gt = torch.zeros(N, M, 3)
+    gt[0, 0] = torch.tensor([0.0, 0, 0])
+    gt[0, 1] = torch.tensor([1.0, 0, 0])
+    gt[0, 2] = torch.tensor([2.0, 0, 0])
+    gt[0, 3] = torch.tensor([2.0, 1, 0])
+    gt[0, 4] = torch.tensor([3.0, 0, 0])  # OD1
+    gt[0, 5] = torch.tensor([3.0, 2, 0])  # OD2
+    denoised = gt.clone().unsqueeze(0)
+    denoised[0, 0, 4] = gt[0, 5]  # prediction swapped OD1/OD2
+    denoised[0, 0, 5] = gt[0, 4]
+
+    features = {
+        "atom_gt_positions": gt,
+        "atom_gt_mask": torch.ones(N, M, dtype=torch.bool),
+        "seq_mask": torch.ones(N, dtype=torch.bool),
+        "mol_type": torch.full((N,), const.MOL_PROTEIN, dtype=torch.long),
+        "token_to_rep_atom": torch.tensor([1], dtype=torch.long),
+        "atom_swap_pairs": torch.tensor([[0, 4, 5]], dtype=torch.long),
+    }
+    pred = {
+        "denoised": denoised,
+        "gt_augmented": gt.unsqueeze(0),
+        "noise_levels": torch.tensor([1.0]),
+        "mini_rollout_pos": denoised,
+    }
+
+    cfg_off = TrainingConfig()
+    cfg_on = TrainingConfig(share_atom_ligand_symmetry=True)
+    _t, comp_off = diffusion_only_loss(pred, features, cfg_off)
+    _t, comp_on = diffusion_only_loss(pred, features, cfg_on)
+    assert comp_on["smooth_lddt"].item() < comp_off["smooth_lddt"].item()
+
+
 def test_shared_gt_symmetry_noop_without_tables():
     """No swap tables (or no rollout) → GT returned unchanged."""
     N, M = 1, 6
