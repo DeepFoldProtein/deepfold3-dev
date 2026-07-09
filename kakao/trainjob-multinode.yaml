@@ -49,20 +49,32 @@ spec:
       - NCCL_IB_DISABLE
       - "-x"
       - NCCL_IB_HCA
-      - "-x"
-      - NCCL_SOCKET_IFNAME
+      # - "-x"
+      # - NCCL_SOCKET_IFNAME
       - "-x"
       - NCCL_NVLS_ENABLE
       - "-x"
-      - NCCL_P2P_LEVEL
-      - "-x"
+      # - NCCL_P2P_LEVEL
+      # - "-x"
       - NCCL_DEBUG
       - "-x"
       - NCCL_DEBUG_SUBSYS
       - "-x"
+      - NCCL_DEBUG_FILE
+      - "-x"
+      - NCCL_RAS_ENABLE
+      - "-x"
       - TORCH_NCCL_ASYNC_ERROR_HANDLING
       - "-x"
       - TORCH_FR_BUFFER_SIZE
+      - "-x"
+      - TORCH_NCCL_ENABLE_TIMING
+      - "-x"
+      - TORCH_NCCL_DUMP_ON_TIMEOUT
+      - "-x"
+      - TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+      - "-x"
+      - TORCH_FR_DUMP_TEMP_FILE
       - "-x"
       - PYTORCH_CUDA_ALLOC_CONF
       - "-x"
@@ -195,38 +207,66 @@ spec:
         # NCCL auto-probe picks unreachable HCAs and falls back to TCP over
         # eth0 (Calico), cutting throughput ~2×. Regenerate from the Multus
         # network-status annotation if the cluster PCI layout ever changes.
-        value: "mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
-      - name: NCCL_SOCKET_IFNAME
-        # Pin NCCL OOB (bootstrap + small control msgs) to the Calico pod
-        # network. Without this, NCCL may pick one of the Multus net1..net8
-        # interfaces for OOB, whose IPs come from per-pod IPAM pools that
-        # aren't mutually routable — we saw node-0-6 hang on socketPollConnect
-        # to 10.1.25.x owned by another pod. eth0 is the shared Calico layer
-        # and is always reachable via service DNS.
-        value: "eth0"
+        value: "=mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
       - name: NCCL_NVLS_ENABLE
         # NVLink SHARP in-network reduction on B200 NVLink5. Moves intra-node
         # allreduce accumulation into the NVSwitch so GPUs stream-and-receive
         # instead of full ring. NCCL ≥ 2.19 auto-enables on supported HW but
         # explicit avoids auto-detect quirks.
         value: "1"
-      - name: NCCL_P2P_LEVEL
-        value: "NVL"
+      # - name: NCCL_P2P_LEVEL
+      #   value: "NVL"
       - name: NCCL_DEBUG
-        # WARN: silence steady-state INIT/TUNING spam. Flip to INFO (with
-        # SUBSYS=INIT,NET) only when debugging comm setup. Transport already
-        # confirmed 2026-06-13: all connections NET/IB (mlx5_14..21), zero
-        # NET/Socket fallback (see memory project_fapek5_dt_spike_collective).
-        value: "WARN"
+        # WARN by default; `NCCL_LOG=1 bash kakao/submit.sh …` flips to INFO for
+        # verbose per-collective + net/proxy timing to a NODE-LOCAL file (below),
+        # to diagnose the ~80-min periodic collective stall
+        # (export/burst-periodic-stall/). Transport already confirmed 2026-06-13:
+        # all NET/IB (mlx5_14..21), zero Socket fallback.
+        value: "__NCCL_DEBUG__"
       - name: NCCL_DEBUG_SUBSYS
-        # INIT = comm setup/timings. TUNING = algo/proto choice per msg size
-        # (logged once per size, no per-collective spam). Use INIT,NET to see
-        # per-connection transport, INIT,COLL for the per-AllReduce trace.
-        value: "INIT,TUNING"
+        # Default INIT,TUNING (setup + per-size algo choice; no per-collective
+        # spam). NCCL_LOG=1 → INIT,NET,COLL,PROFILE (per-AllReduce + proxy/net
+        # op timing = the closest in-pod proxy for switch PortXmitWait).
+        value: "__NCCL_DEBUG_SUBSYS__"
+      - name: NCCL_DEBUG_FILE
+        # Empty by default (WARN → stdout, stays in the per-rank stdout.log).
+        # NCCL_LOG=1 → /tmp/nccl.%h.%p.log: NODE-LOCAL (not the shared PVC) so the
+        # verbose logging doesn't add fabric/PVC I/O and confound the very
+        # congestion we measure; %h/%p give one clean file per rank. Collect
+        # after a burst with monitor/collect_nccl_logs.sh.
+        value: "__NCCL_DEBUG_FILE__"
+      - name: NCCL_RAS_ENABLE
+        # RAS straggler/hang detector — background thread, ~zero overhead, always
+        # on. Query LIVE during a burst:  kubectl exec <pod> -- ncclras
+        # → per-rank collective progress; lagging ranks name the straggler.
+        value: "1"
       - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
         value: "1"
       - name: TORCH_FR_BUFFER_SIZE
         value: "20000"
+      - name: TORCH_NCCL_ENABLE_TIMING
+        # Record per-collective durations in the flight-recorder ring buffer.
+        # Small per-collective CUDA-event cost → only on when NCCL_LOG=1. Dump on
+        # demand via torch._C._distributed_c10d._dump_nccl_trace(), or auto on a
+        # watchdog timeout (below). During a burst the all-reduce durations spike.
+        value: "__TORCH_NCCL_ENABLE_TIMING__"
+      - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+        value: "1"
+      - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+        # On-demand flight-recorder dump trigger. PGNCCL's monitor thread creates
+        # a per-rank FIFO at <path><rank>; writing one byte to it serializes the
+        # FR ring buffer (recent collectives + per-op durations when
+        # TORCH_NCCL_ENABLE_TIMING=1) to <TORCH_FR_DUMP_TEMP_FILE><rank>.
+        # Node-local; ~free when idle. Trigger+collect during a burst with
+        # monitor/dump_fr.sh; read dumps with torch...flight_recorder.fr_trace.
+        # This is the only tool that sees the gradient AllReduces (NCCL COLL log
+        # + RAS opCount are blind to them — registered-buffer/coalesced path).
+        value: "/tmp/nccl_fr_pipe"
+      - name: TORCH_FR_DUMP_TEMP_FILE
+        # Node-local base path for FR dumps (pipe-triggered or watchdog-timeout);
+        # PGNCCL appends the global rank. Pickle format. (torch 2.11 name; the
+        # old TORCH_NCCL_DEBUG_INFO_TEMP_FILE is deprecated → warning.)
+        value: "/tmp/nccl_fr_dump_"
       - name: PYTORCH_CUDA_ALLOC_CONF
         # expandable_segments: grow CUDA allocations in-place instead of the
         # default fixed-size segment pool, so caching-allocator fragmentation

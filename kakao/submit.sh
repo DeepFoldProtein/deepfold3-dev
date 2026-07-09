@@ -38,6 +38,30 @@ WANDB_PROJECT="${WANDB_PROJECT:-deepfold3-stage0}"
 WANDB_ENTITY="${WANDB_ENTITY:-DeepFoldProtein}"
 N_NODES="${N_NODES:-8}"
 
+# --- NCCL / collective debug logging (opt-in via NCCL_LOG=1) ------------------
+# Confirms the ~80-min periodic collective stall (see export/burst-periodic-stall/).
+# NCCL_LOG=1: verbose per-collective + net/proxy timing (NCCL_DEBUG=INFO, SUBSYS
+# INIT,NET,COLL,PROFILE) written to a NODE-LOCAL file /tmp/nccl.<host>.<pid>.log
+# (not the shared PVC, so it doesn't add fabric/PVC I/O and confound the
+# measurement) + flight-recorder collective timing. Collect after a burst with
+#   bash monitor/collect_nccl_logs.sh <job>
+# RAS straggler detection is ALWAYS on regardless of this toggle — query it live:
+#   kubectl exec <pod> -- ncclras
+# Default (NCCL_LOG unset) = WARN to stdout, run unperturbed.
+if [[ "${NCCL_LOG:-0}" == "1" ]]; then
+    NCCL_DEBUG_VAL="INFO"
+    NCCL_DEBUG_SUBSYS_VAL="INIT,NET,COLL,PROFILE"
+    NCCL_DEBUG_FILE_VAL="/tmp/nccl.%h.%p.log"
+    TORCH_TIMING_VAL="1"
+    NCCL_LOG_BANNER="ON -> /tmp/nccl.<host>.<pid>.log (node-local; monitor/collect_nccl_logs.sh)"
+else
+    NCCL_DEBUG_VAL="WARN"
+    NCCL_DEBUG_SUBSYS_VAL="INIT,TUNING"
+    NCCL_DEBUG_FILE_VAL=""
+    TORCH_TIMING_VAL="0"
+    NCCL_LOG_BANNER="off (NCCL_LOG=1 to capture collective timing)"
+fi
+
 # k8s names must be DNS-1123 (lowercase alphanumerics + hyphens).
 # Cap at 45 so JobSet-generated pod names fit the 63-char DNS-1123 label
 # limit. Pods are ``<jobset>-launcher-0-<jobIdx>-<podIdx>``: the
@@ -58,6 +82,7 @@ cat <<EOF
 │   wandb         : ${WANDB_ENTITY}/${WANDB_PROJECT}
 │   extra args    : ${EXTRA_ARGS:-<none>}
 │   nodes × gpus  : ${N_NODES} × 8 = $((N_NODES * 8)) ranks
+│   nccl debug    : ${NCCL_LOG_BANNER}
 ╰────────────────────────────────────────────────────────────╯
 EOF
 
@@ -71,6 +96,10 @@ sed \
     -e "s|__WANDB_ENTITY__|${WANDB_ENTITY}|g" \
     -e "s|__EXTRA_ARGS__|${EXTRA_ARGS}|g" \
     -e "s|__N_NODES__|${N_NODES}|g" \
+    -e "s|__NCCL_DEBUG__|${NCCL_DEBUG_VAL}|g" \
+    -e "s|__NCCL_DEBUG_SUBSYS__|${NCCL_DEBUG_SUBSYS_VAL}|g" \
+    -e "s|__NCCL_DEBUG_FILE__|${NCCL_DEBUG_FILE_VAL}|g" \
+    -e "s|__TORCH_NCCL_ENABLE_TIMING__|${TORCH_TIMING_VAL}|g" \
     "${YAML}" \
     | ${KUBECTL} apply -f -
 
