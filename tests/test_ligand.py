@@ -280,6 +280,13 @@ def test_featurize_protein_plus_ligand():
     # frame_token_index should default to (i, i, i) for polymer tokens.
     assert (feats["frame_token_index"][:3] == torch.arange(3).unsqueeze(-1)).all()
 
+    # pLDDT neighbour center atom (CA = slot 1) must be distinct from the
+    # distogram/PAE rep atom (CB = slot 4) for standard non-Gly protein
+    # residues — AF3 §4.3.1 restricts the pLDDT m∈R set to CA/C1'.
+    assert "token_to_center_atom" in feats
+    assert (feats["token_to_center_atom"][:3] == 1).all(), "protein center atom should be CA (slot 1)"
+    assert (feats["token_to_rep_atom"][:3] == 4).all(), "ALA rep atom should be CB (slot 4)"
+
     # Check ref_pos for ligand tokens has non-zero positions
     assert feats["ref_pos"][3, 0].abs().sum() > 0, "Ligand token should have non-zero ref_pos"
 

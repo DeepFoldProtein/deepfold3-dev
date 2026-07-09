@@ -355,6 +355,11 @@ class Featurizer:
         from deepfold3.data.feature.ref_atoms import decode_atom_name_chars
 
         token_to_rep_atom = np.zeros(N, dtype=np.int64)
+        # Token *center* atom (CA for protein, C1' for nucleic, slot-0 for
+        # ligand/atomized) — distinct from ``token_to_rep_atom`` (the
+        # distogram/PAE pseudo-beta = CB / C4 / C2). AF3 §4.3.1 restricts the
+        # pLDDT neighbour set m∈R to these center atoms, NOT the rep atoms.
+        token_to_center_atom = np.zeros(N, dtype=np.int64)
         rep_atom_present = np.zeros(N, dtype=bool)
         frames_mask_np = np.zeros(N, dtype=bool)
         frame_atom_index = np.zeros((N, 3), dtype=np.int64)
@@ -391,6 +396,7 @@ class Featurizer:
                 rep_atom_present[i] = bool(ref_mask[i, 0])
                 continue
             if mt == const.MOL_PROTEIN:
+                token_to_center_atom[i] = 1  # CA is the pLDDT-neighbour center atom
                 if rt == 7:  # GLY
                     token_to_rep_atom[i] = 1  # CA
                     rep_atom_present[i] = bool(ref_mask[i, 1])
@@ -430,6 +436,9 @@ class Featurizer:
                 if rep_idx >= 0:
                     token_to_rep_atom[i] = rep_idx
                     rep_atom_present[i] = True
+                # pLDDT-neighbour center atom is the ribose C1' (AF3 §4.3.1);
+                # fall back to the rep atom if C1' is unresolved.
+                token_to_center_atom[i] = c1_idx if c1_idx >= 0 else token_to_rep_atom[i]
                 if c1_idx >= 0 and c3_idx >= 0 and c4_idx >= 0:
                     frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
                     frames_mask_np[i] = True
@@ -605,6 +614,7 @@ class Featurizer:
             "pair_mask": pair_mask,
             "frames_mask": frames_mask,
             "token_to_rep_atom": torch.from_numpy(token_to_rep_atom),
+            "token_to_center_atom": torch.from_numpy(token_to_center_atom),
             "frame_atom_index": torch.from_numpy(frame_atom_index),
             "frame_token_index": torch.from_numpy(frame_token_index),
             "chirality_atom_idx": torch.from_numpy(chirality_atom_idx_np),
@@ -1475,6 +1485,7 @@ class Featurizer:
             "pair_mask": torch.zeros(0, 0, dtype=torch.bool),
             "frames_mask": torch.zeros(0, dtype=torch.bool),
             "token_to_rep_atom": torch.zeros(0, dtype=torch.int64),
+            "token_to_center_atom": torch.zeros(0, dtype=torch.int64),
             "frame_atom_index": torch.zeros(0, 3, dtype=torch.int64),
             "frame_token_index": torch.zeros(0, 3, dtype=torch.int64),
             "chirality_atom_idx": torch.zeros(0, dtype=torch.int64),

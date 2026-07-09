@@ -1975,6 +1975,12 @@ def training_loss(
     atom_mask = features["atom_gt_mask"]  # [N, M]
     seq_mask = features["seq_mask"].bool()  # [N] — pred-layout validity (kept raw for the reg)
     rep_idx = features.get("token_to_rep_atom")
+    # pLDDT's neighbour set m∈R is the token *center* atom (CA/C1'), NOT the
+    # distogram rep atom (CB/C4/C2) — AF3 §4.3.1. Fall back to rep_idx for
+    # legacy features that predate token_to_center_atom.
+    center_idx = features.get("token_to_center_atom")
+    if center_idx is None:
+        center_idx = rep_idx
 
     # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
     # score EVERY GT-based loss (smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE,
@@ -2399,7 +2405,7 @@ def training_loss(
                     gt_pos,
                     loss_atom_mask,
                     mol_type=features.get("mol_type"),
-                    rep_idx=rep_idx,
+                    rep_idx=center_idx,
                 )
                 losses["plddt"] = l_plddt
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_plddt
