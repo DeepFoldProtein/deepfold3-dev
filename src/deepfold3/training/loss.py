@@ -607,15 +607,19 @@ def diffusion_mse_loss(
 
     mask = atom_mask.float()  # [N, M]
 
-    # Build per-atom loss weight: molecule-type upweighting (DNA/RNA 5×, ligand 10×)
-    # multiplied by optional region weights. Shared by weighted_rigid_align and
-    # the final MSE reduction so the alignment target and loss target agree on
-    # which atoms matter (AF3 §3.7.1 eq. 4).
+    # Build per-atom loss weight: molecule-type upweighting, multiplied by
+    # optional region weights. Shared by weighted_rigid_align and the final MSE
+    # reduction so the alignment target and loss target agree on which atoms
+    # matter. AF3 §3.7.1 eq. 4 is ADDITIVE over a base weight of 1:
+    #   w_l = 1 + f_l^dna·α_dna + f_l^rna·α_rna + f_l^ligand·α_ligand
+    # with α_dna = α_rna = ``nucleotide_loss_weight`` (5) and α_ligand =
+    # ``ligand_loss_weight`` (10) → nucleotide atoms weigh 6, ligand atoms 11
+    # (NOT 5/10 — the base-1 must not be overwritten).
     if mol_type is not None:
         token_weight = torch.ones(mask.shape[0], device=mask.device)
-        token_weight[mol_type == 1] = nucleotide_loss_weight  # DNA (MOL_DNA == 1)
-        token_weight[mol_type == 2] = nucleotide_loss_weight  # RNA (MOL_RNA == 2)
-        token_weight[mol_type == 3] = ligand_loss_weight
+        token_weight = token_weight + (mol_type == 1).to(token_weight) * nucleotide_loss_weight  # DNA
+        token_weight = token_weight + (mol_type == 2).to(token_weight) * nucleotide_loss_weight  # RNA
+        token_weight = token_weight + (mol_type == 3).to(token_weight) * ligand_loss_weight  # ligand
         weight_2d = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
         weight_2d = mask
