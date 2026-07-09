@@ -646,6 +646,42 @@ def filter_structure(
     # anchor- and geometry-dependent and the limit varies by stage (initial=20,
     # fine-tune=larger). Use select_interface_chains() from this module per sample.
 
+    # Cascade: a NONPOLYMER (ligand / glycan) chain covalently attached to a
+    # rejected chain is orphaned — its covalent partner is gone — so mark it
+    # invalid too (OF3 ``remove_chain_and_attached_ligands``). Propagated
+    # transitively through ligand→ligand bonds (e.g. a glycan tree), but never
+    # into a valid polymer chain (only ligand targets are cascaded).
+    if len(structure.bonds) > 0 and len(structure.chains) > 0:
+        atom_to_chain = np.full(len(structure.atoms), -1, dtype=np.int64)
+        for ch in structure.chains:
+            s = int(ch["atom_idx"])
+            n = int(ch["atom_num"])
+            atom_to_chain[s : s + n] = int(ch["asym_id"])
+        mol_of = {int(ch["asym_id"]): int(ch["mol_type"]) for ch in structure.chains}
+        ci_by_id = {ci.chain_id: ci for ci in record.chains}
+        n_atoms = len(atom_to_chain)
+        inter_pairs: list[tuple[int, int]] = []
+        for b in structure.bonds:
+            a1, a2 = int(b["atom_1"]), int(b["atom_2"])
+            if not (0 <= a1 < n_atoms and 0 <= a2 < n_atoms):
+                continue
+            c1, c2 = int(atom_to_chain[a1]), int(atom_to_chain[a2])
+            if c1 >= 0 and c2 >= 0 and c1 != c2:
+                inter_pairs.append((c1, c2))
+        # Fixpoint: invalidate a valid ligand chain bonded to any invalid chain.
+        changed = True
+        while changed:
+            changed = False
+            invalid_ids = {ci.chain_id for ci in record.chains if not ci.valid}
+            for a, b in inter_pairs:
+                for x, y in ((a, b), (b, a)):
+                    if x in invalid_ids and mol_of.get(y) == const.MOL_NONPOLYMER:
+                        ciy = ci_by_id.get(y)
+                        if ciy is not None and ciy.valid:
+                            ciy.valid = False
+                            reasons[ciy.chain_name] = "orphaned ligand (attached chain rejected)"
+                            changed = True
+
     # Mark interfaces invalid if either chain is invalid
     valid_chain_ids = {ci.chain_id for ci in record.chains if ci.valid}
     for iface in record.interfaces:

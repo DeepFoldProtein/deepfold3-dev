@@ -523,3 +523,71 @@ def test_no_insertion_when_auth_numbering_not_contiguous(tmp_path):
     structure, _record = process_mmcif(p, use_assembly=False)
     names = [r["name"].decode("ascii").strip() for r in structure.residues]
     assert names == ["ALA", "GLY", "PRO", "VAL"]  # no SER inserted
+
+
+# --- Cascade: orphaned ligand invalidation ---------------------------------
+
+
+def _one_res(name, res_id, x):
+    return (name, 0, res_id, True, [("CA", float(x), 0.0, 0.0, True)])
+
+
+def test_cascade_invalidates_ligand_attached_to_rejected_chain():
+    """A ligand covalently bonded to a chain that fails filters is invalidated
+    too (OF3 remove_chain_and_attached_ligands)."""
+    from deepfold3.data.prepare.filters import filter_structure
+    from deepfold3.data.types import ChainInfo, Record
+
+    # chain 0: 2-residue protein (< min_residues=4), atoms 0,1;
+    # chain 1: ligand atom 2 covalently bonded to protein atom 1 (far → no clash).
+    st = _build(
+        [
+            (const.MOL_PROTEIN, 1, 0, [_one_res("ALA", 1, 0.0), _one_res("ALA", 2, 1.0)]),
+            (const.MOL_NONPOLYMER, 2, 0, [("LIG", 20, 1, False, [("C1", 20.0, 0.0, 0.0, True)])]),
+        ]
+    )
+    st = Structure(atoms=st.atoms, bonds=_bonds([(1, 2)]), residues=st.residues, chains=st.chains)
+    record = Record(
+        id="t",
+        chains=[
+            ChainInfo(0, "C0", const.MOL_PROTEIN, "c0", "m0", 2),
+            ChainInfo(1, "C1", const.MOL_NONPOLYMER, "c1", "m1", 1),
+        ],
+        interfaces=[],
+    )
+    filter_structure(st, record)
+    valid = {ci.chain_id: ci.valid for ci in record.chains}
+    assert valid[0] is False  # protein too short
+    assert valid[1] is False  # ligand orphaned → cascaded invalid
+
+
+def test_cascade_keeps_ligand_attached_to_valid_chain():
+    """A ligand bonded to a passing chain stays valid (cascade only from invalid)."""
+    from deepfold3.data.prepare.filters import filter_structure
+    from deepfold3.data.types import ChainInfo, Record
+
+    # chain 0: 4-residue protein (passes), atoms 0-3; chain 1: ligand atom 4 bonded to atom 3.
+    st = _build(
+        [
+            (
+                const.MOL_PROTEIN,
+                1,
+                0,
+                [_one_res("ALA", 1, 0.0), _one_res("ALA", 2, 1.0), _one_res("ALA", 3, 2.0), _one_res("ALA", 4, 3.0)],
+            ),
+            (const.MOL_NONPOLYMER, 2, 0, [("LIG", 20, 1, False, [("C1", 20.0, 0.0, 0.0, True)])]),
+        ]
+    )
+    st = Structure(atoms=st.atoms, bonds=_bonds([(3, 4)]), residues=st.residues, chains=st.chains)
+    record = Record(
+        id="t",
+        chains=[
+            ChainInfo(0, "C0", const.MOL_PROTEIN, "c0", "m0", 4),
+            ChainInfo(1, "C1", const.MOL_NONPOLYMER, "c1", "m1", 1),
+        ],
+        interfaces=[],
+    )
+    filter_structure(st, record)
+    valid = {ci.chain_id: ci.valid for ci in record.chains}
+    assert valid[0] is True  # protein passes
+    assert valid[1] is True  # ligand attached to a valid chain → kept
