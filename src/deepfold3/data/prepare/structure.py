@@ -469,8 +469,10 @@ def finalize_standard_residue_atoms(
     name-mapped modified residues (e.g. SEP, TPO) and ligands are passed through
     unchanged so their observed atom set / order is preserved.
 
-    Missing *whole* residues (chain-break / terminal gaps) are intentionally NOT
-    inserted here — see the module docstring / prepare notes.
+    Entirely-missing *internal* residues are inserted upstream in
+    ``process_mmcif`` (Item 4b) as 0-atom entries, which this function then
+    materialises like any other standard residue. Terminal (chain start/end)
+    gaps are intentionally not filled.
 
     Returns:
         New ``(atoms, residues, chains, bonds)`` arrays with bonds remapped to the
@@ -768,6 +770,13 @@ def process_mmcif(
             chain_atom_data: list[tuple] = []  # full atom tuples
             chain_coords: list[list[float]] = []
 
+            # Item 4b: canonical 3-letter sequence (1:1 with label_seq) + the
+            # previous resolved residue's (label_seq, auth res_id), used to insert
+            # entirely-missing INTERNAL residues as unresolved tokens (below).
+            _canon_three = entity_canonical_three.get(entity_name)
+            prev_label: int | None = None
+            prev_auth: int | None = None
+
             for res in sc_span:
                 if res.entity_type == gemmi.EntityType.Water:
                     continue
@@ -792,6 +801,7 @@ def process_mmcif(
                     res_id = res.seqid.num
                 except Exception:
                     res_id = res_offset + len(chain_res_data)
+                cur_label = res.label_seq  # 1-based index into full_sequence (None if unset)
 
                 # Standard (single-token) polymer residues are the canonical
                 # amino acids (0-19) and nucleotides (22-30, incl. unknown N/DN).
@@ -800,6 +810,49 @@ def process_mmcif(
                 is_standard = mol_type != const.MOL_NONPOLYMER and res_type != 20
                 res_atom_start = atom_offset + len(chain_atom_data)
                 res_atom_count = 0
+
+                # Item 4b (OF3 ``add_unresolved_polymer_residues``): fill
+                # entirely-missing INTERNAL residues as unresolved tokens so
+                # contiguous cropping and the token stream see chain-break
+                # residues. Gaps are detected in ``label_seq`` (the canonical
+                # sequence index) and filled only when the auth numbering is
+                # contiguous across the gap, so each inserted residue's
+                # ``residue_index`` (auth) is unambiguous. Terminal (chain
+                # start/end) gaps are deliberately not filled. Each missing
+                # residue is emitted with 0 atoms → ``finalize_standard_residue_atoms``
+                # materialises its full reference atom set as ``is_present=False``
+                # (masked from the GT losses; see the rep-presence gate in loss.py).
+                if (
+                    _canon_three is not None
+                    and cur_label is not None
+                    and prev_label is not None
+                    and cur_label > prev_label + 1
+                    and (res_id - prev_auth) == (cur_label - prev_label)
+                ):
+                    for _lbl in range(prev_label + 1, cur_label):
+                        if _lbl - 1 >= len(_canon_three):
+                            break
+                        _miss_name = _canon_three[_lbl - 1][:5]
+                        _miss_type = const.get_res_type(_miss_name, mol_type)
+                        if _miss_type == 20:
+                            continue  # unknown/unmaterialisable residue → leave the gap
+                        _miss_auth = prev_auth + (_lbl - prev_label)
+                        all_residues.append(
+                            (
+                                _miss_name.encode("ascii"),
+                                _miss_type,
+                                mol_type,
+                                int(_miss_auth),
+                                res_atom_start,  # 0-width span at the current residue boundary
+                                0,
+                                True,  # standard (single-token)
+                                False,  # unresolved
+                            )
+                        )
+                        chain_res_data.append((_miss_name, _miss_auth, True))
+                if cur_label is not None:
+                    prev_label = cur_label
+                    prev_auth = res_id
 
                 # CCD valid atom names for this residue (if cache provided)
                 _ccd_valid = ccd_atom_names.get(res_name.strip()) if ccd_atom_names is not None else None

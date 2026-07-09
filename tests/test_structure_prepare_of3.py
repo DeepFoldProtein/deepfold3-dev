@@ -11,6 +11,7 @@ Covers, on small synthetic Structures (no gemmi / CIF needed):
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from deepfold3.data import const
 from deepfold3.data.prepare.structure import (
@@ -424,3 +425,101 @@ def test_disulfide_does_not_atomize_cysteines():
     # Both CYS stay single residue tokens (not per-atom).
     assert len(tok.tokens) == 2
     assert all(t["atom_num"] > 1 for t in tok.tokens)
+
+
+# --- Item 4b: missing internal residue materialization ----------------------
+
+# Full canonical sequence = ALA GLY SER PRO VAL (label_seq 1..5).
+_GAP_SEQ = [(1, "ALA"), (2, "GLY"), (3, "SER"), (4, "PRO"), (5, "VAL")]
+
+
+def _gap_cif(present: list[tuple[str, int, int]]) -> str:
+    """Build a minimal single-chain protein mmCIF.
+
+    ``present`` = list of ``(comp, label_seq, auth_seq)`` residues actually
+    observed (N/CA/C backbone atoms each). The full sequence stays ``_GAP_SEQ``
+    so omitted label positions are internal gaps.
+    """
+    header = [
+        "data_TEST",
+        "_entry.id TEST",
+        "_entity.id 1",
+        "_entity.type polymer",
+        "_entity_poly.entity_id 1",
+        "_entity_poly.type polypeptide(L)",
+        "_entity_poly.pdbx_seq_one_letter_code_can AGSPV",
+        "loop_",
+        "_entity_poly_seq.entity_id",
+        "_entity_poly_seq.num",
+        "_entity_poly_seq.mon_id",
+    ]
+    header += [f"1 {num} {mon}" for num, mon in _GAP_SEQ]
+    header += [
+        "loop_",
+        "_atom_site.group_PDB",
+        "_atom_site.id",
+        "_atom_site.type_symbol",
+        "_atom_site.label_atom_id",
+        "_atom_site.label_alt_id",
+        "_atom_site.label_comp_id",
+        "_atom_site.label_asym_id",
+        "_atom_site.label_entity_id",
+        "_atom_site.label_seq_id",
+        "_atom_site.Cartn_x",
+        "_atom_site.Cartn_y",
+        "_atom_site.Cartn_z",
+        "_atom_site.occupancy",
+        "_atom_site.B_iso_or_equiv",
+        "_atom_site.auth_seq_id",
+        "_atom_site.auth_asym_id",
+        "_atom_site.pdbx_PDB_model_num",
+    ]
+    aid = 0
+    x = 0.0
+    for comp, label, auth in present:
+        for elem, name in (("N", "N"), ("C", "CA"), ("C", "C")):
+            aid += 1
+            x += 1.5
+            header.append(
+                f"{'ATOM'} {aid} {elem} {name} . {comp} A 1 {label} {x:.1f} 0.0 0.0 1.0 0.0 {auth} A 1"
+            )
+    return "\n".join(header) + "\n"
+
+
+def test_missing_internal_residue_materialized_as_unresolved(tmp_path):
+    """A wholly-missing internal residue (label_seq 3 = SER, auth contiguous) is
+    inserted as an unresolved token with a materialized reference atom set."""
+    pytest.importorskip("gemmi")
+    from deepfold3.data.prepare.structure import process_mmcif
+
+    # observed: 1,2,4,5 (SER at label 3 omitted); auth == label (contiguous).
+    p = tmp_path / "gap.cif"
+    p.write_text(_gap_cif([("ALA", 1, 1), ("GLY", 2, 2), ("PRO", 4, 4), ("VAL", 5, 5)]))
+    structure, _record = process_mmcif(p, use_assembly=False)
+
+    names = [r["name"].decode("ascii").strip() for r in structure.residues]
+    present = [bool(r["is_present"]) for r in structure.residues]
+    res_ids = [int(r["res_id"]) for r in structure.residues]
+
+    assert names == ["ALA", "GLY", "SER", "PRO", "VAL"]
+    assert present == [True, True, False, True, True]  # SER is the unresolved gap
+    assert res_ids == [1, 2, 3, 4, 5]  # inserted auth res_id is unambiguous
+
+    ser = structure.residues[2]
+    assert ser["atom_num"] > 0  # full reference atom set materialized
+    ser_atoms = structure.atoms[int(ser["atom_idx"]) : int(ser["atom_idx"]) + int(ser["atom_num"])]
+    assert not ser_atoms["is_present"].any()  # every materialized atom is unresolved
+
+
+def test_no_insertion_when_auth_numbering_not_contiguous(tmp_path):
+    """If the auth numbering is not contiguous with the label gap, the ambiguous
+    missing residue is skipped (conservative)."""
+    pytest.importorskip("gemmi")
+    from deepfold3.data.prepare.structure import process_mmcif
+
+    # gap 2->4 but auth jumps 2->40, so (40-2) != (4-2) → skip insertion.
+    p = tmp_path / "gap2.cif"
+    p.write_text(_gap_cif([("ALA", 1, 1), ("GLY", 2, 2), ("PRO", 4, 40), ("VAL", 5, 41)]))
+    structure, _record = process_mmcif(p, use_assembly=False)
+    names = [r["name"].decode("ascii").strip() for r in structure.residues]
+    assert names == ["ALA", "GLY", "PRO", "VAL"]  # no SER inserted
