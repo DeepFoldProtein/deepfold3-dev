@@ -191,15 +191,33 @@ def template_features_from_chain(
     query_to_seqres: dict[int, int],
     query_length: int,
     max_atoms: int = const.MAX_ATOMS_PER_TOKEN,
+    indices_are_struct: bool = False,
 ):
     """Extract query-aligned ``TemplateFeatures`` from a cached ChainTemplate.
 
     This is the only per-hit work once the chain is cached: ``_realign_mapping``
     (seqres→structure) + ``_fill_template_features`` (pure numpy). No gemmi.
+
+    Args:
+        indices_are_struct: If True, the template indices in ``query_to_seqres``
+            are already 0-based **resolved-residue** (structure) positions —
+            they index ``ct.struct_seq`` / ``ct.lookup`` directly — so the
+            seqres→structure realignment is skipped. This is the case for
+            structure-based search hits (e.g. Foldseek), whose alignment is
+            computed against the observed-residue sequence rather than SEQRES;
+            applying ``_realign_mapping`` to such indices would double-shift and
+            corrupt the alignment. Default False keeps the SEQRES-space behaviour
+            used by MMseqs2 / HHsearch hits.
     """
     from deepfold3.data.parse.templates import _fill_template_features, _realign_mapping
 
-    mapping = _realign_mapping(ct.seqres, ct.struct_seq, query_to_seqres)
+    if indices_are_struct:
+        # Already structure-space: keep only in-range positions (lookup keys are
+        # 0..len(struct_seq)-1) and use directly, no realignment.
+        n = len(ct.struct_seq)
+        mapping = {q: s for q, s in query_to_seqres.items() if 0 <= s < n}
+    else:
+        mapping = _realign_mapping(ct.seqres, ct.struct_seq, query_to_seqres)
     feats, _ = _fill_template_features(ct.lookup, mapping, query_length, max_atoms)
     return feats
 

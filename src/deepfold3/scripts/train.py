@@ -417,7 +417,7 @@ def train(
         parts = ds_spec.split(":")
         if len(parts) < 2:
             raise click.BadParameter(
-                "--dataset format: name:path[:weight[:strategy[:distill[:format]]]], got: " + ds_spec
+                "--dataset format: name:path[:weight[:strategy[:distill[:format[:tpl_struct_space]]]]], got: " + ds_spec
             )
         entry = DatasetConfig(
             name=parts[0],
@@ -426,6 +426,7 @@ def train(
             strategy=parts[3] if len(parts) > 3 else "uniform",
             is_distillation=parts[4].lower() in ("true", "1", "yes") if len(parts) > 4 else False,
             format=parts[5] if len(parts) > 5 else "df3",
+            monomer_template_struct_space=parts[6].lower() in ("true", "1", "yes") if len(parts) > 6 else False,
         )
         # CLI dataset with same name replaces config-defined one
         if entry.name in existing_ds:

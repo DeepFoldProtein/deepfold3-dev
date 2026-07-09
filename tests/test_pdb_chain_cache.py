@@ -128,3 +128,29 @@ def test_compute_chain_msa_cols_dedup_order():
 
 def test_compute_chain_msa_cols_none():
     assert compute_chain_msa_cols(np.array([0, 1]), None) == {}
+
+
+def test_indices_are_struct_skips_realign():
+    """Foldseek-style hits carry structure-space template indices: with
+    ``indices_are_struct=True`` they index the resolved-residue lookup directly
+    (no seqres realignment). With the default (SEQRES-space), a leading unresolved
+    gap shifts the mapping. This guards the ``monomer_template_struct_space`` path.
+    """
+    L = 5
+    lookup = {}
+    for i in range(L):
+        pos = np.full((A, 3), float(i), dtype=np.float32)
+        msk = np.ones(A, dtype=bool)
+        lookup[i] = (i, pos, msk)  # aatype == struct index for easy assertions
+    # seqres has a 2-residue unresolved gap at the front; struct_seq is the tail.
+    ct = ChainTemplate(seqres="GGACDEF", struct_seq="ACDEF", lookup=lookup)
+    query_to_template = {0: 2, 1: 3}  # template indices 2, 3
+
+    fs = template_features_from_chain(ct, query_to_template, query_length=4, indices_are_struct=True)
+    # struct-space: index 2 -> residue 2, index 3 -> residue 3 (aatype == index).
+    assert int(fs.aatype[0]) == 2
+    assert int(fs.aatype[1]) == 3
+
+    fr = template_features_from_chain(ct, query_to_template, query_length=4, indices_are_struct=False)
+    # seqres-space realignment shifts past the 2-residue leading gap -> different residues.
+    assert (int(fr.aatype[0]), int(fr.aatype[1])) != (2, 3)

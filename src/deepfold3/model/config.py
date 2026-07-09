@@ -577,6 +577,12 @@ class DatasetConfig:
             monomer distillation set skip (wasted) interface crops while a
             multi-chain PDB set keeps them (AF3 §2.7 samples the strategy
             per example). ``None`` = use the global weights.
+        monomer_template_struct_space: If True, this dataset's monomer template
+            hits (``monomer_templates/{msa_id}.json``) carry structure-space
+            (resolved-residue) template indices rather than SEQRES-space ones —
+            e.g. Foldseek structure-search hits. The seqres→structure realignment
+            is then skipped at feature extraction. Default False (MMseqs2/HHsearch
+            SEQRES-space behaviour).
     """
 
     name: str = ""
@@ -588,6 +594,7 @@ class DatasetConfig:
     cutoff_date: str = ""
     exclude_loss_mol_types: list[int] = field(default_factory=list)
     crop_weights: dict[str, float] | None = None
+    monomer_template_struct_space: bool = False
 
 
 @dataclass

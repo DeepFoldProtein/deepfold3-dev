@@ -294,6 +294,7 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
+                monomer_template_struct_space=spec.monomer_template_struct_space,
                 **_with_crop_weights(ds_kwargs, spec),
             )
         return ds, recs

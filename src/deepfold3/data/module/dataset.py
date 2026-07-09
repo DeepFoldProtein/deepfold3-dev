@@ -159,6 +159,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         slow_sample_log_threshold_s: float = 0.0,
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
+        monomer_template_struct_space: bool = False,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -255,6 +256,10 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_template_date = max_template_date
         self.default_template_cutoff_date = default_template_cutoff_date
         self.prefer_monomer_templates = prefer_monomer_templates
+        # Monomer template hits store structure-space (resolved-residue) template
+        # indices instead of SEQRES-space ones (e.g. Foldseek search). When set,
+        # the seqres→structure realignment is skipped at feature-extraction time.
+        self.monomer_template_struct_space = monomer_template_struct_space
         self._has_templates = (self.data_dir / "templates").is_dir()
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
         # Per-chain template cache (memory LRU + hierarchical sharded disk).
@@ -614,7 +619,12 @@ class TrainingDataset(torch.utils.data.Dataset):
                     if not query_indices:
                         continue
                     query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
-                    feats = template_features_from_chain(ct, query_to_seqres, chain_info.num_residues)
+                    feats = template_features_from_chain(
+                        ct,
+                        query_to_seqres,
+                        chain_info.num_residues,
+                        indices_are_struct=self.monomer_template_struct_space,
+                    )
                 except Exception:
                     logger.debug(
                         "Failed to extract monomer template %s chain %s for %s/%s",

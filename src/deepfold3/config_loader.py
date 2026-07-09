@@ -124,6 +124,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "format": fmt,
                 "cutoff_date": str(entry.get("cutoff_date", "")),
                 "exclude_loss_mol_types": excl,
+                "monomer_template_struct_space": bool(entry.get("monomer_template_struct_space", False)),
             }
         )
     return result
