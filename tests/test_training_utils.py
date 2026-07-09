@@ -954,6 +954,118 @@ class TestCheckpointResume:
         sampler.set_epoch(6)  # new epoch — reset
         assert sampler.sample_idx == 0
 
+    def test_multi_dataset_sampler_infinite_crosses_chunk_boundary(self):
+        """Infinite iterator never exhausts and reproduces the finite per-chunk draws.
+
+        The first ``epoch_size`` indices of the infinite stream must equal the
+        finite epoch-0 shard, and the next ``epoch_size`` must equal the finite
+        epoch-1 shard — so workers prefetch across the boundary with no drain
+        while the sampling distribution is unchanged.
+        """
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+
+        records = _make_records(40)
+        configs = [{"records": records, "dataset_len": 40, "weight": 1.0, "strategy": "uniform"}]
+
+        finite = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3
+        )
+        finite.set_epoch(0)
+        chunk0 = list(iter(finite))
+        finite.set_epoch(1)
+        chunk1 = list(iter(finite))
+
+        inf = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3, infinite=True
+        )
+        it = iter(inf)
+        stream = [next(it) for _ in range(20)]  # spans two chunks, never raises
+
+        assert stream[:10] == chunk0
+        assert stream[10:] == chunk1
+        assert inf.epoch == 1  # advanced as a logging/resume counter
+
+    def test_multi_dataset_sampler_infinite_resume_across_chunk(self):
+        """Resume mid-stream in infinite mode continues the exact sequence.
+
+        Captures state after the chunk boundary, restores into a fresh sampler,
+        and checks the tail matches the uninterrupted stream — the resume
+        protocol the trainer relies on for the multi-dataset path.
+        """
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+
+        records = _make_records(40)
+        configs = [{"records": records, "dataset_len": 40, "weight": 1.0, "strategy": "uniform"}]
+
+        full = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
+        )
+        it = iter(full)
+        ref = [next(it) for _ in range(20)]
+
+        a = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
+        )
+        it_a = iter(a)
+        prefix = [next(it_a) for _ in range(11)]  # 8 + 3 → mid second chunk
+        snap = a.state_dict()
+        assert snap["epoch"] == 1
+        assert snap["sample_idx"] == 3
+
+        b = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
+        )
+        b.load_state_dict(snap)
+        b.set_epoch(snap["epoch"])  # trainer calls this; same epoch → no reset
+        it_b = iter(b)
+        tail = [next(it_b) for _ in range(9)]
+
+        assert prefix + tail == ref
+
+    def test_multi_dataset_sampler_finite_checkpoint_resumes_infinite_identically(self):
+        """Cross-version resume: a checkpoint saved by the OLD finite sampler
+        continues bit-identically under the NEW infinite sampler.
+
+        The live arms were checkpointed under ``infinite=False``; resuming them
+        under ``infinite=True`` must not perturb the sample stream. ``_draw_shard``
+        is shared and the ``{epoch, sample_idx, seed}`` schema is unchanged, so
+        the continuation from (epoch, sample_idx) is identical — only the
+        epoch-boundary prefetch behaviour differs.
+        """
+        from deepfold3.data.sample.multi import MultiDatasetSampler
+
+        records = _make_records(40)
+        configs = [{"records": records, "dataset_len": 40, "weight": 1.0, "strategy": "uniform"}]
+
+        # Old run: finite sampler, mid-epoch-E checkpoint at sample_idx I.
+        old = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=6, num_replicas=1, rank=0, seed=9  # infinite=False
+        )
+        old.set_epoch(2)
+        it_old = iter(old)
+        consumed = [next(it_old) for _ in range(4)]  # mid epoch 2
+        snap = old.state_dict()
+        assert snap == {"epoch": 2, "sample_idx": 4, "seed": 9}
+        rest_of_epoch2 = list(it_old)  # finite: drains to end of epoch 2
+
+        # What the finite run would draw next (epoch 3) after the trainer's
+        # while-level epoch increment + set_epoch reset.
+        old.set_epoch(3)
+        epoch3 = list(iter(old))
+
+        # New run: same checkpoint, resumed under the infinite sampler.
+        new = MultiDatasetSampler(
+            dataset_configs=configs, epoch_size=6, num_replicas=1, rank=0, seed=9, infinite=True
+        )
+        new.load_state_dict(snap)
+        new.set_epoch(snap["epoch"])
+        it_new = iter(new)
+        cont = [next(it_new) for _ in range(len(rest_of_epoch2) + len(epoch3))]
+
+        # Identical continuation across the version switch and the E→E+1 boundary.
+        assert cont == rest_of_epoch2 + epoch3
+        assert consumed + cont == consumed + rest_of_epoch2 + epoch3
+
     def test_multi_dataset_sampler_full_round_trip_through_checkpoint_manager(self, tmp_path):
         """End-to-end: MultiDatasetSampler state goes through CheckpointManager save/load."""
         from deepfold3.data.sample.multi import MultiDatasetSampler
