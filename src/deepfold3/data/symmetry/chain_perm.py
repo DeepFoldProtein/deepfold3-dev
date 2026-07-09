@@ -499,36 +499,37 @@ def compute_chain_permutation_tokens(
     )
 
 
-def apply_chain_permutation_tokens(
-    gt_pos: torch.Tensor,  # [..., N, M, 3]
-    atom_mask: torch.Tensor,  # [N, M] bool
+def chain_permutation_index(
     asym_id: torch.Tensor,  # [N] int
     chain_assignment: dict[int, int],
-    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal
+    device: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reorder GT token rows according to a chain assignment.
+    """Build the token reorder for a chain assignment.
 
-    For each pred chain, its rows are replaced with the rows of the GT chain
-    given by the assignment. Without ``sym_token_index`` the two chains are
-    matched **positionally** and length-mismatched groups are skipped (legacy
-    — the case gap-1 addresses). With ``sym_token_index`` each pred token is
+    Returns ``(index, keep)`` — ``index[i]`` is the GT token feeding pred token
+    ``i`` (so ``gt_new[i] = gt[index[i]]``), and ``keep[i]`` is False when pred
+    token ``i`` has no GT counterpart under the assignment (only reachable on
+    the sym-index path). Identity assignment → ``(arange, all-True)``.
+
+    Without ``sym_token_index`` chains are matched **positionally** and
+    length-mismatched groups are skipped (legacy). With it, each pred token is
     matched to the GT token of the **same per-chain ordinal**, so symmetric
-    chains a crop cut to unequal token counts are still reordered; pred tokens
-    with no GT counterpart under the assignment have their mask zeroed (there
-    is no aligned GT coordinate to score against). Returns the permuted
-    ``gt_pos`` and matching mask, both detached.
+    chains a crop cut to unequal counts are still reordered (gap-1).
     """
     import torch
 
-    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
-        return gt_pos.detach(), atom_mask.detach()
+    dev = device if device is not None else asym_id.device
+    n_tokens = int(asym_id.shape[0])
+    asym_ids_t = asym_id.to(dtype=torch.long, device=dev)
+    keep = torch.ones(n_tokens, dtype=torch.bool, device=dev)
 
-    n_tokens = gt_pos.shape[-3]
-    asym_ids_t = asym_id.to(dtype=torch.long, device=gt_pos.device)
+    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return torch.arange(n_tokens, dtype=torch.long, device=dev), keep
 
     if sym_token_index is None:
         # Legacy positional path: reorder only equal-length chain pairs.
-        index = torch.arange(n_tokens, dtype=torch.long, device=gt_pos.device)
+        index = torch.arange(n_tokens, dtype=torch.long, device=dev)
         chain_by_asym: dict[int, torch.Tensor] = {}
         for a in chain_assignment.values():
             a_int = int(a)
@@ -542,9 +543,7 @@ def apply_chain_permutation_tokens(
             if pred_idx.numel() != gt_idx.numel():
                 continue
             index[pred_idx] = gt_idx
-        permuted = gt_pos.index_select(-3, index).detach()
-        permuted_mask = atom_mask.index_select(0, index).detach()
-        return permuted, permuted_mask
+        return index, keep
 
     # sym-index path: match pred token → GT token of the same per-chain ordinal.
     import numpy as np
@@ -552,7 +551,7 @@ def apply_chain_permutation_tokens(
     asym_np = asym_ids_t.detach().cpu().numpy()
     sym_np = sym_token_index.detach().cpu().numpy()
     index_np = np.arange(n_tokens, dtype=np.int64)
-    keep = np.ones(n_tokens, dtype=bool)  # pred tokens with a matched GT counterpart
+    keep_np = np.ones(n_tokens, dtype=bool)
 
     for pred_asym, gt_asym in chain_assignment.items():
         if int(pred_asym) == int(gt_asym):
@@ -574,12 +573,34 @@ def apply_chain_permutation_tokens(
         for r in pred_rows.tolist():
             g = gt_of_sym.get(int(sym_np[r]))
             if g is None:
-                keep[r] = False  # no GT token of this ordinal → nothing to score
+                keep_np[r] = False  # no GT token of this ordinal → nothing to score
             else:
                 index_np[r] = g
 
-    index = torch.from_numpy(index_np).to(device=gt_pos.device)
-    keep_t = torch.from_numpy(keep).to(device=gt_pos.device)
+    index = torch.from_numpy(index_np).to(device=dev)
+    keep = torch.from_numpy(keep_np).to(device=dev)
+    return index, keep
+
+
+def apply_chain_permutation_tokens(
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    asym_id: torch.Tensor,  # [N] int
+    chain_assignment: dict[int, int],
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder GT token rows (and mask) according to a chain assignment.
+
+    Thin wrapper over :func:`chain_permutation_index`. Pred tokens with no GT
+    counterpart (sym-index path) have their mask zeroed — there is no aligned
+    GT coordinate to score against. Returns the permuted ``gt_pos`` and mask,
+    both detached. Used for the per-sample augmented GT in the diffusion MSE.
+    """
+    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return gt_pos.detach(), atom_mask.detach()
+    index, keep = chain_permutation_index(asym_id, chain_assignment, sym_token_index, device=gt_pos.device)
     permuted = gt_pos.index_select(-3, index).detach()
-    permuted_mask = (atom_mask.index_select(0, index) & keep_t.unsqueeze(-1)).detach()
+    permuted_mask = (atom_mask.index_select(0, index) & keep.unsqueeze(-1)).detach()
     return permuted, permuted_mask
+
+

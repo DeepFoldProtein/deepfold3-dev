@@ -1705,6 +1705,27 @@ def diffusion_only_loss(
     """
     gt_pos = features["atom_gt_positions"]
     atom_mask = features["atom_gt_mask"]
+    seq_mask = features["seq_mask"].bool()
+    gt_aug = pred["gt_augmented"]
+
+    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
+    # apply it to the shared GT — the augmented GT the diffusion MSE scores AND
+    # the un-augmented GT that smooth-lDDT / FAPE / backbone-chirality score.
+    # Previously only the diffusion MSE saw the permutation, leaving the other
+    # losses on un-permuted GT. Doing it here (single application point) means
+    # the diffusion head's own chain perm is skipped below (``asym_id`` omitted).
+    chain_assign = chain_perm_from_mini_rollout(pred, features)
+    asym_id_feat = features.get("asym_id")
+    if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
+        from deepfold3.data.symmetry.chain_perm import chain_permutation_index
+
+        c_index, c_keep = chain_permutation_index(
+            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
+        )
+        gt_pos = gt_pos.index_select(0, c_index)
+        atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
+        seq_mask = seq_mask & c_keep
+        gt_aug = gt_aug.index_select(-3, c_index)
 
     region_label = features.get(f"mask_{MASK_REGION}")
     region_weights: torch.Tensor | None = None
@@ -1723,13 +1744,15 @@ def diffusion_only_loss(
         atom_mask = atom_mask * loss_weight_mask.unsqueeze(-1)
 
     denoised = pred["denoised"]
-    gt_aug = pred["gt_augmented"]
     noise_levels = pred["noise_levels"]
 
     components: dict[str, torch.Tensor] = {}
     total = gt_pos.new_zeros(())
 
     if cfg.alpha_diffusion > 0:
+        # GT already chain-permuted above → diffusion MSE skips its own chain
+        # perm (no ``asym_id``) and only resolves the per-sample atom/ligand
+        # symmetry + rigid align.
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
@@ -1742,13 +1765,6 @@ def diffusion_only_loss(
             atom_swap_pairs=features.get("atom_swap_pairs"),
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             ligand_perms=features.get("ligand_perms"),
-            asym_id=features.get("asym_id"),
-            entity_id=features.get("entity_id"),
-            chain_assign=chain_perm_from_mini_rollout(pred, features),
-            atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
-            token_to_rep_atom=features.get("token_to_rep_atom"),
-            seq_mask=features.get("seq_mask"),
-            sym_token_index=features.get("sym_token_index"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         components["diffusion_mse"] = l_mse.detach()
@@ -1805,7 +1821,7 @@ def diffusion_only_loss(
                 denoised,
                 gt_pos,
                 atom_mask,
-                features["seq_mask"].bool(),
+                seq_mask,
                 features["asym_id"],
                 features["mol_type"],
             )
@@ -1820,7 +1836,7 @@ def diffusion_only_loss(
             and "frame_token_index" in features
             and "frame_atom_index" in features
         ):
-            seq_m = features["seq_mask"].bool()
+            seq_m = seq_mask
             frm_m = features.get("frames_mask")
             frm_m = frm_m.bool() if frm_m is not None else seq_m
             pair_m = features.get("pair_mask")
@@ -1868,8 +1884,30 @@ def training_loss(
     """
     gt_pos = features["atom_gt_positions"]  # [N, M, 3]
     atom_mask = features["atom_gt_mask"]  # [N, M]
-    seq_mask = features["seq_mask"].bool()  # [N]
+    seq_mask = features["seq_mask"].bool()  # [N] — pred-layout validity (kept raw for the reg)
     rep_idx = features.get("token_to_rep_atom")
+
+    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
+    # score EVERY GT-based loss (smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE,
+    # tm_true) against the permuted GT — previously only the diffusion MSE saw
+    # it. Reorders the shared gt_pos / atom_mask so each pred chain lines up
+    # with its assigned GT chain; ``gt_seq_mask`` additionally drops pred tokens
+    # with no GT counterpart. ``seq_mask`` stays raw for the pred-side
+    # representation regularisers below. ``c_index`` (if any) also permutes the
+    # augmented GT in the non-chunked diffusion recompute path.
+    chain_assign = chain_perm_from_mini_rollout(pred, features)
+    asym_id_feat = features.get("asym_id")
+    c_index: torch.Tensor | None = None
+    gt_seq_mask = seq_mask
+    if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
+        from deepfold3.data.symmetry.chain_perm import chain_permutation_index
+
+        c_index, c_keep = chain_permutation_index(
+            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
+        )
+        gt_pos = gt_pos.index_select(0, c_index)
+        atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
+        gt_seq_mask = seq_mask & c_keep
 
     losses: dict[str, torch.Tensor] = {}
     # Anchor total to the distogram prediction (pair features or logits)
@@ -1901,10 +1939,10 @@ def training_loss(
         loss_weight_mask = None
     if loss_weight_mask is not None:
         loss_atom_mask = atom_mask * loss_weight_mask.unsqueeze(-1)
-        loss_seq_mask = seq_mask & (loss_weight_mask >= 0.5)
+        loss_seq_mask = gt_seq_mask & (loss_weight_mask >= 0.5)
     else:
         loss_atom_mask = atom_mask
-        loss_seq_mask = seq_mask
+        loss_seq_mask = gt_seq_mask
 
     # --- Single/pair-representation magnitude regularization ---
     # ``alpha_{single,pair}_reg is None`` disables entirely; 0.0 is
@@ -1966,6 +2004,12 @@ def training_loss(
         gt_aug = pred["gt_augmented"]  # [S, N, M, 3]
         noise_levels = pred["noise_levels"]  # [S]
 
+        # GT already chain-permuted above → permute the augmented GT the same
+        # way and skip the diffusion MSE's own chain perm (no ``asym_id``); it
+        # only resolves the per-sample atom/ligand symmetry + rigid align.
+        if c_index is not None:
+            gt_aug = gt_aug.index_select(-3, c_index)
+
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
@@ -1978,13 +2022,6 @@ def training_loss(
             atom_swap_pairs=features.get("atom_swap_pairs"),
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
             ligand_perms=features.get("ligand_perms"),
-            asym_id=features.get("asym_id"),
-            entity_id=features.get("entity_id"),
-            chain_assign=chain_perm_from_mini_rollout(pred, features),
-            atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
-            token_to_rep_atom=features.get("token_to_rep_atom"),
-            seq_mask=features.get("seq_mask"),
-            sym_token_index=features.get("sym_token_index"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         losses["diffusion_mse"] = l_mse
@@ -2053,7 +2090,7 @@ def training_loss(
                 denoised,
                 gt_pos,
                 loss_atom_mask,
-                seq_mask.bool(),
+                gt_seq_mask,
                 features["asym_id"],
                 features["mol_type"],
             )
