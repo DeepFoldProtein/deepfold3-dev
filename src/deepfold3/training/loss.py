@@ -411,7 +411,16 @@ def chain_perm_from_mini_rollout(
     from deepfold3.data.symmetry.chain_perm import compute_chain_permutation_tokens
 
     # mini-rollout is ``[S_mini, N, M, 3]`` — use the first sample.
-    return compute_chain_permutation_tokens(mini_pos[0], gt_pos, atom_mask.bool(), asym_id, entity_id)
+    return compute_chain_permutation_tokens(
+        mini_pos[0],
+        gt_pos,
+        atom_mask.bool(),
+        asym_id,
+        entity_id,
+        token_to_rep_atom=features.get("token_to_rep_atom"),
+        mol_type=features.get("mol_type"),
+        seq_mask=features.get("seq_mask"),
+    )
 
 
 def diffusion_mse_loss(
@@ -430,6 +439,8 @@ def diffusion_mse_loss(
     entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
     chain_assign: dict[int, int] | None = None,  # pre-computed pred→GT chain mapping
     atom_perm_pred: torch.Tensor | None = None,  # [N, M, 3] — mini-rollout reference for atom/ligand swap decisions
+    token_to_rep_atom: torch.Tensor | None = None,  # [N] int — rep-atom slot (chain-perm token centers)
+    seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens for chain perm
     apply_rigid_align: bool = True,
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
@@ -509,7 +520,16 @@ def diffusion_mse_loss(
             # original mask (pre-existing behavior).
             permuted_chunks = []
             for s in range(S):
-                assign_s = compute_chain_permutation_tokens(pred_pos[s], gt_pos[s], atom_mask_bool, asym_id, entity_id)
+                assign_s = compute_chain_permutation_tokens(
+                    pred_pos[s],
+                    gt_pos[s],
+                    atom_mask_bool,
+                    asym_id,
+                    entity_id,
+                    token_to_rep_atom=token_to_rep_atom,
+                    mol_type=mol_type,
+                    seq_mask=seq_mask,
+                )
                 new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, assign_s)
                 permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
@@ -1714,6 +1734,8 @@ def diffusion_only_loss(
             entity_id=features.get("entity_id"),
             chain_assign=chain_perm_from_mini_rollout(pred, features),
             atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
+            token_to_rep_atom=features.get("token_to_rep_atom"),
+            seq_mask=features.get("seq_mask"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         components["diffusion_mse"] = l_mse.detach()
@@ -1946,6 +1968,8 @@ def training_loss(
             entity_id=features.get("entity_id"),
             chain_assign=chain_perm_from_mini_rollout(pred, features),
             atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
+            token_to_rep_atom=features.get("token_to_rep_atom"),
+            seq_mask=features.get("seq_mask"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         losses["diffusion_mse"] = l_mse

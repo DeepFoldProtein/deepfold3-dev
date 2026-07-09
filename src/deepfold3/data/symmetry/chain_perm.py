@@ -70,6 +70,7 @@ def _anchor_greedy_assignment(
     at_pred: dict[int, np.ndarray],
     at_gt: dict[int, np.ndarray],
     res: dict[int, np.ndarray],
+    is_lig: dict[int, bool] | None = None,
 ) -> dict[int, int]:
     """AF-Multimer anchor-based greedy chain assignment (AF3 §4.2).
 
@@ -81,9 +82,11 @@ def _anchor_greedy_assignment(
     thing the permutation must resolve — drives the assignment.
 
     Algorithm:
-      1. Anchor entity = the entity with the fewest resolved chains (least
-         ambiguous), tie-broken toward more resolved atoms; ``gt_anchor`` =
-         its most-resolved chain.
+      1. Anchor entity = a **polymer** entity if any (ligand-only entities are
+         deprioritised — their still-unresolved symmetric atoms make for a
+         noisy frame, per OF3 ``get_gt_anchor_mask``); among equal-priority
+         entities, the fewest resolved chains (least ambiguous), tie-broken
+         toward more resolved atoms; ``gt_anchor`` = its most-resolved chain.
       2. For each predicted chain of the anchor entity (the candidate global
          frames), Kabsch-align it onto ``gt_anchor``, apply that transform to
          every predicted chain centroid, and greedily assign each predicted
@@ -94,7 +97,10 @@ def _anchor_greedy_assignment(
     centroids (``None`` if fully unresolved); ``at_*`` / ``res`` are the
     per-chain resolved-atom coordinate blocks + boolean mask used only for
     the anchor Kabsch (chains of one entity share their atom layout, so the
-    anchor pair's blocks line up row-for-row).
+    anchor pair's blocks line up row-for-row). ``is_lig`` maps chain id →
+    True for ligand (all-nonpolymer) chains; used only to deprioritise
+    ligand-only entities as the anchor. When ``None``, no ligand distinction
+    is made (legacy behaviour).
     """
     from collections import defaultdict
 
@@ -117,9 +123,15 @@ def _anchor_greedy_assignment(
         ent_res[ent_of[a]].append(a)
     natoms = {a: int(res[a].sum()) for a in resolved_chains}
 
+    # Deprioritise ligand-only entities as the anchor (their symmetric atoms
+    # are not yet permutation-resolved → noisy frame). Among equal ligand-ness:
+    # fewest symmetry mates (least ambiguous), then most resolved atoms.
+    def _ent_is_ligand(e: int) -> bool:
+        return bool(is_lig) and all(is_lig.get(a, False) for a in ent_res[e])
+
     anchor_entity = min(
         ent_res.keys(),
-        key=lambda e: (len(ent_res[e]), -max(natoms[a] for a in ent_res[e])),
+        key=lambda e: (_ent_is_ligand(e), len(ent_res[e]), -max(natoms[a] for a in ent_res[e])),
     )
     gt_anchor = max(ent_res[anchor_entity], key=lambda a: natoms[a])
     # Candidate global frames: predicted chains of the anchor entity whose
@@ -326,6 +338,9 @@ def compute_chain_permutation_tokens(
     atom_mask: torch.Tensor,  # [N, M] bool
     asym_id: torch.Tensor,  # [N] int
     entity_id: torch.Tensor,  # [N] int
+    token_to_rep_atom: torch.Tensor | None = None,  # [N] int — rep-atom slot per token
+    mol_type: torch.Tensor | None = None,  # [N] int — polymer/ligand anchor priority
+    seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens
 ) -> dict[int, int]:
     """Token-layout version of :func:`compute_chain_permutation`.
 
@@ -339,25 +354,57 @@ def compute_chain_permutation_tokens(
     spatial correspondence between symmetric copies that a per-pair Kabsch
     cost (rotation-invariant, hence blind to position) cannot.
 
+    ``token_to_rep_atom`` selects each token's representative (token-center)
+    atom — CA / C1' / the single ligand atom — so the alignment operates on
+    the AF-Multimer/AF3 §4.2 primitive rather than all heavy atoms (cleaner
+    centroids, and a row-for-row ``[T]`` correspondence between symmetric
+    chains). When absent, all heavy atoms are flattened (legacy behaviour).
+    ``mol_type`` lets ligand-only entities be deprioritised as the anchor.
+    ``seq_mask`` drops padding tokens (which carry ``asym_id == 0`` and would
+    otherwise pollute chain 0's token block).
+
     Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in singleton
     entity classes or when no valid anchor frame exists.
     """
     import numpy as np
     import torch
 
+    from deepfold3.data import const
+
     asym_ids_np = asym_id.detach().cpu().numpy()
     entity_ids_np = entity_id.detach().cpu().numpy()
+    mol_np = mol_type.detach().cpu().numpy() if mol_type is not None else None
+    valid_np = (
+        seq_mask.detach().cpu().numpy().astype(bool)
+        if seq_mask is not None
+        else np.ones(asym_ids_np.shape[0], dtype=bool)
+    )
 
-    # Iterate chains in first-appearance order to keep results stable
+    # Pre-gather the representative (token-center) atom per token to [N, 3];
+    # each chain then reduces to a clean [T]-row block. All heavy atoms would
+    # give a ragged, noisier centroid and break the row-for-row anchor Kabsch.
+    if token_to_rep_atom is not None:
+        with torch.no_grad():
+            rep = token_to_rep_atom.to(dtype=torch.long, device=pred_pos.device)
+            tok_ar = torch.arange(rep.shape[0], device=pred_pos.device)
+            am = atom_mask.to(device=pred_pos.device)
+            pred_rep = pred_pos[tok_ar, rep].detach().cpu().numpy().astype(np.float64, copy=False)  # [N, 3]
+            gt_rep = gt_pos[tok_ar, rep].detach().cpu().numpy().astype(np.float64, copy=False)
+            mask_rep = am[tok_ar, rep].detach().cpu().numpy().astype(bool)  # [N]
+    else:
+        pred_rep = gt_rep = mask_rep = None
+
+    # Iterate chains in first-appearance order (over real tokens) for stability.
     seen: set[int] = set()
     chain_order: list[int] = []
-    for a in asym_ids_np.tolist():
-        if a in seen:
+    for i, a in enumerate(asym_ids_np.tolist()):
+        if not valid_np[i] or a in seen:
             continue
         seen.add(a)
         chain_order.append(int(a))
 
     ent_of: dict[int, int] = {}
+    lig_of: dict[int, bool] = {}
     cen_pred: dict[int, np.ndarray | None] = {}
     cen_gt: dict[int, np.ndarray | None] = {}
     at_pred: dict[int, np.ndarray] = {}
@@ -366,24 +413,40 @@ def compute_chain_permutation_tokens(
 
     with torch.no_grad():
         for asym in chain_order:
-            idx = np.where(asym_ids_np == asym)[0]
+            idx = np.where((asym_ids_np == asym) & valid_np)[0]
             ent_of[asym] = int(entity_ids_np[idx[0]])
-            tok_idx = torch.as_tensor(idx, dtype=torch.long, device=pred_pos.device)
-            # Flatten (token × atom) so chains of one entity share a row layout.
-            m = atom_mask[tok_idx].reshape(-1).detach().cpu().numpy().astype(bool)  # [T*M]
+            if mol_np is not None:
+                lig_of[asym] = bool(np.all(mol_np[idx] == const.MOL_NONPOLYMER))
+            if pred_rep is not None:
+                m = mask_rep[idx]  # [T]
+                pf = pred_rep[idx]  # [T, 3]
+                gf = gt_rep[idx]
+            else:
+                tok_idx = torch.as_tensor(idx, dtype=torch.long, device=pred_pos.device)
+                # Flatten (token × atom) so chains of one entity share a row layout.
+                m = atom_mask[tok_idx].reshape(-1).detach().cpu().numpy().astype(bool)  # [T*M]
+                pf = pred_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
+                gf = gt_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
             if not m.any():
                 cen_pred[asym] = None
                 cen_gt[asym] = None
                 continue
-            pf = pred_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
-            gf = gt_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
             at_pred[asym] = pf
             at_gt[asym] = gf
             res[asym] = m
             cen_pred[asym] = pf[m].mean(axis=0)
             cen_gt[asym] = gf[m].mean(axis=0)
 
-    return _anchor_greedy_assignment(chain_order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res)
+    return _anchor_greedy_assignment(
+        chain_order,
+        ent_of,
+        cen_pred,
+        cen_gt,
+        at_pred,
+        at_gt,
+        res,
+        is_lig=lig_of if mol_np is not None else None,
+    )
 
 
 def apply_chain_permutation_tokens(
