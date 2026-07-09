@@ -275,6 +275,321 @@ def _estimate_assembly_chains(st: gemmi.Structure, assembly_id: str = "1") -> in
     return sum(len(g.operators) * len(g.subchains) for g in assembly.generators)
 
 
+def _atom_name(atom: np.void) -> str:
+    """Stripped ASCII atom name for a single ``ATOM_DTYPE`` row."""
+    return atom["name"].decode("ascii", errors="replace").strip()
+
+
+def _res_name(res: np.void) -> str:
+    """Stripped ASCII residue name for a single ``RESIDUE_DTYPE`` row."""
+    return res["name"].decode("ascii", errors="replace").strip()
+
+
+def _atom_chain_res_moltype(
+    residues: np.ndarray, chains: np.ndarray, n_atoms: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-atom (asym_id, res_id, mol_type) lookup arrays.
+
+    Built from the residue / chain atom ranges so bond-level predicates can be
+    evaluated without re-parsing gemmi. Atoms not covered by any residue/chain
+    (should not happen) keep the ``-1`` sentinel.
+    """
+    atom_asym = np.full(n_atoms, -1, dtype=np.int64)
+    atom_res_id = np.full(n_atoms, -1, dtype=np.int64)
+    atom_mol_type = np.full(n_atoms, -1, dtype=np.int64)
+    for res in residues:
+        s = int(res["atom_idx"])
+        c = int(res["atom_num"])
+        atom_res_id[s : s + c] = int(res["res_id"])
+        atom_mol_type[s : s + c] = int(res["mol_type"])
+    for ch in chains:
+        s = int(ch["atom_idx"])
+        c = int(ch["atom_num"])
+        atom_asym[s : s + c] = int(ch["asym_id"])
+    return atom_asym, atom_res_id, atom_mol_type
+
+
+def fix_arginine_naming(atoms: np.ndarray, residues: np.ndarray) -> None:
+    """Swap ARG NH1/NH2 names so NH1 is always the one nearer CD (in-place).
+
+    Mirrors OF3 ``cleanup.fix_arginine_naming`` (AF3 §2.1): the NH1/NH2 labels
+    of a guanidinium group are chemically interchangeable, so PDB deposition can
+    assign them either way. This canonicalises by geometry (name follows the
+    nearer atom) so equivalent arginines across copies get identical labels —
+    required for a consistent reference atom set and symmetry matching. Only the
+    ``name`` fields are swapped; coordinates stay put. Residues missing any of
+    NH1/NH2/CD are skipped.
+    """
+    for res in residues:
+        if _res_name(res) != "ARG":
+            continue
+        s = int(res["atom_idx"])
+        c = int(res["atom_num"])
+        nh1 = nh2 = cd = -1
+        for ai in range(s, s + c):
+            nm = _atom_name(atoms[ai])
+            if nm == "NH1":
+                nh1 = ai
+            elif nm == "NH2":
+                nh2 = ai
+            elif nm == "CD":
+                cd = ai
+        if nh1 < 0 or nh2 < 0 or cd < 0:
+            continue
+        cd_xyz = np.array([atoms[cd]["x"], atoms[cd]["y"], atoms[cd]["z"]], dtype=np.float64)
+        nh1_xyz = np.array([atoms[nh1]["x"], atoms[nh1]["y"], atoms[nh1]["z"]], dtype=np.float64)
+        nh2_xyz = np.array([atoms[nh2]["x"], atoms[nh2]["y"], atoms[nh2]["z"]], dtype=np.float64)
+        d1 = float(np.linalg.norm(nh1_xyz - cd_xyz))
+        d2 = float(np.linalg.norm(nh2_xyz - cd_xyz))
+        if d2 < d1:
+            # NH2 is nearer CD → relabel so NH1 becomes the nearer atom.
+            tmp = atoms[nh1]["name"].copy()
+            atoms[nh1]["name"] = atoms[nh2]["name"]
+            atoms[nh2]["name"] = tmp
+
+
+def prefilter_bonds(
+    atoms: np.ndarray,
+    residues: np.ndarray,
+    chains: np.ndarray,
+    bonds: np.ndarray,
+    is_dative: np.ndarray | None = None,
+    max_len: float = const.MAX_BOND_LENGTH,
+) -> np.ndarray:
+    """Filter the bond list, mirroring OF3 ``cleanup.prefilter_bonds``.
+
+    Removes, in a single pass over ``bonds``:
+      (a) inter-chain dative / metal-coordination bonds (``is_dative`` True and
+          the two partners are in different chains);
+      (b) inter-chain polymer–polymer links (e.g. cross-chain disulfides);
+      (c) intra-chain polymer–polymer links between non-consecutive residues
+          (``|Δres_id| > 1``, e.g. intra-chain disulfides);
+      (d) any bond longer than ``max_len`` Å (default 2.4).
+
+    "Polymer" is the set of standard polymers {protein, DNA, RNA}; a bond to a
+    ligand (glycan, metal, cofactor) is never a polymer–polymer link. Bonds with
+    a NaN length (an unresolved partner) are always kept, matching OF3 — though
+    the prepare pipeline runs this before any unresolved atoms are added, so all
+    lengths are finite here.
+
+    Args:
+        atoms/residues/chains: the structure arrays (used for coords + per-atom
+            chain / res_id / mol_type).
+        bonds: ``BOND_DTYPE`` array to filter.
+        is_dative: optional ``[n_bonds]`` bool — True for metal-coordination
+            (``_struct_conn`` ``metalc``) bonds. ``None`` treats all bonds as
+            non-dative (so only (b)–(d) apply).
+        max_len: bond-length cutoff in Å.
+
+    Returns:
+        A filtered ``BOND_DTYPE`` array (possibly empty).
+    """
+    if len(bonds) == 0:
+        return bonds
+
+    n_atoms = len(atoms)
+    atom_asym, atom_res_id, atom_mol_type = _atom_chain_res_moltype(residues, chains, n_atoms)
+    coords = np.stack([atoms["x"], atoms["y"], atoms["z"]], axis=1).astype(np.float64)
+    polymer_types = (const.MOL_PROTEIN, const.MOL_DNA, const.MOL_RNA)
+
+    keep = np.ones(len(bonds), dtype=bool)
+    for k in range(len(bonds)):
+        a1 = int(bonds[k]["atom_1"])
+        a2 = int(bonds[k]["atom_2"])
+        if not (0 <= a1 < n_atoms and 0 <= a2 < n_atoms):
+            keep[k] = False
+            continue
+
+        inter_chain = atom_asym[a1] != atom_asym[a2]
+
+        # (d) length cutoff
+        d = float(np.linalg.norm(coords[a1] - coords[a2]))
+        if not np.isnan(d) and d > max_len:
+            keep[k] = False
+            continue
+
+        # (a) inter-chain dative / metal-coordination
+        if is_dative is not None and bool(is_dative[k]) and inter_chain:
+            keep[k] = False
+            continue
+
+        # (b) + (c) polymer–polymer links
+        is_pp = atom_mol_type[a1] in polymer_types and atom_mol_type[a2] in polymer_types
+        if is_pp:
+            if inter_chain:
+                keep[k] = False
+                continue
+            if abs(int(atom_res_id[a1]) - int(atom_res_id[a2])) > 1:
+                keep[k] = False
+                continue
+
+    return bonds[keep]
+
+
+def _guess_element_int(atom_name: str) -> int:
+    """Atomic number guessed from a heavy-atom name (standard-residue subset).
+
+    Standard amino-acid / nucleotide heavy atoms are all single-letter elements
+    (C, N, O, P, S), so the first alphabetic character identifies the element.
+    Only used for materialised unresolved atoms, whose element is never read for
+    featurisation (the featurizer gates on ``is_present``) — this keeps the
+    stored value sensible for inspection.
+    """
+    name = atom_name.strip().lstrip("0123456789")
+    return const.element_name_to_int(name[0]) if name else 0
+
+
+def finalize_standard_residue_atoms(
+    atoms: np.ndarray,
+    residues: np.ndarray,
+    chains: np.ndarray,
+    bonds: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Strip terminal atoms and materialise unresolved intra-residue atoms.
+
+    Combines two OF3 cleanup steps that both rewrite the atom array, so the
+    structure is rebuilt (with a bond-index remap) exactly once:
+
+    * **Item 5 — terminal-atom removal** (OF3 ``remove_std_residue_terminal_atoms``):
+      drops OXT (protein) and OP3 / O3P (nucleic 5') from *standard* residues so
+      every token of a residue type maps to the same fixed atom set. Non-standard
+      residues are atomized per-atom and keep their terminal atoms.
+
+    * **Item 4a — unresolved intra-residue atom materialisation** (OF3
+      ``add_unresolved_atoms_within_residue``): pads each present standard
+      residue to its full heavy-atom reference set (``const.REF_ATOMS``, which
+      already excludes leaving atoms + hydrogens). Missing atoms are appended
+      with ``is_present=False``, occupancy/coords 0, so the downstream featurizer
+      masks them out of the GT loss (``atom_gt_mask``) — behaviourally identical
+      to the previous "atom simply absent" handling, but with a complete,
+      consistent per-token atom set.
+
+    Only residues whose stored name is a canonical standard residue
+    (``const.STANDARD_PROTEIN_RES3`` / ``STANDARD_NUCLEIC_RES``) are touched;
+    name-mapped modified residues (e.g. SEP, TPO) and ligands are passed through
+    unchanged so their observed atom set / order is preserved.
+
+    Missing *whole* residues (chain-break / terminal gaps) are intentionally NOT
+    inserted here — see the module docstring / prepare notes.
+
+    Returns:
+        New ``(atoms, residues, chains, bonds)`` arrays with bonds remapped to the
+        new atom indices (bonds referencing a removed terminal atom are dropped).
+    """
+    new_atoms: list[tuple] = []
+    new_residues: list[tuple] = []
+    new_chains: list[tuple] = []
+    old_to_new: dict[int, int] = {}
+
+    for ch in chains:
+        c_mol_type = int(ch["mol_type"])
+        c_res_start = int(ch["res_idx"])
+        c_res_num = int(ch["res_num"])
+        chain_atom_start = len(new_atoms)
+        chain_res_start = len(new_residues)
+
+        is_protein = c_mol_type == const.MOL_PROTEIN
+        is_nucleic = c_mol_type in (const.MOL_RNA, const.MOL_DNA)
+
+        for ri in range(c_res_start, c_res_start + c_res_num):
+            res = residues[ri]
+            r_name = _res_name(res)
+            r_atom_start = int(res["atom_idx"])
+            r_atom_num = int(res["atom_num"])
+            res_atom_start_new = len(new_atoms)
+
+            is_std_named = (is_protein and r_name in const.STANDARD_PROTEIN_RES3) or (
+                is_nucleic and r_name in const.STANDARD_NUCLEIC_RES
+            )
+
+            if is_std_named:
+                leaving = (
+                    const.PROTEIN_LEAVING_ATOMS if is_protein else const.NUCLEIC_LEAVING_ATOMS
+                )
+                observed_names: set[str] = set()
+                # Emit observed atoms (minus terminal leaving atoms).
+                for ai in range(r_atom_start, r_atom_start + r_atom_num):
+                    nm = _atom_name(atoms[ai])
+                    if nm in leaving:
+                        continue  # Item 5: terminal-atom strip
+                    old_to_new[ai] = len(new_atoms)
+                    new_atoms.append(tuple(atoms[ai]))
+                    observed_names.add(nm)
+                # Item 4a: materialise missing reference atoms (unresolved).
+                ref_names = const.REF_ATOMS.get(r_name, [])
+                for nm in ref_names:
+                    if nm in observed_names:
+                        continue
+                    new_atoms.append(
+                        (
+                            0.0,  # x
+                            0.0,  # y
+                            0.0,  # z
+                            _guess_element_int(nm),  # element
+                            0.0,  # charge
+                            nm[:4].ljust(4).encode("ascii"),  # name
+                            False,  # is_present (unresolved → masked)
+                            0.0,  # b_factor
+                        )
+                    )
+            else:
+                # Ligand / non-standard-named residue: preserve atoms verbatim.
+                for ai in range(r_atom_start, r_atom_start + r_atom_num):
+                    old_to_new[ai] = len(new_atoms)
+                    new_atoms.append(tuple(atoms[ai]))
+
+            res_atom_count_new = len(new_atoms) - res_atom_start_new
+            any_present = any(
+                bool(new_atoms[j][6]) for j in range(res_atom_start_new, len(new_atoms))
+            )
+            new_residues.append(
+                (
+                    res["name"],
+                    int(res["res_type"]),
+                    int(res["mol_type"]),
+                    int(res["res_id"]),
+                    res_atom_start_new,
+                    res_atom_count_new,
+                    bool(res["is_standard"]),
+                    any_present,
+                )
+            )
+
+        chain_atom_count_new = len(new_atoms) - chain_atom_start
+        chain_res_count_new = len(new_residues) - chain_res_start
+        new_chains.append(
+            (
+                ch["name"],
+                int(ch["mol_type"]),
+                int(ch["entity_id"]),
+                int(ch["sym_id"]),
+                int(ch["asym_id"]),
+                chain_res_start,
+                chain_res_count_new,
+                chain_atom_start,
+                chain_atom_count_new,
+            )
+        )
+
+    atoms_arr = np.array(new_atoms, dtype=ATOM_DTYPE) if new_atoms else np.empty(0, dtype=ATOM_DTYPE)
+    residues_arr = (
+        np.array(new_residues, dtype=RESIDUE_DTYPE) if new_residues else np.empty(0, dtype=RESIDUE_DTYPE)
+    )
+    chains_arr = np.array(new_chains, dtype=CHAIN_DTYPE) if new_chains else np.empty(0, dtype=CHAIN_DTYPE)
+
+    # Remap bonds to the new atom indices; drop bonds whose partner was removed.
+    new_bonds: list[tuple] = []
+    for b in bonds:
+        n1 = old_to_new.get(int(b["atom_1"]))
+        n2 = old_to_new.get(int(b["atom_2"]))
+        if n1 is None or n2 is None:
+            continue
+        new_bonds.append((n1, n2, int(b["type"])))
+    bonds_arr = np.array(new_bonds, dtype=BOND_DTYPE) if new_bonds else np.empty(0, dtype=BOND_DTYPE)
+
+    return atoms_arr, residues_arr, chains_arr, bonds_arr
+
+
 def process_mmcif(
     path: Path,
     use_assembly: bool = True,
@@ -662,8 +977,12 @@ def process_mmcif(
     atoms_arr = np.array(all_atoms, dtype=ATOM_DTYPE) if all_atoms else np.empty(0, dtype=ATOM_DTYPE)
     residues_arr = np.array(all_residues, dtype=RESIDUE_DTYPE) if all_residues else np.empty(0, dtype=RESIDUE_DTYPE)
     chains_arr = np.array(all_chains, dtype=CHAIN_DTYPE) if all_chains else np.empty(0, dtype=CHAIN_DTYPE)
-    # Extract cross-entity bonds from mmCIF _struct_conn (disulfide, covalent, metal)
+    # Extract cross-entity bonds from mmCIF _struct_conn (disulfide, covalent, metal).
+    # Track which bonds are metal-coordination (dative) so the OF3 bond prefilter
+    # can drop inter-chain dative bonds (DF3 collapses all conn types to bond
+    # order 1, so the dative marker must be carried separately).
     conn_bonds: list[tuple[int, int, int]] = []
+    conn_dative: list[bool] = []
     _BOND_TYPES = {gemmi.ConnectionType.Covale, gemmi.ConnectionType.Disulf, gemmi.ConnectionType.MetalC}
     for conn in st.connections:
         if conn.type not in _BOND_TYPES:
@@ -673,7 +992,21 @@ def process_mmcif(
         idx2 = atom_lookup.get((p2.chain_name, p2.res_id.seqid.num, p2.atom_name))
         if idx1 is not None and idx2 is not None:
             conn_bonds.append((idx1, idx2, 1))  # bond order 1 (single)
+            conn_dative.append(conn.type == gemmi.ConnectionType.MetalC)
     bonds_arr = np.array(conn_bonds, dtype=BOND_DTYPE) if conn_bonds else np.empty(0, dtype=BOND_DTYPE)
+    is_dative_arr = np.array(conn_dative, dtype=bool) if conn_dative else None
+
+    # OF3-parity structure cleanup (mirrors ``cleanup_structure_of3`` ordering).
+    # Runs on real observed coordinates BEFORE any unresolved atoms are inserted:
+    #   §2.1  arginine NH1/NH2 canonicalisation (Item 7)
+    #   2.5.4 bond prefilter — dative / poly-links / >2.4 Å (Item 6)
+    #   2.5.4 terminal-atom strip + unresolved intra-residue materialisation
+    #         (Items 5 + 4a; single rebuild + bond remap)
+    fix_arginine_naming(atoms_arr, residues_arr)
+    bonds_arr = prefilter_bonds(atoms_arr, residues_arr, chains_arr, bonds_arr, is_dative=is_dative_arr)
+    atoms_arr, residues_arr, chains_arr, bonds_arr = finalize_standard_residue_atoms(
+        atoms_arr, residues_arr, chains_arr, bonds_arr
+    )
 
     structure = Structure(
         atoms=atoms_arr,
