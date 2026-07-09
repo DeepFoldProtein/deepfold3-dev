@@ -2,10 +2,12 @@
 
 Covers the token-layout entry point ``compute_chain_permutation_tokens`` and
 the fixes from the OF3 audit:
-  * representative (token-center) atom alignment (품질 3),
-  * ligand-only entities deprioritised as the anchor (품질 2),
+  * representative (token-center) atom alignment,
+  * ligand-only entities deprioritised as the anchor,
   * ``seq_mask`` padding filter so zero-padded ``asym_id == 0`` tokens do not
-    pollute chain 0's block.
+    pollute chain 0's block,
+  * ``sym_token_index`` matching so symmetric chains a crop cut to unequal
+    token counts are still permuted instead of silently skipped (gap-1).
 """
 
 from __future__ import annotations
@@ -141,3 +143,71 @@ def test_all_atom_fallback_still_runs():
     pred[:, 1] = pred[:, 0] + 0.1
     assign = compute_chain_permutation_tokens(pred, gt, mask, asym, ent)
     assert assign == {0: 1, 1: 0}
+
+
+# ---------------------------------------------------------------------------
+# gap-1: partial crop cuts symmetric chains to UNEQUAL token counts
+# ---------------------------------------------------------------------------
+
+
+def _unequal_crop_swapped(M: int = 2):
+    """Homodimer (entity length 5) that a crop cut to unequal counts.
+
+    Surviving: chain 0 keeps sym 0..3 (4 tokens), chain 1 keeps sym 0..2 (3).
+    GT chain 0 sits near the origin, GT chain 1 near x = 100. The prediction
+    folds the copies swapped, so the correct assignment is ``{0: 1, 1: 0}`` —
+    but positional (equal-count) matching cannot even align 4 vs 3 tokens.
+    """
+    N = 7
+    gt = torch.zeros(N, M, 3)
+    pred = torch.zeros(N, M, 3)
+
+    # rep atom (slot 0) x-coords keyed by sym_token_index
+    gt[0:4, 0, 0] = torch.tensor([0.0, 1, 2, 3])  # GT chain 0 @ origin, sym 0..3
+    gt[4:7, 0, 0] = torch.tensor([100.0, 101, 102])  # GT chain 1 @ x=100, sym 0..2
+    pred[0:4, 0, 0] = torch.tensor([100.0, 101, 102, 103])  # pred chain 0 ≈ GT chain 1 (+extra sym 3)
+    pred[4:7, 0, 0] = torch.tensor([0.0, 1, 2])  # pred chain 1 ≈ GT chain 0
+
+    atom_mask = torch.zeros(N, M, dtype=torch.bool)
+    atom_mask[:, 0] = True
+    asym_id = torch.tensor([0, 0, 0, 0, 1, 1, 1])
+    entity_id = torch.zeros(N, dtype=torch.long)
+    sym_token_index = torch.tensor([0, 1, 2, 3, 0, 1, 2])
+    token_to_rep_atom = torch.zeros(N, dtype=torch.long)
+    mol_type = torch.full((N,), const.MOL_PROTEIN, dtype=torch.long)
+    seq_mask = torch.ones(N, dtype=torch.bool)
+    return pred, gt, atom_mask, asym_id, entity_id, sym_token_index, token_to_rep_atom, mol_type, seq_mask
+
+
+def test_unequal_crop_swap_recovered_with_sym_index():
+    pred, gt, mask, asym, ent, sti, rep, mol, seq = _unequal_crop_swapped()
+    assign = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq, sym_token_index=sti
+    )
+    assert assign == {0: 1, 1: 0}
+
+
+def test_unequal_crop_skipped_without_sym_index():
+    """Documents the gap: without sym_token_index the 4-vs-3 pair can't be
+    matched (equal-count candidate filter) → identity fallback."""
+    pred, gt, mask, asym, ent, _sti, rep, mol, seq = _unequal_crop_swapped()
+    assign = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq
+    )
+    assert assign == {0: 0, 1: 1}
+
+
+def test_apply_sym_index_reorders_and_masks_off_no_counterpart():
+    pred, gt, mask, asym, ent, sti, rep, mol, seq = _unequal_crop_swapped()
+    assign = compute_chain_permutation_tokens(
+        pred, gt, mask, asym, ent, token_to_rep_atom=rep, mol_type=mol, seq_mask=seq, sym_token_index=sti
+    )
+    new_gt, new_mask = apply_chain_permutation_tokens(gt, mask, asym, assign, sym_token_index=sti)
+    # pred chain 0 sym 0..2 pull GT chain 1 (x≈100..102); sym 3 has no GT
+    # counterpart in chain 1 (only sym 0..2) → masked off.
+    assert new_mask[0, 0] and new_mask[1, 0] and new_mask[2, 0]
+    assert not new_mask[3, 0]  # sym 3 token: no aligned GT → mask zeroed
+    assert torch.allclose(new_gt[0:3, 0, 0], torch.tensor([100.0, 101, 102]))
+    # pred chain 1 sym 0..2 pull GT chain 0 (x≈0..2).
+    assert torch.allclose(new_gt[4:7, 0, 0], torch.tensor([0.0, 1, 2]))
+    assert new_mask[4, 0] and new_mask[5, 0] and new_mask[6, 0]

@@ -71,6 +71,7 @@ def _anchor_greedy_assignment(
     at_gt: dict[int, np.ndarray],
     res: dict[int, np.ndarray],
     is_lig: dict[int, bool] | None = None,
+    sti: dict[int, np.ndarray] | None = None,
 ) -> dict[int, int]:
     """AF-Multimer anchor-based greedy chain assignment (AF3 §4.2).
 
@@ -96,11 +97,16 @@ def _anchor_greedy_assignment(
     Per-chain inputs are keyed by chain id: ``cen_*`` are resolved-atom
     centroids (``None`` if fully unresolved); ``at_*`` / ``res`` are the
     per-chain resolved-atom coordinate blocks + boolean mask used only for
-    the anchor Kabsch (chains of one entity share their atom layout, so the
-    anchor pair's blocks line up row-for-row). ``is_lig`` maps chain id →
-    True for ligand (all-nonpolymer) chains; used only to deprioritise
-    ligand-only entities as the anchor. When ``None``, no ligand distinction
-    is made (legacy behaviour).
+    the anchor Kabsch. ``is_lig`` maps chain id → True for ligand
+    (all-nonpolymer) chains; used only to deprioritise ligand-only entities as
+    the anchor. When ``None``, no ligand distinction is made (legacy behaviour).
+
+    ``sti`` maps chain id → its per-token ``sym_token_index`` array (same row
+    order as ``at_*`` / ``res``). When given, the anchor Kabsch matches
+    symmetric chains by **shared sym-index** rather than requiring equal token
+    counts, so chains a crop cut to unequal lengths still align on their common
+    residues (gap-1). When ``None``, chains of one entity are assumed to share
+    their atom layout row-for-row (legacy positional path).
     """
     from collections import defaultdict
 
@@ -134,19 +140,54 @@ def _anchor_greedy_assignment(
         key=lambda e: (_ent_is_ligand(e), len(ent_res[e]), -max(natoms[a] for a in ent_res[e])),
     )
     gt_anchor = max(ent_res[anchor_entity], key=lambda a: natoms[a])
-    # Candidate global frames: predicted chains of the anchor entity whose
-    # atom layout matches gt_anchor's (row-for-row Kabsch correspondence).
-    candidates = [a for a in ent_res[anchor_entity] if res[a].shape[0] == res[gt_anchor].shape[0]]
-    if not candidates:
-        return assignment
+
+    def _anchor_kabsch_points(pa: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """Matched (pred_pa, gt_anchor) coords for the anchor Kabsch.
+
+        Over tokens resolved in both chains. Positional row-for-row when
+        ``sti`` is None (equal-length same-entity chains, legacy path); by
+        shared ``sym_token_index`` when provided, so a symmetric chain that a
+        crop cut to a different surviving token count still aligns on the
+        residues the two chains have in common. Returns ``None`` when fewer
+        than 3 points match (Kabsch under-determined → skip this frame).
+        """
+        if sti is None:
+            # Legacy: row-for-row correspondence needs equal token counts.
+            if res[pa].shape[0] != res[gt_anchor].shape[0]:
+                return None
+            both = res[pa] & res[gt_anchor]
+            if int(both.sum()) < 3:
+                return None
+            return at_pred[pa][both], at_gt[gt_anchor][both]
+        pa_sti, pa_res = sti[pa], res[pa]
+        p_of_sym: dict[int, int] = {}
+        for r in range(pa_sti.shape[0]):
+            if pa_res[r]:
+                p_of_sym.setdefault(int(pa_sti[r]), r)  # dup sym (atomized) → first
+        g_sti, g_res = sti[gt_anchor], res[gt_anchor]
+        rows_p: list[int] = []
+        rows_g: list[int] = []
+        seen: set[int] = set()
+        for r in range(g_sti.shape[0]):
+            if not g_res[r]:
+                continue
+            s = int(g_sti[r])
+            rp = p_of_sym.get(s)
+            if rp is not None and s not in seen:
+                seen.add(s)
+                rows_p.append(rp)
+                rows_g.append(r)
+        if len(rows_p) < 3:
+            return None
+        return at_pred[pa][rows_p], at_gt[gt_anchor][rows_g]
 
     best: dict[int, int] | None = None
     best_score = np.inf
-    for pa in candidates:
-        both = res[pa] & res[gt_anchor]
-        if int(both.sum()) < 3:
+    for pa in ent_res[anchor_entity]:
+        pts = _anchor_kabsch_points(pa)
+        if pts is None:
             continue
-        r_mat, t_vec = _kabsch_transform_np(at_pred[pa][both], at_gt[gt_anchor][both])
+        r_mat, t_vec = _kabsch_transform_np(pts[0], pts[1])
         trial = {a: a for a in order}
         score = 0.0
         for chs in groups.values():
@@ -341,6 +382,7 @@ def compute_chain_permutation_tokens(
     token_to_rep_atom: torch.Tensor | None = None,  # [N] int — rep-atom slot per token
     mol_type: torch.Tensor | None = None,  # [N] int — polymer/ligand anchor priority
     seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
 ) -> dict[int, int]:
     """Token-layout version of :func:`compute_chain_permutation`.
 
@@ -361,7 +403,9 @@ def compute_chain_permutation_tokens(
     chains). When absent, all heavy atoms are flattened (legacy behaviour).
     ``mol_type`` lets ligand-only entities be deprioritised as the anchor.
     ``seq_mask`` drops padding tokens (which carry ``asym_id == 0`` and would
-    otherwise pollute chain 0's token block).
+    otherwise pollute chain 0's token block). ``sym_token_index`` (rep-atom
+    path only) keys the anchor Kabsch by shared per-chain ordinal, so
+    symmetric chains a crop cut to unequal token counts still align (gap-1).
 
     Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in singleton
     entity classes or when no valid anchor frame exists.
@@ -374,6 +418,7 @@ def compute_chain_permutation_tokens(
     asym_ids_np = asym_id.detach().cpu().numpy()
     entity_ids_np = entity_id.detach().cpu().numpy()
     mol_np = mol_type.detach().cpu().numpy() if mol_type is not None else None
+    sym_np = sym_token_index.detach().cpu().numpy() if sym_token_index is not None else None
     valid_np = (
         seq_mask.detach().cpu().numpy().astype(bool)
         if seq_mask is not None
@@ -405,6 +450,7 @@ def compute_chain_permutation_tokens(
 
     ent_of: dict[int, int] = {}
     lig_of: dict[int, bool] = {}
+    sti_of: dict[int, np.ndarray] = {}
     cen_pred: dict[int, np.ndarray | None] = {}
     cen_gt: dict[int, np.ndarray | None] = {}
     at_pred: dict[int, np.ndarray] = {}
@@ -436,6 +482,9 @@ def compute_chain_permutation_tokens(
             res[asym] = m
             cen_pred[asym] = pf[m].mean(axis=0)
             cen_gt[asym] = gf[m].mean(axis=0)
+            # sym-index key (rep-atom path only): row-aligned with pf/gf/m.
+            if pred_rep is not None and sym_np is not None:
+                sti_of[asym] = sym_np[idx]
 
     return _anchor_greedy_assignment(
         chain_order,
@@ -446,6 +495,7 @@ def compute_chain_permutation_tokens(
         at_gt,
         res,
         is_lig=lig_of if mol_np is not None else None,
+        sti=sti_of if (pred_rep is not None and sym_np is not None) else None,
     )
 
 
@@ -454,14 +504,19 @@ def apply_chain_permutation_tokens(
     atom_mask: torch.Tensor,  # [N, M] bool
     asym_id: torch.Tensor,  # [N] int
     chain_assignment: dict[int, int],
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reorder GT token rows according to a chain assignment.
 
-    For each pred chain, the rows whose ``asym_id`` matches the pred
-    chain are replaced with the rows of the GT chain given by the
-    assignment. Length-mismatched groups are skipped (the assignment
-    builder already does this so this branch is defensive). Returns the
-    permuted ``gt_pos`` and matching mask, both detached.
+    For each pred chain, its rows are replaced with the rows of the GT chain
+    given by the assignment. Without ``sym_token_index`` the two chains are
+    matched **positionally** and length-mismatched groups are skipped (legacy
+    — the case gap-1 addresses). With ``sym_token_index`` each pred token is
+    matched to the GT token of the **same per-chain ordinal**, so symmetric
+    chains a crop cut to unequal token counts are still reordered; pred tokens
+    with no GT counterpart under the assignment have their mask zeroed (there
+    is no aligned GT coordinate to score against). Returns the permuted
+    ``gt_pos`` and matching mask, both detached.
     """
     import torch
 
@@ -470,24 +525,61 @@ def apply_chain_permutation_tokens(
 
     n_tokens = gt_pos.shape[-3]
     asym_ids_t = asym_id.to(dtype=torch.long, device=gt_pos.device)
-    index = torch.arange(n_tokens, dtype=torch.long, device=gt_pos.device)
 
-    # Pre-build asym -> token index list for the source side
-    chain_by_asym: dict[int, torch.Tensor] = {}
-    for a in chain_assignment.values():
-        a_int = int(a)
-        if a_int not in chain_by_asym:
-            chain_by_asym[a_int] = torch.where(asym_ids_t == a_int)[0]
+    if sym_token_index is None:
+        # Legacy positional path: reorder only equal-length chain pairs.
+        index = torch.arange(n_tokens, dtype=torch.long, device=gt_pos.device)
+        chain_by_asym: dict[int, torch.Tensor] = {}
+        for a in chain_assignment.values():
+            a_int = int(a)
+            if a_int not in chain_by_asym:
+                chain_by_asym[a_int] = torch.where(asym_ids_t == a_int)[0]
+        for pred_asym, gt_asym in chain_assignment.items():
+            if int(pred_asym) == int(gt_asym):
+                continue
+            pred_idx = torch.where(asym_ids_t == int(pred_asym))[0]
+            gt_idx = chain_by_asym.get(int(gt_asym), pred_idx)
+            if pred_idx.numel() != gt_idx.numel():
+                continue
+            index[pred_idx] = gt_idx
+        permuted = gt_pos.index_select(-3, index).detach()
+        permuted_mask = atom_mask.index_select(0, index).detach()
+        return permuted, permuted_mask
+
+    # sym-index path: match pred token → GT token of the same per-chain ordinal.
+    import numpy as np
+
+    asym_np = asym_ids_t.detach().cpu().numpy()
+    sym_np = sym_token_index.detach().cpu().numpy()
+    index_np = np.arange(n_tokens, dtype=np.int64)
+    keep = np.ones(n_tokens, dtype=bool)  # pred tokens with a matched GT counterpart
 
     for pred_asym, gt_asym in chain_assignment.items():
         if int(pred_asym) == int(gt_asym):
             continue
-        pred_idx = torch.where(asym_ids_t == int(pred_asym))[0]
-        gt_idx = chain_by_asym.get(int(gt_asym), pred_idx)
-        if pred_idx.numel() != gt_idx.numel():
+        pred_rows = np.where(asym_np == int(pred_asym))[0]
+        gt_rows = np.where(asym_np == int(gt_asym))[0]
+        # GT sym-index → GT row. A duplicate sym (e.g. stochastic atomization
+        # expanded a residue) makes the mapping ill-defined → skip this chain.
+        gt_of_sym: dict[int, int] = {}
+        dup = False
+        for r in gt_rows.tolist():
+            s = int(sym_np[r])
+            if s in gt_of_sym:
+                dup = True
+                break
+            gt_of_sym[s] = r
+        if dup:
             continue
-        index[pred_idx] = gt_idx
+        for r in pred_rows.tolist():
+            g = gt_of_sym.get(int(sym_np[r]))
+            if g is None:
+                keep[r] = False  # no GT token of this ordinal → nothing to score
+            else:
+                index_np[r] = g
 
+    index = torch.from_numpy(index_np).to(device=gt_pos.device)
+    keep_t = torch.from_numpy(keep).to(device=gt_pos.device)
     permuted = gt_pos.index_select(-3, index).detach()
-    permuted_mask = atom_mask.index_select(0, index).detach()
+    permuted_mask = (atom_mask.index_select(0, index) & keep_t.unsqueeze(-1)).detach()
     return permuted, permuted_mask

@@ -420,6 +420,7 @@ def chain_perm_from_mini_rollout(
         token_to_rep_atom=features.get("token_to_rep_atom"),
         mol_type=features.get("mol_type"),
         seq_mask=features.get("seq_mask"),
+        sym_token_index=features.get("sym_token_index"),
     )
 
 
@@ -441,6 +442,7 @@ def diffusion_mse_loss(
     atom_perm_pred: torch.Tensor | None = None,  # [N, M, 3] — mini-rollout reference for atom/ligand swap decisions
     token_to_rep_atom: torch.Tensor | None = None,  # [N] int — rep-atom slot (chain-perm token centers)
     seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens for chain perm
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust chain-perm key)
     apply_rigid_align: bool = True,
 ) -> torch.Tensor:
     """Weighted MSE between denoised predictions and augmented GT.
@@ -508,7 +510,7 @@ def diffusion_mse_loss(
             permuted_mask = atom_mask_bool
             for s in range(S):
                 new_gt, permuted_mask = apply_chain_permutation_tokens(
-                    gt_pos[s], atom_mask_bool, asym_id, chain_assign
+                    gt_pos[s], atom_mask_bool, asym_id, chain_assign, sym_token_index=sym_token_index
                 )
                 permuted_chunks.append(new_gt)
             atom_mask = permuted_mask
@@ -529,8 +531,11 @@ def diffusion_mse_loss(
                     token_to_rep_atom=token_to_rep_atom,
                     mol_type=mol_type,
                     seq_mask=seq_mask,
+                    sym_token_index=sym_token_index,
                 )
-                new_gt, _ = apply_chain_permutation_tokens(gt_pos[s], atom_mask_bool, asym_id, assign_s)
+                new_gt, _ = apply_chain_permutation_tokens(
+                    gt_pos[s], atom_mask_bool, asym_id, assign_s, sym_token_index=sym_token_index
+                )
                 permuted_chunks.append(new_gt)
         gt_pos = torch.stack(permuted_chunks, dim=0)
 
@@ -1736,6 +1741,7 @@ def diffusion_only_loss(
             atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
             token_to_rep_atom=features.get("token_to_rep_atom"),
             seq_mask=features.get("seq_mask"),
+            sym_token_index=features.get("sym_token_index"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         components["diffusion_mse"] = l_mse.detach()
@@ -1970,6 +1976,7 @@ def training_loss(
             atom_perm_pred=(pred["mini_rollout_pos"][0] if "mini_rollout_pos" in pred else None),
             token_to_rep_atom=features.get("token_to_rep_atom"),
             seq_mask=features.get("seq_mask"),
+            sym_token_index=features.get("sym_token_index"),
             apply_rigid_align=cfg.use_rigid_align,
         )
         losses["diffusion_mse"] = l_mse
