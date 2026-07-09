@@ -156,6 +156,7 @@ class Featurizer:
         asym_id = torch.from_numpy(tokens["asym_id"].astype(np.int64))
         entity_id = torch.from_numpy(tokens["entity_id"].astype(np.int64))
         sym_id = torch.from_numpy(tokens["sym_id"].astype(np.int64))
+        sym_token_index = torch.from_numpy(tokens["sym_token_index"].astype(np.int64))
         seq_mask = torch.ones(N, dtype=torch.bool)
 
         # ------------------------------------------------------------------
@@ -597,6 +598,7 @@ class Featurizer:
             "asym_id": asym_id,
             "entity_id": entity_id,
             "sym_id": sym_id,
+            "sym_token_index": sym_token_index,
             "mol_type": mol_type_tensor,
             "token_res_name": torch.from_numpy(token_res_name),
             "seq_mask": seq_mask,
@@ -1470,6 +1472,7 @@ class Featurizer:
             "asym_id": torch.zeros(0, dtype=torch.int64),
             "entity_id": torch.zeros(0, dtype=torch.int64),
             "sym_id": torch.zeros(0, dtype=torch.int64),
+            "sym_token_index": torch.zeros(0, dtype=torch.int64),
             "mol_type": torch.zeros(0, dtype=torch.int64),
             "token_res_name": torch.zeros(0, 5, dtype=torch.int8),
             "seq_mask": torch.zeros(0, dtype=torch.bool),

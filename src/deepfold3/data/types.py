@@ -76,6 +76,13 @@ TOKEN_DTYPE = np.dtype(
         ("asym_id", np.int32),
         ("entity_id", np.int32),
         ("sym_id", np.int32),
+        # Per-chain token ordinal (0-based, reset per chain), assigned pre-crop.
+        # Identical across symmetry-equivalent chains (same entity → same token
+        # sequence), so it survives cropping as a stable cross-copy key for
+        # chain-permutation matching on partially-cropped symmetric chains
+        # (OF3 ``mol_sym_token_index``). Not unique per token after stochastic
+        # atomization (expanded atoms inherit the residue's ordinal).
+        ("sym_token_index", np.int32),
         ("atom_idx", np.int32),  # index in atoms array of this token's atoms
         ("atom_num", np.int16),  # number of atoms belonging to this token
         ("center_x", np.float32),  # representative atom x (for cropping)

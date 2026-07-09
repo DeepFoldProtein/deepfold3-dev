@@ -51,6 +51,7 @@ DIM0_KEYS = {
     "asym_id",
     "entity_id",
     "sym_id",
+    "sym_token_index",
     "mol_type",
     "token_res_name",
     "seq_mask",

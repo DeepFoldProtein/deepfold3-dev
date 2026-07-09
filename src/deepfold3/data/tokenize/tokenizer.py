@@ -64,6 +64,12 @@ class Tokenizer:
             res_start = int(chain["res_idx"])
             res_end = res_start + int(chain["res_num"])
 
+            # Per-chain token ordinal (reset each chain). Symmetric copies of an
+            # entity are tokenized identically, so token k of every copy gets the
+            # same value — a cross-copy key that survives cropping (see
+            # ``sym_token_index`` in TOKEN_DTYPE). Increments wherever token_idx does.
+            chain_tok_ord = 0
+
             if mol_type in (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA):
                 chain_msa_col = 0  # per-chain MSA column counter
                 for ri in range(res_start, res_end):
@@ -100,6 +106,7 @@ class Tokenizer:
                                 asym_id=asym_id,
                                 entity_id=entity_id,
                                 sym_id=sym_id,
+                                sym_token_index=chain_tok_ord,
                                 atom_idx=atom_idx,
                                 atom_num=atom_num,
                                 center_x=cx,
@@ -114,6 +121,7 @@ class Tokenizer:
                             atom_to_token[atom_idx + ai] = (token_idx, ai)
 
                         token_idx += 1
+                        chain_tok_ord += 1
                         chain_msa_col += 1
                     else:
                         # AF3 §2.6: modified (non-standard) residue — one token per atom.
@@ -134,6 +142,7 @@ class Tokenizer:
                                     asym_id=asym_id,
                                     entity_id=entity_id,
                                     sym_id=sym_id,
+                                    sym_token_index=chain_tok_ord,
                                     atom_idx=global_ai,
                                     atom_num=1,
                                     center_x=cx,
@@ -145,6 +154,7 @@ class Tokenizer:
                             msa_col_list.append(chain_msa_col)
                             atom_to_token[global_ai] = (token_idx, 0)
                             token_idx += 1
+                            chain_tok_ord += 1
                         chain_msa_col += 1
 
             elif mol_type == const.MOL_NONPOLYMER:
@@ -174,6 +184,7 @@ class Tokenizer:
                                 asym_id=asym_id,
                                 entity_id=entity_id,
                                 sym_id=sym_id,
+                                sym_token_index=chain_tok_ord,
                                 atom_idx=global_ai,  # global atom index
                                 atom_num=1,  # each token = 1 atom
                                 center_x=cx,
@@ -185,6 +196,7 @@ class Tokenizer:
                         msa_col_list.append(-1)  # ligands have no MSA column
                         atom_to_token[global_ai] = (token_idx, 0)
                         token_idx += 1
+                        chain_tok_ord += 1
 
         # Build token bonds from structure bonds (cross-entity + ligand intra-bonds)
         seen_bonds: set[tuple[int, int]] = set()
