@@ -1,4 +1,5 @@
 training:
+  optimizer_type: schedule_free
   lr: 0.0018
   # Default 0 here matches the AF3 supplement (no weight decay during
   # initial training). Production runs set this from the optimizer config
@@ -11,14 +12,15 @@ training:
   weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
+  decoupling_parameter: 200.0
 
   warmup_steps: 1000
-  start_decay_after: 50000
-  decay_every: 50000
-  decay_factor: 0.95
-  finetune_scheduler: af3
-  cosine_min_lr_ratio: 0.1
-  cosine_max_steps: 20000
+  # start_decay_after: 50000
+  # decay_every: 50000
+  # decay_factor: 0.95
+  # finetune_scheduler: af3
+  # cosine_min_lr_ratio: 0.1
+  # cosine_max_steps: 20000
 
   grad_clip_norm: 10.0
   grad_norm_fp64: true
@@ -162,12 +164,6 @@ training:
   skip_load_optimizer: false
   skip_load_scheduler: false
   skip_load_step: false
-  # Schedule-Free stage-transition knob. When resuming into a new stage
-  # (crop/loss change), true rewinds x's averaging clock so x re-tracks z
-  # for the new objective, while keeping z + v (no preconditioner transient)
-  # and k (LR warmup / bias correction). No-op for AdamW. Default off →
-  # plain full-resume continuation.
-  sf_reset_clock: false
 
   wandb_enabled: true
   wandb_project: deepfold3-stage0

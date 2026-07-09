@@ -532,22 +532,29 @@ class Trainer:
                 if base_lrs is not None:
                     self.scheduler.base_lrs = [target_lr] * len(base_lrs)
 
-        # Resume average_concentration override: same "yaml wins" pattern as
-        # the LR override above. Justified because average_concentration is
-        # purely a hyperparameter; nothing in optimizer.state[p] is tied to
-        # its specific value (weight_sum/lr_max are vanilla-only and remain
-        # frozen on the refined branch). Switching a saved vanilla-SF run
-        # to refined mid-trajectory is exactly the new arm's case.
+        # Resume decoupling_parameter override: same "yaml wins" pattern as
+        # the LR override above. Justified because decoupling_parameter (C) is
+        # purely a hyperparameter; nothing in optimizer.state[p] is tied to its
+        # value. The weight_sum/lr_max accumulator is C-independent — C only
+        # rescales the final averaging coefficient (Algorithm 2 line 11) — so
+        # switching a saved run's C mid-trajectory (incl. vanilla → refined) is
+        # safe.
         if resumed and self.optimizer.param_groups:
-            target_ac = self.cfg.average_concentration
-            saved_ac = self.optimizer.param_groups[0].get("average_concentration", None)
-            if saved_ac != target_ac:
+            # Migrate the legacy group-key from checkpoints saved before
+            # average_concentration → decoupling_parameter was renamed, so
+            # step() (reads group["decoupling_parameter"]) can't KeyError.
+            for g in self.optimizer.param_groups:
+                if "decoupling_parameter" not in g and "average_concentration" in g:
+                    g["decoupling_parameter"] = g.pop("average_concentration")
+            target_c = self.cfg.decoupling_parameter
+            saved_c = self.optimizer.param_groups[0].get("decoupling_parameter", None)
+            if saved_c != target_c:
                 rank_zero_info(
-                    f"[resume] average_concentration override: {saved_ac} → {target_ac} "
+                    f"[resume] decoupling_parameter override: {saved_c} → {target_c} "
                     "(yaml wins; no internal accumulator entangled with this field)"
                 )
                 for g in self.optimizer.param_groups:
-                    g["average_concentration"] = target_ac
+                    g["decoupling_parameter"] = target_c
 
         # Resume EMA shadow re-seed: if the source checkpoint has no saved
         # EMA shadow (e.g. an EMA-on-x arm starting from a vanilla-SF

@@ -27,12 +27,17 @@ effective averaging window of x to β₁ implicitly (because the y
 interpolation is ``(1-β₁)·z + β₁·x`` so β₁ controls how much fresh z
 bleeds through to the loss point each step, AND through ``weight_lr_power=2``
 the lr_max² accumulator post-warmup geometrically determines x's window).
-Set ``average_concentration=C`` to switch to::
+Set ``decoupling_parameter=C`` to switch to Algorithm 2, line 11::
 
-    c_t = (1 - β₁) · C / t       (Through the River, eq. (Refined SF))
+    c_t = min{ (γ_t² / Σ γ_i²) · (1 - β₁)·C , 1 }
 
-so β₁ governs only the momentum role and C governs only the averaging
-width. The closed-form weight of z_i in x_T is
+i.e. the vanilla weight ratio ``γ_t²/Σγ_i²`` (which the accumulator still
+computes) scaled by the decoupling factor ``(1-β₁)·C`` and clamped to 1.
+Since ``γ_t²/Σγ_i² ≈ 1/t`` this is asymptotically ``c_t = (1-β₁)·C/t``, the
+form quoted in the paper's analysis; we implement the exact Algorithm-2
+line so warmup / lr-weighting are handled faithfully. β₁ then governs only
+the momentum role and C governs only the averaging width. The closed-form
+weight of z_i in x_T is
 ``α_i^T ≈ α · i^(α-1) / T^α`` with ``α = (1-β₁)·C``:
 
     α = 1   (≡ C = 1/(1-β₁), e.g. β₁=0.9 → C=10): vanilla equivalent
@@ -41,9 +46,10 @@ width. The closed-form weight of z_i in x_T is
     α >> 1  :  x ≈ most-recent z (no averaging)
     α < 1   :  past dominates (rarely useful)
 
-Default ``average_concentration=None`` keeps the paper-faithful Defazio
-2024 path unchanged, including ``weight_sum`` / ``lr_max`` accumulator
-state for checkpoint compat.
+Default ``decoupling_parameter=None`` keeps the paper-faithful Defazio
+2024 path (``c_t = γ_t²/Σγ_i²``). The ``weight_sum`` / ``lr_max``
+accumulator is shared by both paths — the refined branch reuses the same
+ratio and only rescales it by ``(1-β₁)·C``.
 
 State layout — three iterates, two tensors per parameter:
 
@@ -106,25 +112,25 @@ class AdamWScheduleFree(Optimizer):
         r: Power on ``(k+1)`` in the running-average weight (paper default 0).
         weight_lr_power: Power on ``lr_max`` in the running-average weight
             (paper default 2.0).
-        average_concentration: Refined-SF averaging width C (arxiv
-            2507.09846 "Through the River"). When set, replaces the
-            vanilla c_t = γ_t²/Σγ_i² averaging weight with
-            c_t = (1-β₁)·C/(k+1), decoupling β₁ from x's averaging window.
-            ``None`` (default) preserves paper-faithful Defazio 2024
-            behaviour. Must be > 0 if not None.
+        decoupling_parameter: Refined-SF averaging width C (arxiv
+            2507.09846 "Through the River", Algorithm 2 line 11). When set,
+            scales the vanilla c_t = γ_t²/Σγ_i² averaging weight by
+            (1-β₁)·C (clamped to 1), decoupling β₁ from x's averaging
+            window. ``None`` (default) preserves paper-faithful Defazio
+            2024 behaviour. Must be > 0 if not None.
     """
 
     def __init__(
         self,
         params: Iterable[torch.Tensor] | Iterable[dict],
-        lr: float = 0.0025,
-        betas: tuple[float, float] = (0.9, 0.999),
+        lr: float = 0.001,
+        betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         warmup_steps: int = 0,
         r: float = 0.0,
         weight_lr_power: float = 2.0,
-        average_concentration: float | None = None,
+        decoupling_parameter: float | None = None,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"lr must be >= 0, got {lr}")
@@ -136,9 +142,9 @@ class AdamWScheduleFree(Optimizer):
             raise ValueError(f"eps must be >= 0, got {eps}")
         if warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
-        if average_concentration is not None and average_concentration <= 0:
+        if decoupling_parameter is not None and decoupling_parameter <= 0:
             raise ValueError(
-                f"average_concentration must be > 0 or None, got {average_concentration}"
+                f"decoupling_parameter must be > 0 or None, got {decoupling_parameter}"
             )
 
         defaults = dict(
@@ -147,12 +153,6 @@ class AdamWScheduleFree(Optimizer):
             eps=eps,
             r=r,
             k=0,
-            # Averaging clock, decoupled from ``k``. Normally advances in
-            # lockstep with ``k`` (so behaviour is identical to a single
-            # counter), but ``reset_averaging_clock`` can rewind it alone to
-            # re-warm x's tracking of z at a stage boundary without
-            # re-triggering LR warmup / Adam bias correction (both on ``k``).
-            avg_k=0,
             warmup_steps=warmup_steps,
             train_mode=False,
             weight_sum=0.0,
@@ -160,7 +160,7 @@ class AdamWScheduleFree(Optimizer):
             scheduled_lr=0.0,
             weight_lr_power=weight_lr_power,
             weight_decay=weight_decay,
-            average_concentration=average_concentration,
+            decoupling_parameter=decoupling_parameter,
         )
         super().__init__(params, defaults)
 
@@ -254,37 +254,6 @@ class AdamWScheduleFree(Optimizer):
         raise ValueError("Parameter not found in any param_group.")
 
     # ------------------------------------------------------------------ #
-    # Averaging-clock reset                                              #
-    # ------------------------------------------------------------------ #
-
-    @torch.no_grad()
-    def reset_averaging_clock(self) -> None:
-        """Rewind x's averaging clock so it re-tracks z aggressively.
-
-        Zeros the per-group averaging counter ``avg_k`` and the paper-path
-        accumulators ``weight_sum`` / ``lr_max``, so the next step's ``ckp1``
-        jumps back near 1 (``x → z``) and then re-decays. This is the
-        Schedule-Free analog of restarting an LR/EMA schedule at a
-        training-stage boundary (crop/loss change): ``x`` re-adapts to the
-        new objective instead of staying frozen under a cold, deep average.
-
-        Deliberately leaves untouched:
-
-        * ``z`` (fast iterate) and ``exp_avg_sq`` (``v``, second moment) — so
-          no preconditioner transient is introduced (the reason to prefer
-          this over resetting the whole optimizer state);
-        * ``k`` — so LR warmup (``sched``) and Adam bias correction
-          (``1 - β₂^{k+1}``) keep running at their mature values rather than
-          re-warming against an already-matured ``v``.
-
-        No-op-safe to call once on resume before the first step.
-        """
-        for group in self.param_groups:
-            group["avg_k"] = 0
-            group["weight_sum"] = 0.0
-            group["lr_max"] = -1.0
-
-    # ------------------------------------------------------------------ #
     # Step                                                               #
     # ------------------------------------------------------------------ #
 
@@ -303,10 +272,6 @@ class AdamWScheduleFree(Optimizer):
             beta1, beta2 = group["betas"]
             decay = group["weight_decay"]
             k = group["k"]
-            # Averaging clock (== k on a fresh run; diverges only after
-            # ``reset_averaging_clock``). ``.get`` default keeps checkpoints
-            # saved before ``avg_k`` existed loadable — they start it at k.
-            avg_k = group.get("avg_k", k)
             r = group["r"]
             warmup_steps = group["warmup_steps"]
             weight_lr_power = group["weight_lr_power"]
@@ -324,26 +289,29 @@ class AdamWScheduleFree(Optimizer):
 
             lr_max = group["lr_max"] = max(lr, group["lr_max"])
 
-            ac = group["average_concentration"]
-            if ac is None:
-                # Defazio 2024 Algorithm 1, line 10 — paper-faithful.
-                # ``avg_k`` (not ``k``) drives the averaging clock; the
-                # accumulator ``weight_sum`` / ``lr_max`` carry the rest.
-                weight = ((avg_k + 1) ** r) * (lr_max**weight_lr_power)
-                weight_sum = group["weight_sum"] = group["weight_sum"] + weight
-                ckp1 = weight / weight_sum if weight_sum > 0 else 0.0
-            else:
-                # Through the River (arxiv 2507.09846), refined averaging:
-                # c_t = (1 - β₁) · C / t, decoupling β₁ from x's averaging
-                # width. weight_sum / lr_max are NOT updated here — they
-                # remain at their last paper-faithful value for state-dict
-                # round-trip but do not influence the refined ckp1.
+            # Vanilla averaging weight — Defazio 2024 Algorithm 1, line 10
+            # (== Through-the-River Algorithm 1). Accumulator is shared by
+            # both paths; the refined branch reuses this exact ratio.
+            weight = ((k + 1) ** r) * (lr_max**weight_lr_power)
+            weight_sum = group["weight_sum"] = group["weight_sum"] + weight
+            ckp1 = weight / weight_sum if weight_sum > 0 else 0.0
+
+            ac = group["decoupling_parameter"]
+            if ac is not None:
+                # Refined SF — Through the River (arxiv 2507.09846),
+                # Algorithm 2 line 11:
+                #   c_{t+1} = min{ (γ_t²/Σγ_i²) · (1-β₁)·C , 1 }
+                # i.e. scale the vanilla ratio above by (1-β₁)·C, decoupling
+                # β₁ from x's averaging width. Asymptotically (γ_t²/Σγ_i² ≈
+                # 1/t) this is the paper's analysis form c_t = (1-β₁)·C/t; we
+                # implement the exact Algorithm-2 line so warmup / lr-weighting
+                # stay faithful.
                 #
                 # The min(1.0, ...) clamp keeps the lerp valid for the first
-                # ⌈(1-β₁)·C⌉ steps where the literal formula could exceed 1
-                # (β₁=0.9, C=200 → first 20 steps clamped; x just tracks z
-                # there, then transitions to the (1-β)C/t schedule).
-                ckp1 = min(1.0, (1.0 - beta1) * ac / (avg_k + 1))
+                # ~⌈(1-β₁)·C⌉ steps where the product could exceed 1 (β₁=0.9,
+                # C=200 → x just tracks z there, then decays under the ratio).
+                ckp1 *= (1.0 - beta1) * ac
+                ckp1 = min(1.0, ckp1)
 
             active = [p for p in group["params"] if p.grad is not None]
             for p in active:
@@ -354,7 +322,6 @@ class AdamWScheduleFree(Optimizer):
 
             if not active:
                 group["k"] = k + 1
-                group["avg_k"] = avg_k + 1
                 continue
 
             y, grad, exp_avg_sq, z = zip(
@@ -385,7 +352,6 @@ class AdamWScheduleFree(Optimizer):
             torch._foreach_sub_(z, grad, alpha=lr)
 
             group["k"] = k + 1
-            group["avg_k"] = avg_k + 1
 
 
 @contextmanager

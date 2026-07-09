@@ -15,7 +15,7 @@ base: initial.yaml
 #
 # Overrides:
 #   - optimizer_type: schedule_free   (default adamw)
-#   - average_concentration: 200      (refined SF)
+#   - decoupling_parameter: 200      (refined SF)
 #   - batch_size_per_rank: 3, accumulate: 1 → eff. batch 288
 #
 # v2 reference (registry):
@@ -35,7 +35,7 @@ base: initial.yaml
 
 training:
   optimizer_type: schedule_free
-  average_concentration: 200.0
+  decoupling_parameter: 200.0
 
   batch_size_per_rank: 3
   accumulate_grad_batches: 1

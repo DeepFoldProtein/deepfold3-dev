@@ -701,11 +701,12 @@ class TrainingConfig:
     # SF's x directly (responsive, current state). "shadow" reads EMA-over-x
     # (slow, 1/(1-ema_decay) lag). Training-time shadow update is unaffected.
     eval_snapshot: Literal["average", "shadow"] = "average"
-    # Refined SF averaging width (Through the River, arxiv 2507.09846).
-    # ``None`` keeps vanilla SF (`c_t = γ_t²/Σγ_i² ≈ 1/t`); a float ``C``
-    # switches to ``c_t = (1−β₁)·C / t`` decoupling β₁ from x's averaging window.
-    # Ignored unless ``optimizer_type == "schedule_free"``.
-    average_concentration: float | None = None
+    # Refined SF decoupling parameter C (Through the River, arxiv 2507.09846,
+    # Algorithm 2 line 11). ``None`` keeps vanilla SF (`c_t = γ_t²/Σγ_i²`); a
+    # float ``C`` scales that weight by ``(1−β₁)·C`` (clamped to 1), decoupling
+    # β₁ from x's averaging window. Ignored unless ``optimizer_type ==
+    # "schedule_free"``.
+    decoupling_parameter: float | None = None
 
     # Per-bucket strong weight decay. Maps a substring pattern → multiplier;
     # weights whose ``named_parameters`` name contains any key get routed to
@@ -996,14 +997,6 @@ class TrainingConfig:
     skip_load_optimizer: bool = False
     skip_load_scheduler: bool = False
     skip_load_step: bool = False
-    # Schedule-Free only: on resume, rewind x's averaging clock (avg step
-    # counter + weight_sum/lr_max) so x re-tracks z for the new stage, while
-    # keeping z + v (no preconditioner transient) and k (LR warmup / bias
-    # correction). The SF analog of restarting an LR schedule at a stage
-    # boundary. Applied only when the optimizer state is loaded (moot under
-    # skip_load_optimizer, which already starts a fresh clock). No-op for
-    # AdamW. See docs/training.md § Optimizer.
-    sf_reset_clock: bool = False
 
     # Experiment tracking
     wandb_enabled: bool = False  # explicit on/off; takes precedence over wandb_project

@@ -195,7 +195,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
             betas=cfg.betas,
             eps=cfg.eps,
             warmup_steps=cfg.warmup_steps,
-            average_concentration=cfg.average_concentration,
+            decoupling_parameter=cfg.decoupling_parameter,
         )
         # SF.step() raises if not in train mode. Eval/checkpoint save flip it
         # via ``optimizer_eval_mode`` and restore on exit.
@@ -209,7 +209,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         # Through the River (arxiv 2507.09846 §6) finds that EMA on top of
         # vanilla SF gives little benefit (because SF's x already provides
         # implicit weight averaging with a wide window). With refined SF
-        # (``average_concentration`` set), x's window is tighter, so external
+        # (``decoupling_parameter`` set), x's window is tighter, so external
         # EMA can add complementary smoothing — a useful ablation knob.
         if cfg.ema_decay > 0:
             rank_zero_info(
@@ -224,7 +224,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         rank_zero_info(
             f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, "
             f"weight_decay={cfg.weight_decay}, "
-            f"average_concentration={cfg.average_concentration} "
+            f"decoupling_parameter={cfg.decoupling_parameter} "
             f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay{strong_summary})"
         )
         return optimizer
