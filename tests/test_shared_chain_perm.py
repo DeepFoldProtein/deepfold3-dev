@@ -182,3 +182,37 @@ def test_resolve_gt_atom_symmetry_noop_without_tables():
     gt = torch.randn(N, M, 3)
     mask = torch.ones(N, M, dtype=torch.bool)
     assert torch.allclose(resolve_gt_atom_symmetry(gt.clone(), {}, gt, mask), gt)
+
+
+def test_inter_chain_bonds_from_features_groups_ligand_attachment():
+    """A cross-chain token bond with a non-polymer endpoint groups the two
+    chains into one covalent permutation component (item 11 wiring)."""
+    from deepfold3.training.loss import _inter_chain_bonds_from_features
+
+    N = 4
+    asym = torch.tensor([0, 0, 1, 2])  # chain0 protein, chain1 ligand/glycan, chain2 protein
+    mol = torch.tensor(
+        [const.MOL_PROTEIN, const.MOL_PROTEIN, const.MOL_NONPOLYMER, const.MOL_PROTEIN]
+    )
+    bm = torch.zeros(N, N, 1)
+    bm[1, 2, 0] = bm[2, 1, 0] = 1.0  # protein(chain0) — glycan(chain1)
+    out = _inter_chain_bonds_from_features({"bond_matrix": bm, "asym_id": asym, "mol_type": mol})
+    assert out == [(0, 1)]
+
+
+def test_inter_chain_bonds_excludes_polymer_polymer_disulfide():
+    """An inter-chain polymer–polymer bond (disulfide) must NOT group the chains
+    — OF3 strips those in prefilter; the non-polymer-endpoint rule matches that."""
+    from deepfold3.training.loss import _inter_chain_bonds_from_features
+
+    asym = torch.tensor([0, 1])
+    mol = torch.tensor([const.MOL_PROTEIN, const.MOL_PROTEIN])
+    bm = torch.zeros(2, 2, 1)
+    bm[0, 1, 0] = bm[1, 0, 0] = 1.0
+    assert _inter_chain_bonds_from_features({"bond_matrix": bm, "asym_id": asym, "mol_type": mol}) is None
+
+
+def test_inter_chain_bonds_none_without_bond_matrix():
+    from deepfold3.training.loss import _inter_chain_bonds_from_features
+
+    assert _inter_chain_bonds_from_features({"asym_id": torch.tensor([0, 1])}) is None

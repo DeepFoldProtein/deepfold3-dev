@@ -204,7 +204,13 @@ class Cropper:
             strategy = "contiguous" if force_contiguous_chain is not None else self._sample_strategy(attempt_rng)
 
             if strategy == "contiguous":
-                cand = self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, attempt_rng)
+                # Contiguous cropping is AF-Multimer 2.7.2 Algorithm 1 (OF3
+                # ``set_contiguous_crop_mask``): it permutes ALL chains and splits
+                # the token budget across them, and is *anchor-agnostic*. Only a
+                # legacy explicit ``chain_id`` (``force_contiguous_chain``) restricts
+                # it to a single chain. The sampler anchor biases spatial /
+                # interface seeding only (AF3 §2.7), never the contiguous strategy.
+                cand = self._contiguous_crop(tokens, max_tokens, max_atoms, force_contiguous_chain, attempt_rng)
             elif strategy == "interface":
                 cand = self._interface_spatial_crop(
                     tokens,
@@ -294,38 +300,139 @@ class Cropper:
         chain_id: int | None,
         rng: random.Random,
     ) -> np.ndarray:
-        """Return selected token indices (sorted) for contiguous cropping."""
+        """Contiguous crop via AF-Multimer 2.7.2 Algorithm 1.
+
+        Mirrors OF3 ``set_contiguous_crop_mask``: permute all chains and split
+        the token budget (``max_tokens``) across them, each chain contributing a
+        random contiguous sub-segment. ``crop_size_min`` forces a chain to
+        contribute when the remaining chains cannot fill the budget on their own.
+
+        The legacy explicit ``chain_id`` restricts the crop to that single chain
+        (used by ``crop(chain_id=...)`` / the direct-call tests); otherwise the
+        crop spans a random permutation of all chains.
+
+        DF3-specific: after the token-budget selection we still honour the
+        ``max_atoms`` cap (which OF3 does not have). Tokens are collected in
+        chain-permutation order and truncated once the atom budget would be
+        exceeded, so the cap never inflates the crop. Returns sorted token
+        indices (required by ``_reindex_hierarchy``).
+        """
+        asym = tokens["asym_id"]
         if chain_id is not None:
-            chain_mask = tokens["asym_id"] == chain_id
+            chains = [int(chain_id)]
         else:
-            # Pick a random chain
-            chains = np.unique(tokens["asym_id"])
-            chosen_chain = rng.choice(chains.tolist())
-            chain_mask = tokens["asym_id"] == chosen_chain
+            chains = np.unique(asym).tolist()
+            rng.shuffle(chains)
 
-        chain_indices = np.where(chain_mask)[0]
-        if len(chain_indices) == 0:
-            chain_indices = np.arange(len(tokens))
+        token_budget = int(max_tokens)
+        # Precompute each chain's (sorted) global token positions.
+        chain_positions = {c: np.where(asym == c)[0] for c in chains}
 
-        max_start = max(0, len(chain_indices) - 1)
-        start_in_chain = rng.randint(0, max_start)
-        start_global = int(chain_indices[start_in_chain])
+        # AF-Multimer Alg 1 accounting: ``n_remaining`` is the combined token
+        # length of chains not yet processed (excluding the current one).
+        n_remaining = int(sum(len(chain_positions[c]) for c in chains))
+        n_added = 0
+        segments: list[np.ndarray] = []  # global token indices, in permutation order
 
-        # Expand from start_global, collecting tokens sequentially
+        for c in chains:
+            positions = chain_positions[c]
+            chain_length = int(len(positions))
+            if chain_length == 0:
+                continue
+            n_remaining -= chain_length
+
+            crop_size_max = min(token_budget - n_added, chain_length)
+            crop_size_min = min(chain_length, max(0, token_budget - n_added - n_remaining))
+            # Guard against a degenerate empty range (should not occur since
+            # crop_size_min <= crop_size_max whenever n_added < token_budget).
+            crop_size_max = max(crop_size_max, crop_size_min)
+            crop_size = rng.randint(crop_size_min, crop_size_max)  # inclusive both ends
+            n_added += crop_size
+
+            if crop_size > 0:
+                crop_start = rng.randint(0, chain_length - crop_size)  # inclusive
+                segments.append(positions[crop_start : crop_start + crop_size])
+
+            if n_added >= token_budget:
+                break
+
+        if segments:
+            selected_all = np.concatenate(segments)
+        else:
+            # Degenerate fallback (e.g. every chain empty): take the leading tokens.
+            selected_all = np.arange(min(token_budget, len(tokens)), dtype=np.int64)
+
+        # Enforce the per-crop atom budget (unchanged DF3 behaviour). Iterate in
+        # chain-permutation order and stop before the budget is exceeded.
         selected: list[int] = []
         atom_count = 0
-        for i in range(start_global, len(tokens)):
-            an = int(tokens[i]["atom_num"])
-            if len(selected) >= max_tokens or atom_count + an > max_atoms:
+        for gi in selected_all.tolist():
+            an = int(tokens[gi]["atom_num"])
+            if len(selected) >= token_budget or atom_count + an > max_atoms:
                 break
-            selected.append(i)
+            selected.append(int(gi))
             atom_count += an
 
-        return np.array(selected, dtype=np.int64)
+        return np.array(sorted(selected), dtype=np.int64)
 
     # ------------------------------------------------------------------
     # Spatial cropping (KD-tree based)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _select_knn(
+        tokens: np.ndarray,
+        pool_idx: np.ndarray,
+        tree,
+        seed_coord: np.ndarray,
+        max_tokens: int,
+        max_atoms: int,
+    ) -> np.ndarray:
+        """KNN token selection over a candidate pool, sorted, budget-capped.
+
+        ``tree`` is a ``KDTree`` built over ``coords[pool_idx]``; the query
+        returns *pool-local* indices which are mapped back to global token
+        indices via ``pool_idx``. Selection stops at ``max_tokens`` tokens or
+        when the next token would exceed ``max_atoms`` (atom cap unchanged).
+        """
+        k = min(max_tokens * 2, len(pool_idx))
+        dists, indices = tree.query(seed_coord, k=k)
+        indices = np.atleast_1d(indices[0])  # flatten; atleast_1d handles k=1
+
+        selected: list[int] = []
+        atom_count = 0
+        for li in indices:
+            gi = int(pool_idx[int(li)])
+            an = int(tokens[gi]["atom_num"])
+            if len(selected) >= max_tokens or atom_count + an > max_atoms:
+                break
+            selected.append(gi)
+            atom_count += an
+
+        return np.array(sorted(selected), dtype=np.int64)
+
+    @staticmethod
+    def _resolved_pool(
+        coords: np.ndarray,
+        valid: np.ndarray,
+        token_resolved: np.ndarray | None,
+    ) -> np.ndarray:
+        """Global indices of the RESOLVED token-center candidate pool.
+
+        OF3 parity (``get_resolved_token_center_atoms``): the spatial /
+        interface crop candidate pool is resolved token-center atoms only —
+        unresolved tokens are never crop candidates and are *not* centroid-filled
+        into the KD-tree (which is why no centroid replacement is done here).
+        Falls back to ``valid`` (non-zero centers) when no per-token resolved
+        mask is supplied (legacy / direct-call paths) or when it would empty the
+        pool.
+        """
+        pool_mask = valid
+        if token_resolved is not None:
+            r = valid & token_resolved
+            if r.any():
+                pool_mask = r
+        return np.where(pool_mask)[0]
 
     def _spatial_crop(
         self,
@@ -338,15 +445,18 @@ class Cropper:
     ) -> np.ndarray:
         """Return selected token indices (sorted) for spatial cropping.
 
-        The seed token is drawn from ``_seed_pool`` (resolved tokens in the
-        ``anchor_chain`` when available), so the crop is centred on the
-        sampler's preferred chain rather than a uniformly random token.
+        The candidate pool is RESOLVED token-center atoms only (OF3
+        ``get_resolved_token_center_atoms`` / ``set_spatial_crop_mask_with_ref``)
+        — unresolved tokens are never selected. The seed token is drawn from
+        ``_seed_pool`` (resolved tokens in the ``anchor_chain`` when available),
+        so the crop is centred on the sampler's preferred chain rather than a
+        uniformly random token.
         """
         try:
             from scipy.spatial import KDTree
         except ImportError:
-            # Fall back to contiguous
-            return self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, rng)
+            # Fall back to contiguous (anchor-agnostic AF-Multimer).
+            return self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
 
         coords = np.stack(
             [
@@ -357,34 +467,17 @@ class Cropper:
             axis=1,
         )
 
-        # Replace zeros (missing coords) with centroid
         valid = ~np.all(coords == 0.0, axis=1)
-        if valid.sum() == 0:
-            return self._contiguous_crop(tokens, max_tokens, max_atoms, anchor_chain, rng)
+        pool_idx = self._resolved_pool(coords, valid, token_resolved)
+        if len(pool_idx) == 0:
+            return self._contiguous_crop(tokens, max_tokens, max_atoms, None, rng)
 
-        centroid = coords[valid].mean(axis=0)
-        coords[~valid] = centroid
-
-        # Pick a seed token from the preferred (resolved, anchor-chain) pool
+        # Seed is a resolved token in the preferred chain → always in the pool.
         seed_idx = rng.choice(self._seed_pool(tokens, valid, token_resolved, anchor_chain))
         seed_coord = coords[seed_idx : seed_idx + 1]
 
-        tree = KDTree(coords)
-        # Query nearest neighbors progressively
-        k = min(max_tokens * 2, len(tokens))
-        dists, indices = tree.query(seed_coord, k=k)
-        indices = np.atleast_1d(indices[0])  # flatten; atleast_1d handles k=1
-
-        selected: list[int] = []
-        atom_count = 0
-        for idx in indices:
-            an = int(tokens[idx]["atom_num"])
-            if len(selected) >= max_tokens or atom_count + an > max_atoms:
-                break
-            selected.append(int(idx))
-            atom_count += an
-
-        return np.array(sorted(selected), dtype=np.int64)
+        tree = KDTree(coords[pool_idx])
+        return self._select_knn(tokens, pool_idx, tree, seed_coord, max_tokens, max_atoms)
 
     # ------------------------------------------------------------------
     # Interface-seeded spatial cropping
@@ -427,72 +520,49 @@ class Cropper:
         if valid.sum() < 2:
             return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
-        centroid = coords[valid].mean(axis=0)
-        coords[~valid] = centroid
-
-        # Only resolved tokens are eligible interface seeds (an unresolved
-        # token collapsed onto the centroid must never seed a crop, and two
-        # such tokens from different chains sit at distance 0 → a false
-        # interface). ``valid`` already excludes centre-less tokens; intersect
-        # with ``token_resolved`` when available for the stricter guarantee.
-        seed_eligible = valid.copy()
-        if token_resolved is not None:
-            r = seed_eligible & token_resolved
-            if r.any():
-                seed_eligible = r
-
-        # Find interface tokens: tokens within interface_distance of another chain.
-        # When ``anchor_chains`` is given, only count tokens of those two
-        # specific chains as eligible seeds (the sampler's interface
-        # selection drives which interface gets cropped).
-        asym_ids = tokens["asym_id"]
-        tree = KDTree(coords)
-        interface_indices: list[int] = []
-
-        if anchor_chains is not None:
-            a, b = anchor_chains
-            for i in range(len(tokens)):
-                if not seed_eligible[i]:
-                    continue
-                if asym_ids[i] not in (a, b):
-                    continue
-                neighbors = tree.query_ball_point(coords[i], self.interface_distance)
-                other = b if asym_ids[i] == a else a
-                # ``valid[j]`` guards against a centroid-collapsed unresolved
-                # neighbour faking a zero-distance cross-chain contact.
-                if any(asym_ids[j] == other and valid[j] for j in neighbors):
-                    interface_indices.append(i)
-        else:
-            for i in range(len(tokens)):
-                if not seed_eligible[i]:
-                    continue
-                neighbors = tree.query_ball_point(coords[i], self.interface_distance)
-                for j in neighbors:
-                    if asym_ids[j] != asym_ids[i] and valid[j]:
-                        interface_indices.append(i)
-                        break
-
-        if not interface_indices:
+        # Candidate + interface-detection pool is RESOLVED token-center atoms
+        # only (OF3 parity). Because unresolved tokens are excluded entirely,
+        # a cross-chain neighbour is always a real (resolved) contact — no
+        # centroid-fill and no per-neighbour ``valid`` guard is needed.
+        pool_idx = self._resolved_pool(coords, valid, token_resolved)
+        if len(pool_idx) < 2:
             return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
-        # Pick seed from interface tokens, then expand spatially
-        seed_idx = rng.choice(interface_indices)
-        seed_coord = coords[seed_idx : seed_idx + 1]
+        pool_coords = coords[pool_idx]
+        pool_asym = tokens["asym_id"][pool_idx]
+        tree = KDTree(pool_coords)
 
-        k = min(max_tokens * 2, len(tokens))
-        dists, indices = tree.query(seed_coord, k=k)
-        indices = np.atleast_1d(indices[0])
+        # Find interface tokens: pool tokens within interface_distance of a token
+        # in a different chain. When ``anchor_chains`` is given, only tokens of
+        # those two specific chains are eligible seeds and only a contact with
+        # the *other* anchor chain counts (the sampler's interface selection
+        # drives which interface gets cropped). ``interface_local`` holds
+        # pool-local indices.
+        interface_local: list[int] = []
+        if anchor_chains is not None:
+            a, b = int(anchor_chains[0]), int(anchor_chains[1])
+            for i in range(len(pool_idx)):
+                ai = int(pool_asym[i])
+                if ai != a and ai != b:
+                    continue
+                other = b if ai == a else a
+                neighbors = tree.query_ball_point(pool_coords[i], self.interface_distance)
+                if any(int(pool_asym[j]) == other for j in neighbors):
+                    interface_local.append(i)
+        else:
+            for i in range(len(pool_idx)):
+                ai = int(pool_asym[i])
+                neighbors = tree.query_ball_point(pool_coords[i], self.interface_distance)
+                if any(int(pool_asym[j]) != ai for j in neighbors):
+                    interface_local.append(i)
 
-        selected: list[int] = []
-        atom_count = 0
-        for idx in indices:
-            an = int(tokens[idx]["atom_num"])
-            if len(selected) >= max_tokens or atom_count + an > max_atoms:
-                break
-            selected.append(int(idx))
-            atom_count += an
+        if not interface_local:
+            return self._spatial_crop(tokens, max_tokens, max_atoms, rng, token_resolved=token_resolved)
 
-        return np.array(sorted(selected), dtype=np.int64)
+        # Pick seed from interface tokens, then expand spatially over the pool.
+        seed_local = rng.choice(interface_local)
+        seed_coord = pool_coords[seed_local : seed_local + 1]
+        return self._select_knn(tokens, pool_idx, tree, seed_coord, max_tokens, max_atoms)
 
     # ------------------------------------------------------------------
     # Re-index after crop

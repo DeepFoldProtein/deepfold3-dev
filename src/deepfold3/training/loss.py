@@ -386,6 +386,51 @@ def smooth_lddt_loss(
 # ---------------------------------------------------------------------------
 
 
+def _inter_chain_bonds_from_features(
+    features: dict[str, torch.Tensor],
+) -> list[tuple[int, int]] | None:
+    """Derive covalent inter-chain bonds (as ``(asym_a, asym_b)`` pairs) for the
+    chain-permutation component grouping, from the token bond adjacency.
+
+    Reads the ``bond_matrix`` feature ([N, N, 1], emitted only when the example
+    has token-level bonds) + ``asym_id`` + ``mol_type``. A pair of tokens on
+    *different* chains linked by a token bond groups those chains into one
+    covalently-connected permutation component — but ONLY when at least one
+    endpoint is a NON-POLYMER (glycan / covalent ligand). Inter-chain
+    polymer–polymer links (disulfides) do not group chains: OF3 strips those in
+    ``prefilter_bonds`` before the permutation, and requiring a non-polymer
+    endpoint gives the same net grouping whether or not the stored bonds were
+    prefiltered. Returns ``None`` when there is nothing to group (→ each chain is
+    its own component, the entity-only behaviour).
+    """
+    bm = features.get("bond_matrix")
+    asym = features.get("asym_id")
+    if bm is None or asym is None:
+        return None
+    # Loss runs per example → expect [N, N, 1]; bail on any other layout.
+    if bm.dim() != 3 or bm.shape[0] != asym.shape[0]:
+        return None
+    with torch.no_grad():
+        idx = (bm[..., 0] > 0).nonzero(as_tuple=False)  # [K, 2] token pairs
+    if idx.numel() == 0:
+        return None
+    asym_np = asym.detach().cpu().numpy()
+    mol = features.get("mol_type")
+    mol_np = mol.detach().cpu().numpy() if mol is not None else None
+    MOL_NONPOLYMER = 3
+    pairs: set[tuple[int, int]] = set()
+    for i, j in idx.tolist():
+        if i >= j:
+            continue  # symmetric adjacency → keep one direction
+        ai, aj = int(asym_np[i]), int(asym_np[j])
+        if ai == aj:
+            continue  # intra-chain bond
+        if mol_np is not None and not (int(mol_np[i]) == MOL_NONPOLYMER or int(mol_np[j]) == MOL_NONPOLYMER):
+            continue  # polymer–polymer inter-chain link (disulfide) → not a grouping bond
+        pairs.add((ai, aj) if ai < aj else (aj, ai))
+    return sorted(pairs) or None
+
+
 def chain_perm_from_mini_rollout(
     pred: dict[str, torch.Tensor],
     features: dict[str, torch.Tensor],
@@ -421,6 +466,7 @@ def chain_perm_from_mini_rollout(
         mol_type=features.get("mol_type"),
         seq_mask=features.get("seq_mask"),
         sym_token_index=features.get("sym_token_index"),
+        inter_chain_bonds=_inter_chain_bonds_from_features(features),
     )
 
 
@@ -607,15 +653,19 @@ def diffusion_mse_loss(
 
     mask = atom_mask.float()  # [N, M]
 
-    # Build per-atom loss weight: molecule-type upweighting (DNA/RNA 5×, ligand 10×)
-    # multiplied by optional region weights. Shared by weighted_rigid_align and
-    # the final MSE reduction so the alignment target and loss target agree on
-    # which atoms matter (AF3 §3.7.1 eq. 4).
+    # Build per-atom loss weight: molecule-type upweighting, multiplied by
+    # optional region weights. Shared by weighted_rigid_align and the final MSE
+    # reduction so the alignment target and loss target agree on which atoms
+    # matter. AF3 §3.7.1 eq. 4 is ADDITIVE over a base weight of 1:
+    #   w_l = 1 + f_l^dna·α_dna + f_l^rna·α_rna + f_l^ligand·α_ligand
+    # with α_dna = α_rna = ``nucleotide_loss_weight`` (5) and α_ligand =
+    # ``ligand_loss_weight`` (10) → nucleotide atoms weigh 6, ligand atoms 11
+    # (NOT 5/10 — the base-1 must not be overwritten).
     if mol_type is not None:
         token_weight = torch.ones(mask.shape[0], device=mask.device)
-        token_weight[mol_type == 1] = nucleotide_loss_weight  # DNA (MOL_DNA == 1)
-        token_weight[mol_type == 2] = nucleotide_loss_weight  # RNA (MOL_RNA == 2)
-        token_weight[mol_type == 3] = ligand_loss_weight
+        token_weight = token_weight + (mol_type == 1).to(token_weight) * nucleotide_loss_weight  # DNA
+        token_weight = token_weight + (mol_type == 2).to(token_weight) * nucleotide_loss_weight  # RNA
+        token_weight = token_weight + (mol_type == 3).to(token_weight) * ligand_loss_weight  # ligand
         weight_2d = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
         weight_2d = mask
@@ -1971,6 +2021,12 @@ def training_loss(
     atom_mask = features["atom_gt_mask"]  # [N, M]
     seq_mask = features["seq_mask"].bool()  # [N] — pred-layout validity (kept raw for the reg)
     rep_idx = features.get("token_to_rep_atom")
+    # pLDDT's neighbour set m∈R is the token *center* atom (CA/C1'), NOT the
+    # distogram rep atom (CB/C4/C2) — AF3 §4.3.1. Fall back to rep_idx for
+    # legacy features that predate token_to_center_atom.
+    center_idx = features.get("token_to_center_atom")
+    if center_idx is None:
+        center_idx = rep_idx
 
     # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
     # score EVERY GT-based loss (smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE,
@@ -2248,8 +2304,20 @@ def training_loss(
     if rep_idx is not None:
         arange_n = torch.arange(N, device=gt_pos.device)
         gt_rep = gt_pos[arange_n, rep_idx]  # [N, 3]
+        # Gate the rep-atom coordinate losses (distogram / PAE / PDE) on GT
+        # presence of the representative atom. ``loss_seq_mask`` alone is
+        # CCD-derived (``rep_atom_present`` from the reference conformer) so it
+        # stays True for a token whose rep atom (CB / C4 / C2 / CA) is unresolved
+        # in the GT — which would otherwise inject a (0, 0, 0) rep coordinate into
+        # the distance targets. Uses the chain-permuted ``atom_mask`` so it lines
+        # up with the permuted ``gt_rep``. AF3 masks these tokens out of the
+        # rep-atom losses; this is also the prerequisite for materializing
+        # entirely-unresolved residues as tokens (structure-prepare item 4b).
+        rep_present = atom_mask[arange_n, rep_idx].bool()  # [N]
     else:
         gt_rep = gt_pos[:, 1, :]  # fallback to CA
+        rep_present = torch.ones(N, dtype=torch.bool, device=gt_pos.device)
+    rep_seq_mask = loss_seq_mask & rep_present
 
     # --- Distogram loss (all samples, incl. distillation) ---
     # AF3 §5.2 Table 6: "Train structure and distogram" = True for stages 1–3
@@ -2265,7 +2333,7 @@ def training_loss(
                 pred["distogram_features"],
                 pred["distogram_weight"],
                 gt_rep,
-                loss_seq_mask,
+                rep_seq_mask,
                 chunk_n=cfg.fused_ce_chunk_n,
             )
             e_disto = None
@@ -2274,15 +2342,15 @@ def training_loss(
                     e_disto = distogram_entropy_fused(
                         pred["distogram_features"],
                         pred["distogram_weight"],
-                        loss_seq_mask,
+                        rep_seq_mask,
                         chunk_n=cfg.fused_ce_chunk_n,
                     )
         elif "distogram" in pred:
-            l_disto = distogram_loss(pred["distogram"], gt_rep, loss_seq_mask)
+            l_disto = distogram_loss(pred["distogram"], gt_rep, rep_seq_mask)
             e_disto = None
             if cfg.log_distogram_entropy:
                 with torch.no_grad():
-                    e_disto = distogram_entropy(pred["distogram"], loss_seq_mask)
+                    e_disto = distogram_entropy(pred["distogram"], rep_seq_mask)
         else:
             l_disto = None
             e_disto = None
@@ -2349,6 +2417,10 @@ def training_loss(
             pair_mask_for_tm = features.get("pair_mask")
             if pair_mask_for_tm is None:
                 pair_mask_for_tm = loss_seq_mask.unsqueeze(1) & loss_seq_mask.unsqueeze(0)
+            # Gate on GT rep-atom presence (consistent with the distogram / PAE /
+            # PDE losses) so materialized unresolved residues (item 4b, whose rep
+            # atom is (0,0,0)) don't leak into the tm_true / itm_true diagnostic.
+            pair_mask_for_tm = pair_mask_for_tm.bool() & rep_present.unsqueeze(0) & rep_present.unsqueeze(1)
             pae_mask_for_tm = (frames_mask_feat.bool().unsqueeze(-1) & pair_mask_for_tm.bool()).float()
             mask_s_tm = (
                 pae_mask_for_tm.unsqueeze(0)
@@ -2356,7 +2428,7 @@ def training_loss(
                 * gt_angle_ok_tm.float().unsqueeze(0).unsqueeze(-1)
             )  # [1, N, N]
 
-            n_eff_tm = int(loss_seq_mask.sum().item())
+            n_eff_tm = int(rep_seq_mask.sum().item())
             if mask_s_tm.sum() > 0 and n_eff_tm > 0:
                 losses["tm_true"] = _tm_score_from_error(true_error, mask_s_tm, n_eff_tm)
                 asym_id_for_tm = features.get("asym_id")
@@ -2395,7 +2467,7 @@ def training_loss(
                     gt_pos,
                     loss_atom_mask,
                     mol_type=features.get("mol_type"),
-                    rep_idx=rep_idx,
+                    rep_idx=center_idx,
                 )
                 losses["plddt"] = l_plddt
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_plddt
@@ -2413,13 +2485,13 @@ def training_loss(
                     pred["pde_weight"],
                     mini_rep,
                     gt_rep,
-                    loss_seq_mask,
+                    rep_seq_mask,
                     chunk_n=cfg.fused_ce_chunk_n,
                 )
                 losses["pde"] = l_pde
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
             elif "pde" in pred:
-                l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, loss_seq_mask)
+                l_pde = pde_loss(pred["pde"], mini_rep, gt_rep, rep_seq_mask)
                 losses["pde"] = l_pde
                 total = total + cfg.alpha_confidence * conf_valid_mask * l_pde
 
@@ -2471,6 +2543,9 @@ def training_loss(
                         # supervise pairs involving an excluded token.
                         keep = loss_weight_mask >= 0.5
                         pair_mask_feat = pair_mask_feat.bool() & keep.unsqueeze(1) & keep.unsqueeze(0)
+                    # Drop pairs whose frame/target token has an unresolved GT rep
+                    # atom — the aligned error uses gt_rep (see rep_seq_mask).
+                    pair_mask_feat = pair_mask_feat.bool() & rep_present.unsqueeze(0) & rep_present.unsqueeze(1)
                     pae_mask = (frames_mask.bool().unsqueeze(-1) & pair_mask_feat.bool()).float()
 
                     if "pae_features" in pred:

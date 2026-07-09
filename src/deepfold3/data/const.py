@@ -66,6 +66,43 @@ RES_TYPE_INDEX_TO_NAME: dict[int, str] = {v: k for k, v in RES_TYPE_ORDER.items(
 # MSA gap token (matches ``"-"`` in RES_TYPE_ORDER)
 MSA_GAP = 21
 
+# Standard residue name sets (AF3 SI Table 13; mirrors OF3
+# ``STANDARD_PROTEIN_RESIDUES_3`` / ``STANDARD_NUCLEIC_ACID_RESIDUES``). Used by
+# the prepare-time structure cleanup to decide which residues are "standard"
+# (single-token, fixed reference atom set) and therefore eligible for terminal-
+# atom stripping + unresolved-atom materialization.
+STANDARD_PROTEIN_RES3: frozenset[str] = frozenset(
+    {
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        "UNK",
+    }
+)
+STANDARD_NUCLEIC_RES: frozenset[str] = frozenset(
+    {"A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN"}
+)
+
+# Canonical polymer backbone bond atom sets (OF3
+# ``residues.PEPTIDE_BOND_ATOMS`` / ``PHOSPHODIESTER_BOND_ATOMS``). An
+# inter-residue covalent bond whose two atoms both lie in one of these sets is
+# the standard backbone link and does NOT mark a residue as covalently modified.
+PEPTIDE_BOND_ATOMS: frozenset[str] = frozenset({"N", "C"})
+PHOSPHODIESTER_BOND_ATOMS: frozenset[str] = frozenset({"P", "O3'", "O5'"})
+
+# Leaving atoms removed from standard polymer residues when polymerised, so every
+# token of a given residue type maps to the same fixed atom set (OF3
+# ``MOLECULE_TYPE_TO_LEAVING_ATOMS`` / AF3 §2.5.4). OXT is the protein
+# C-terminal carboxyl oxygen; OP3 / O3P is the nucleic 5'-phosphate leaving
+# oxygen. Kept in sync with the reference-conformer trimming in
+# ``feature/ref_atoms.py``.
+PROTEIN_LEAVING_ATOMS: frozenset[str] = frozenset({"OXT"})
+NUCLEIC_LEAVING_ATOMS: frozenset[str] = frozenset({"OP3", "O3P"})
+
+# Maximum covalent bond length (Å) retained by the prepare-time bond prefilter
+# (OF3 ``prefilter_bonds`` ``remove_longer_than``). Bonds longer than this are
+# dropped as spurious.
+MAX_BOND_LENGTH: float = 2.4
+
 # Crystallization aids removed from X-ray structures (AF3 §2.5.4, SI Table 9).
 # Buffer / cryo / precipitant ligands that are not part of the biological
 # assembly and would otherwise appear as spurious NONPOLYMER tokens.

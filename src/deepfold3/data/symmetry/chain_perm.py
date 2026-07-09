@@ -9,13 +9,19 @@ the training loop.
 
 This module computes the optimal ground-truth-to-prediction chain
 assignment following AlphaFold-Multimer / AlphaFold 3 §4.2: chains are
-grouped by ``entity_id``, a single global rigid frame is fitted from an
-anchor chain, and each predicted chain is greedily matched to the
-spatially nearest ground-truth chain of the same entity. A per-pair
-Kabsch cost is *not* used — it removes the global rotation and so scores
-only internal shape (near-identical, hence ambiguous, for symmetric
-copies), which cannot resolve the spatial correspondence the permutation
-exists for. Entity groups of size 1 are passed through unchanged.
+grouped into **covalently-connected components** (a polymer chain plus its
+covalently-bonded glycans / ligands — OF3 ``assign_mol_symmetry_ids``),
+a single global rigid frame is fitted from an anchor chain, and each
+predicted component is greedily matched — as a whole unit — to the
+spatially nearest ground-truth component of its symmetry class (components
+sharing a class iff their coarse molecule graphs are isomorphic;
+see :mod:`deepfold3.data.symmetry.mol_labels`). A per-pair Kabsch cost is
+*not* used — it removes the global rotation and so scores only internal
+shape (near-identical, hence ambiguous, for symmetric copies), which cannot
+resolve the spatial correspondence the permutation exists for. With no
+inter-chain covalent bonds every chain is its own singleton component and a
+component class reduces to an ``entity_id`` class; symmetry classes of size 1
+are passed through unchanged.
 
 Heteromers (e.g. A2B2) are handled naturally: the anchor's global frame
 plus the per-entity greedy match assign each entity's copies independently.
@@ -62,6 +68,56 @@ def _kabsch_transform_np(p: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.n
     return r, t
 
 
+def _match_component_chains(
+    pred_members: tuple[int, ...],
+    gt_members: tuple[int, ...],
+    r_mat: np.ndarray,
+    t_vec: np.ndarray,
+    ent_of: dict[int, int],
+    cen_pred: dict[int, np.ndarray | None],
+    cen_gt: dict[int, np.ndarray | None],
+) -> tuple[dict[int, int], float]:
+    """Map one predicted component's chains onto a matched GT component's chains.
+
+    The two components are in the same symmetry class (isomorphic coarse
+    graphs), so their per-entity chain multisets are identical. Within the
+    matched pair, each predicted chain is greedily assigned to the spatially
+    nearest still-unused GT chain **of the same entity** (after the global
+    anchor frame ``R, t``). For a singleton component this is the single
+    same-entity chain — identical to the historical per-chain match.
+
+    Returns ``({pred_asym: gt_asym}, summed_squared_distance)``.
+    """
+    from collections import defaultdict
+
+    gt_by_ent: dict[int, list[int]] = defaultdict(list)
+    for g in gt_members:
+        if cen_gt.get(g) is not None:
+            gt_by_ent[ent_of[g]].append(g)
+
+    mapping: dict[int, int] = {}
+    score = 0.0
+    used: set[int] = set()
+    for p in pred_members:
+        if cen_pred.get(p) is None:
+            continue
+        pt = r_mat @ cen_pred[p] + t_vec
+        best_d: float | None = None
+        best_g: int | None = None
+        for g in gt_by_ent.get(ent_of[p], ()):
+            if g in used:
+                continue
+            d = float(((pt - cen_gt[g]) ** 2).sum())
+            if best_d is None or d < best_d:
+                best_d = d
+                best_g = g
+        if best_g is not None:
+            used.add(best_g)
+            mapping[p] = best_g
+            score += best_d
+    return mapping, score
+
+
 def _anchor_greedy_assignment(
     order: list[int],
     ent_of: dict[int, int],
@@ -72,6 +128,7 @@ def _anchor_greedy_assignment(
     res: dict[int, np.ndarray],
     is_lig: dict[int, bool] | None = None,
     sti: dict[int, np.ndarray] | None = None,
+    inter_chain_bonds: list[tuple] | None = None,
 ) -> dict[int, int]:
     """AF-Multimer anchor-based greedy chain assignment (AF3 §4.2).
 
@@ -82,6 +139,14 @@ def _anchor_greedy_assignment(
     nearest ground-truth chain of the same entity. Spatial position — the
     thing the permutation must resolve — drives the assignment.
 
+    Chains are permuted at the granularity of **covalently-connected
+    components** (AF3 §4.2 / OF3 ``assign_mol_symmetry_ids``): a polymer chain
+    and its covalently-bonded glycans / ligands form one unit that moves
+    together, and two components are interchangeable only when their coarse
+    molecule graphs are isomorphic. With no inter-chain covalent bonds every
+    chain is its own singleton component and a component class reduces to an
+    ``entity_id`` class — behaviourally identical to the entity-only path.
+
     Algorithm:
       1. Anchor entity = a **polymer** entity if any (ligand-only entities are
          deprioritised — their still-unresolved symmetric atoms make for a
@@ -90,8 +155,10 @@ def _anchor_greedy_assignment(
          toward more resolved atoms; ``gt_anchor`` = its most-resolved chain.
       2. For each predicted chain of the anchor entity (the candidate global
          frames), Kabsch-align it onto ``gt_anchor``, apply that transform to
-         every predicted chain centroid, and greedily assign each predicted
-         chain to the nearest unused GT chain of its entity.
+         every predicted **component** centroid (the component's polymer-anchor
+         chain centroid), greedily assign each predicted component to the
+         nearest unused GT component of its symmetry class, then match the
+         chains within the paired components (per-entity nearest).
       3. Keep the frame with the smallest total matched squared distance.
 
     Per-chain inputs are keyed by chain id: ``cen_*`` are resolved-atom
@@ -107,18 +174,31 @@ def _anchor_greedy_assignment(
     counts, so chains a crop cut to unequal lengths still align on their common
     residues (gap-1). When ``None``, chains of one entity are assumed to share
     their atom layout row-for-row (legacy positional path).
+
+    ``inter_chain_bonds`` lists covalent bonds crossing a chain boundary — each
+    ``(asym_a, asym_b)`` or ``(asym_a, asym_b, rel_atom_a, rel_atom_b)`` — used
+    to build the covalent components and their isomorphism classes. ``None`` /
+    empty → singleton components (each chain its own unit).
     """
     from collections import defaultdict
 
     import numpy as np
 
+    from deepfold3.data.symmetry.mol_labels import (
+        assign_component_symmetry_classes,
+        connected_chain_components,
+    )
+
     assignment = {a: a for a in order}
 
-    groups: dict[int, list[int]] = defaultdict(list)
-    for a in order:
-        groups[ent_of[a]].append(a)
-    if not any(len(v) > 1 for v in groups.values()):
-        return assignment  # no symmetric copies → nothing to permute
+    # Covalently-connected components + their graph-isomorphism symmetry classes.
+    components, _comp_of = connected_chain_components(order, inter_chain_bonds)
+    class_of = assign_component_symmetry_classes(components, ent_of, inter_chain_bonds)
+    class_to_comps: dict[int, list[int]] = defaultdict(list)
+    for ci, cls in enumerate(class_of):
+        class_to_comps[cls].append(ci)
+    if not any(len(v) > 1 for v in class_to_comps.values()):
+        return assignment  # no symmetric component copies → nothing to permute
 
     resolved_chains = [a for a in order if cen_pred.get(a) is not None and cen_gt.get(a) is not None]
     if len(resolved_chains) < 2:
@@ -128,6 +208,30 @@ def _anchor_greedy_assignment(
     for a in resolved_chains:
         ent_res[ent_of[a]].append(a)
     natoms = {a: int(res[a].sum()) for a in resolved_chains}
+
+    # Each component is represented for the whole-unit spatial match by its
+    # anchor chain — the polymer (non-ligand), most-resolved member — so a
+    # misplaced light glycan / ligand cannot drag the unit's match away from the
+    # polymer it is bonded to. For a singleton component this is just the chain
+    # itself (unchanged common path). ``None`` when no member chain is resolved.
+    def _rep_atoms(a: int) -> int:
+        r = res.get(a)
+        return int(r.sum()) if r is not None else 0
+
+    def _chain_is_lig(a: int) -> bool:
+        return bool(is_lig.get(a, False)) if is_lig else False
+
+    comp_cen_pred: dict[int, np.ndarray | None] = {}
+    comp_cen_gt: dict[int, np.ndarray | None] = {}
+    for ci, members in enumerate(components):
+        resolved = [a for a in members if cen_pred.get(a) is not None and cen_gt.get(a) is not None]
+        if not resolved:
+            comp_cen_pred[ci] = None
+            comp_cen_gt[ci] = None
+            continue
+        rep = min(resolved, key=lambda a: (_chain_is_lig(a), -_rep_atoms(a)))
+        comp_cen_pred[ci] = cen_pred[rep]
+        comp_cen_gt[ci] = cen_gt[rep]
 
     # Deprioritise ligand-only entities as the anchor (their symmetric atoms
     # are not yet permutation-resolved → noisy frame). Among equal ligand-ness:
@@ -190,24 +294,30 @@ def _anchor_greedy_assignment(
         r_mat, t_vec = _kabsch_transform_np(pts[0], pts[1])
         trial = {a: a for a in order}
         score = 0.0
-        for chs in groups.values():
-            gt_avail = [c for c in chs if cen_gt.get(c) is not None]
-            used: set[int] = set()
-            for pc in [c for c in chs if cen_pred.get(c) is not None]:
-                pt = r_mat @ cen_pred[pc] + t_vec
+        # Match whole components within each symmetry class, then the chains
+        # inside each paired component. Singleton components collapse to the
+        # per-chain, per-entity greedy match (unchanged common path).
+        for comps in class_to_comps.values():
+            gt_avail = [c for c in comps if comp_cen_gt[c] is not None]
+            used_comps: set[int] = set()
+            for pc in [c for c in comps if comp_cen_pred[c] is not None]:
+                pt = r_mat @ comp_cen_pred[pc] + t_vec
                 best_d: float | None = None
-                best_g: int | None = None
+                best_gc: int | None = None
                 for gc in gt_avail:
-                    if gc in used:
+                    if gc in used_comps:
                         continue
-                    d = float(((pt - cen_gt[gc]) ** 2).sum())
+                    d = float(((pt - comp_cen_gt[gc]) ** 2).sum())
                     if best_d is None or d < best_d:
                         best_d = d
-                        best_g = gc
-                if best_g is not None:
-                    used.add(best_g)
-                    trial[pc] = best_g
-                    score += best_d
+                        best_gc = gc
+                if best_gc is not None:
+                    used_comps.add(best_gc)
+                    chain_map, chain_score = _match_component_chains(
+                        components[pc], components[best_gc], r_mat, t_vec, ent_of, cen_pred, cen_gt
+                    )
+                    trial.update(chain_map)
+                    score += chain_score
         if score < best_score:
             best_score = score
             best = trial
@@ -215,19 +325,62 @@ def _anchor_greedy_assignment(
     return best if best is not None else assignment
 
 
+def _inter_chain_bonds_from_structure(
+    chains: np.ndarray,
+    bonds: np.ndarray | None,
+) -> list[tuple] | None:
+    """Derive inter-chain covalent bonds (as asym-id pairs) from a Structure.
+
+    Maps each ``BOND_DTYPE`` bond's global atom endpoints to the chain that
+    owns them (via each chain's ``[atom_idx, atom_idx + atom_num)`` range) and
+    keeps only bonds that cross a chain boundary. Each returned entry is
+    ``(asym_a, asym_b, rel_atom_a, rel_atom_b)`` where ``rel_atom_*`` is the
+    endpoint's atom index relative to its chain — the OF3 link-node label used
+    to sharpen the component isomorphism to the attachment site. Returns
+    ``None`` when there are no inter-chain bonds.
+    """
+    import bisect
+
+    if bonds is None or len(bonds) == 0 or len(chains) == 0:
+        return None
+
+    ranges = sorted((int(r["atom_idx"]), int(r["atom_idx"]) + int(r["atom_num"]), int(r["asym_id"])) for r in chains)
+    starts = [r[0] for r in ranges]
+
+    def owner(atom: int) -> tuple[int | None, int]:
+        i = bisect.bisect_right(starts, atom) - 1
+        if 0 <= i < len(ranges):
+            s, e, asym = ranges[i]
+            if s <= atom < e:
+                return asym, s
+        return None, 0
+
+    out: list[tuple] = []
+    for b in bonds:
+        a1, a2 = int(b["atom_1"]), int(b["atom_2"])
+        c1, s1 = owner(a1)
+        c2, s2 = owner(a2)
+        if c1 is None or c2 is None or c1 == c2:
+            continue
+        out.append((c1, c2, a1 - s1, a2 - s2))
+    return out or None
+
+
 def compute_chain_permutation(
     pred_coords: torch.Tensor,  # [N_atoms, 3]
     gt_coords: torch.Tensor,  # [N_atoms, 3]
     gt_mask: torch.Tensor,  # [N_atoms] bool
     chains: np.ndarray,  # CHAIN_DTYPE structured array
+    bonds: np.ndarray | None = None,  # BOND_DTYPE — inter-chain covalent bonds
 ) -> dict[int, int]:
     """Find the optimal pred-to-GT chain mapping for a multimer.
 
     Flat atom-layout adapter around :func:`_anchor_greedy_assignment`
-    (AF-Multimer / AF3 §4.2): chains are grouped by ``entity_id``, a
-    single global rigid frame is fitted from an anchor chain, and each
-    predicted chain is greedily matched to the spatially nearest GT chain
-    of the same entity over resolved heavy atoms. This resolves the
+    (AF-Multimer / AF3 §4.2): chains are grouped into covalently-connected
+    components, a single global rigid frame is fitted from an anchor chain, and
+    each predicted component is greedily matched (whole-unit) to the spatially
+    nearest GT component of its isomorphism class over resolved heavy atoms,
+    then its chains to the paired GT component's chains. This resolves the
     spatial correspondence between symmetric copies — which a
     rotation-invariant per-pair Kabsch cost cannot, since it collapses to
     a near-constant matrix for identical chains and yields an arbitrary
@@ -246,6 +399,11 @@ def compute_chain_permutation(
     chains : np.ndarray
         Structured array with ``CHAIN_DTYPE`` fields — at minimum
         ``entity_id``, ``asym_id``, ``atom_idx`` and ``atom_num``.
+    bonds : np.ndarray, optional
+        ``BOND_DTYPE`` bonds (``atom_1``, ``atom_2``). Inter-chain covalent
+        bonds group chains into components that permute as whole molecules
+        (AF3 §4.2). ``None`` / no inter-chain bonds → each chain is its own
+        component (entity-only behaviour, unchanged).
 
     Returns
     -------
@@ -288,7 +446,10 @@ def compute_chain_permutation(
             cen_pred[a] = pf[m].mean(axis=0)
             cen_gt[a] = gf[m].mean(axis=0)
 
-    return _anchor_greedy_assignment(order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res)
+    inter_chain_bonds = _inter_chain_bonds_from_structure(chains, bonds)
+    return _anchor_greedy_assignment(
+        order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res, inter_chain_bonds=inter_chain_bonds
+    )
 
 
 def apply_chain_permutation(
@@ -383,18 +544,26 @@ def compute_chain_permutation_tokens(
     mol_type: torch.Tensor | None = None,  # [N] int — polymer/ligand anchor priority
     seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens
     sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
+    inter_chain_bonds: list[tuple] | None = None,  # covalent (asym_a, asym_b[, rel_a, rel_b]) pairs
 ) -> dict[int, int]:
     """Token-layout version of :func:`compute_chain_permutation`.
 
     Operates on the per-token ``[N, M, 3]`` layout used by the diffusion
     loss. Tokens are grouped by ``asym_id`` (each chain is one group) and
-    chains into permutation classes by ``entity_id``. The pred → GT chain
-    assignment is resolved by :func:`_anchor_greedy_assignment` — the
-    AF-Multimer anchor-based greedy algorithm (AF3 §4.2): a single global
-    frame is fitted from an anchor chain and each predicted chain is matched
-    to the spatially nearest GT chain of the same entity. This resolves the
-    spatial correspondence between symmetric copies that a per-pair Kabsch
-    cost (rotation-invariant, hence blind to position) cannot.
+    chains into covalently-connected components (AF3 §4.2 / OF3
+    ``assign_mol_symmetry_ids``); components are matched into permutation
+    classes by graph isomorphism. The pred → GT chain assignment is resolved by
+    :func:`_anchor_greedy_assignment` — the AF-Multimer anchor-based greedy
+    algorithm (AF3 §4.2): a single global frame is fitted from an anchor chain
+    and each predicted component is matched (as a whole unit) to the spatially
+    nearest GT component of its class. This resolves the spatial correspondence
+    between symmetric copies that a per-pair Kabsch cost (rotation-invariant,
+    hence blind to position) cannot.
+
+    ``inter_chain_bonds`` lists covalent bonds crossing a chain boundary (as
+    ``(asym_a, asym_b)`` pairs) so a protein chain plus its bonded glycans /
+    ligands permute together. ``None`` / empty → each chain is its own
+    singleton component (entity-only behaviour, unchanged).
 
     ``token_to_rep_atom`` selects each token's representative (token-center)
     atom — CA / C1' / the single ligand atom — so the alignment operates on
@@ -496,6 +665,7 @@ def compute_chain_permutation_tokens(
         res,
         is_lig=lig_of if mol_np is not None else None,
         sti=sti_of if (pred_rep is not None and sym_np is not None) else None,
+        inter_chain_bonds=inter_chain_bonds,
     )
 
 

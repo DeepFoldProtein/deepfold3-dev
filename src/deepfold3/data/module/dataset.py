@@ -184,16 +184,12 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.atomize_prob = float(atomize_prob)
         self.atomize_source = atomize_source
         self.atomize_max_residues = int(atomize_max_residues)
-        # Pre-compute chain selection for records exceeding max_chains
-        # (deterministic per record, no need to recompute each __getitem__).
-        self._dropped_chains_cache: dict[str, set[int]] = {}
-        if max_chains > 0:
-            from deepfold3.data.prepare.filters import select_interface_chains
-
-            for r in records:
-                dropped = select_interface_chains(r, max_polymer_chains=max_chains)
-                if dropped:
-                    self._dropped_chains_cache[r.id] = dropped
+        # Large-assembly chain "pre-crop" (>max_chains effective chains). Unlike
+        # the old anchor-independent greedy selection (precomputed per record),
+        # the OF3 ``crop_chainwise`` selection is spatial and depends on the
+        # sampled anchor, so it must run per __getitem__ (see _load_sample). Only
+        # the reference distance is stored here.
+        self.chain_crop_interface_distance = interface_distance
         self.is_distillation = is_distillation
         # Per-dataset exclusion: tokens whose mol_type is in this list are
         # synthesised into a ``MASK_LOSS_WEIGHT`` channel (1.0 elsewhere,
@@ -311,18 +307,39 @@ class TrainingDataset(torch.utils.data.Dataset):
             raise FileNotFoundError(f"Structure file not found: {struct_path}")
         structure = Structure.load(struct_path)
 
-        # Training-time chain selection (AF3 §2.5.4 / Table 6).
-        # Pre-computed at init time; look up from cache.
-        dropped_chain_ids: set[int] = self._dropped_chains_cache.get(record.id, set())
-        if dropped_chain_ids:
-            mask = ~np.isin(structure.chains["asym_id"], list(dropped_chain_ids))
-            structure = Structure(
-                atoms=structure.atoms,
-                residues=structure.residues,
-                chains=structure.chains[mask],
-                bonds=structure.bonds,
-                name=structure.name,
+        # Training-time large-assembly chain "pre-crop" (AF3 §2.5.4 / Table 6):
+        # keep the spatially-closest ``max_chains`` chains around a random
+        # reference atom in the sampled anchor (chain/interface), re-include
+        # proximal ligands, and always keep the preferred chain/interface (OF3
+        # ``crop_chainwise``). Runs per sample because it is anchor- and
+        # geometry-dependent. The anchor drawn by the sampler is threaded through
+        # so it is never dropped (the crop then seeds on a surviving chain).
+        dropped_chain_ids: set[int] = set()
+        if self.max_chains > 0:
+            from deepfold3.data.prepare.filters import select_interface_chains
+
+            all_ids = {int(a) for a in structure.chains["asym_id"]}
+            # Deterministic under a fixed global seed (determinism mode), varies
+            # per sample and per epoch (torch worker seed reseeded per epoch).
+            precrop_rng = random.Random((torch.initial_seed() ^ (idx * 0x9E3779B1)) & 0xFFFFFFFF)
+            kept = select_interface_chains(
+                structure,
+                anchor=crop_anchor,
+                max_chains=self.max_chains,
+                interface_distance=self.chain_crop_interface_distance,
+                ligand_inclusion_distance=5.0,  # OF3 default ligand_inclusion_distance
+                rng=precrop_rng,
             )
+            dropped_chain_ids = all_ids - kept
+            if dropped_chain_ids:
+                mask = np.isin(structure.chains["asym_id"], list(kept))
+                structure = Structure(
+                    atoms=structure.atoms,
+                    residues=structure.residues,
+                    chains=structure.chains[mask],
+                    bonds=structure.bonds,
+                    name=structure.name,
+                )
         timing["structure"], _t = time.perf_counter() - _t, time.perf_counter()
 
         # Tokenize on the structure ALONE (empty MSA). Tokenization never reads

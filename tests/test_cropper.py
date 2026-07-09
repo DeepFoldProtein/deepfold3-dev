@@ -33,6 +33,7 @@ def make_tokens(
     n_chains: int = 1,
     atoms_per_token: int = 5,
     coords: np.ndarray | None = None,
+    unresolved: set[int] | None = None,
 ) -> tuple[np.ndarray, Structure]:
     """Build a synthetic TOKEN_DTYPE array + matching minimal Structure.
 
@@ -41,7 +42,14 @@ def make_tokens(
     provided (shape [n, 3]), it sets (center_x, center_y, center_z) and also
     the corresponding atom (x, y, z). Otherwise tokens are placed on a
     1D line with spacing 10Å.
+
+    ``unresolved`` is a set of token indices whose atoms are marked
+    ``is_present=False`` (so the token is *unresolved*) while KEEPING a non-zero
+    center coord (so it is still geometrically ``valid``). This isolates the
+    item-10 invariant: exclusion must be driven by the resolved mask, not by the
+    zero-coord ``valid`` mask.
     """
+    unresolved = unresolved or set()
     if coords is None:
         coords = np.zeros((n, 3), dtype=np.float32)
         coords[:, 0] = np.arange(n) * 10.0
@@ -76,10 +84,11 @@ def make_tokens(
     for i in range(n):
         a0 = int(tokens[i]["atom_idx"])
         an = int(tokens[i]["atom_num"])
+        present = i not in unresolved
         atoms[a0 : a0 + an]["x"] = float(coords[i, 0])
         atoms[a0 : a0 + an]["y"] = float(coords[i, 1])
         atoms[a0 : a0 + an]["z"] = float(coords[i, 2])
-        atoms[a0 : a0 + an]["is_present"] = True
+        atoms[a0 : a0 + an]["is_present"] = present
         atoms[a0 : a0 + an]["element"] = 6
 
     residues = np.zeros(n, dtype=RESIDUE_DTYPE)
@@ -87,7 +96,7 @@ def make_tokens(
         residues[i]["res_id"] = i
         residues[i]["atom_idx"] = int(tokens[i]["atom_idx"])
         residues[i]["atom_num"] = atoms_per_token
-        residues[i]["is_present"] = True
+        residues[i]["is_present"] = i not in unresolved
 
     chains = np.zeros(n_chains, dtype=CHAIN_DTYPE)
     for c in range(n_chains):
@@ -121,12 +130,14 @@ def make_tokenized(
     coords: np.ndarray | None = None,
     with_msa: bool = False,
     with_bonds: bool = False,
+    unresolved: set[int] | None = None,
 ) -> Tokenized:
     tokens, structure = make_tokens(
         n,
         n_chains=n_chains,
         atoms_per_token=atoms_per_token,
         coords=coords,
+        unresolved=unresolved,
     )
 
     paired_msa: dict[int, MSA] = {}
@@ -499,3 +510,249 @@ def test_remap_msa_col_idx_preserves_ligand_gaps():
     assert int(remapped[1]) == -1
     # 7 and 3 rebase to their rank within the sorted-by-first-occurrence cols.
     assert int(remapped[0]) == 0 and int(remapped[2]) == 1
+
+
+# ===========================================================================
+# ITEM 8 — Contiguous crop = AF-Multimer 2.7.2 Algorithm 1 (OF3 parity)
+#
+# The rewritten _contiguous_crop permutes ALL chains and splits the token
+# budget across them; each chain contributes a random contiguous sub-segment.
+# ===========================================================================
+
+
+def _segment_is_contiguous_within_chain(selected: np.ndarray, chain_global: np.ndarray) -> bool:
+    """A chain's contribution must be a contiguous run of that chain's tokens."""
+    picked = np.intersect1d(selected, chain_global)
+    if len(picked) <= 1:
+        return True
+    pos = np.searchsorted(chain_global, picked)
+    return bool(np.all(np.diff(pos) == 1))
+
+
+def test_contiguous_afm_splits_budget_across_chains():
+    """3 chains of 30 tokens, budget 45: the crop must span >=2 chains, fill the
+    budget exactly (no atom cap), and each chain's slice is contiguous."""
+    import random
+
+    tokens, _ = make_tokens(90, n_chains=3)  # 30 tokens per chain
+    cropper = Cropper()
+    for seed in range(10):
+        sel = cropper._contiguous_crop(
+            tokens, max_tokens=45, max_atoms=10_000_000, chain_id=None, rng=random.Random(seed)
+        )
+        # Budget is fully used (total capacity 90 >= 45) and never exceeded.
+        assert len(sel) == 45
+        # Sorted (required by _reindex_hierarchy).
+        assert np.all(np.diff(sel) >= 1)
+        # No single 30-token chain can fill 45 → must span >=2 chains.
+        assert len({int(a) for a in tokens["asym_id"][sel]}) >= 2
+        # Per-chain contribution is a contiguous sub-segment.
+        for c in np.unique(tokens["asym_id"]):
+            chain_global = np.where(tokens["asym_id"] == c)[0]
+            assert _segment_is_contiguous_within_chain(sel, chain_global)
+
+
+def test_contiguous_afm_respects_atom_budget_multichain():
+    """The atom cap is preserved: with 100 atoms/token and a 250-atom budget the
+    multi-chain contiguous crop keeps at most 2 tokens."""
+    import random
+
+    tokens, _ = make_tokens(60, n_chains=3, atoms_per_token=100)
+    cropper = Cropper()
+    sel = cropper._contiguous_crop(tokens, max_tokens=30, max_atoms=250, chain_id=None, rng=random.Random(0))
+    assert 0 < len(sel) <= 2
+    assert int(tokens["atom_num"][sel].sum()) <= 250
+
+
+def test_contiguous_afm_single_chain_still_contiguous():
+    """Single chain reduces to a single contiguous segment (legacy behaviour)."""
+    import random
+
+    tokens, _ = make_tokens(80, n_chains=1)
+    cropper = Cropper()
+    sel = cropper._contiguous_crop(tokens, max_tokens=25, max_atoms=10_000_000, chain_id=None, rng=random.Random(4))
+    assert len(sel) == 25
+    assert np.array_equal(sel, np.arange(sel[0], sel[0] + 25))
+    assert {int(a) for a in tokens["asym_id"][sel]} == {0}
+
+
+# ===========================================================================
+# ITEM 10 — Spatial / interface crop candidate pool = resolved tokens only
+#
+# Unresolved token-center atoms are never crop candidates (OF3
+# get_resolved_token_center_atoms). Here the unresolved tokens keep NON-ZERO
+# coords, so only the resolved mask (not the zero-coord `valid` mask) can
+# exclude them.
+# ===========================================================================
+
+
+def test_spatial_crop_excludes_unresolved_tokens():
+    pytest.importorskip("scipy")
+    n = 60
+    coords = np.zeros((n, 3), dtype=np.float32)
+    coords[:, 0] = np.arange(n) * 1.0 + 1.0  # tight cluster, all non-zero centers
+    unresolved = set(range(0, n, 2))  # every other token unresolved (but valid coords)
+    data = make_tokenized(n, coords=coords, unresolved=unresolved)
+
+    cropper = Cropper(contiguous_weight=0.0, spatial_weight=1.0, interface_weight=0.0)
+    out = cropper.crop(data, max_tokens=20, max_atoms=10_000_000, seed=1)
+
+    # residue_index preserves the ORIGINAL token index through the crop.
+    sel_orig = {int(r) for r in out.tokens["residue_index"]}
+    assert sel_orig.isdisjoint(unresolved), f"selected unresolved tokens: {sel_orig & unresolved}"
+    # Every selected token's atoms are resolved.
+    assert bool(out.structure.atoms["is_present"].all())
+    assert len(out.tokens) == 20
+
+
+def test_interface_crop_excludes_unresolved_tokens():
+    pytest.importorskip("scipy")
+    n = 40
+    n_a = 20
+    coords = np.zeros((n, 3), dtype=np.float32)
+    coords[:n_a, 0] = np.arange(n_a) * 3.0
+    coords[n_a:, 0] = np.arange(n - n_a) * 3.0
+    coords[n_a:, 1] = 4.0  # chain B offset 4Å → dense cross-chain interface
+    unresolved = {5, 6, n_a, n_a + 1}  # unresolved tokens on both chains near the interface
+    data = make_tokenized(n, n_chains=2, coords=coords, unresolved=unresolved)
+
+    cropper = Cropper(contiguous_weight=0.0, spatial_weight=0.0, interface_weight=1.0, interface_distance=15.0)
+    out = cropper.crop(data, max_tokens=20, max_atoms=10_000_000, seed=2)
+
+    sel_orig = {int(r) for r in out.tokens["residue_index"]}
+    assert sel_orig.isdisjoint(unresolved)
+    assert bool(out.structure.atoms["is_present"].all())
+    # The interface crop still spans both chains.
+    assert len({int(a) for a in out.tokens["asym_id"]}) == 2
+
+
+# ===========================================================================
+# ITEM 9 — Large-assembly chain "pre-crop" = OF3 crop_chainwise
+#
+# select_interface_chains now takes the Structure + sampled anchor and keeps
+# the spatially-closest N chains, re-includes proximal ligands, and ALWAYS
+# keeps the preferred chain/interface.
+# ===========================================================================
+
+
+def _make_structure(chain_specs: list[dict]) -> Structure:
+    """Build a minimal Structure from per-chain specs.
+
+    Each spec: ``{"mol_type": int, "coords": [[x,y,z], ...], "present": [bool]|None}``.
+    Chains occupy contiguous atom ranges (as the real pipeline guarantees).
+    """
+    atoms_parts: list[np.ndarray] = []
+    residues_parts: list[np.ndarray] = []
+    chains = np.zeros(len(chain_specs), dtype=CHAIN_DTYPE)
+    atom_cursor = 0
+    res_cursor = 0
+    for aid, spec in enumerate(chain_specs):
+        pts = np.asarray(spec["coords"], dtype=np.float64)
+        k = len(pts)
+        present = spec.get("present")
+        present = np.ones(k, dtype=bool) if present is None else np.asarray(present, dtype=bool)
+
+        a = np.zeros(k, dtype=ATOM_DTYPE)
+        a["x"], a["y"], a["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+        a["is_present"] = present
+        a["element"] = 6
+        atoms_parts.append(a)
+
+        r = np.zeros(1, dtype=RESIDUE_DTYPE)
+        r[0]["atom_idx"] = atom_cursor
+        r[0]["atom_num"] = k
+        r[0]["is_present"] = bool(present.any())
+        residues_parts.append(r)
+
+        chains[aid]["name"] = f"C{aid}".encode()
+        chains[aid]["mol_type"] = spec["mol_type"]
+        chains[aid]["asym_id"] = aid
+        chains[aid]["res_idx"] = res_cursor
+        chains[aid]["res_num"] = 1
+        chains[aid]["atom_idx"] = atom_cursor
+        chains[aid]["atom_num"] = k
+        atom_cursor += k
+        res_cursor += 1
+
+    atoms = np.concatenate(atoms_parts) if atoms_parts else np.empty(0, dtype=ATOM_DTYPE)
+    residues = np.concatenate(residues_parts) if residues_parts else np.empty(0, dtype=RESIDUE_DTYPE)
+    return Structure(atoms=atoms, bonds=np.empty(0, dtype=BOND_DTYPE), residues=residues, chains=chains)
+
+
+def test_select_interface_chains_below_limit_keeps_all():
+    from deepfold3.data import const
+    from deepfold3.data.prepare.filters import select_interface_chains
+
+    specs = [{"mol_type": const.MOL_PROTEIN, "coords": [[x * 10.0, 0.0, 0.0]]} for x in range(3)]
+    struct = _make_structure(specs)
+    kept = select_interface_chains(struct, anchor=None, max_chains=20)
+    assert kept == {0, 1, 2}
+
+
+def test_select_interface_chains_closest_n():
+    pytest.importorskip("scipy")
+    import random
+
+    from deepfold3.data import const
+    from deepfold3.data.prepare.filters import select_interface_chains
+
+    # 5 protein chains on a line at x = 0,10,20,30,40; anchor chain 0.
+    specs = [{"mol_type": const.MOL_PROTEIN, "coords": [[x * 10.0, 0.0, 0.0]]} for x in range(5)]
+    struct = _make_structure(specs)
+    kept = select_interface_chains(struct, anchor=("chain", 0, -1), max_chains=3, rng=random.Random(0))
+    assert kept == {0, 1, 2}  # 3 spatially closest to chain 0 (at x=0)
+
+
+def test_select_interface_chains_anchor_always_kept():
+    """The prior greedy (anchor-independent) pre-crop could drop the sampled
+    chain. The OF3 approach force-keeps it — even when it is far away AND has
+    no resolved atoms (so it is not even a ranking candidate)."""
+    pytest.importorskip("scipy")
+    import random
+
+    from deepfold3.data import const
+    from deepfold3.data.prepare.filters import select_interface_chains
+
+    specs = [{"mol_type": const.MOL_PROTEIN, "coords": [[x * 10.0, 0.0, 0.0]]} for x in range(4)]
+    # Chain 4: far away and entirely unresolved.
+    specs.append({"mol_type": const.MOL_PROTEIN, "coords": [[1000.0, 0.0, 0.0]], "present": [False]})
+    struct = _make_structure(specs)
+    kept = select_interface_chains(struct, anchor=("chain", 4, -1), max_chains=3, rng=random.Random(0))
+    assert 4 in kept
+
+
+def test_select_interface_chains_ligand_reinclusion():
+    pytest.importorskip("scipy")
+    import random
+
+    from deepfold3.data import const
+    from deepfold3.data.prepare.filters import select_interface_chains
+
+    specs = [{"mol_type": const.MOL_PROTEIN, "coords": [[x * 10.0, 0.0, 0.0]]} for x in range(4)]
+    specs.append({"mol_type": const.MOL_NONPOLYMER, "coords": [[1.0, 0.0, 0.0]]})  # chain 4: near chain 0
+    specs.append({"mol_type": const.MOL_NONPOLYMER, "coords": [[1000.0, 0.0, 0.0]]})  # chain 5: far
+    struct = _make_structure(specs)
+
+    kept = select_interface_chains(
+        struct, anchor=("chain", 0, -1), max_chains=3, ligand_inclusion_distance=5.0, rng=random.Random(0)
+    )
+    # 4 protein chains (>3 effective) → pre-crop triggers; ligands don't count.
+    assert {0, 1, 2}.issubset(kept)
+    assert 3 not in kept  # 4th protein chain is beyond the closest 3
+    assert 4 in kept  # ligand within 5Å of a kept chain → re-included
+    assert 5 not in kept  # distant ligand dropped
+
+
+def test_select_interface_chains_interface_anchor_keeps_both():
+    pytest.importorskip("scipy")
+    import random
+
+    from deepfold3.data import const
+    from deepfold3.data.prepare.filters import select_interface_chains
+
+    # 6 protein chains; interface anchor (0, 5) at opposite ends (no direct
+    # contact) — both must survive regardless of the closest-N ranking.
+    specs = [{"mol_type": const.MOL_PROTEIN, "coords": [[x * 10.0, 0.0, 0.0]]} for x in range(6)]
+    struct = _make_structure(specs)
+    kept = select_interface_chains(struct, anchor=("interface", 0, 5), max_chains=3, rng=random.Random(1))
+    assert 0 in kept and 5 in kept
