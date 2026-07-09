@@ -124,7 +124,7 @@ def _plot(series, category, rows):
     ax[2].plot(s, [r["helixified_strand"] for r in rows], "-o", color="tab:orange", label="pred-α truly β (helixified strand)")
     ax[2].set_title("helix over-prediction")
     for a in ax:
-        a.set_xlabel("training step"); a.set_ylim(0, 1); a.grid(alpha=0.3); a.legend(fontsize=8)
+        a.set_xlabel("training step"); a.set_ylim(-0.02, 1.02); a.grid(alpha=0.3); a.legend(fontsize=8)
     fig.suptitle(f"{series} {category} — SS precision/recall trajectory (DSSP, FoldBench monomer)")
     png = BENCH / "runs" / series / "ss_analysis" / f"ss_pr_traj_{category}.png"
     fig.tight_layout(); fig.savefig(png, dpi=130)

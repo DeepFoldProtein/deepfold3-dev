@@ -221,7 +221,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
                     nlast = rows[-1].get(f"{c}_n", 0) if rows else 0
                     ax.plot([p[0] for p in ys], [p[1] for p in ys], "-",
                             color=colors[c], alpha=0.7, lw=1.2, label=f"{c} (n={nlast})")
-            ax.set_ylabel(label); ax.set_title(label); ax.grid(alpha=0.3)
+            ax.set_ylabel(label); ax.set_title(label); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3)
         axes[-1].set_xlabel("training step")
         axes[0].legend(fontsize=8, ncol=2)
         fig.suptitle(f"{series} — FoldBench-small {category}  (median + IQR across targets)")

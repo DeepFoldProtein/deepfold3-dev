@@ -129,7 +129,7 @@ def _plot(series, category, rows, out_dir):
             ys = [next((r[key] for r in rows if r["step"] == s and r["group"] == g), None) for s in steps]
             nlast = next((r["n_targets"] for r in rows[::-1] if r["group"] == g), 0)
             ax[i].plot(steps, ys, "-o", color=col[g], label=f"{g} (n={nlast})")
-        ax[i].set_title(title); ax[i].set_xlabel("step"); ax[i].set_ylim(0, 1)
+        ax[i].set_title(title); ax[i].set_xlabel("step"); ax[i].set_ylim(-0.02, 1.02)
         ax[i].grid(alpha=0.3); ax[i].legend(fontsize=8)
     fig.suptitle(f"{series} {category} — SS by DSSP fold class (does helix-overpred concentrate in β-rich?)")
     png = out_dir / f"ss_byclass_traj_{category}.png"

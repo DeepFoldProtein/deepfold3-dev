@@ -178,7 +178,7 @@ def _plot(series, category, rows):
         axes[1].plot(steps, [r[f"f1_3_{c}"] for r in rows], "-o", color=cols[c], label=c)
     axes[1].set_title("3-state per-class F1 vs step"); axes[1].set_ylabel("F1")
     for ax in axes:
-        ax.set_xlabel("training step"); ax.grid(alpha=0.3); ax.legend()
+        ax.set_xlabel("training step"); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3); ax.legend()
     fig.suptitle(f"{series} -- FoldBench-small {category}  DSSP secondary-structure F1")
     png = BENCH / "runs" / series / "ss_analysis" / f"ss_f1_{category}.png"
     fig.tight_layout(); fig.savefig(png, dpi=130)
