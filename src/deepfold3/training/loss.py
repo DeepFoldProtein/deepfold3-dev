@@ -424,6 +424,69 @@ def chain_perm_from_mini_rollout(
     )
 
 
+def resolve_shared_gt_atom_symmetry(
+    pred: dict[str, torch.Tensor],
+    features: dict[str, torch.Tensor],
+    gt_pos: torch.Tensor,  # [N, M, 3] — shared (already chain-permuted) GT
+    atom_mask: torch.Tensor,  # [N, M] bool — GT resolved mask
+) -> torch.Tensor:
+    """Resolve intra-residue / ligand atom symmetry on the shared GT (AF3 §4.2).
+
+    OF3 resolves the whole permutation (chain + atom + ligand) once from the
+    mini-rollout and shares it with every GT-based loss. The chain part is
+    handled by the caller; this adds the per-atom part: it aligns the rollout
+    onto the GT (global Kabsch, so the local symmetric-atom decision is made in
+    a common frame) and applies the same atom / ligand permutation ops the
+    diffusion MSE uses, relabelling GT's symmetric atoms (ASP OD1/OD2, PHE ring,
+    PO4 oxygens, …) to match the prediction. Benefits the per-atom GT losses
+    (smooth-lDDT, pLDDT, exp_resolved) and ligand-sensitive distogram — and
+    monomers too (symmetric side chains need no chain perm). The diffusion MSE
+    keeps its own per-noise-sample resolution. No-op when the rollout or the
+    symmetry tables are absent.
+    """
+    mini = pred.get("mini_rollout_pos")
+    if mini is None:
+        return gt_pos
+    atom_swap = features.get("atom_swap_pairs")
+    lig_swap = features.get("ligand_swap_pairs")
+    lig_perms = features.get("ligand_perms")
+    has_atom = atom_swap is not None and len(atom_swap) > 0
+    has_lswap = lig_swap is not None and len(lig_swap) > 0
+    has_lperm = lig_perms is not None and len(lig_perms) > 0
+    if not (has_atom or has_lswap or has_lperm):
+        return gt_pos
+
+    from deepfold3.data.symmetry.atom_perms import (
+        apply_ligand_token_permutation,
+        apply_ligand_token_swap,
+        apply_token_atom_permutation,
+    )
+
+    n, m = gt_pos.shape[0], gt_pos.shape[1]
+    # Align the rollout onto the (chain-permuted) GT before deciding the local
+    # symmetric-atom swaps (OF3 Kabsch-aligns pred→GT first). Weight the Kabsch
+    # by the **representative (token-center) atoms only** — CA / C1' are not
+    # symmetric, so they anchor a stable frame; weighting by all atoms lets the
+    # symmetric atoms being resolved skew the very alignment used to resolve them.
+    rep_idx = features.get("token_to_rep_atom")
+    if rep_idx is not None:
+        w2d = torch.zeros(n, m, device=gt_pos.device, dtype=gt_pos.dtype)
+        w2d[torch.arange(n, device=gt_pos.device), rep_idx.to(gt_pos.device)] = 1.0
+        w = (w2d.bool() & atom_mask).reshape(-1).to(gt_pos.dtype)
+    else:
+        w = atom_mask.reshape(-1).to(gt_pos.dtype)
+    mref = weighted_rigid_align(mini[0].reshape(1, -1, 3), gt_pos.reshape(1, -1, 3), w).reshape(1, n, m, 3)
+    mask_b = atom_mask.bool()
+    gt = gt_pos.unsqueeze(0)  # [1, N, M, 3]
+    if has_atom:
+        gt = apply_token_atom_permutation(mref, gt, mask_b, atom_swap)
+    if has_lswap:
+        gt = apply_ligand_token_swap(mref, gt, mask_b, lig_swap)
+    if has_lperm:
+        gt = apply_ligand_token_permutation(mref, gt, mask_b, lig_perms)
+    return gt[0]
+
+
 def diffusion_mse_loss(
     pred_pos: torch.Tensor,  # [S, N, M, 3]
     gt_pos: torch.Tensor,  # [S, N, M, 3] (augmented GT per sample)
@@ -1727,6 +1790,11 @@ def diffusion_only_loss(
         seq_mask = seq_mask & c_keep
         gt_aug = gt_aug.index_select(-3, c_index)
 
+    # Also resolve intra-residue / ligand atom symmetry on the shared GT (from
+    # the mini-rollout) so smooth-lDDT sees the symmetry-corrected GT — the
+    # diffusion MSE still resolves it per noise sample on gt_aug.
+    gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
+
     region_label = features.get(f"mask_{MASK_REGION}")
     region_weights: torch.Tensor | None = None
     if region_label is not None and cfg.region_loss_weights:
@@ -1908,6 +1976,12 @@ def training_loss(
         gt_pos = gt_pos.index_select(0, c_index)
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         gt_seq_mask = seq_mask & c_keep
+
+    # Also resolve intra-residue / ligand atom symmetry on the shared GT (from
+    # the mini-rollout), so the per-atom GT losses (smooth-lDDT, pLDDT,
+    # exp_resolved) and the ligand-sensitive distogram (gt_rep) score against
+    # the symmetry-corrected GT. Applies to monomers too (symmetric side chains).
+    gt_pos = resolve_shared_gt_atom_symmetry(pred, features, gt_pos, atom_mask)
 
     losses: dict[str, torch.Tensor] = {}
     # Anchor total to the distogram prediction (pair features or logits)

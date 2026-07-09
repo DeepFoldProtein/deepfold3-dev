@@ -12,7 +12,7 @@ import torch
 
 from deepfold3.data import const
 from deepfold3.model.config import TrainingConfig
-from deepfold3.training.loss import diffusion_only_loss, smooth_lddt_loss
+from deepfold3.training.loss import diffusion_only_loss, resolve_shared_gt_atom_symmetry, smooth_lddt_loss
 
 
 def _swapped_asym_homodimer():
@@ -103,3 +103,46 @@ def test_identity_assignment_leaves_losses_unchanged():
         mol_type=features["mol_type"],
     ).item()
     assert abs(comp["smooth_lddt"].item() - raw) < 1e-5
+
+
+def test_shared_gt_resolves_symmetric_side_chain_atoms():
+    """Intra-residue symmetric atoms (e.g. ASP OD1/OD2) are relabelled on the
+    shared GT to match the mini-rollout — benefiting the per-atom GT losses,
+    not only the diffusion MSE."""
+    N, M = 1, 6  # one residue: N, CA, C, O anchor the frame; slots 4/5 are the symmetric pair
+    gt = torch.zeros(N, M, 3)
+    gt[0, 0] = torch.tensor([0.0, 0, 0])
+    gt[0, 1] = torch.tensor([1.0, 0, 0])
+    gt[0, 2] = torch.tensor([2.0, 0, 0])
+    gt[0, 3] = torch.tensor([2.0, 1, 0])
+    gt[0, 4] = torch.tensor([3.0, 0, 0])  # OD1
+    gt[0, 5] = torch.tensor([3.0, 2, 0])  # OD2
+
+    # Mini-rollout: same backbone, OD1/OD2 swapped relative to the GT labelling.
+    mini = gt.clone().unsqueeze(0)  # [1, N, M, 3]
+    mini[0, 0, 4] = gt[0, 5]
+    mini[0, 0, 5] = gt[0, 4]
+
+    atom_mask = torch.ones(N, M, dtype=torch.bool)
+    pred = {"mini_rollout_pos": mini}
+    features = {
+        "atom_swap_pairs": torch.tensor([[0, 4, 5]], dtype=torch.long),
+        "token_to_rep_atom": torch.tensor([1], dtype=torch.long),  # CA
+    }
+
+    resolved = resolve_shared_gt_atom_symmetry(pred, features, gt, atom_mask)
+
+    # GT's symmetric atoms are now labelled to match the prediction.
+    assert torch.allclose(resolved[0, 4], mini[0, 0, 4])  # slot 4 ← GT OD2
+    assert torch.allclose(resolved[0, 5], mini[0, 0, 5])  # slot 5 ← GT OD1
+    # Backbone untouched.
+    assert torch.allclose(resolved[0, :4], gt[0, :4])
+
+
+def test_shared_gt_symmetry_noop_without_tables():
+    """No swap tables (or no rollout) → GT returned unchanged."""
+    N, M = 1, 6
+    gt = torch.randn(N, M, 3)
+    mask = torch.ones(N, M, dtype=torch.bool)
+    assert torch.allclose(resolve_shared_gt_atom_symmetry({"mini_rollout_pos": gt.unsqueeze(0)}, {}, gt, mask), gt)
+    assert torch.allclose(resolve_shared_gt_atom_symmetry({}, {"atom_swap_pairs": torch.tensor([[0, 4, 5]])}, gt, mask), gt)
