@@ -435,7 +435,8 @@ def diffusion_mse_loss(
     ligand_loss_weight: float = 10.0,
     region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
     atom_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] (token, M_a, M_b)
-    ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 2] (token_a, token_b) ligand swaps
+    ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] atomized-residue inter-token swaps
+    ligand_perms: torch.Tensor | None = None,  # [R, 4] (ligand_id, perm_id, dst, src) CCD automorphisms
     asym_id: torch.Tensor | None = None,  # [N] int — per-token chain id
     entity_id: torch.Tensor | None = None,  # [N] int — per-token entity id (for chain perm grouping)
     chain_assign: dict[int, int] | None = None,  # pre-computed pred→GT chain mapping
@@ -585,6 +586,11 @@ def diffusion_mse_loss(
         from deepfold3.data.symmetry.atom_perms import apply_ligand_token_swap
 
         gt_pos = apply_ligand_token_swap(pred_pos, gt_pos, atom_mask.bool(), ligand_swap_pairs)
+
+    if ligand_perms is not None and len(ligand_perms) > 0:
+        from deepfold3.data.symmetry.atom_perms import apply_ligand_token_permutation
+
+        gt_pos = apply_ligand_token_permutation(pred_pos, gt_pos, atom_mask.bool(), ligand_perms)
 
     weight_mask = weight_2d.unsqueeze(-1)  # [N, M, 1]
     # AF3 §5.3 eq. 3 / OF3 ``mse_loss`` / Protenix ``MSELoss``: divide by
@@ -1735,6 +1741,7 @@ def diffusion_only_loss(
             region_weights=region_weights,
             atom_swap_pairs=features.get("atom_swap_pairs"),
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
+            ligand_perms=features.get("ligand_perms"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
             chain_assign=chain_perm_from_mini_rollout(pred, features),
@@ -1970,6 +1977,7 @@ def training_loss(
             region_weights=region_weights,
             atom_swap_pairs=features.get("atom_swap_pairs"),
             ligand_swap_pairs=features.get("ligand_swap_pairs"),
+            ligand_perms=features.get("ligand_perms"),
             asym_id=features.get("asym_id"),
             entity_id=features.get("entity_id"),
             chain_assign=chain_perm_from_mini_rollout(pred, features),

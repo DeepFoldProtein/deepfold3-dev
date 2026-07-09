@@ -157,60 +157,62 @@ def compute_token_atom_symmetry_pairs(structure, tokens: np.ndarray) -> np.ndarr
     return np.asarray(pair_list, dtype=np.int32)
 
 
-def compute_ligand_token_swap_pairs(
+# AF3 §4.2 caps ligand automorphism enumeration at 1000 permutations (OF3
+# ``get_cropped_permutations`` uses the same ceiling).
+_MAX_LIGAND_PERMS = 1000
+
+
+def compute_ligand_token_permutations(
     structure,
     tokens: np.ndarray,
     ligand_perm_cache: dict[str, list[list[int]]] | None,
+    max_perms: int = _MAX_LIGAND_PERMS,
 ) -> np.ndarray:
-    """Token-pair swaps for ligand atoms via the precomputed CCD automorphism cache.
+    """Whole-permutation table for ligand CCD automorphisms (AF3 §4.2 / OF3).
 
-    Each ligand atom in our layout occupies its own token (``atom_num=1``,
-    only slot ``M=0``), so ligand symmetries become **inter-token** swaps.
-    For every ligand chain we look up its CCD residue name, fetch the
-    automorphism group from ``ligand_perm_cache`` (the JSON dict produced
-    by ``deepfold3 build-ccd-cache --automorphisms``), extract the involution pairs
-    from each automorphism, and map them back to current token indices
-    via ``token['atom_in_res']`` — the crop-robust CCD-local atom index the
-    tokenizer stamps on each ligand atom token (``residue_index`` now holds
-    res_id, so the automorphism key is decoupled from it).
+    Unlike a pairwise 2-cycle approach (which can only express involutions and
+    decides them independently), this preserves the **full automorphism group**
+    so the loss can pick the single permutation minimising ligand RMSD
+    — the OF3 ``get_final_atom_permutation_index`` behaviour. It therefore
+    resolves 3-fold+ symmetries (e.g. PO4's three equivalent oxygens) and
+    correlated multi-atom swaps that the pairwise path cannot.
 
-    Returns a ``[N_pairs, 3]`` int32 array of ``(token_a, token_b, group_id)``
-    triples. ``group_id`` is unique per emitted pair, so ligand swaps are
-    decided independently — but the pairs of a ligand are first reduced to a
-    **valid matching** (no atom in two pairs), which removes the previous
-    hazard of applying overlapping transpositions (e.g. ``(1,2)`` and
-    ``(1,3)`` pulled from two different automorphisms) that swap one atom
-    twice into an invalid combination. Only involution (2-cycle) components
-    are used; odd cycles (e.g. a 3-fold rotation) cannot be expressed as
-    simultaneous swaps and are skipped — the identity is a safe fallback.
+    For each ligand chain we look up its CCD automorphism group (from
+    ``build-ccd-cache --automorphisms``), map each permutation's atom indices
+    to current token indices via ``token['atom_in_res']`` (CCD-local index),
+    and emit one row per **moved** atom of each non-identity permutation:
+    ``(ligand_id, perm_id, dst_token, src_token)``. Fixed points are omitted —
+    they contribute equally to every permutation and cancel in the
+    identity-relative cost the loss minimises, so listing only moved atoms
+    keeps the table tiny (a transposition → 2 rows, a 3-cycle → 3).
+
+    A permutation is dropped if any of its moved atoms maps outside the crop
+    (``atom_in_res`` absent from the surviving tokens) — a partial permutation
+    is not a valid automorphism. Consumed by
+    :func:`apply_ligand_token_permutation`.
     """
     import numpy as np
 
     from deepfold3.data import const
 
-    empty = np.empty((0, 3), dtype=np.int32)
+    empty = np.empty((0, 4), dtype=np.int32)
     if not ligand_perm_cache:
         return empty
 
-    # Group cropped ligand tokens by asym_id; each group is one ligand
-    # chain (= one residue under our prepare pipeline).
+    # Group cropped ligand tokens by asym_id; CCD-local atom index -> token idx.
     ligand_groups: dict[int, dict[int, int]] = {}
     for i, tok in enumerate(tokens):
         if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
             continue
-        asym = int(tok["asym_id"])
-        local_atom_idx = int(tok["atom_in_res"])
-        ligand_groups.setdefault(asym, {})[local_atom_idx] = i
-
+        ligand_groups.setdefault(int(tok["asym_id"]), {})[int(tok["atom_in_res"])] = i
     if not ligand_groups:
         return empty
 
-    # asym_id -> CCD code via the structure.chains/residues lookup
     chains = structure.chains
     residues = structure.residues
 
-    pair_list: list[tuple[int, int, int]] = []
-    group_id = 0
+    rows: list[tuple[int, int, int, int]] = []
+    ligand_id = 0
     for asym, local_to_token in ligand_groups.items():
         chain_rows = chains[chains["asym_id"] == asym]
         if len(chain_rows) == 0:
@@ -222,28 +224,127 @@ def compute_ligand_token_swap_pairs(
         perms = ligand_perm_cache.get(ccd_code)
         if not perms or len(perms) <= 1:
             continue
-        pair_set: set[tuple[int, int]] = set()
-        for perm in perms:
-            for i, j in enumerate(perm):
-                if j > i and 0 <= j < len(perm) and perm[j] == i:
-                    pair_set.add((i, j))
-        # Reduce to a valid matching: greedily keep pairs whose atoms haven't
-        # already been claimed, so no atom is swapped by two pairs at once.
-        used_local: set[int] = set()
-        for local_a, local_b in sorted(pair_set):
-            if local_a in used_local or local_b in used_local:
+        emitted_any = False
+        n_kept = 0
+        for perm_id, perm in enumerate(perms):
+            if n_kept >= max_perms:
+                break
+            # ``perm[k]`` = GT atom that maps onto slot k (OF3 gt[perm] convention).
+            moved = [(k, perm[k]) for k in range(len(perm)) if perm[k] != k]
+            if not moved:
+                continue  # identity → no rows (it is the default fallback)
+            row_buf: list[tuple[int, int, int, int]] = []
+            ok = True
+            for k, pk in moved:
+                dst = local_to_token.get(k)
+                src = local_to_token.get(pk)
+                if dst is None or src is None:
+                    ok = False  # a moved atom fell outside the crop → invalid perm
+                    break
+                row_buf.append((ligand_id, perm_id, dst, src))
+            if not ok:
                 continue
-            tok_a = local_to_token.get(local_a)
-            tok_b = local_to_token.get(local_b)
-            if tok_a is not None and tok_b is not None:
-                used_local.add(local_a)
-                used_local.add(local_b)
-                pair_list.append((tok_a, tok_b, group_id))
-                group_id += 1
+            rows.extend(row_buf)
+            emitted_any = True
+            n_kept += 1
+        if emitted_any:
+            ligand_id += 1
 
-    if not pair_list:
+    if not rows:
         return empty
-    return np.asarray(pair_list, dtype=np.int32)
+    return np.asarray(rows, dtype=np.int32)
+
+
+def apply_ligand_token_permutation(
+    pred_pos: torch.Tensor,  # [..., N, M, 3]
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    perm_table: np.ndarray | torch.Tensor,  # [R, 4] (ligand_id, perm_id, dst_token, src_token)
+) -> torch.Tensor:
+    """Resolve ligand symmetry by whole-permutation RMSD (AF3 §4.2 / OF3).
+
+    For each ligand, among its candidate CCD automorphisms plus the identity,
+    pick the permutation minimising ``Σ‖pred - gt[perm]‖²`` over the ligand's
+    resolved atoms, then reorder GT accordingly. This is the ligand analogue
+    of OF3 ``get_final_atom_permutation_index``: the whole permutation is
+    scored jointly, so 3-fold+ symmetries and correlated swaps are resolved
+    (the pairwise :func:`apply_ligand_token_swap` cannot).
+
+    ``perm_table`` lists only the moved atoms of each non-identity permutation
+    (``dst != src``); the cost is evaluated identity-relative so fixed points
+    are irrelevant. A permutation is considered only if **all** its moved atoms
+    are resolved on both sides (else it is skipped, so the winner is always
+    safe to write). The decision is per leading (diffusion-sample) dimension,
+    in the caller's aligned frame; a ligand whose best permutation does not
+    beat identity is left unchanged.
+    """
+    import torch
+
+    if perm_table is None or len(perm_table) == 0:
+        return gt_pos.detach()
+    if not isinstance(perm_table, torch.Tensor):
+        tab = torch.as_tensor(perm_table, dtype=torch.long, device=gt_pos.device)
+    else:
+        tab = perm_table.to(dtype=torch.long, device=gt_pos.device)
+
+    # Drop collate zero-padding: padded rows are (0,0,0,0); a real moved-atom
+    # row always has dst != src.
+    tab = tab[tab[:, 2] != tab[:, 3]]
+    if tab.numel() == 0:
+        return gt_pos.detach()
+
+    lig = tab[:, 0]
+    dst = tab[:, 2]
+    src = tab[:, 3]
+
+    # Resolved-on-both mask per row (atom_mask is per-example, not per-sample).
+    m = atom_mask[dst, 0] & atom_mask[src, 0]  # [R] bool
+
+    # Identity-relative per-row cost: ‖pred_dst - gt_src‖² - ‖pred_dst - gt_dst‖².
+    pred_dst = pred_pos[..., dst, 0, :]  # [..., R, 3]
+    gt_src = gt_pos[..., src, 0, :]
+    gt_dst = gt_pos[..., dst, 0, :]
+    delta = ((pred_dst - gt_src).pow(2).sum(dim=-1) - (pred_dst - gt_dst).pow(2).sum(dim=-1)) * m.to(pred_dst.dtype)
+
+    # Group rows by (ligand, perm).
+    lp = torch.stack([lig, tab[:, 1]], dim=1)  # [R, 2]
+    uniq_lp, gid = torch.unique(lp, dim=0, return_inverse=True)  # gid [R], uniq_lp [G, 2]
+    ng = uniq_lp.shape[0]
+    grp_lig = uniq_lp[:, 0]  # [G]
+
+    lead = delta.shape[:-1]
+    dcost = torch.zeros(*lead, ng, dtype=delta.dtype, device=delta.device).index_add_(-1, gid, delta)  # [..., G]
+
+    # A permutation is usable only if every one of its moved atoms is resolved
+    # on both sides — else its cost is unreliable and applying it would write a
+    # garbage GT coordinate into a resolved slot. Mark such groups invalid.
+    unres = torch.zeros(ng, dtype=delta.dtype, device=delta.device).index_add_(
+        -1, gid, (~m).to(delta.dtype)
+    )  # [G]
+    invalid_g = unres > 0
+    if invalid_g.any():
+        dcost = dcost.masked_fill(invalid_g, float("inf"))
+
+    permuted = gt_pos.clone()
+    p_flat = permuted.reshape(-1, *gt_pos.shape[-3:])  # [F, N, M, 3]
+    g_flat = gt_pos.reshape(-1, *gt_pos.shape[-3:])
+    dcost_flat = dcost.reshape(-1, ng)  # [F, G]
+
+    ligands = torch.unique(lig)
+    applied_any = False
+    for f in range(p_flat.shape[0]):
+        row_cost = dcost_flat[f]  # [G]
+        for lg in ligands.tolist():
+            cand = torch.where(grp_lig == lg, row_cost, torch.full_like(row_cost, float("inf")))
+            best_g = int(torch.argmin(cand).item())
+            if float(cand[best_g]) < 0.0:  # beats identity
+                sel = gid == best_g
+                p_flat[f, dst[sel], 0, :] = g_flat[f, src[sel], 0, :]
+                applied_any = True
+
+    if not applied_any:
+        return gt_pos.detach()
+    return p_flat.reshape_as(gt_pos).detach()
 
 
 def _residue_name_for_atom(structure, atom_idx: int) -> str | None:

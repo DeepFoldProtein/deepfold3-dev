@@ -17,11 +17,12 @@ reference for module structure but no Protenix code is reproduced.
 from deepfold3.data.symmetry.atom_perms import (
     RESIDUE_ATOM_SYMMETRY_GROUPS,
     apply_atom_permutation,
+    apply_ligand_token_permutation,
     apply_ligand_token_swap,
     apply_token_atom_permutation,
     build_residue_symmetry_pairs,
     compute_atom_symmetry_pairs,
-    compute_ligand_token_swap_pairs,
+    compute_ligand_token_permutations,
     compute_token_atom_symmetry_pairs,
 )
 from deepfold3.data.symmetry.chain_perm import (
@@ -36,12 +37,13 @@ __all__ = [
     "apply_atom_permutation",
     "apply_chain_permutation",
     "apply_chain_permutation_tokens",
+    "apply_ligand_token_permutation",
     "apply_ligand_token_swap",
     "apply_token_atom_permutation",
     "build_residue_symmetry_pairs",
     "compute_atom_symmetry_pairs",
     "compute_chain_permutation",
     "compute_chain_permutation_tokens",
-    "compute_ligand_token_swap_pairs",
+    "compute_ligand_token_permutations",
     "compute_token_atom_symmetry_pairs",
 ]

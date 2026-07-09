@@ -669,34 +669,30 @@ class Featurizer:
             # best-of-two swap per (sample, pair).
             from deepfold3.data.symmetry.atom_perms import (
                 compute_atomized_residue_token_swap_pairs,
-                compute_ligand_token_swap_pairs,
+                compute_ligand_token_permutations,
                 compute_token_atom_symmetry_pairs,
             )
 
             atom_swap_pairs = compute_token_atom_symmetry_pairs(data.structure, tokens)
             result["atom_swap_pairs"] = torch.from_numpy(atom_swap_pairs)
 
-            # Ligand inter-token swap pairs (CCD automorphism cache).
-            # Each ligand atom is its own token, so swaps are over
-            # (token_a, token_b, group_id) triples at slot M=0. Empty when no
-            # cache is loaded or the crop has no symmetric ligands.
-            ligand_swap_pairs = compute_ligand_token_swap_pairs(data.structure, tokens, self.ligand_perm_cache)
+            # Ligand CCD automorphisms (AF3 §4.2): the whole permutation group,
+            # resolved by joint RMSD in the loss (``apply_ligand_token_permutation``).
+            # ``[R, 4]`` (ligand_id, perm_id, dst_token, src_token) over moved
+            # atoms only. Empty when no cache is loaded or the crop has no
+            # symmetric ligands. Handles 3-fold+ symmetries the pairwise path
+            # dropped.
+            ligand_perms = compute_ligand_token_permutations(data.structure, tokens, self.ligand_perm_cache)
+            result["ligand_perms"] = torch.from_numpy(ligand_perms)
+
             # Atomized standard residues (training regularizer) whose side chain
-            # is symmetric (ASP/GLU/ARG/…) also need inter-token swaps — same
-            # (token_a, token_b, group_id) slot-0 layout as ligands, so
-            # concatenate them into ``ligand_swap_pairs`` (loss applies both via
-            # one path). Offset the atomized group ids past the ligand ids so
-            # the joint-swap grouping in ``apply_ligand_token_swap`` keeps the
-            # two sources' groups distinct.
+            # is symmetric (ASP/GLU/ARG/…) need inter-token swaps — genuine
+            # 2-cycles, correctly handled by the pairwise best-of-two path.
+            # ``(token_a, token_b, group_id)`` slot-0 triples (group id keeps a
+            # PHE/TYR ring flip joint).
+            ligand_swap_pairs = np.empty((0, 3), dtype=np.int32)
             if is_atomized.any():
-                atomized_swaps = compute_atomized_residue_token_swap_pairs(data.structure, tokens)
-                if len(atomized_swaps) > 0:
-                    if len(ligand_swap_pairs) > 0:
-                        atomized_swaps = atomized_swaps.copy()
-                        atomized_swaps[:, 2] += int(ligand_swap_pairs[:, 2].max()) + 1
-                        ligand_swap_pairs = np.concatenate([ligand_swap_pairs, atomized_swaps], axis=0)
-                    else:
-                        ligand_swap_pairs = atomized_swaps
+                ligand_swap_pairs = compute_atomized_residue_token_swap_pairs(data.structure, tokens)
             result["ligand_swap_pairs"] = torch.from_numpy(ligand_swap_pairs)
 
             # Bond features for bond violation loss (AF3 §5.3: polymer–ligand

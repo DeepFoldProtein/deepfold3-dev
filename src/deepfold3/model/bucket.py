@@ -105,9 +105,10 @@ PAD_PASSTHROUGH_KEYS = {
     "bond_atom_indices",
     "bond_gt_distances",
     "bond_loss_mask",
-    # Symmetry permutation tables (size = number of swap pairs)
+    # Symmetry permutation tables (size = number of swap pairs / perm rows)
     "atom_swap_pairs",
     "ligand_swap_pairs",
+    "ligand_perms",
     # Per-sample scalars / metadata
     "resolution",
     "is_distillation",
