@@ -241,6 +241,15 @@ Confidence is computed **per diffusion sample** -- the head runs S times.
 
 Also exposes `compute_distogram(features, num_recycles)` which runs only the evoformer (no diffusion) for fast validation.
 
+### `masked_msa.py` -- Masked-MSA (BERT) Head (optional)
+
+Self-supervised BERT-style MSA objective, gated by `ModelConfig.masked_msa.enabled` (default off). Training-only; runs in `forward_training`, never in `forward`/inference.
+
+- **`apply_bert_mask`**: corrupts a `replace_fraction` (0.15) of valid MSA entries on the **gradient (final-recycle) pass only**, before the MSA stack. Replacement is the categorical mixture `uniform·random_aa + profile·profile + same·one_hot(msa)`, remaining mass → `const.MSA_MASK` (=31, the free slot in the 32-class MSA vocab, so the 34-d `msa_feat` input is unchanged). Returns `(bert_msa, true_msa, bert_mask)`.
+- **`MaskedMSAHead`** -- single-query MSA cross-attention: for each token `i`, `h_i = Attn(q=s_i, k/v=m[:,i])` over the MSA rows, then `logits_ri = Linear(MLP([m_ri, s_i, h_i]))`. Inputs LayerNorm-ed; projections `LinearNoBias` with random (`linear`/`relu`) init — learns from scratch on structure-only warm-start. Output `[S, N, 32]`.
+
+`Evoformer.forward` now also returns the final MSA-stack representation under key `"msa"`; the head reads `embeddings["msa"]` + `embeddings["single"]` (both attached), so its gradient trains the MSA stack and the single track. Loss: `training.loss.masked_msa_loss` (BERT CE over `bert_mask` entries), weight `TrainingConfig.alpha_masked_msa`.
+
 ## Atom Representation
 
 Two parallel layouts coexist throughout the model:
