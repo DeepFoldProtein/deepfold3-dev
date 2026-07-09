@@ -59,6 +59,7 @@ DIM0_KEYS = {
     "frame_atom_index",
     "frame_token_index",
     "token_to_rep_atom",
+    "token_to_center_atom",
     "chirality_atom_idx",
     "chirality_target",
     "fape_atom_index",

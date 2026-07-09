@@ -139,6 +139,51 @@ class TestCollation:
         assert batch["mask_loss_weight"][0, :192].min() == 1.0
         assert batch["mask_loss_weight"][1, :50].min() == 1.0
 
+    def test_bucket_pad_token_to_center_atom_kept_in_lockstep(self):
+        """``token_to_center_atom`` (per-token rep-atom slot for pLDDT) must be
+        padded along N so it stays aligned with ``mol_type`` / ``atom_gt_mask``
+        after bucketing. Regression for the FT3 plddt_loss shape mismatch
+        (``mol_type`` [384] vs ``atom_mask`` [210]) — the feature was emitted by
+        the featurizer but missing from ``DIM0_KEYS``, so it passed through
+        unpadded while every other token feature was padded to the bucket."""
+        from deepfold3.model.bucket import next_bucket
+
+        feat = _make_features(200, seed=0)
+        feat["mol_type"] = torch.zeros(200, dtype=torch.long)
+        feat["token_to_rep_atom"] = torch.ones(200, dtype=torch.long)
+        feat["token_to_center_atom"] = torch.ones(200, dtype=torch.long)
+
+        batch = collate_fn([feat], bucket_pad=True)
+        expected_n = next_bucket(200)
+        assert batch["token_to_center_atom"].shape == (1, expected_n)
+        # Stays lockstep with the other per-token features.
+        assert batch["token_to_center_atom"].shape[1] == batch["mol_type"].shape[1]
+        assert batch["token_to_center_atom"].shape[1] == batch["token_to_rep_atom"].shape[1]
+        # Real slots unchanged; padded slots 0 (masked out via seq_mask=0 there).
+        assert batch["token_to_center_atom"][0, :200].min() == 1
+        assert batch["token_to_center_atom"][0, 200:].sum() == 0
+
+    def test_every_featurizer_key_registered_in_bucket(self):
+        """Every per-example feature the featurizer emits must be registered in
+        one of ``bucket.py``'s pad-lists (DIM0/DIM01/DIM1/passthrough). An
+        unregistered key silently passes through ``pad_features`` unpadded,
+        desyncing its N dim from the bucketed features — the root cause of the
+        FT3 ``token_to_center_atom`` crash. Static guard against the next one."""
+        import re
+        from pathlib import Path
+
+        import deepfold3.model.bucket as bucket
+
+        src = Path(bucket.__file__).parent.parent / "data" / "feature" / "featurizer.py"
+        emitted = set(re.findall(r'"([a-z_0-9]+)":\s*torch\.', src.read_text()))
+        registered = bucket.DIM0_KEYS | bucket.DIM01_KEYS | bucket.DIM1_KEYS | bucket.PAD_PASSTHROUGH_KEYS
+        missing = emitted - registered
+        assert not missing, (
+            f"featurizer emits keys absent from bucket.py pad-lists: {sorted(missing)}. "
+            "Add each to DIM0_KEYS/DIM01_KEYS/DIM1_KEYS (if N-dependent) or "
+            "PAD_PASSTHROUGH_KEYS (if not), or it will be padded incorrectly."
+        )
+
     def test_bucket_pad_off_by_default(self):
         """Without bucket_pad, behaviour is unchanged from the legacy collate."""
         feats = [_make_features(100, seed=0)]
