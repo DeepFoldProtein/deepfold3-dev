@@ -247,3 +247,26 @@ def test_initial_yaml_patchr_exclude_loss_mol_types():
     assert by_name["patchr"]["exclude_loss_mol_types"] == []
     assert by_name["long_monomers"]["exclude_loss_mol_types"] == []
     assert by_name["short_monomers"]["exclude_loss_mol_types"] == []
+
+
+def test_distogram_gated_on_gt_rep_presence():
+    """A token whose GT representative atom is unresolved is dropped from the
+    distogram, even though seq_mask (CCD-derived rep_atom_present) keeps it.
+
+    Flipping only ``atom_gt_mask`` at the rep atom must change the distogram
+    term: the old code masked the distogram with seq_mask alone (independent of
+    atom_gt_mask at the rep atom), so this isolates the new GT-rep-presence gate.
+    """
+    from deepfold3.training.loss import training_loss
+
+    pred_a, feats_a, cfg = _build_mini_loss_inputs(with_mask=False)  # seeded → deterministic
+    _, losses_a = training_loss(pred_a, feats_a, cfg)
+
+    pred_b, feats_b, _ = _build_mini_loss_inputs(with_mask=False)
+    m = feats_b["atom_gt_mask"].clone()
+    m[0, 1] = False  # unresolve token 0's rep atom (rep_idx == 1)
+    feats_b["atom_gt_mask"] = m
+    _, losses_b = training_loss(pred_b, feats_b, cfg)
+
+    assert torch.isfinite(losses_b["distogram"])
+    assert not torch.allclose(losses_a["distogram"], losses_b["distogram"])
