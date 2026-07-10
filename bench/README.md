@@ -1,9 +1,18 @@
 # bench/ — FoldBench evaluation of df3 checkpoint series
 
-Tracks DeepFold3 structure quality on **FoldBench-small** (`num_tokens <= 384`,
+Tracks DeepFold3 structure quality on **FoldBench-small** (`num_tokens <= 1024`,
 a subset of [FoldBench](https://github.com/BEAM-Labs/FoldBench)) across a
 training trajectory, scored with OpenStructure (OST) and stratified by DSSP
 secondary-structure fold class.
+
+Categories: monomer (`monomer_protein`, `monomer_rna`, `monomer_dna`) and
+interface (`interface_protein_protein`, `interface_antibody_antigen`,
+`interface_protein_dna`, `interface_protein_rna`, `interface_protein_peptide`).
+Each target is folded with **4 seeds** (FoldBench convention) × `--num-samples`
+diffusion samples; aggregates are best-of-N over all seed×sample structures.
+`interface_protein_ligand` builds but is not swept by default (no ligand-aware
+OST scorer yet). Nucleic chains carry no MSA, so interface inputs recover their
+DNA/RNA partners straight from the ground-truth CIF.
 
 ## Model series
 
@@ -33,7 +42,7 @@ bench/
 │   └── msa            -> /data/msa/foldbench/merged   ({pdb}__{chain}.a3m, m8, paired/)
 ├── inputs/
 │   ├── <category>/<pdb>.json         # generated deepfold3 inference inputs
-│   ├── <category>_manifest.csv       # pdb_id, num_tokens, in_small (<=384)
+│   ├── <category>_manifest.csv       # pdb_id, num_tokens, in_small (<=1024)
 │   └── <category>_dssp.csv           # pdb_id, pct_H/E/C, fold_class
 ├── runs/<series>/
 │   ├── pred/step_<N>/<pdb>/seed-<s>_sample-<i>/model.cif
@@ -44,22 +53,32 @@ bench/
 └── scripts/
 ```
 
-## Pipeline (monomer_protein implemented; interfaces are TODO)
+## Pipeline (all categories; monomer + interface)
 
 ```bash
 cd /home/jovyan/work/deepfold3-dev
 PY=.venv/bin/python
 
-# 1. inputs + FoldBench-small filter  (once per category)
-$PY bench/scripts/build_inputs.py  --category monomer_protein --max-tokens 384
-# 2. DSSP fold classes                (once per category)
+# 1. inputs + FoldBench-small filter  (once per category; <=1024 tokens default)
+$PY bench/scripts/build_inputs.py  --category monomer_protein
+# 2. DSSP fold classes                (monomer_protein only)
 $PY bench/scripts/dssp_classify.py --category monomer_protein
-# 3. inference — 4 GPUs, latest first ('all' = full 5k grid)
-$PY bench/scripts/run_sweep.py --series df3v1 --steps 90000 --category monomer_protein
+# 3. inference — 4 GPUs, 4 seeds, latest first ('all' = full grid)
+$PY bench/scripts/run_sweep.py --series df3v1 --steps 90000 --category monomer_protein --seed 42,43,44,45
 # 4. score with OST (per step)
 $PY bench/scripts/eval_ost.py  --series df3v1 --step 90000 --category monomer_protein
 # 5. trajectory table + plot (after several steps scored)
 $PY bench/scripts/summarize.py --series df3v1 --category monomer_protein
+```
+
+**End-to-end automation** — `auto.sh` polls the live training dir and, for each
+new 1k-grid checkpoint, sweeps every configured category (build → sweep → OST →
+summarize; monomer_protein also gets the DSSP suite):
+
+```bash
+nohup bash bench/scripts/auto.sh runs/df3-stage0-r5 3600 \
+      > bench/runs/df3v1/logs/auto.log 2>&1 &
+# Env: SERIES, CATEGORIES, SEEDS (default 42,43,44,45), NUM_SAMPLES, MAX_TOKENS (1024)
 ```
 
 ## Scripts

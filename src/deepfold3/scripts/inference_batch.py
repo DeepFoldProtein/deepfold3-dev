@@ -21,12 +21,20 @@ Usage::
         --inputs-file inputs.txt \\
         --params runs/df3-fapeS3/checkpoint_10000.pt \\
         --num-samples 30 \\
+        --seed 42 --seed 43 --seed 44 --seed 45 \\
         --snapshot average \\
         --output-template '{json_dir}/inference/{params_stem}'
+
+``--seed`` is repeatable: each input is folded once per seed into its own
+``seed-{seed}_sample-{s}`` subdir (S seeds x num_samples structures). With
+``--skip-existing`` a job is skipped only when every requested (seed, sample)
+is already on disk, and any individually-complete seed is skipped, so an
+interrupted multi-seed sweep resumes seed-by-seed.
 
 Per-job options (num-recycles, num-samples, seed, plot-confidences,
 template-cache, pdb-mmcif-dir) apply uniformly to every line.
 """
+
 from __future__ import annotations
 
 import time
@@ -67,6 +75,7 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
             state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
         if isinstance(ckpt, dict) and "model_cfg" in ckpt:
             import copy
+
             ckpt_model_cfg = copy.deepcopy(ckpt["model_cfg"])
     else:
         import warnings
@@ -82,9 +91,7 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
 
     model_cfg = ckpt_model_cfg if ckpt_model_cfg is not None else ModelConfig()
     if ckpt_model_cfg is None and params.suffix == ".pt":
-        click.echo(
-            "[batch] checkpoint has no embedded model_cfg — using ModelConfig() defaults"
-        )
+        click.echo("[batch] checkpoint has no embedded model_cfg — using ModelConfig() defaults")
 
     if optim == "all":
         model_cfg.optim = OptimConfig.all_enabled()
@@ -112,15 +119,29 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
 
 
 def _run_one_job(
-    model, model_cfg, dev: torch.device,
-    json_input: Path, output_dir: Path,
+    model,
+    model_cfg,
+    dev: torch.device,
+    json_input: Path,
+    output_dir: Path,
     *,
-    num_recycles: int, num_samples: int, seed: int | None,
-    template_cache: Path | None, pdb_mmcif_dir: Path | None,
+    num_recycles: int,
+    num_samples: int,
+    seeds: list[int],
+    template_cache: Path | None,
+    pdb_mmcif_dir: Path | None,
     plot_confidences: bool,
+    skip_existing: bool,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
-    branch of ``inference``."""
+    branch of ``inference``.
+
+    ``seeds`` is the CLI-provided seed list; when empty each JSON's own
+    ``modelSeeds`` are used. Every seed is folded independently and written to
+    its own ``seed-{seed}_sample-{s}`` subdir, so a job with S seeds and
+    ``num_samples`` samples yields S x num_samples structures. When
+    ``skip_existing`` is set, any seed whose full set of sample CIFs already
+    exists is skipped (per-seed resume)."""
     from deepfold3.data.module.dataset import InferenceInput
     from deepfold3.data.parse.json_input import parse_json_input
     from deepfold3.io.confidences import (
@@ -160,6 +181,7 @@ def _run_one_job(
     use_bucket = model_cfg.optim.use_torch_compile
     if use_bucket:
         from deepfold3.model.bucket import next_bucket, pad_features
+
         bucket_n = next_bucket(N)
         if bucket_n > N:
             feats, original_n = pad_features(feats, bucket_n)
@@ -168,15 +190,22 @@ def _run_one_job(
     feats = {k: v.to(dev) for k, v in feats.items()}
 
     json_seeds = list(job.model_seeds) if job.model_seeds else [42]
-    seed_list = ([seed] + [s for s in json_seeds if s != seed]) if seed is not None else json_seeds
+    # CLI seeds (when provided) are authoritative — replace the JSON's own
+    # seeds so a benchmark sweep folds exactly the requested set. Dedup while
+    # preserving order.
+    seed_list = list(dict.fromkeys(seeds)) if seeds else json_seeds
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summaries: list[dict] = []
 
     for current_seed in seed_list:
-        click.echo(
-            f"[batch] {json_input.name}  seed={current_seed} samples={num_samples} recycles={num_recycles}"
-        )
+        if skip_existing and all(
+            (output_dir / f"seed-{int(current_seed)}_sample-{int(s)}" / "model.cif").exists()
+            for s in range(num_samples)
+        ):
+            click.echo(f"[batch]   seed {current_seed}: all {num_samples} samples present — skip")
+            continue
+        click.echo(f"[batch] {json_input.name}  seed={current_seed} samples={num_samples} recycles={num_recycles}")
         t0 = time.perf_counter()
         with torch.inference_mode():
             model_output = model(feats, seed=current_seed, num_recycles=num_recycles, num_samples=num_samples)
@@ -184,6 +213,7 @@ def _run_one_job(
         iter_feats = feats
         if use_bucket and original_n < feats["res_type"].shape[0]:
             from deepfold3.model.bucket import unpad_features, unpad_output
+
             model_output = unpad_output(model_output, original_n)
             iter_feats = unpad_features(feats, original_n)
         click.echo(f"  done in {time.perf_counter() - t0:.1f}s")
@@ -192,23 +222,25 @@ def _run_one_job(
             sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
             sample_dir.mkdir(parents=True, exist_ok=True)
             save_mmcif(
-                sample_dir / "model.cif", model_output, iter_feats,
-                entity_descriptions=entity_descriptions, title=job_title, sample_idx=s,
+                sample_dir / "model.cif",
+                model_output,
+                iter_feats,
+                entity_descriptions=entity_descriptions,
+                title=job_title,
+                sample_idx=s,
             )
             conf_path = sample_dir / "confidences.json"
-            summary = save_confidences_json(conf_path, model_output, iter_feats,
-                                            sample_idx=s, seed=int(current_seed))
+            summary = save_confidences_json(conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed))
             summary = {**summary, "seed": int(current_seed), "sample": int(s)}
             summaries.append(summary)
             if plot_confidences:
                 from deepfold3.scripts.plot_confidences import plot_confidences_file
+
                 plot_confidences_file(conf_path, conf_path.with_suffix(".png"))
 
     if summaries:
         save_ranking_scores_csv(output_dir / "ranking_scores.csv", summaries)
-        summary_name = (
-            f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
-        )
+        summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
         save_summary_confidences_json(output_dir / summary_name, summaries, job_name=job_name)
 
 
@@ -225,42 +257,72 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
         if len(parts) == 2:
             output_dir = Path(parts[1])
         else:
-            output_dir = Path(output_template.format(
-                json_dir=str(json_path.parent),
-                json_stem=json_path.stem,
-                json_name=json_path.name,
-                params_stem=params.stem,
-            ))
+            output_dir = Path(
+                output_template.format(
+                    json_dir=str(json_path.parent),
+                    json_stem=json_path.stem,
+                    json_name=json_path.name,
+                    params_stem=params.stem,
+                )
+            )
         out.append((json_path, output_dir))
     return out
 
 
 @cli.command("inference-batch")
-@click.option("--inputs-file", type=click.Path(exists=True, path_type=Path), default=None,
-              help="Text file: 'json_path [TAB output_dir]' per line, '#' comments allowed")
-@click.option("--json", "json_paths", multiple=True,
-              type=click.Path(exists=True, path_type=Path),
-              help="Repeatable JSON input path. Output dir from --output-template.")
-@click.option("--output-template", default="{json_dir}/inference",
-              help="Output dir template when only a JSON path is provided. "
-                   "Variables: {json_dir}, {json_stem}, {json_name}, {params_stem}.")
-@click.option("--params", required=True, type=click.Path(exists=True, path_type=Path),
-              help="Model parameters (.safetensors / .pt / .bin / .bin.zst)")
+@click.option(
+    "--inputs-file",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Text file: 'json_path [TAB output_dir]' per line, '#' comments allowed",
+)
+@click.option(
+    "--json",
+    "json_paths",
+    multiple=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Repeatable JSON input path. Output dir from --output-template.",
+)
+@click.option(
+    "--output-template",
+    default="{json_dir}/inference",
+    help="Output dir template when only a JSON path is provided. "
+    "Variables: {json_dir}, {json_stem}, {json_name}, {params_stem}.",
+)
+@click.option(
+    "--params",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Model parameters (.safetensors / .pt / .bin / .bin.zst)",
+)
 @click.option("--num-recycles", default=10, show_default=True)
 @click.option("--num-samples", default=5, show_default=True)
-@click.option("--snapshot", type=click.Choice(["auto", "shadow", "average", "fast"]),
-              default="auto", show_default=True)
-@click.option("--seed", default=None, type=int,
-              help="If set, prepended to each JSON's modelSeeds list. Defaults to JSON's own seeds.")
+@click.option("--snapshot", type=click.Choice(["auto", "shadow", "average", "fast"]), default="auto", show_default=True)
+@click.option(
+    "--seed",
+    "seeds",
+    multiple=True,
+    type=int,
+    help="Repeatable model seed (e.g. --seed 42 --seed 43). Each input is folded "
+    "once per seed into its own seed-*_sample-* subdir. When given, replaces "
+    "each JSON's modelSeeds; defaults to the JSON's own seeds.",
+)
 @click.option("--device", default=None)
 @click.option("--template-cache", default=None, type=click.Path(path_type=Path))
 @click.option("--pdb-mmcif-dir", default=None, type=click.Path(exists=True, path_type=Path))
-@click.option("--optim", default="inference",
-              type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
-              show_default=True)
+@click.option(
+    "--optim",
+    default="inference",
+    type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
+    show_default=True,
+)
 @click.option("--plot-confidences", is_flag=True, default=False)
-@click.option("--skip-existing/--no-skip-existing", default=True, show_default=True,
-              help="Skip jobs whose output dir already has any seed-* subdir.")
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=True,
+    show_default=True,
+    help="Skip jobs whose output dir already has any seed-* subdir.",
+)
 def inference_batch(
     inputs_file: Path | None,
     json_paths: tuple[Path, ...],
@@ -269,7 +331,7 @@ def inference_batch(
     num_recycles: int,
     num_samples: int,
     snapshot: str,
-    seed: int | None,
+    seeds: tuple[int, ...],
     device: str | None,
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
@@ -285,10 +347,14 @@ def inference_batch(
     if inputs_file:
         jobs += _parse_inputs_file(inputs_file, output_template, params)
     for jp in json_paths:
-        out_dir = Path(output_template.format(
-            json_dir=str(jp.parent), json_stem=jp.stem, json_name=jp.name,
-            params_stem=params.stem,
-        ))
+        out_dir = Path(
+            output_template.format(
+                json_dir=str(jp.parent),
+                json_stem=jp.stem,
+                json_name=jp.name,
+                params_stem=params.stem,
+            )
+        )
         jobs.append((jp, out_dir))
 
     click.echo(f"[batch] {len(jobs)} jobs queued")
@@ -298,12 +364,30 @@ def inference_batch(
 
     model, model_cfg = _load_model_once(params, snapshot, dev, optim)
 
+    seed_list = list(dict.fromkeys(seeds))
+
+    def _job_complete(od: Path) -> bool:
+        """A job is complete when every requested (seed, sample) CIF exists.
+
+        With CLI seeds we know the exact set; without them we can't cheaply
+        know the JSON's own seeds, so fall back to the any-seed-dir heuristic.
+        """
+        if not od.exists():
+            return False
+        if seed_list:
+            return all(
+                (od / f"seed-{int(s)}_sample-{int(k)}" / "model.cif").exists()
+                for s in seed_list
+                for k in range(num_samples)
+            )
+        return any(p.name.startswith("seed-") for p in od.iterdir() if p.is_dir())
+
     n_done = 0
     n_skipped = 0
     t_total = time.perf_counter()
     for idx, (jp, od) in enumerate(jobs, 1):
-        if skip_existing and od.exists() and any(p.name.startswith("seed-") for p in od.iterdir() if p.is_dir()):
-            click.echo(f"[batch] [{idx}/{len(jobs)}] SKIP {jp.name} → {od} (already has seed-* subdirs)")
+        if skip_existing and _job_complete(od):
+            click.echo(f"[batch] [{idx}/{len(jobs)}] SKIP {jp.name} → {od} (all seeds/samples present)")
             n_skipped += 1
             continue
         if not jp.exists():
@@ -311,10 +395,18 @@ def inference_batch(
             continue
         click.echo(f"[batch] [{idx}/{len(jobs)}] {jp.name} → {od}")
         _run_one_job(
-            model, model_cfg, dev, jp, od,
-            num_recycles=num_recycles, num_samples=num_samples, seed=seed,
-            template_cache=template_cache, pdb_mmcif_dir=pdb_mmcif_dir,
+            model,
+            model_cfg,
+            dev,
+            jp,
+            od,
+            num_recycles=num_recycles,
+            num_samples=num_samples,
+            seeds=seed_list,
+            template_cache=template_cache,
+            pdb_mmcif_dir=pdb_mmcif_dir,
             plot_confidences=plot_confidences,
+            skip_existing=skip_existing,
         )
         n_done += 1
 

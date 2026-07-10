@@ -3,7 +3,7 @@
 FoldBench ships only target CSVs (``pdb_id`` + interface/chain ids) and
 ground-truth CIFs — not folding inputs. This script materialises one
 deepfold3-dialect JSON per target plus a manifest with the token count, so
-the FoldBench-small subset (``num_tokens <= 384``) can be selected and the
+the FoldBench-small subset (``num_tokens <= 1024``) can be selected and the
 4-GPU sweep driven off a flat list.
 
 Sources (all read-only):
@@ -24,7 +24,7 @@ machinery is category-agnostic so they slot in without other changes.
 Usage::
 
     python bench/scripts/build_inputs.py --category monomer_protein
-    python bench/scripts/build_inputs.py --category monomer_protein --max-tokens 384
+    python bench/scripts/build_inputs.py --category monomer_protein --max-tokens 1024
 """
 from __future__ import annotations
 
@@ -58,10 +58,11 @@ INTERFACE_CATEGORIES = {
     "interface_protein_rna",
     "interface_protein_peptide",
 }
-# monomer_protein standing set is len<=768 (confirmed 2026-06-23); NA monomers
-# stay small (they are short anyway).
-DEFAULT_MAX_TOKENS = {"monomer_protein": 768, "monomer_rna": 384, "monomer_dna": 384,
-                      **{c: 768 for c in INTERFACE_CATEGORIES}}
+# FoldBench-small cap: <=1024 tokens for every category (fits a single B200
+# forward comfortably; NA monomers are short anyway). Override with --max-tokens.
+FOLDBENCH_SMALL_MAX_TOKENS = 1024
+DEFAULT_MAX_TOKENS = {c: FOLDBENCH_SMALL_MAX_TOKENS
+                      for c in list(MONOMER_KIND) + list(INTERFACE_CATEGORIES)}
 
 
 def read_query_sequence(a3m_path: Path) -> str:
@@ -82,11 +83,17 @@ def seq_from_gt_cif(pdb_id: str, chain_id: str) -> str:
 
     st = gemmi.read_structure(str(GT_ROOT / f"{pdb_id}.cif"))
     st.setup_entities()
-    for model in st:
-        for chain in model:
-            if chain.name != chain_id:
-                continue
+    model = st[0]
+    for chain in model:
+        if chain.name == chain_id:
             return gemmi.one_letter_code([r.name for r in chain])
+    # FoldBench's monomer target CSVs sometimes name the chain in a different
+    # namespace than the GT assembly CIF (e.g. row says 'A' but the CIF labels
+    # the single RNA chain 'B'). A monomer target is one polymer chain, so fall
+    # back to it rather than dropping the target.
+    polymers = [c for c in model if len(c.get_polymer())]
+    if polymers:
+        return gemmi.one_letter_code(polymers[0].get_polymer().extract_sequence())
     raise ValueError(f"chain {chain_id} not found in {pdb_id}")
 
 
@@ -165,6 +172,46 @@ def paired_path(pdb_id: str, chain_id: str) -> Path | None:
     return p if p.exists() else None
 
 
+def nucleic_groups_from_cif(pdb_id: str) -> list[dict]:
+    """DNA/RNA chain groups recovered from the GT assembly CIF.
+
+    Nucleic acids get no MSA in this pipeline, so ``enumerate_chain_groups``
+    (which only walks a3m files) misses them entirely — a protein–NA interface
+    would then be folded as a bare protein. We pull every DNA/RNA polymer
+    chain straight from the ground-truth CIF, group homo-copies by sequence,
+    and return ``[{chain_ids, sequence, kind}]``. Proteins are deliberately
+    left to the a3m path (so they keep their MSA and are not duplicated when
+    the a3m and CIF chain-namespaces differ)."""
+    import gemmi
+
+    st = gemmi.read_structure(str(GT_ROOT / f"{pdb_id}.cif"))
+    st.setup_entities()
+    by_seq: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+    for chain in st[0]:
+        poly = chain.get_polymer()
+        if not len(poly):
+            continue
+        ptype = poly.check_polymer_type()
+        if ptype == gemmi.PolymerType.Dna:
+            kind = "dna"
+        elif ptype == gemmi.PolymerType.Rna:
+            kind = "rna"
+        else:
+            continue  # protein / peptide / hybrid — sourced from a3m
+        seq = gemmi.one_letter_code(poly.extract_sequence()).strip()
+        if not seq or set(seq.upper()) <= {"X", "-", "N"}:
+            continue
+        key = (kind, seq)
+        if key not in by_seq:
+            by_seq[key] = {"chain_ids": [], "sequence": seq, "kind": kind}
+            order.append(key)
+        by_seq[key]["chain_ids"].append(chain.name)
+    for k in order:
+        by_seq[k]["chain_ids"].sort(key=_chain_sort_key)
+    return [by_seq[k] for k in order]
+
+
 def build_interface_input(pdb_id: str, rows: list[dict]) -> tuple[dict, int]:
     """Build a full-assembly deepfold3 input. ``rows`` are this PDB's target
     CSV rows (one per evaluated interface); used to add the ligand entity for
@@ -187,6 +234,15 @@ def build_interface_input(pdb_id: str, rows: list[dict]) -> tuple[dict, int]:
         if pp is not None and kind == "protein":
             block["pairedMsaPath"] = str(pp)
         sequences.append({kind: block})
+        n_tokens += len(g["sequence"]) * len(ids)
+
+    # DNA/RNA partners recovered from the GT assembly (no a3m → invisible to
+    # enumerate_chain_groups). Needed for protein–nucleic interfaces to be
+    # folded as actual complexes; a no-op for all-protein assemblies.
+    for g in nucleic_groups_from_cif(pdb_id):
+        ids = g["chain_ids"]
+        block = {"id": ids if len(ids) > 1 else ids[0], "sequence": g["sequence"]}
+        sequences.append({g["kind"]: block})
         n_tokens += len(g["sequence"]) * len(ids)
 
     # protein_ligand: add the evaluated ligand(s) by CCD code from the CSV.
@@ -272,7 +328,7 @@ def main() -> None:
     ap.add_argument("--category", required=True,
                     choices=sorted(MONOMER_KIND) + sorted(INTERFACE_CATEGORIES))
     ap.add_argument("--max-tokens", type=int, default=None,
-                    help="FoldBench-small cap. Default: 384 monomer / 768 interface.")
+                    help="FoldBench-small token cap. Default: 1024 (all categories).")
     ap.add_argument("--limit", type=int, default=None, help="Debug: first N targets only.")
     args = ap.parse_args()
     cap = args.max_tokens if args.max_tokens is not None else DEFAULT_MAX_TOKENS[args.category]

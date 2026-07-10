@@ -189,7 +189,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
             ds = [d["step"] for d in dist]
             ax2.fill_between(ds, [d["q25"] for d in dist], [d["q75"] for d in dist],
                              color="tab:orange", alpha=0.15, lw=0, label="DockQ IQR (q25–q75)")
-            ax2.plot(ds, [d["med"] for d in dist], ":", color="tab:orange", lw=1.6,
+            ax2.plot(ds, [d["med"] for d in dist], ":o", color="tab:orange", lw=1.6, ms=3,
                      label="median DockQ")
         ax.set_xlabel("training step"); ax.set_ylabel("success rate (%)")
         ax2.set_ylabel("mean DockQ")
@@ -212,15 +212,17 @@ def summarize(series: str, category: str, plot: bool) -> None:
             if pts:
                 xs, lo, hi, med, mn = (list(z) for z in zip(*pts))
                 ax.fill_between(xs, lo, hi, color="k", alpha=0.12, lw=0, label="IQR (q25–q75)")
-                ax.plot(xs, med, "-", color="k", lw=2.5, label="median", zorder=6)
-                ax.plot(xs, mn, "--", color="0.35", lw=1.6, label="mean", zorder=5)
+                # markers on every line so a single benchmarked step still shows
+                # up as a point (a bare line needs >=2 points to render).
+                ax.plot(xs, med, "-o", color="k", lw=2.5, ms=4, label="median", zorder=6)
+                ax.plot(xs, mn, "--o", color="0.35", lw=1.6, ms=3, label="mean", zorder=5)
             for c in classes:
                 ys = [(r["step"], r.get(f"{c}_{mk}")) for r in rows]
                 ys = [p for p in ys if p[1] is not None]
                 if ys:
                     nlast = rows[-1].get(f"{c}_n", 0) if rows else 0
-                    ax.plot([p[0] for p in ys], [p[1] for p in ys], "-",
-                            color=colors[c], alpha=0.7, lw=1.2, label=f"{c} (n={nlast})")
+                    ax.plot([p[0] for p in ys], [p[1] for p in ys], "-o",
+                            color=colors[c], alpha=0.7, lw=1.2, ms=3, label=f"{c} (n={nlast})")
             ax.set_ylabel(label); ax.set_title(label); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3)
         axes[-1].set_xlabel("training step")
         axes[0].legend(fontsize=8, ncol=2)

@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
-# Poll the live training dir for new 5k-grid checkpoints and benchmark each on
-# the monomer FoldBench-small pipeline (symlink -> sweep -> OST -> SS analysis
-# -> summarize). SS analysis = per-class F1 + confusion matrix + precision/recall,
-# fold-class, and per-target-β trajectories (DSSP, into runs/$SERIES/ss_analysis/).
-# GPU-gated: never launches while another sweep is active, so it coexists with
-# the interface orchestrator. Monomer only. Resumable.
+# Poll the live training dir for new 1k-grid checkpoints and benchmark each on
+# the FoldBench-small pipeline across ALL configured categories — monomer
+# (protein / RNA / DNA) and interface (protein-protein, antibody-antigen,
+# protein-DNA / -RNA / -peptide). Per category: symlink -> sweep -> OST eval
+# -> summarize. monomer_protein additionally gets the DSSP secondary-structure
+# analysis (per-class F1 + confusion + precision/recall + fold-class + per-target
+# beta trajectories, into runs/$SERIES/ss_analysis/).
 #
-#   nohup bash bench/scripts/auto_5k.sh [TRAIN_DIR] [POLL_SECONDS] \
-#         > bench/runs/df3v1/logs/auto_5k.log 2>&1 &
+# FoldBench-small = num_tokens <= MAX_TOKENS (default 1024). Each target is
+# folded with 4 seeds (SEEDS) x --num-samples samples. GPU-gated: never launches
+# while another sweep (orchestrate.sh / run_sweep.py) is active, so it coexists
+# with a separate orchestrator. Resumable (per checkpoint x category).
+#
+#   nohup bash bench/scripts/auto.sh [TRAIN_DIR] [POLL_SECONDS] \
+#         > bench/runs/df3v1/logs/auto.log 2>&1 &
+#
+# Env overrides:
+#   SERIES        series name              (default df3v1)
+#   CATEGORIES    space list of categories (default: the 8 below)
+#   SEEDS         comma list of seeds      (default 42,43,44,45 — FoldBench uses 4)
+#   NUM_SAMPLES   diffusion samples / seed (default 5)
+#   MAX_TOKENS    FoldBench-small cap      (default 1024)
+#   STEP_OFFSET   series-global step shift (default 0)
 set -u
 cd "$(dirname "$0")/../.."
 SERIES="${SERIES:-df3v1}"
-CATEGORY=monomer_protein
-TRAIN_DIR="${1:-runs/df3-25e5-c10-g35}"
+TRAIN_DIR="${1:-runs/df3-stage0-r5}"
 POLL="${2:-3600}"            # ~1 h
 # STEP_OFFSET shifts the benchmarked step number (raw checkpoint step N is
 # logged as N+OFFSET) so a fork that restarts the step counter (e.g. stage1
@@ -20,12 +33,43 @@ POLL="${2:-3600}"            # ~1 h
 # of colliding with the earlier phase's points. e.g. STEP_OFFSET=110000:
 # stage1 checkpoint_5000 -> df3v1 step_115000 (continues after stage0's 110k).
 OFFSET="${STEP_OFFSET:-0}"
+SEEDS="${SEEDS:-42,43,44,45}"
+NUM_SAMPLES="${NUM_SAMPLES:-5}"
+MAX_TOKENS="${MAX_TOKENS:-1024}"
+# Note: interface_protein_ligand is omitted by default — eval_ost has no
+# ligand-aware scorer, so it would be mis-scored as a monomer. Add it to
+# CATEGORIES only alongside a proper ligand metric.
+CATEGORIES="${CATEGORIES:-monomer_protein monomer_rna monomer_dna \
+interface_protein_protein interface_antibody_antigen \
+interface_protein_dna interface_protein_rna interface_protein_peptide}"
 PY=.venv/bin/python
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
+echo "[auto] categories: $CATEGORIES"
+echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS"
 
 sweep_active() {
   pgrep -f "orchestrate.sh" >/dev/null || pgrep -f "run_sweep.py" >/dev/null \
     || pgrep -f "inference-batch" >/dev/null
+}
+
+# Build inputs once at startup (idempotent; rebuilds JSONs + manifest at the
+# current cap). New categories / a raised cap slot in without re-benchmarking
+# existing predictions (sweep is skip-existing).
+for CAT in $CATEGORIES; do
+  echo "[auto] $(date '+%m-%d %H:%M') building inputs for $CAT (<=$MAX_TOKENS tokens) ..."
+  $PY bench/scripts/build_inputs.py --category "$CAT" --max-tokens "$MAX_TOKENS" || \
+    echo "[auto] WARN build_inputs failed for $CAT"
+done
+
+run_ss_analysis() {  # monomer_protein only — DSSP secondary-structure suite
+  local CAT="$1" G="$2"
+  $PY bench/scripts/ss_f1.py           --series "$SERIES" --category "$CAT" --steps all --workers 48
+  $PY bench/scripts/ss_confusion.py    --series "$SERIES" --category "$CAT" --step "$G"  --workers 48
+  $PY bench/scripts/ss_pr_traj.py      --series "$SERIES" --category "$CAT" --steps all --workers 48
+  $PY bench/scripts/ss_byclass_traj.py --series "$SERIES" --category "$CAT" --steps all --workers 48
+  $PY bench/scripts/ss_target_traj.py  --series "$SERIES" --category "$CAT" --group beta --steps all --workers 48
+  $PY bench/scripts/ss_struct_corr.py  --series "$SERIES" --category "$CAT" --step "$G"
+  $PY bench/scripts/ss_coherence.py    --series "$SERIES" --category "$CAT" --step "$G"  --workers 48
 }
 
 while true; do
@@ -34,28 +78,34 @@ while true; do
     case "$N" in (*[!0-9]*) continue ;; esac          # skip _checkpoint_* etc.
     (( N % 1000 == 0 )) || continue                    # 1k grid only (raw step)
     G=$(( N + OFFSET ))                                 # series-global step
-    [ -e "bench/ckpts/$SERIES/step_$G.pt" ] && continue # already benchmarked
+
+    # Which categories still need this step? (per-category summary.csv marker)
+    todo=""
+    for CAT in $CATEGORIES; do
+      [ -e "bench/runs/$SERIES/eval/$CAT/step_$G/summary.csv" ] && continue
+      todo="$todo $CAT"
+    done
+    [ -z "$todo" ] && continue                          # fully benchmarked
+
     if sweep_active; then
       echo "[auto] $(date '+%m-%d %H:%M') sweep active -- defer step $G"; break
     fi
-    echo "[auto] $(date '+%m-%d %H:%M') benchmarking checkpoint $N -> step $G"
+
+    echo "[auto] $(date '+%m-%d %H:%M') benchmarking checkpoint $N -> step $G  [$todo ]"
     mkdir -p "bench/ckpts/$SERIES"                      # self-heal for new series
     ln -sfn "$(realpath "$ckpt")" "bench/ckpts/$SERIES/step_$G.pt"
-    $PY bench/scripts/run_sweep.py --series $SERIES --steps $G --category $CATEGORY \
-        --gpus 0,1,2,3 --num-samples 5 --num-recycles 10 --seed 42 --snapshot average
-    $PY bench/scripts/eval_ost.py  --series $SERIES --step $G --category $CATEGORY --workers 48
-    # --- SS analysis (DSSP) -> runs/$SERIES/ss_analysis/ ---
-    # ss_confusion warms the per-sample ss_strings.json cache for step $G (also
-    # writes the per-step matrix under ss_analysis/confusion/); the --steps all
-    # trajectory scripts then reuse that cache, so they only DSSP uncached steps.
-    $PY bench/scripts/ss_f1.py         --series $SERIES --category $CATEGORY --steps all --workers 48
-    $PY bench/scripts/ss_confusion.py  --series $SERIES --category $CATEGORY --step $G   --workers 48
-    $PY bench/scripts/ss_pr_traj.py    --series $SERIES --category $CATEGORY --steps all --workers 48
-    $PY bench/scripts/ss_byclass_traj.py --series $SERIES --category $CATEGORY --steps all --workers 48
-    $PY bench/scripts/ss_target_traj.py  --series $SERIES --category $CATEGORY --group beta --steps all --workers 48
-    $PY bench/scripts/ss_struct_corr.py  --series $SERIES --category $CATEGORY --step $G   # SS vs lDDT/TM/GDT correlation
-    $PY bench/scripts/ss_coherence.py    --series $SERIES --category $CATEGORY --step $G --workers 48  # dRMSD coherence length (size-binned)
-    $PY bench/scripts/summarize.py --series $SERIES --category $CATEGORY
+
+    for CAT in $todo; do
+      echo "[auto] $(date '+%m-%d %H:%M') === $CAT step $G ==="
+      $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
+          --gpus 0,1,2,3 --num-samples "$NUM_SAMPLES" --num-recycles 10 \
+          --seed "$SEEDS" --snapshot average
+      $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
+      if [ "$CAT" = "monomer_protein" ]; then
+        run_ss_analysis "$CAT" "$G"
+      fi
+      $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT"
+    done
     echo "[auto] $(date '+%m-%d %H:%M') done step $G"
   done
   sleep "$POLL"

@@ -6,18 +6,23 @@ forward cost), and run one ``deepfold3 inference-batch`` process per GPU.
 Each process loads the 5.8 GB checkpoint once and folds its whole shard, so
 weight loads = n_gpus, not n_targets.
 
-Resumable: ``inference-batch --skip-existing`` skips any target whose output
-dir already has a ``seed-*`` subdir, so re-running fills only the gaps.
+Resumable: ``inference-batch --skip-existing`` skips any (target, seed) whose
+sample CIFs already exist, so re-running fills only the gaps — including a
+sweep interrupted partway through its seed list.
+
+Multi-seed: ``--seed`` takes a comma list (FoldBench folds 4 seeds); each
+target is folded once per seed under its own ``seed-{seed}_sample-*`` subdir.
 
 Layout written (one model series, one step):
 
-    bench/runs/{series}/pred/step_{N}/{pdb_id}/seed-{seed}_sample-{s}/model.cif
-                                              /ranking_scores.csv
+    bench/runs/{series}/pred/{category}/step_{N}/{pdb_id}/seed-{seed}_sample-{s}/model.cif
+                                                         /ranking_scores.csv
 
 Usage::
 
-    # latest checkpoint, all 4 GPUs (default), 5 samples, seed 42
-    python bench/scripts/run_sweep.py --series df3v1 --steps 90000 --category monomer_protein
+    # latest checkpoint, all 4 GPUs (default), 5 samples, 4 seeds
+    python bench/scripts/run_sweep.py --series df3v1 --steps 90000 \
+        --category monomer_protein --seed 42,43,44,45
 
     # the full 5k-grid trajectory, latest first
     python bench/scripts/run_sweep.py --series df3v1 --steps all --category monomer_protein
@@ -69,7 +74,7 @@ def shard_round_robin(targets: list[tuple[str, int]], n: int) -> list[list[str]]
 
 
 def run_step(series: str, step: int, category: str, gpus: list[int],
-             num_samples: int, num_recycles: int, seed: int, snapshot: str) -> None:
+             num_samples: int, num_recycles: int, seeds: list[int], snapshot: str) -> None:
     params = BENCH / "ckpts" / series / f"step_{step}.pt"
     if not params.exists():
         print(f"[sweep] SKIP step {step}: no checkpoint at {params}", file=sys.stderr)
@@ -111,9 +116,10 @@ def run_step(series: str, step: int, category: str, gpus: list[int],
             "--optim", "inference",
             "--num-samples", str(num_samples),
             "--num-recycles", str(num_recycles),
-            "--seed", str(seed),
             "--skip-existing",
         ]
+        for sd in seeds:
+            cmd += ["--seed", str(sd)]
         print(f"  GPU {gpu}: {len(shard)} targets -> {log.name}")
         procs.append((gpu, subprocess.Popen(cmd, env=env,
                                              stdout=open(log, "w"), stderr=subprocess.STDOUT)))
@@ -137,11 +143,14 @@ def main() -> None:
     ap.add_argument("--gpus", default="0,1,2,3", help="comma list of GPU ids")
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--num-recycles", type=int, default=10)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--seed", default="42",
+                    help="Comma list of model seeds, e.g. 42,43,44,45. Each target is folded "
+                         "once per seed (FoldBench uses 4). Default: 42.")
     ap.add_argument("--snapshot", default="average", choices=["auto", "average", "shadow", "fast"])
     args = ap.parse_args()
 
     gpus = [int(g) for g in args.gpus.split(",") if g != ""]
+    seeds = [int(s) for s in str(args.seed).split(",") if s != ""]
     if args.steps == "all":
         steps = ALL_STEPS
     else:
@@ -149,10 +158,10 @@ def main() -> None:
 
     print(f"[sweep] series={args.series} steps={steps} gpus={gpus} "
           f"samples={args.num_samples} recycles={args.num_recycles} "
-          f"seed={args.seed} snapshot={args.snapshot}")
+          f"seeds={seeds} snapshot={args.snapshot}")
     for step in steps:
         run_step(args.series, step, args.category, gpus,
-                 args.num_samples, args.num_recycles, args.seed, args.snapshot)
+                 args.num_samples, args.num_recycles, seeds, args.snapshot)
 
 
 if __name__ == "__main__":

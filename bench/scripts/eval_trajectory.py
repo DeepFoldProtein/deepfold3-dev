@@ -111,7 +111,8 @@ def make_plot(rows, prefix, inflection, series, category):
         orac = [r.get(ocol) for r in rows]
         ax.plot(steps, mean, color=color, lw=1.6, marker=".", ms=4, label="mean")
         if any(o is not None for o in orac):
-            ax.plot(steps, orac, color=color, lw=1.0, ls="--", alpha=0.7, label="oracle (best-of-N)")
+            ax.plot(steps, orac, color=color, lw=1.0, ls="--", marker=".", ms=4, alpha=0.7,
+                    label="oracle (best-of-N)")
         ax.axvline(inflection, color="red", ls="--", alpha=0.6)
         pre, npre = slope_per_1k(steps, mean, steps[0], inflection)
         post, npost = slope_per_1k(steps, mean, inflection, steps[-1])
