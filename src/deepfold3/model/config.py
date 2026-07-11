@@ -694,6 +694,23 @@ class TrainingConfig:
     # degrades update quality and feeds magnitude drift; dropping the step
     # is cleaner than applying garbage. 0 disables.
     grad_norm_skip_threshold: float = 0.0
+    # Per-rank gradient clipping (OF3-style). When True the ENTIRE backward
+    # runs under ``no_sync`` (DDP's automatic gradient all-reduce is
+    # suppressed), each rank clips its own LOCAL gradient to
+    # ``grad_clip_norm``, and the clipped per-rank grads are then averaged
+    # with a single manual all-reduce. This bounds any one rank's
+    # contribution BEFORE averaging, so a pathological sample cannot dominate
+    # the batch-mean gradient (standard global clipping clips the
+    # already-averaged gradient, after the bad sample has been mixed in).
+    #
+    # Cost: the manual all-reduce runs after the full backward, so it no
+    # longer overlaps the backward pass, and DDP's ``reduce_dtype`` comm hook
+    # is bypassed (reduction is fp32). ``static_graph`` is forced off (it is
+    # incompatible with the always-on ``no_sync``). With
+    # ``batch_size_per_rank > 1`` the clip is per-rank over the within-rank
+    # sample mean, not literally per-sample. Default off; see
+    # ``docs/training.md`` § Gradient Management.
+    per_rank_grad_clip: bool = False
 
     # EMA
     ema_decay: float = 0.999
@@ -1081,13 +1098,12 @@ class DistogramConfig:
     first_break: float = 2.3125
     last_break: float = 21.6875
     use_half_logits_ln: bool = False
-    # ``half_logits`` weight init: stddev = α / sqrt(fan_in). Default α=0.05
-    # gives very small initial logits — softmax stays close to uniform
-    # 1/num_bins so the distogram CE starts near log(num_bins) — but the
-    # weight is non-zero, so the distogram gradient reaches ``pair`` from
-    # step 0 and constrains its magnitude during early training. AF3 ships
-    # α=0 (zeros init); set ``half_logits_init_alpha=0.0`` to restore that.
-    half_logits_init_alpha: float = 0.05
+    # ``half_logits`` weight init: stddev = α / sqrt(fan_in). Default α=0 is the
+    # AF3/OF3 stock zeros init — the distogram starts as the uniform 1/num_bins
+    # distribution. Set α>0 (e.g. 0.05) for a small-normal init: the softmax
+    # stays close to uniform (CE ≈ log(num_bins)) but the weight is non-zero, so
+    # the distogram gradient reaches ``pair`` from step 0.
+    half_logits_init_alpha: float = 0.0
 
 
 @dataclass

@@ -35,7 +35,13 @@ class TrainState:
         consecutive_nan_skips: How many opt steps in a row were skipped
             due to non-finite loss or grads. Reset to 0 on a successful
             step. ``cfg.max_consecutive_nan_skips`` bounds this.
-        last_grad_norm: Most recent global grad norm (for logging).
+        last_grad_norm: Most recent grad norm used for the clip/skip
+            decision (for logging). In per-rank-clip mode this is the
+            per-rank pre-clip norm; otherwise the global pre-clip norm.
+        last_grad_norm_global: Post-all-reduce global grad norm, set only in
+            per-rank-clip mode (``None`` otherwise). This is the norm of the
+            averaged, already-clipped gradient the optimizer actually steps
+            on — bounded by ``grad_clip_norm``.
         last_num_recycles: Number of recycles sampled for the last
             microstep (for microstep logging).
     """
@@ -46,6 +52,7 @@ class TrainState:
     best_eval_loss: float = field(default_factory=lambda: float("inf"))
     consecutive_nan_skips: int = 0
     last_grad_norm: torch.Tensor | None = None
+    last_grad_norm_global: torch.Tensor | None = None
     last_num_recycles: int = 0
 
 
