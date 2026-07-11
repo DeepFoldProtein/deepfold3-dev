@@ -184,6 +184,8 @@ During training, the number of recycles is randomly sampled per microstep: `n �
 - Optimizer steps only on accumulation boundaries
 - **NaN detection**: distributed all-reduce ensures all ranks agree on NaN/Inf; affected steps are skipped with a warning
 
+**Global vs. per-rank clipping.** By default the clip runs on the DDP-averaged gradient (all-reduce fires, overlapped with backward, then `clip_grad_norm_` clips the mean). `per_rank_grad_clip: true` (OF3-style) instead runs the **entire backward under `no_sync`** so `.grad` stays each rank's local contribution, clips that local gradient to `grad_clip_norm`, and only then averages the clipped per-rank grads with a single **manual all-reduce** (`SUM ÷ world_size`). This bounds any one rank before it is mixed into the mean, so a pathological sample cannot dominate the batch-mean gradient. Trade-offs: the manual all-reduce runs after the full backward (no backward/all-reduce overlap), the `reduce_dtype` comm hook is bypassed (fp32 reduction), and `static_graph` is forced off. With `batch_size_per_rank > 1` the clip is per-rank over the within-rank sample mean, not literally per-sample. The finite/outlier skip consensus uses the per-rank pre-clip norm (catches a blow-up before the reduce spreads it). Two norms are logged: `grad_norm` (per-rank pre-clip) and `grad_norm_global` (`train/grad_norm_global`, post-reduce, ≤ clip).
+
 ### Mixed Precision
 
 Training runs under `bf16` autocast by default (`TrainingConfig.dtype`). A few numerically sensitive regions are pinned to `fp32` via `ModelConfig.precision` (`PrecisionConfig`):

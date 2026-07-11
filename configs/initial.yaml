@@ -1,15 +1,7 @@
 training:
   optimizer_type: schedule_free
-  lr: 0.0018
-  # Default 0 here matches the AF3 supplement (no weight decay during
-  # initial training). Production runs set this from the optimizer config
-  # layered on top — configs/schedule_free.yaml overrides to 0.05 to
-  # bound zero-init out_proj weight growth (the PairFormer single-stream
-  # divergence diagnosed in df3-sf-bs3-12n-deepnet-20260502-012417). Decay
-  # is applied only to matmul weights — LN scales/biases, gates, and
-  # input embeddings auto-route to the no-decay group via
-  # optim.py:_NO_DECAY_NAME_SUBSTRINGS. See docs/training.md § Optimizer.
-  weight_decay: 0.0
+  lr: 1.8e-4
+  weight_decay: 1.0e-4
   betas: [0.9, 0.95]
   eps: 1.0e-8
   decoupling_parameter: 200.0
@@ -31,8 +23,15 @@ training:
   # incident actually corrupts training.
   grad_norm_log_threshold: 0.0
   grad_norm_skip_threshold: 0.0
+  # Per-rank gradient clipping (OF3-style): clip each rank's LOCAL grad to
+  # grad_clip_norm, then manually all-reduce the clipped grads. Bounds any
+  # one rank's contribution before averaging (vs. global clip on the
+  # already-averaged grad). Forces the whole backward under no_sync, so the
+  # grad all-reduce no longer overlaps backward — measure the cost via the
+  # SLOW_STEP ``bwd`` phase before enabling on large runs. Default off.
+  per_rank_grad_clip: false
   max_consecutive_nan_skips: 10
-  accumulate_grad_batches: 2
+  accumulate_grad_batches: 1
   ema_decay: 0.999
   # eval_snapshot: "average" (SF's x — fast response, default) or
   # "shadow" (EMA over x — slow, 1/(1-ema_decay) step lag, matches
@@ -57,12 +56,13 @@ training:
   diffusion_chunk_size: 8
   mini_rollout_steps: 20
   mini_rollout_samples: 1
+  diffusion_mse_per_sample_symmetry: false
 
   alpha_diffusion: 4.0
   alpha_smooth_lddt: 1.0
   alpha_distogram: 0.03
-  alpha_confidence: 0.0
-  alpha_pae: 0.0
+  alpha_confidence: 1.0e-4
+  alpha_pae: 1.0
   alpha_bond: 0.0
   # Masked-MSA (BERT) auxiliary CE weight. Requires
   # model.masked_msa.enabled. Kept small (~distogram scale) so it nudges the
@@ -115,14 +115,14 @@ training:
   slow_step_log_threshold_s: 0.0
   find_unused_parameters: false
   static_graph: true
-  bucket_cap_mb: 10
+  bucket_cap_mb: 25
   gradient_as_bucket_view: true
   # NCCL watchdog deadline (also used by ``collective_guard`` to attribute hangs).
   collective_timeout_s: 600.0
   train_confidence_only: false
 
   max_steps: 200_000
-  seed: 42
+  seed: 101
   checkpoint_interval: 500
   checkpoint_every_hours: 0.0
   eval_samples: 1024
@@ -172,7 +172,7 @@ training:
 datasets:
   - name: patchr
     data_dir: /data/distillation/patchr_training
-    weight: 0.5
+    weight: 0.50
     strategy: weighted
     is_distillation: false
     format: df3
@@ -198,6 +198,15 @@ datasets:
     is_distillation: true
     format: of3
     crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
+
+  # - name: afdb_multi
+  #   data_dir: /data/distillation/afdb_nvda
+  #   weight: 0.10
+  #   strategy: weighted
+  #   is_distillation: true
+  #   format: df3
+  #   monomer_template_struct_space: true # Foldseek
+  #   crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
 
 eval_datasets:
   - name: patchr_eval
