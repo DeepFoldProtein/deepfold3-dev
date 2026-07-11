@@ -61,6 +61,28 @@ def _clip_grad_norm_fp64(parameters, max_norm: float) -> torch.Tensor:
     return total
 
 
+def _all_reduce_grads_(parameters, world_size: int) -> None:
+    """Average per-rank gradients across ranks with one coalesced all-reduce.
+
+    Used only in per-rank grad-clip mode: the whole backward ran under
+    ``no_sync`` so DDP's reducer never fired, and each rank has already
+    clipped its LOCAL gradient. This averages the clipped grads
+    (``SUM ÷ world_size``) so the optimizer steps on the mean of the
+    per-rank clipped directions. Gradients are fp32 (fp32 master weights →
+    fp32 ``.grad``), so a single fp32 flat-buffer reduction is exact and
+    needs no dtype grouping. In-place: ``.grad`` holds the averaged value on
+    return.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return
+    flat = torch._utils._flatten_dense_tensors(grads)
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(world_size)
+    for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads), strict=True):
+        g.copy_(synced)
+
+
 def is_chunked_diffusion_active(cfg: TrainingConfig) -> bool:
     """Return True when diffusion is run in fixed-size chunks inside each microstep.
 
@@ -303,7 +325,9 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
       auto-disable ``static_graph`` when either is active.
     """
     chunked_diffusion = is_chunked_diffusion_active(cfg)
-    needs_no_sync = chunked_diffusion or cfg.accumulate_grad_batches > 1
+    # Per-rank grad clip defers ALL gradient all-reduce to a manual reduce
+    # after clipping, so even the sync-step backward runs under no_sync.
+    needs_no_sync = chunked_diffusion or cfg.accumulate_grad_batches > 1 or cfg.per_rank_grad_clip
     use_static_graph = cfg.static_graph and not needs_no_sync
 
     if not dist.is_distributed:
@@ -317,9 +341,27 @@ def wrap_ddp(model: nn.Module, dist: DistInfo, cfg: TrainingConfig) -> tuple[nn.
             reasons.append(f"diffusion_chunk_size={cfg.diffusion_chunk_size}")
         if cfg.accumulate_grad_batches > 1:
             reasons.append(f"accumulate_grad_batches={cfg.accumulate_grad_batches}")
+        if cfg.per_rank_grad_clip:
+            reasons.append("per_rank_grad_clip=True")
         rank_zero_info(
             "static_graph auto-disabled (%s): model.no_sync() is required, which conflicts with static_graph.",
             ", ".join(reasons),
+        )
+
+    if cfg.per_rank_grad_clip:
+        # Invariant surfaced at startup: per-rank clip is correct ONLY while
+        # DDP's automatic all-reduce is suppressed on every backward (which
+        # ``AccumulationLoop.step_context`` guarantees via always-on
+        # no_sync). If a future change let a backward run without no_sync,
+        # ``.grad`` would already be all-reduced and the per-rank clip would
+        # silently degrade to a global clip.
+        rank_zero_info(
+            "per-rank grad clip ON: DDP auto all-reduce suppressed (no_sync on every "
+            "backward); each rank clips its LOCAL grad to grad_clip_norm=%.3g, then a "
+            "single manual all-reduce averages the clipped grads. static_graph and the "
+            "reduce_dtype comm hook are unused in this mode; the reduce runs after the "
+            "backward (no overlap).",
+            cfg.grad_clip_norm,
         )
 
     ddp_model = DDP(
@@ -506,6 +548,14 @@ class WrappedOptimizer:
         clears it, it may silently skip on some ranks (per-device
         ``found_inf``) while advancing on others → param drift without
         any observable log line.
+
+        Per-rank clip (``cfg.per_rank_grad_clip``): the whole backward ran
+        under ``no_sync`` (DDP never all-reduced), so the clip above acts on
+        this rank's LOCAL gradient. We then average the already-clipped
+        per-rank grads with a single manual all-reduce and measure the
+        post-reduce global norm. The returned ``grad_norm`` stays the LOCAL
+        pre-clip norm, so the downstream finite/outlier consensus catches a
+        per-rank blow-up before the reduce would spread it across ranks.
         """
         self.scaler.unscale_(self.optimizer)
 
@@ -515,6 +565,14 @@ class WrappedOptimizer:
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip).detach()
         state.last_grad_norm = grad_norm
+
+        if self.cfg.per_rank_grad_clip and self.dist.is_distributed:
+            _all_reduce_grads_(self.model.parameters(), self.dist.world_size)
+            # Measure-only (max_norm=inf → no scaling): norm of the averaged,
+            # already-clipped gradient the optimizer actually steps on.
+            state.last_grad_norm_global = _clip_grad_norm_fp64(self.model.parameters(), float("inf")).detach()
+        else:
+            state.last_grad_norm_global = None
         return grad_norm
 
     def step_or_skip(self, state: TrainState) -> StepResult:

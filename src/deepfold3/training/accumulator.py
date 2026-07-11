@@ -30,10 +30,16 @@ from deepfold3.training.distributed import DistInfo
 class AccumulationLoop:
     """Own the ``no_sync`` gating for both gradient accumulation and chunked diffusion."""
 
-    def __init__(self, ddp_model: nn.Module, dist: DistInfo, num_steps: int) -> None:
+    def __init__(
+        self, ddp_model: nn.Module, dist: DistInfo, num_steps: int, *, per_rank_clip: bool = False
+    ) -> None:
         self.ddp_model = ddp_model
         self.dist = dist
         self.num_steps = num_steps
+        # Per-rank grad clip defers ALL gradient all-reduce to a manual
+        # reduce after clipping, so even the sync-step backward runs under
+        # no_sync (there is no DDP all-reduce to leave un-suppressed).
+        self.per_rank_clip = per_rank_clip
 
     def is_sync_step(self, global_step_before_increment: int) -> bool:
         """Return True when the microstep at ``global_step + 1`` is a sync boundary."""
@@ -43,9 +49,12 @@ class AccumulationLoop:
         """Context manager for the outer (aux) backward inside ``_optimizer_step``.
 
         Suppress DDP all_reduce on non-final accumulation microsteps
-        when running distributed.
+        when running distributed. In per-rank-clip mode the sync-step
+        backward is ALSO suppressed — the all-reduce is done manually after
+        the per-rank clip in ``WrappedOptimizer._unscale_clip_and_measure``.
         """
-        if not is_sync_step and self.dist.is_distributed:
+        defer_all_reduce = self.per_rank_clip or not is_sync_step
+        if defer_all_reduce and self.dist.is_distributed:
             return self.ddp_model.no_sync()
         return nullcontext()
 

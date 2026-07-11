@@ -6,6 +6,8 @@ returns the dict that gets handed to ``TrackerHub.log``.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -21,6 +23,7 @@ def build_step_payload(
     peak_mem_gb: float,
     data_wait: float = 0.0,
     grad_norm_max: float = float("nan"),
+    grad_norm_global: float = float("nan"),
     dt_min: float = float("nan"),
     dt_max: float = float("nan"),
 ) -> dict[str, float]:
@@ -36,6 +39,10 @@ def build_step_payload(
     payload["train/epoch"] = epoch
     payload["train/grad_norm"] = grad_norm
     payload["train/grad_norm_max"] = grad_norm_max
+    # Emitted only in per-rank-clip mode (finite); NaN otherwise means the
+    # key is absent so standard-mode dashboards aren't polluted.
+    if math.isfinite(grad_norm_global):
+        payload["train/grad_norm_global"] = grad_norm_global
     payload["train/step_time_s"] = dt
     payload["train/step_time_min_s"] = dt_min
     payload["train/step_time_max_s"] = dt_max

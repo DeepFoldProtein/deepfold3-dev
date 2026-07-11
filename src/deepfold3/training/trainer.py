@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import time
 from functools import partial
 from pathlib import Path
@@ -170,6 +171,7 @@ class Trainer:
             ddp_model=self.ddp_model,
             dist=self.dist,
             num_steps=self.cfg.accumulate_grad_batches,
+            per_rank_clip=self.cfg.per_rank_grad_clip,
         )
         self.optimizer = build_optimizer(self.model, self.cfg)
         self.scheduler = build_scheduler(self.optimizer, self.cfg)
@@ -727,6 +729,11 @@ class Trainer:
         gn_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
         gn_max = torch.zeros((), device=self.dist.device, dtype=torch.float64)
         gn_count = 0
+        # Post-all-reduce global grad norm — only populated in per-rank-clip
+        # mode (``last_grad_norm_global`` is None otherwise). Tracks the norm
+        # of the averaged, already-clipped gradient the optimizer steps on.
+        gn_global_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
+        gn_global_count = 0
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
@@ -863,6 +870,9 @@ class Trainer:
                     gn_sum += _gn
                     gn_max = torch.maximum(gn_max, _gn)
                     gn_count += 1
+                    if self.state.last_grad_norm_global is not None:
+                        gn_global_sum += self.state.last_grad_norm_global.detach().to(torch.float64)
+                        gn_global_count += 1
 
                 # Flush probe row (rank-0 only); pass per-microstep loss
                 # (total + components from ``loss_dict``) so the probe JSONL
@@ -976,9 +986,14 @@ class Trainer:
                     else:
                         grad_norm_mean = float("nan")
                         grad_norm_window_max = float("nan")
+                    grad_norm_global_mean = (
+                        (gn_global_sum / gn_global_count).item() if gn_global_count > 0 else float("nan")
+                    )
                     gn_sum.zero_()
                     gn_max.zero_()
                     gn_count = 0
+                    gn_global_sum.zero_()
+                    gn_global_count = 0
 
                     # Event-timed step time: window sum (→ dt mean / tok-s) plus
                     # per-effective-step min/max (→ burst tail). ``flush`` issues
@@ -1059,6 +1074,10 @@ class Trainer:
                                 parts.append(f"{k}={v:.4f}")
                         parts.append(f"grad_norm={grad_norm:.3f}")
                         parts.append(f"gn_max={grad_norm_window_max:.3f}")
+                        # Per-rank-clip mode only: norm after the manual
+                        # all-reduce of the clipped per-rank grads.
+                        if math.isfinite(grad_norm_global_mean):
+                            parts.append(f"gn_global={grad_norm_global_mean:.3f}")
                         parts.append(f"lr={lr:.2e}")
                         if tok_per_sec >= 1000:
                             parts.append(f"tok/s={tok_per_sec / 1000:.1f}k")
@@ -1080,6 +1099,7 @@ class Trainer:
                             epoch=self.state.epoch,
                             grad_norm=grad_norm,
                             grad_norm_max=grad_norm_window_max,
+                            grad_norm_global=grad_norm_global_mean,
                             dt=dt,
                             dt_min=dt_window_min,
                             dt_max=dt_window_max,
