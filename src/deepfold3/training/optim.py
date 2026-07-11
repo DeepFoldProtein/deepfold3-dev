@@ -61,26 +61,30 @@ def _clip_grad_norm_fp64(parameters, max_norm: float) -> torch.Tensor:
     return total
 
 
-def _all_reduce_grads_(parameters, world_size: int) -> None:
-    """Average per-rank gradients across ranks with one coalesced all-reduce.
+def _all_reduce_grads_(parameters, world_size: int) -> torch.Tensor:
+    """Average per-rank gradients across ranks; return the post-reduce global norm.
 
     Used only in per-rank grad-clip mode: the whole backward ran under
     ``no_sync`` so DDP's reducer never fired, and each rank has already
-    clipped its LOCAL gradient. This averages the clipped grads
-    (``SUM ÷ world_size``) so the optimizer steps on the mean of the
-    per-rank clipped directions. Gradients are fp32 (fp32 master weights →
-    fp32 ``.grad``), so a single fp32 flat-buffer reduction is exact and
-    needs no dtype grouping. In-place: ``.grad`` holds the averaged value on
-    return.
+    clipped its LOCAL gradient. The clipped grads are averaged across ranks
+    with a single coalesced ``AVG`` all-reduce (the mean folds into the
+    collective — no separate divide pass), so the optimizer steps on the mean
+    of the per-rank clipped directions. The global L2 norm of that averaged
+    gradient is measured from the contiguous ``flat`` buffer in one fused fp64
+    reduction and returned, so the caller needs no extra param sweep to log
+    it. Gradients are fp32 (fp32 master weights → fp32 ``.grad``), so a single
+    flat-buffer reduction is exact and needs no dtype grouping. In-place:
+    ``.grad`` holds the averaged value on return.
     """
     grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
-        return
+        return torch.zeros((), dtype=torch.float32, device="cpu")
     flat = torch._utils._flatten_dense_tensors(grads)
-    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-    flat.div_(world_size)
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # SUM ÷ world_size, folded into the collective
+    global_norm = torch.linalg.vector_norm(flat, 2, dtype=torch.float64).to(torch.float32)
     for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads), strict=True):
         g.copy_(synced)
+    return global_norm
 
 
 def is_chunked_diffusion_active(cfg: TrainingConfig) -> bool:
@@ -567,12 +571,11 @@ class WrappedOptimizer:
         state.last_grad_norm = grad_norm
 
         if self.cfg.per_rank_grad_clip and self.dist.is_distributed:
-            _all_reduce_grads_(self.model.parameters(), self.dist.world_size)
-            # Measure-only (max_norm=inf → no scaling): norm of the averaged,
-            # already-clipped gradient the optimizer actually steps on.
-            state.last_grad_norm_global = _clip_grad_norm_fp64(self.model.parameters(), float("inf")).detach()
-        else:
-            state.last_grad_norm_global = None
+            # Manual all-reduce (DDP's reducer is suppressed under no_sync). The
+            # returned norm is measured from the averaged flat buffer, so no
+            # extra param sweep is needed. Outside per-rank mode the field
+            # stays at its ``None`` default (never read by the trainer).
+            state.last_grad_norm_global = _all_reduce_grads_(self.model.parameters(), self.dist.world_size).detach()
         return grad_norm
 
     def step_or_skip(self, state: TrainState) -> StepResult:
