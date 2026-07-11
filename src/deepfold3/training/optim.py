@@ -72,18 +72,34 @@ def _all_reduce_grads_(parameters, world_size: int) -> torch.Tensor:
     of the per-rank clipped directions. The global L2 norm of that averaged
     gradient is measured from the contiguous ``flat`` buffer in one fused fp64
     reduction and returned, so the caller needs no extra param sweep to log
-    it. Gradients are fp32 (fp32 master weights → fp32 ``.grad``), so a single
-    flat-buffer reduction is exact and needs no dtype grouping. In-place:
-    ``.grad`` holds the averaged value on return.
+    it.
+
+    The flat buffer spans EVERY trainable param in a fixed order (missing
+    grad → zeros), NOT just params that received a grad this step. That set is
+    data-dependent: a distillation sample skips the confidence/PAE loss so its
+    confidence params get no gradient, and because the backward ran under
+    ``no_sync`` DDP's reducer never zero-filled them — so they stay ``None``.
+    Filtering ``p.grad is not None`` would then size the buffer differently on
+    a rank that drew a distillation sample vs a PDB sample, and the collective
+    would DEADLOCK (mismatched counts). ``requires_grad`` is static and
+    identical on every rank, so a full-layout buffer is always the same size.
+    Grads are fp32 (fp32 master weights), so a single flat-buffer reduction is
+    exact and needs no dtype grouping. In-place: ``.grad`` holds the averaged
+    value on return (created for params that had none locally, matching DDP's
+    zero-fill-then-reduce semantics).
     """
-    grads = [p.grad for p in parameters if p.grad is not None]
-    if not grads:
+    params = [p for p in parameters if p.requires_grad]
+    if not params:
         return torch.zeros((), dtype=torch.float32, device="cpu")
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
     flat = torch._utils._flatten_dense_tensors(grads)
     dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # SUM ÷ world_size, folded into the collective
     global_norm = torch.linalg.vector_norm(flat, 2, dtype=torch.float64).to(torch.float32)
-    for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads), strict=True):
-        g.copy_(synced)
+    for p, synced in zip(params, torch._utils._unflatten_dense_tensors(flat, grads), strict=True):
+        if p.grad is None:
+            p.grad = synced.clone()  # unused locally, but nonzero on another rank → must step
+        else:
+            p.grad.copy_(synced)
     return global_norm
 
 
