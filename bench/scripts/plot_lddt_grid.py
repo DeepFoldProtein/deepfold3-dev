@@ -130,17 +130,19 @@ def plot(data: dict[str, list[dict]], series: str, out_png: Path) -> None:
     ax.set_ylim(0, 1)
     ax.grid(True, alpha=0.3)
 
-    # Two legends: one maps colour -> category, one explains the line styles.
-    cat_legend = ax.legend(loc="upper left", fontsize=9, title="category")
+    # Two legends: category (colour) is parked below the axes, spread across
+    # columns so it never covers data; the small mean/median style key stays inside.
+    cat_legend = ax.legend(
+        loc="upper center", bbox_to_anchor=(0.5, -0.10), borderaxespad=0, ncol=4, fontsize=9, title="category"
+    )
     ax.add_artist(cat_legend)
     style_handles = [
         plt.Line2D([], [], color="0.3", ls="-", marker="o", label="mean"),
         plt.Line2D([], [], color="0.3", ls="--", marker="x", label="median"),
     ]
-    ax.legend(handles=style_handles, loc="lower right", fontsize=9)
+    ax.legend(handles=style_handles, loc="upper left", fontsize=9)
 
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=130)
+    fig.savefig(out_png, dpi=130, bbox_inches="tight", bbox_extra_artists=[cat_legend])
     plt.close(fig)
 
 
