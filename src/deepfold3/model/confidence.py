@@ -20,7 +20,6 @@ Attribute names match the Haiku → PyTorch converter mapping.
 
 from __future__ import annotations
 
-import math
 from functools import partial as _partial
 
 import torch
@@ -31,7 +30,7 @@ from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock, _resolve_branch_residual_gain
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, sum_fusion_init_
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -77,15 +76,9 @@ class ConfidenceHead(nn.Module):
         self.right_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
         self.distogram_feat_project = LinearNoBias(DGRAM_NUM_BINS, c_pair)
 
-        # Variance-matched init for 3-way sum-fusion in _embed_features
-        # (left+right outer sum of target_feat + distogram). Default fan-in-based
-        # init gives the distogram stream (one-hot over 39 bins) output stddev
-        # ~1/sqrt(39), ~9× smaller than target_feat (dense, ~O(1) output) —
-        # distogram is effectively crushed at init. Target = 1/sqrt(3) ≈ 0.577.
-        _conf_target = 1.0 / math.sqrt(3)
-        sum_fusion_init_(self.left_target_feat_project.weight, _conf_target, "dense")
-        sum_fusion_init_(self.right_target_feat_project.weight, _conf_target, "dense")
-        sum_fusion_init_(self.distogram_feat_project.weight, _conf_target, "one_hot")
+        # target_feat / distogram projections use plain per-Linear Lecun init
+        # (OF3/AF3 stock). The previous 3-way variance-matched sum-fusion
+        # override was removed.
 
         # 4-layer PairFormer with single track (same as trunk)
         self.layers = nn.ModuleList(

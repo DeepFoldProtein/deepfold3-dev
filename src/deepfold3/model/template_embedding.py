@@ -33,8 +33,6 @@ Dense atom indices (from deepfold3.data.const):
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +42,7 @@ from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
 from deepfold3.model.embedders import dgram_from_positions as _dgram_from_positions
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, sum_fusion_init_
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 
 # Dense atom indices for backbone atoms
@@ -270,26 +268,10 @@ class SingleTemplateEmbedding(nn.Module):
         # LayerNorm on query embedding before projection
         self.query_norm = LayerNorm(pc)
 
-        # Variance-matched init for 9-way sum-fusion (from-scratch training).
-        # Default 'relu' init gives stddev(W)=sqrt(2/fan_in); with fan_in ranging
-        # over {1, 31, 39, pair_channel}, per-stream output stddev at init
-        # varies by ~20× across streams, causing mask/scalar streams (fan_in=1)
-        # to dominate over one-hot streams (fan_in=31-39) before the downstream
-        # PairFormer LN rescues. Target = 1/sqrt(9) ≈ 0.333 per stream.
-        _templ_target = 1.0 / math.sqrt(9)
-        # Sparse/one-hot-concentrated inputs
-        sum_fusion_init_(self.embed_dgram.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_pseudo_beta.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_aatype_row.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_aatype_col.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_backbone_mask.weight, _templ_target, "one_hot")
-        # 1-D continuous components (unit vector axes ∈ [-1, 1]) — treat as
-        # one_hot for fan_in=1 case (the two formulas collapse to the same thing).
-        sum_fusion_init_(self.embed_unit_vec_x.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_unit_vec_y.weight, _templ_target, "one_hot")
-        sum_fusion_init_(self.embed_unit_vec_z.weight, _templ_target, "one_hot")
-        # Query pair is post-LN (per-entry stddev ≈ 1) — dense formula applies.
-        sum_fusion_init_(self.embed_query.weight, _templ_target, "dense")
+        # Feature projections keep plain per-Linear He (relu) init, matching
+        # AF3's ``template_pair_embedding_*`` (initializer='relu'). The previous
+        # 9-way variance-matched sum-fusion override was removed in favour of
+        # OF3/AF3 stock per-Linear init.
 
         # PairFormer stack
         pf = cfg.pairformer

@@ -30,7 +30,6 @@ from deepfold3.model.primitives import (
     LayerNorm,
     LinearNoBias,
     af3_linear_init_,
-    chunked_linear_init_,
     layer_norm,
 )
 
@@ -502,12 +501,12 @@ class DiffusionConditioningBlock(nn.Module):
         super().__init__()
         self.sigma_data = sigma_data
         # Pair conditioning: concat(pair_emb, rel_feat) → linear
-        # IntFold §5.4.2: init each concat slice with its own fan_in (not the
-        # sum) so Lecun stddev matches a per-feature linear + add.
+        # Concat-then-project conditioning with plain Lecun init over the full
+        # concatenated fan-in (OF3/AF3 stock). The previous per-concat-slice
+        # ``chunked_linear_init_`` was removed.
         pair_in = c_pair_in + rel_feat_dim
         self.pair_cond_norm_w = nn.Parameter(torch.ones(pair_in))
         self.pair_cond_proj = LinearNoBias(pair_in, c_pair_out)
-        chunked_linear_init_(self.pair_cond_proj.weight, [c_pair_in, rel_feat_dim])
         self.pair_trans0 = make_transition_block(
             c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
         )
@@ -519,7 +518,6 @@ class DiffusionConditioningBlock(nn.Module):
         single_in = c_single_in + target_feat_dim  # 384 + 447 = 831
         self.single_cond_norm_w = nn.Parameter(torch.ones(single_in))
         self.single_cond_proj = LinearNoBias(single_in, c_single_out)
-        chunked_linear_init_(self.single_cond_proj.weight, [c_single_in, target_feat_dim])
 
         # Noise embedding conditioning (Fourier weights loaded from safetensors)
         self.register_buffer("fourier_weight", torch.zeros(fourier_dim))
