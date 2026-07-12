@@ -151,6 +151,17 @@ AF3_MONOMER = {
     "monomer_rna": {"lddt": 0.61, "tm": 0.41, "gdt": 0.53},      # n=15
 }
 
+# AF3 whole-complex lDDT per interface category (same table, full set) — the
+# reference for the interface panel's lower (whole-model lDDT) plot. Ligand is
+# omitted (it reports LDDT-LP / LDDT-PLI, not whole-model lDDT, and isn't swept).
+AF3_INTERFACE_LDDT = {
+    "interface_protein_protein": 0.84,
+    "interface_antibody_antigen": 0.88,
+    "interface_protein_dna": 0.85,
+    "interface_protein_rna": 0.78,
+    "interface_protein_peptide": 0.84,
+}
+
 
 def dockq_tier_fractions(series: str, category: str, mode: str = "oracle") -> list[dict]:
     """Per step: fraction of interfaces in each DockQ CAPRI tier.
@@ -243,11 +254,11 @@ def summarize(series: str, category: str, plot: bool) -> None:
 
     if is_interface(category):
         # Two panels: (1) DockQ CAPRI quality tiers stacked per benchmarked step,
-        # (2) whole-model lDDT median + IQR. Categorical x (one bar/point per
-        # step) keeps the panels aligned; both use the full [0, 1] y-range.
+        # (2) whole-model lDDT median + IQR. x is the real training step (numeric,
+        # so gaps are to scale); both panels share it. Both use the [0, 1] range.
         tiers = dockq_tier_fractions(series, category, mode="oracle")
         ld = interface_lddt_dist(series, category)
-        fig, (axd, axl) = plt.subplots(2, 1, figsize=(10, 9))
+        fig, (axd, axl) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
 
         # Steps where the model hasn't folded (whole-model median lDDT < 0.5) get
         # their success-rate column hatched over: early DockQ "successes" there
@@ -256,19 +267,25 @@ def summarize(series: str, category: str, plot: bool) -> None:
         LDDT_FOLD_THRESH = 0.5
         ld_by_step = {d["step"]: d["med"] for d in ld}
 
+        # Bar width in step units = 72% of the smallest gap between benchmarked
+        # steps, so bars never overlap even when the grid is irregular (1k/2k/5k).
+        all_steps = sorted({t["step"] for t in tiers} | {d["step"] for d in ld})
+        gaps = [b - a for a, b in zip(all_steps, all_steps[1:])]
+        bar_w = 0.72 * min(gaps) if gaps else 800.0
+
         if tiers:
-            xs = list(range(len(tiers)))
-            bottom = [0.0] * len(xs)
+            steps = [t["step"] for t in tiers]
+            bottom = [0.0] * len(steps)
             for name, lbl, _lo, _hi, col in DOCKQ_TIERS:
                 vals = [t[name] for t in tiers]
-                axd.bar(xs, vals, bottom=bottom, width=0.72, color=col,
+                axd.bar(steps, vals, bottom=bottom, width=bar_w, color=col,
                         edgecolor="white", linewidth=0.5, label=f"{name} ({lbl})")
                 bottom = [b + v for b, v in zip(bottom, vals)]
-            unfolded = [i for i, t in enumerate(tiers)
+            unfolded = [t["step"] for t in tiers
                         if (ld_by_step.get(t["step"]) is not None
                             and ld_by_step[t["step"]] < LDDT_FOLD_THRESH)]
-            for j, i in enumerate(unfolded):
-                axd.axvspan(i - 0.42, i + 0.42, facecolor="none", edgecolor="0.4",
+            for j, s in enumerate(unfolded):
+                axd.axvspan(s - bar_w / 2, s + bar_w / 2, facecolor="none", edgecolor="0.4",
                             hatch="////", linewidth=0.0, zorder=9,
                             label=f"lDDT < {LDDT_FOLD_THRESH:g} (unfolded — unreliable)"
                             if j == 0 else None)
@@ -278,20 +295,29 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 # this line is directly comparable to the top of each stack.
                 axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8,
                             label=f"AF3 success @0.23 ({af3:.0%})")
-            axd.set_xticks(xs); axd.set_xticklabels([str(t["step"]) for t in tiers])
             axd.set_ylim(0, 1.0); axd.set_ylabel("fraction of interfaces")
             axd.set_title(f"DockQ CAPRI quality tiers (best-of-N per interface)  n={tiers[-1]['n']}")
             axd.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, title="tier")
             axd.grid(axis="y", alpha=0.3)
 
         if ld:
-            xs2 = list(range(len(ld)))
-            axl.fill_between(xs2, [d["q25"] for d in ld], [d["q75"] for d in ld],
+            steps_l = [d["step"] for d in ld]
+            axl.fill_between(steps_l, [d["q25"] for d in ld], [d["q75"] for d in ld],
                              color="k", alpha=0.12, lw=0, label="IQR (q25–q75)")
-            axl.plot(xs2, [d["med"] for d in ld], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
-            axl.plot(xs2, [d["mean"] for d in ld], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
-            axl.set_xticks(xs2); axl.set_xticklabels([str(d["step"]) for d in ld])
+            axl.plot(steps_l, [d["med"] for d in ld], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
+            axl.plot(steps_l, [d["mean"] for d in ld], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
+            af3ld = AF3_INTERFACE_LDDT.get(category)
+            if af3ld is not None:
+                axl.axhline(af3ld, color="#d7301f", ls="--", lw=1.8, zorder=7,
+                            label=f"AF3 lDDT ({af3ld:.2f})")
             axl.legend(loc="upper left", fontsize=8)
+        if all_steps:
+            # pad by a bar so edge bars aren't clipped. sharex applies to both.
+            axl.set_xlim(all_steps[0] - bar_w, all_steps[-1] + bar_w)
+            # tick each benchmarked step only when there are few; on a dense grid
+            # let matplotlib pick round-number ticks so labels don't collide.
+            if len(all_steps) <= 12:
+                axl.set_xticks(all_steps)
         axl.set_ylim(-0.02, 1.02); axl.set_ylabel("lDDT (whole model)")
         axl.set_xlabel("training step"); axl.grid(alpha=0.3)
         axl.set_title("whole-model lDDT (median + IQR across targets)")
