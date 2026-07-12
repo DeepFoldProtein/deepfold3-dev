@@ -39,8 +39,11 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 # Note: interface_protein_ligand is omitted by default — eval_ost has no
 # ligand-aware scorer, so it would be mis-scored as a monomer. Add it to
 # CATEGORIES only alongside a proper ligand metric.
-CATEGORIES="${CATEGORIES:-monomer_protein monomer_rna monomer_dna \
-interface_protein_protein interface_antibody_antigen \
+# Category priority (highest first): the three we watch most closely lead, so a
+# fresh checkpoint scores monomer_protein / protein-protein / antibody-antigen
+# before the rest. Order here is the per-checkpoint eval order.
+CATEGORIES="${CATEGORIES:-monomer_protein interface_protein_protein interface_antibody_antigen \
+monomer_rna monomer_dna \
 interface_protein_dna interface_protein_rna interface_protein_peptide}"
 PY=.venv/bin/python
 
@@ -97,44 +100,50 @@ run_ss_analysis() {  # monomer_protein only — DSSP secondary-structure suite
   $PY bench/scripts/ss_coherence.py    --series "$SERIES" --category "$CAT" --step "$G"  --workers 48
 }
 
+# Process ONE (checkpoint, category) unit per iteration, re-scanning every time,
+# so priority is re-evaluated at each unit boundary: newest checkpoint first,
+# and within it the CATEGORIES order (monomer_protein / protein-protein /
+# antibody-antigen lead). A fresh checkpoint landing mid-run preempts the older
+# backlog at the next boundary instead of waiting a whole pass.
 while true; do
-  for ckpt in $(ls "$TRAIN_DIR"/checkpoint_*.pt 2>/dev/null | sort -t_ -k2 -n); do
+  # Highest-priority pending unit = newest 1k-grid checkpoint x its first
+  # still-missing category (per-category summary.csv marker).
+  sel_ckpt=""; sel_step=""; sel_cat=""
+  for ckpt in $(ls "$TRAIN_DIR"/checkpoint_*.pt 2>/dev/null | sort -t_ -k2 -nr); do
     N=$(basename "$ckpt" | sed 's/checkpoint_//;s/\.pt//')
     case "$N" in (*[!0-9]*) continue ;; esac          # skip _checkpoint_* etc.
     (( N % 1000 == 0 )) || continue                    # 1k grid only (raw step)
     G=$(( N + OFFSET ))                                 # series-global step
-
-    # Which categories still need this step? (per-category summary.csv marker)
-    todo=""
     for CAT in $CATEGORIES; do
-      [ -e "bench/runs/$SERIES/eval/$CAT/step_$G/summary.csv" ] && continue
-      todo="$todo $CAT"
-    done
-    [ -z "$todo" ] && continue                          # fully benchmarked
-
-    if sweep_active; then
-      echo "[auto] $(date '+%m-%d %H:%M') sweep active -- defer step $G"; break
-    fi
-
-    echo "[auto] $(date '+%m-%d %H:%M') benchmarking checkpoint $N -> step $G  [$todo ]"
-    mkdir -p "bench/ckpts/$SERIES"                      # self-heal for new series
-    ln -sfn "$(realpath "$ckpt")" "bench/ckpts/$SERIES/step_$G.pt"
-
-    for CAT in $todo; do
-      echo "[auto] $(date '+%m-%d %H:%M') === $CAT step $G ==="
-      $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
-          --gpus 0,1,2,3 --num-samples "$NUM_SAMPLES" --num-recycles 10 \
-          --seed "$SEEDS" --snapshot average
-      $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
-      if [ "$CAT" = "monomer_protein" ]; then
-        run_ss_analysis "$CAT" "$G"
+      if [ ! -e "bench/runs/$SERIES/eval/$CAT/step_$G/summary.csv" ]; then
+        sel_ckpt="$ckpt"; sel_step="$G"; sel_cat="$CAT"; break
       fi
-      $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT"
     done
-    # cross-category lDDT overview (mean + median per step, all categories)
-    $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" || \
-      echo "[auto] WARN plot_lddt_grid failed"
-    echo "[auto] $(date '+%m-%d %H:%M') done step $G"
+    [ -n "$sel_cat" ] && break                          # newest checkpoint wins
   done
-  sleep "$POLL"
+
+  if [ -z "$sel_cat" ]; then
+    sleep "$POLL"; continue                             # all done -> wait for new checkpoints
+  fi
+  if sweep_active; then
+    echo "[auto] $(date '+%m-%d %H:%M') external sweep active -- defer"; sleep 60; continue
+  fi
+
+  G="$sel_step"; CAT="$sel_cat"
+  echo "[auto] $(date '+%m-%d %H:%M') === $CAT step $G (newest-pending) ==="
+  mkdir -p "bench/ckpts/$SERIES"                        # self-heal for new series
+  ln -sfn "$(realpath "$sel_ckpt")" "bench/ckpts/$SERIES/step_$G.pt"
+
+  $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
+      --gpus 0,1,2,3 --num-samples "$NUM_SAMPLES" --num-recycles 10 \
+      --seed "$SEEDS" --snapshot average
+  $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
+  if [ "$CAT" = "monomer_protein" ]; then
+    run_ss_analysis "$CAT" "$G"
+  fi
+  $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT"
+  # cross-category lDDT overview (mean + median per step, all categories)
+  $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" || \
+    echo "[auto] WARN plot_lddt_grid failed"
+  echo "[auto] $(date '+%m-%d %H:%M') done $CAT step $G"
 done
