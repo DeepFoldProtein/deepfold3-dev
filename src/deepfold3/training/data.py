@@ -274,6 +274,19 @@ def build_dataloaders(
             out[key_map[k]] = float(v)
         return out
 
+    def _spec_kwargs(base: dict, spec) -> dict:
+        """Layer a spec's per-dataset overrides over the global kwargs.
+
+        Applies ``crop_weights`` (via :func:`_with_crop_weights`) and, when set,
+        the per-dataset ``max_template_date`` cap — e.g. AlphaFold-predicted
+        distillation sets (MGnify / AFDB) pin templates to AF3's 2018-04-30
+        distillation cutoff rather than the global training cutoff.
+        """
+        out = _with_crop_weights(base, spec)
+        if getattr(spec, "max_template_date", ""):
+            out = {**out, "max_template_date": spec.max_template_date}
+        return out
+
     def load_from_spec(spec, *, keep_after: bool, preloaded_records=None):
         recs = preloaded_records if preloaded_records is not None else discover(spec.data_dir, spec.format)
         if spec.cutoff_date:
@@ -289,7 +302,7 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
-                **_with_crop_weights(of3_kwargs, spec),
+                **_spec_kwargs(of3_kwargs, spec),
             )
         else:
             ds = TrainingDataset(
@@ -299,7 +312,7 @@ def build_dataloaders(
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
                 monomer_template_struct_space=spec.monomer_template_struct_space,
-                **_with_crop_weights(ds_kwargs, spec),
+                **_spec_kwargs(ds_kwargs, spec),
             )
         return ds, recs
 

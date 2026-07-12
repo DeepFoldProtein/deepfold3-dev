@@ -125,6 +125,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "cutoff_date": str(entry.get("cutoff_date", "")),
                 "exclude_loss_mol_types": excl,
                 "monomer_template_struct_space": bool(entry.get("monomer_template_struct_space", False)),
+                "max_template_date": str(entry.get("max_template_date", "")),
             }
         )
     return result
