@@ -131,6 +131,9 @@ while true; do
       fi
       $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT"
     done
+    # cross-category lDDT overview (mean + median per step, all categories)
+    $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" || \
+      echo "[auto] WARN plot_lddt_grid failed"
     echo "[auto] $(date '+%m-%d %H:%M') done step $G"
   done
   sleep "$POLL"
