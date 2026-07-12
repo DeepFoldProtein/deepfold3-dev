@@ -36,6 +36,10 @@ OFFSET="${STEP_OFFSET:-0}"
 SEEDS="${SEEDS:-42,43,44,45}"
 NUM_SAMPLES="${NUM_SAMPLES:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
+# GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
+# node: 8-GPU box -> 0..7, 4-GPU box -> 0..3). Override with GPUS=0,1 to reserve.
+GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
+GPUS="${GPUS:-0,1,2,3}"
 # Note: interface_protein_ligand is omitted by default — eval_ost has no
 # ligand-aware scorer, so it would be mis-scored as a monomer. Add it to
 # CATEGORIES only alongside a proper ligand metric.
@@ -135,7 +139,7 @@ while true; do
   ln -sfn "$(realpath "$sel_ckpt")" "bench/ckpts/$SERIES/step_$G.pt"
 
   $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
-      --gpus 0,1,2,3 --num-samples "$NUM_SAMPLES" --num-recycles 10 \
+      --gpus "$GPUS" --num-samples "$NUM_SAMPLES" --num-recycles 10 \
       --seed "$SEEDS" --snapshot average
   $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
   if [ "$CAT" = "monomer_protein" ]; then
