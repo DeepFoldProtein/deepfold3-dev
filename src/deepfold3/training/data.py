@@ -63,13 +63,18 @@ def _make_loader_generator(base_seed: int, rank: int) -> torch.Generator:
 
 
 def _apply_cutoff(records: list, cutoff: str, *, keep_after: bool) -> list:
-    """Filter records by release-date cutoff.
+    """Filter records by release-date cutoff (fail-closed).
 
-    ``keep_after=False`` — training pre-cutoff split: keep records
-    released on or before ``cutoff``; also keep records with unknown
-    release date.
+    ``keep_after=False`` — training pre-cutoff split: keep records released
+    on or before ``cutoff``.
     ``keep_after=True`` — eval post-cutoff split: keep records released
-    strictly after ``cutoff``; drop records with unknown date.
+    strictly after ``cutoff``.
+
+    Records with an **unknown** release date are dropped in **both** modes.
+    A dataset that opts into a ``cutoff_date`` cannot prove such a record is
+    pre-cutoff, so keeping it would risk leaking a future-dated structure
+    into training. Datasets with no ``cutoff_date`` (e.g. distillation sets)
+    never reach this function, so their undated records are unaffected.
     """
     if not cutoff:
         return records
@@ -77,9 +82,8 @@ def _apply_cutoff(records: list, cutoff: str, *, keep_after: bool) -> list:
     for r in records:
         released = r.structure_info.released if r.structure_info else None
         if released is None:
-            if not keep_after:
-                filtered.append(r)
-        elif keep_after:
+            continue  # fail-closed: unknown date → never leak
+        if keep_after:
             if released > cutoff:
                 filtered.append(r)
         else:

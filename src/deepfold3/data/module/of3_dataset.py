@@ -330,9 +330,9 @@ class OF3Dataset(torch.utils.data.Dataset):
         max_templates: Maximum templates per sample (AF3 §2.4).
         max_template_date: Hard cutoff on template release date (ISO YYYY-MM-DD).
             Hits with ``release_date > max_template_date`` are dropped. OF3
-            ``template.npz`` carries ``release_date`` per hit; records without
-            a date fail the filter and are dropped when the cutoff is set.
-            ``None`` disables the filter (match pre-existing behavior).
+            ``template.npz`` carries ``release_date`` per hit; undated hits are
+            dropped. Fail-closed: ``None`` drops **all** templates (no cutoff →
+            cannot prove any hit is in-range) rather than leaking future ones.
     """
 
     def __init__(
@@ -465,13 +465,18 @@ class OF3Dataset(torch.utils.data.Dataset):
         # AF3 §2.4: drop self-hits + enforce hard release-date cutoff. Distillation
         # queries have no meaningful ``released`` date, so the per-query
         # ``release - cutoff_days`` tightening used by the PATCHR path doesn't apply.
+        # Fail-closed: a hit is kept only when the cutoff is set and the hit's own
+        # release date is known and within it — an unset cutoff or an undated hit is
+        # dropped, never leaked (mirrors the PATCHR path in dataset.py).
         record_id_upper = live_record.id.upper()
         cutoff = self.max_template_date
         filtered = [
             h
             for h in hits
             if h.template_pdb_id.upper() != record_id_upper
-            and (cutoff is None or (h.release_date is not None and h.release_date <= cutoff))
+            and cutoff is not None
+            and h.release_date is not None
+            and h.release_date <= cutoff
         ]
         if not filtered:
             return None
