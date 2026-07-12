@@ -114,6 +114,20 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
             excl = [int(x) for x in excl_raw]
         except (TypeError, ValueError) as exc:
             raise ValueError(f"datasets[{i}]: exclude_loss_mol_types must contain integers ({exc})") from exc
+        cw_raw = entry.get("crop_weights")
+        if cw_raw is None:
+            crop_weights = None
+        elif not isinstance(cw_raw, dict):
+            raise ValueError(f"datasets[{i}]: crop_weights must be a mapping, got {type(cw_raw).__name__}")
+        else:
+            valid_cw_keys = {"contiguous", "spatial", "interface"}
+            unknown = set(cw_raw) - valid_cw_keys
+            if unknown:
+                raise ValueError(f"datasets[{i}]: unknown crop_weights keys {sorted(unknown)} (use {valid_cw_keys})")
+            try:
+                crop_weights = {k: float(v) for k, v in cw_raw.items()}
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"datasets[{i}]: crop_weights values must be numbers ({exc})") from exc
         result.append(
             {
                 "name": entry["name"],
@@ -124,6 +138,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "format": fmt,
                 "cutoff_date": str(entry.get("cutoff_date", "")),
                 "exclude_loss_mol_types": excl,
+                "crop_weights": crop_weights,
                 "monomer_template_struct_space": bool(entry.get("monomer_template_struct_space", False)),
                 "max_template_date": str(entry.get("max_template_date", "")),
             }

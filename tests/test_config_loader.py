@@ -173,8 +173,28 @@ class TestNormalizeDatasets:
                 "format": "of3",
                 "cutoff_date": "",
                 "exclude_loss_mol_types": [3],
+                "crop_weights": None,
+                "monomer_template_struct_space": False,
+                "max_template_date": "",
             }
         ]
+
+    def test_crop_weights_passthrough(self):
+        raw = [
+            {
+                "name": "mono",
+                "data_dir": "/data/mono",
+                "crop_weights": {"contiguous": 0.25, "spatial": 0.75, "interface": 0},
+                "max_template_date": "2018-04-30",
+            }
+        ]
+        out = normalize_datasets(raw)[0]
+        assert out["crop_weights"] == {"contiguous": 0.25, "spatial": 0.75, "interface": 0.0}
+        assert out["max_template_date"] == "2018-04-30"
+
+    def test_crop_weights_unknown_key(self):
+        with pytest.raises(ValueError, match="crop_weights"):
+            normalize_datasets([{"name": "x", "data_dir": "/d", "crop_weights": {"bogus": 1.0}}])
 
     def test_defaults(self):
         raw = [{"name": "pdb2", "data_dir": "/data/pdb2"}]
@@ -225,6 +245,9 @@ class TestLoadConfig:
                 "format": "df3",
                 "cutoff_date": "",
                 "exclude_loss_mol_types": [],
+                "crop_weights": None,
+                "monomer_template_struct_space": False,
+                "max_template_date": "",
             }
         ]
 
