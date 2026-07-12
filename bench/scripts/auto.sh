@@ -24,8 +24,8 @@
 #   STEP_OFFSET   series-global step shift (default 0)
 set -u
 cd "$(dirname "$0")/../.."
-SERIES="${SERIES:-df3v1}"
-TRAIN_DIR="${1:-runs/df3-stage0-r5}"
+SERIES="${SERIES:-df3v2}"
+TRAIN_DIR="${1:-runs/df3-stage0-r6}"
 POLL="${2:-3600}"            # ~1 h
 # STEP_OFFSET shifts the benchmarked step number (raw checkpoint step N is
 # logged as N+OFFSET) so a fork that restarts the step counter (e.g. stage1
@@ -43,6 +43,31 @@ CATEGORIES="${CATEGORIES:-monomer_protein monomer_rna monomer_dna \
 interface_protein_protein interface_antibody_antigen \
 interface_protein_dna interface_protein_rna interface_protein_peptide}"
 PY=.venv/bin/python
+
+# --- fast lscpu shim (perf) -------------------------------------------------
+# numpy.testing forks `lscpu` at import (numpy gh-22982, ARM-SVE probe). Every
+# OST `compare-structures` imports numpy, so with --workers 48 up to 48 `lscpu`
+# run at once and serialize in the kernel walking 288 CPUs' sysfs (~24s each in
+# sys time), stalling the whole eval. Shim: bare `lscpu` -> cached output
+# (instant); any flagged call -> real /usr/bin/lscpu. Built once, then reused.
+_FASTBIN="$HOME/.local/fastbin"
+if [ ! -x "$_FASTBIN/lscpu" ]; then
+  mkdir -p "$_FASTBIN"
+  /usr/bin/lscpu > "$_FASTBIN/lscpu.cache" 2>/dev/null || true
+  cat > "$_FASTBIN/lscpu" <<'SH'
+#!/bin/sh
+# fast drop-in for lscpu; see bench/scripts/auto.sh for rationale
+if [ "$#" -eq 0 ] && [ -s "$HOME/.local/fastbin/lscpu.cache" ]; then
+  cat "$HOME/.local/fastbin/lscpu.cache"
+else
+  exec /usr/bin/lscpu "$@"
+fi
+SH
+  chmod +x "$_FASTBIN/lscpu"
+fi
+export PATH="$_FASTBIN:$PATH"
+# ---------------------------------------------------------------------------
+
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
 echo "[auto] categories: $CATEGORIES"
 echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS"
