@@ -17,9 +17,17 @@ import logging
 import os
 from pathlib import Path
 
+import msgspec
+
 from deepfold3.data.types import Record
 
 logger = logging.getLogger(__name__)
+
+# Reused across calls: decodes JSON bytes straight into the Record dataclass tree
+# in a single C pass, skipping both the intermediate dict tree and the per-record
+# Record.from_dict() Python loop (the dominant cost at 100k+ records). ``strict=False``
+# tolerates manifests carrying extra keys (e.g. hand-edited or older-schema files).
+_MANIFEST_DECODER = msgspec.json.Decoder(list[Record], strict=False)
 
 
 def save_manifest(records: list[Record], path: Path) -> None:
@@ -66,9 +74,8 @@ def save_manifest(records: list[Record], path: Path) -> None:
 def load_manifest(path: Path) -> list[Record]:
     """Load a JSON manifest file into a list of Records."""
     path = Path(path)
-    with open(path) as f:
-        data = json.load(f)
-    records = [Record.from_dict(d) for d in data]
+    with open(path, "rb") as f:
+        records = _MANIFEST_DECODER.decode(f.read())
     logger.info("Loaded manifest with %d records from %s", len(records), path)
     return records
 

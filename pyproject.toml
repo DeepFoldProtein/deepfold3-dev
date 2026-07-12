@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scikit-learn>=1.8.0",
     "wandb>=0.26.0",
+    "msgspec>=0.21.1",
 ]
 
 [project.scripts]
