@@ -4,8 +4,9 @@ Companion to ``ss_learning.py``. Where ss_learning tracks secondary-structure
 F1, this tracks the three global structure-accuracy metrics over training,
 reading the *per-sample* values already cached by the analysis pipeline:
 
-  * GDT-TS  ← ``ss_metrics.json["gdt_ts"]``   (Kabsch CA, cutoffs {1,2,4,8} Å)
-  * TM-score← ``tm_score.json["tm_ref"]``
+  * GDT-TS  ← ``lddt.json["gdt_ts"]``         (OST --rigid-scores; falls back to
+              the legacy ``ss_metrics.json["gdt_ts"]`` LGA value for old steps)
+  * TM-score← ``tm_score.json["tm_ref"]``     (OST --tm-score)
   * lDDT    ← ``lddt.json["lddt"]``           (OST, no-stereochecks)
 
 Each ``step_{N}_n30/seed-S_sample-i`` directory contributes one value per
@@ -40,11 +41,14 @@ import json
 import sys
 from pathlib import Path
 
-# (cache filename, json key) per metric, in display order.
+# (metric name, [(cache filename, json key), ...]) — first source that yields a
+# value wins. GDT-TS prefers the OST --rigid-scores value in lddt.json and falls
+# back to the legacy LGA value in ss_metrics.json for steps scored before the
+# OST-GDT-TS integration.
 METRICS = (
-    ("GDT-TS", "ss_metrics.json", "gdt_ts"),
-    ("TM", "tm_score.json", "tm_ref"),
-    ("lDDT", "lddt.json", "lddt"),
+    ("GDT-TS", (("lddt.json", "gdt_ts"), ("ss_metrics.json", "gdt_ts"))),
+    ("TM", (("tm_score.json", "tm_ref"),)),
+    ("lDDT", (("lddt.json", "lddt"),)),
 )
 COLORS = {"GDT-TS": "black", "TM": "tab:green", "lDDT": "tab:purple"}
 
@@ -75,17 +79,18 @@ def _process_step(step: int, targets: list, n_samples: int, seed: int,
     Picklable (module-level) so it can run in a process-pool worker.
     Returns ``(step, {metric_name: [value, ...]})``.
     """
-    out: dict[str, list[float]] = {name: [] for name, _, _ in METRICS}
+    out: dict[str, list[float]] = {name: [] for name, _ in METRICS}
     for _pdb, _ref, infer in targets:
-        step_dir = infer / pattern.format(step=step)
+        step_dir = infer / pattern.format(step=step, n=n_samples)
         if not step_dir.exists():
             continue
         for i in range(n_samples):
             sd = step_dir / f"seed-{seed}_sample-{i}"
             if not sd.exists():
                 continue
-            for name, fname, key in METRICS:
-                v = _read_value(sd, fname, key)
+            for name, sources in METRICS:
+                v = next((x for fname, key in sources
+                          if (x := _read_value(sd, fname, key)) is not None), None)
                 if v is not None:
                     out[name].append(v)
     return step, out
@@ -98,7 +103,7 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
-    names = [n for n, _, _ in METRICS]
+    names = [n for n, _ in METRICS]
     fig = plt.figure(figsize=(15, 16))
     gs = fig.add_gridspec(len(names) + 1, len(names),
                           height_ratios=[1] * len(names) + [1.1])
@@ -131,20 +136,29 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
     for j, name in enumerate(names):
         ax = fig.add_subplot(gs[len(names), j])
         color = COLORS.get(name, f"C{j}")
-        data = [per_step.get(s, {}).get(name, []) for s in recent]
-        bp = ax.boxplot(data, tick_labels=[str(s) for s in recent],
+        ax.set_xlabel("step")
+        if j == 0:
+            ax.set_ylabel("per-sample distribution")
+        ax.set_ylim(-0.02, 1.02)  # [0,1] score range — comparable across metrics/panels
+        ax.grid(alpha=0.3, axis="y")
+        # Drop checkpoints with no samples for this metric before plotting:
+        # matplotlib's boxplot rejects a fully-empty X (and any labels/X length
+        # mismatch) with "Dimensions of labels and X must be compatible".
+        pairs = [(str(s), per_step.get(s, {}).get(name, [])) for s in recent]
+        pairs = [(lbl, d) for lbl, d in pairs if d]
+        ax.set_title(f"{name} — recent {len(pairs)} ckpts")
+        if not pairs:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="gray")
+            continue
+        labels, data = zip(*pairs, strict=True)
+        bp = ax.boxplot(list(data), tick_labels=list(labels),
                         showfliers=True, patch_artist=True,
                         flierprops={"marker": ".", "ms": 2, "alpha": 0.3},
                         medianprops={"color": "black"})
         for patch in bp["boxes"]:
             patch.set(facecolor=color, alpha=0.35)
-        ax.set_title(f"{name} — recent {len(recent)} ckpts")
-        ax.set_xlabel("step")
-        if j == 0:
-            ax.set_ylabel("per-sample distribution")
-        ax.set_ylim(-0.02, 1.02)  # [0,1] score range — comparable across metrics/panels
         ax.tick_params(axis="x", labelrotation=90, labelsize=7)
-        ax.grid(alpha=0.3, axis="y")
 
     fig.suptitle(f"Structure accuracy — {prefix.name}", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
@@ -163,7 +177,7 @@ def _write_csv(steps: list[int], per_step: dict[int, dict[str, list[float]]],
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         for s in steps:
-            for name, _, _ in METRICS:
+            for name, _ in METRICS:
                 v = per_step.get(s, {}).get(name, [])
                 if not v:
                     continue
@@ -190,7 +204,9 @@ def main() -> None:
                     help="Arm subdirectory name under each target.")
     ap.add_argument("--target-spec", action="append", default=[],
                     help="PDB:REF_PATH:INFERENCE_DIR (repeatable).")
-    ap.add_argument("--pattern", default="step_{step}_n30")
+    # {n} expands to --n-samples so the per-sample suffix tracks the driver
+    # (analysis.sh uses n5); a hardcoded _n30 silently matched nothing under n5.
+    ap.add_argument("--pattern", default="step_{step}_n{n}")
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
@@ -237,7 +253,7 @@ def main() -> None:
         results = [step_fn(s) for s in args.steps]
     per_step = {s: d for s, d in results}
 
-    for name, _, _ in METRICS:
+    for name, _ in METRICS:
         last = next((per_step[s][name] for s in reversed(args.steps)
                      if per_step.get(s, {}).get(name)), [])
         if last:

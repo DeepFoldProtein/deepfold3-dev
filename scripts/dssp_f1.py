@@ -39,6 +39,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -51,7 +53,28 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 from check_chirality import needleman_wunsch  # noqa: E402
 
-MKDSSP = "/usr/bin/mkdssp"
+
+def _resolve_mkdssp() -> str:
+    """First mkdssp v4 (conda-forge ``dssp``) binary that actually exists.
+
+    Order: ``$MKDSSP`` → ``mkdssp`` on PATH → ``~/.local/bin/mkdssp`` (the
+    conda-forge symlink) → ``/usr/bin/mkdssp``. ``os.path.exists`` follows
+    symlinks, so a *dangling* ``~/.local/bin/mkdssp`` (its conda env wiped) is
+    skipped rather than silently selected. If nothing exists, returns the bare
+    name ``"mkdssp"`` so a genuinely missing binary raises a loud
+    ``FileNotFoundError`` at call time — the previous ``/usr/bin/mkdssp``
+    fallback pointed at a non-existent path and made DSSP fail *silently*
+    (zero-residue output → blank SS-F1). analysis.sh Phase 2 auto-installs the
+    conda-forge ``dssp`` package and exports ``$MKDSSP`` when it is missing.
+    """
+    for cand in (os.environ.get("MKDSSP"), shutil.which("mkdssp"),
+                 os.path.expanduser("~/.local/bin/mkdssp"), "/usr/bin/mkdssp"):
+        if cand and os.path.exists(cand):
+            return cand
+    return "mkdssp"
+
+
+MKDSSP = _resolve_mkdssp()
 
 # 8-state DSSP labels. Anything else (e.g. blank/coil) collapses to '-'.
 DSSP_8 = ("H", "E", "G", "I", "T", "S", "B", "P", "-")
@@ -247,7 +270,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ref", required=True, type=Path)
     ap.add_argument("--inference-dir", required=True, type=Path)
-    ap.add_argument("--pattern", default="step_{step}_n30")
+    # {n} expands to --n-samples so the per-sample suffix tracks the driver
+    # (analysis.sh uses n5); a hardcoded _n30 silently matched nothing under n5.
+    ap.add_argument("--pattern", default="step_{step}_n{n}")
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
@@ -262,7 +287,7 @@ def main() -> None:
           f"{'acc(8)':>6} | {'acc(3)':>6}")
     print("-" * 90)
     for step in args.steps:
-        sub = args.inference_dir / args.pattern.format(step=step)
+        sub = args.inference_dir / args.pattern.format(step=step, n=args.n_samples)
         if not sub.exists():
             print(f"{step:>6} | (missing)")
             continue

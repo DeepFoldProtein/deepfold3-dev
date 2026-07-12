@@ -332,7 +332,7 @@ def _process_step(step: int, targets: list, ref_dssp: dict,
     agg_f1_3 = {c: [] for c in ("α", "β", "c")}
     agg_macro = []
     for pdb, _ref, infer in targets:
-        step_dir = infer / pattern.format(step=step)
+        step_dir = infer / pattern.format(step=step, n=n_samples)
         if not step_dir.exists():
             continue
         r = measure_one(step_dir, ref_dssp[pdb], n_samples, seed, ref_cif=_ref)
@@ -396,7 +396,10 @@ def main() -> None:
                      help="Arm subdirectory name under each target (default: df3-fapeS3-25e5-c10-g35)")
     src.add_argument("--target-spec", action="append", default=[],
                      help="PDB:REF_PATH:INFERENCE_DIR  (repeatable, overrides bench-root path heuristic for that PDB)")
-    ap.add_argument("--pattern", default="step_{step}_n30")
+    # {n} expands to --n-samples so the per-sample suffix tracks the driver
+    # (analysis.sh uses n5); a hardcoded _n30 silently matched nothing under n5,
+    # so the F1 CSV came out 0-row → EXISTING_STEPS empty → one-point trends.
+    ap.add_argument("--pattern", default="step_{step}_n{n}")
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
