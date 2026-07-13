@@ -9,18 +9,19 @@ gradients, otherwise gradients on these atoms get noised by an
 arbitrary labelling choice.
 
 The table below lists the swap pairs that are equivalent under the side
-chain's local symmetry — well-known biochemistry, identical to the list
-used by AlphaFold 2 (Suppl. §1.8.5, Table 4) and AlphaFold 3 (Suppl.
-§4.3). It is encoded directly as a constant; no third-party code is
-reproduced.
+chain's local symmetry — well-known biochemistry. Each entry is exactly
+the (heavy-atom) graph automorphism of the residue, i.e. what AF3
+(Suppl. §4.2) derives generically by enumerating RDKit permutations per
+chemical component: the AlphaFold 2 renaming set (ASP / GLU / ARG /
+PHE / TYR, Suppl. §1.8.5 Table 4) plus the LEU / VAL gem-dimethyls.
+Residues with only a *pseudo* symmetry are deliberately excluded — e.g.
+HIS (ND1↔CD2, CE1↔NE2 swap N with C, so it is not a true automorphism
+and AF3's RDKit path never emits it) and ASN / GLN (OD1↔ND2, OE1↔NE2
+swap O with N). It is encoded directly as a constant; no third-party
+code is reproduced.
 
 Notes on individual residues:
 
-* **HIS**: ND1 / NE2 swap is *not* a true chemical symmetry (the two
-  nitrogens have different protonation states), but AF2/AF3 treat the
-  ring as symmetric for training because the side chain can rotate
-  ~180° about the Cβ–Cγ bond and the resulting models are
-  experimentally indistinguishable for non-coordinating histidines.
 * **PHE / TYR**: CD1↔CD2 and CE1↔CE2 swap simultaneously (the ring is
   flipped as a unit; you cannot swap CD without also swapping CE).
 * **ASP / GLU / ARG / LEU / VAL**: terminal-group swaps (carboxyl OD/OE,
@@ -50,7 +51,6 @@ _PROTEIN_ATOM_SYMMETRY: Final[dict[str, list[list[tuple[str, str]]]]] = {
     "ARG": [[("NH1", "NH2")]],
     "PHE": [[("CD1", "CD2"), ("CE1", "CE2")]],
     "TYR": [[("CD1", "CD2"), ("CE1", "CE2")]],
-    "HIS": [[("ND1", "CD2"), ("CE1", "NE2")]],
     "LEU": [[("CD1", "CD2")]],
     "VAL": [[("CG1", "CG2")]],
 }
@@ -386,17 +386,16 @@ def compute_atomized_residue_token_swap_pairs(structure, tokens: np.ndarray) -> 
     ligands) rather than the ``(token, M_a, M_b)`` intra-token form that
     :func:`compute_token_atom_symmetry_pairs` emits.
 
-    The swap source is the curated :data:`RESIDUE_ATOM_SYMMETRY_GROUPS` table
-    (AF2/AF3 §4.3), **not** the CCD automorphism cache — the latter misses HIS
-    (ND1/CD2 are different elements) and would add spurious O↔OXT swaps that are
-    invalid in a polymer context. Residue identity is read from the **structure**
+    The swap source is the curated :data:`RESIDUE_ATOM_SYMMETRY_GROUPS` table,
+    **not** the CCD automorphism cache — the latter would add spurious O↔OXT
+    swaps that are invalid in a polymer context. Residue identity is read from the **structure**
     (atomized tokens carry ``res_type == UNK``, matching modified residues, so
     the token no longer names the residue), and atom tokens are grouped back
     into residues by ``(asym_id, residue_index)``.
 
     Returns a ``[N_pairs, 3]`` int32 array of ``(token_a, token_b, group_id)``
     triples, applied at slot 0 by :func:`apply_ligand_token_swap`. All pairs of
-    one residue share a ``group_id`` so a symmetric ring (PHE/TYR/HIS: CD and CE
+    one residue share a ``group_id`` so a symmetric ring (PHE/TYR: CD and CE
     pairs are separate tokens once atomized) flips *as a unit* rather than
     permitting a half-flip.
     """
@@ -461,7 +460,7 @@ def apply_ligand_token_swap(
     Ligand / atomized-residue atoms live at slot ``M=0`` of their own token,
     so a swap is a (``token_a``, ``token_b``) row-pair at position 0. Pairs
     that share a **group id** (optional third column) are decided *jointly* —
-    the whole group swaps or not. This lets an atomized PHE/TYR/HIS ring flip
+    the whole group swaps or not. This lets an atomized PHE/TYR ring flip
     as a unit (its CD/CE pairs are separate tokens, so per-pair decisions
     would allow a chemically-impossible half-flip). A 2-column input is
     treated as one pair per group (independent), matching the legacy path.
@@ -535,7 +534,7 @@ def apply_token_atom_permutation(
     The swap decision is made **jointly over all pairs of a token** (each
     token = one residue = one symmetry group): the cost of every pair is
     summed and the whole group is swapped or not. This is what keeps a
-    PHE/TYR/HIS ring flipping *as a unit* (CD1↔CD2 and CE1↔CE2 together) —
+    PHE/TYR ring flipping *as a unit* (CD1↔CD2 and CE1↔CE2 together) —
     deciding the pairs independently would permit a chemically-impossible
     half-flip (swap CD but not CE). Decisions are made independently per
     leading dimension (each augmented diffusion sample picks its own swap)

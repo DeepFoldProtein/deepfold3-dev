@@ -617,6 +617,7 @@ Systematic comparison of DeepFold3's data pipeline against the AF3 supplementary
 | Paper section | Item               | Our approach                                        | Impact                                    |
 | ------------- | ------------------ | --------------------------------------------------- | ----------------------------------------- |
 | §3.7.1        | Smooth LDDT weight | Now configurable via `alpha_smooth_lddt` (None=off) | AF3 turns it off in fine-tune 1 (Table 6) |
+| §4.2          | Symmetric (ambiguous) atom resolution | Hardcoded per-residue swap table (`data/symmetry/atom_perms.py`: ASP/GLU/ARG/PHE/TYR/LEU/VAL + nucleic OP1/OP2). **TODO: replace with RDKit conformer automorphism per chemical component** — `mol.GetSubstructMatches(mol, uniquify=False, useChirality=False, maxMatches=1000)` → permute GT to min-RMSD, exactly AF3 §4.2 / OF3 `get_cropped_permutations` ([conformer.py:384](../references/openfold-3/openfold3/core/data/primitives/structure/conformer.py#L384)). | Table ≡ RDKit for the 7 standard residues; RDKit additionally covers modified/non-standard residues and 3-fold+ symmetries (e.g. 5′-terminal phosphate OP1/OP2/OP3) generically, and drops the manual HIS pseudo-symmetry that was removed to match AF3. |
 
 ### ❌ Missing (known gaps)
 
