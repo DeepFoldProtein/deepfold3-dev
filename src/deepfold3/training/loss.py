@@ -434,6 +434,7 @@ def _inter_chain_bonds_from_features(
 def chain_perm_from_mini_rollout(
     pred: dict[str, torch.Tensor],
     features: dict[str, torch.Tensor],
+    stability_gate_k: int = 1,
 ) -> dict[int, int] | None:
     """AF3 §4.3 chain permutation from the mini-rollout structure.
 
@@ -444,6 +445,15 @@ def chain_perm_from_mini_rollout(
     permutation aren't present (``mini_rollout_pos``, ``asym_id``,
     ``entity_id``) — callers fall back to the legacy per-sample compute
     on the noisy single-step denoised prediction.
+
+    Stability gate (``stability_gate_k > 1``): resolve the assignment
+    independently from each of the first ``K`` mini-rollout samples and
+    apply it ONLY when all ``K`` agree on the whole-assembly assignment;
+    otherwise return the identity ({}). Independent rollout draws only agree
+    once the symmetric copies genuinely separate, so while a homo-oligomer is
+    collapsed the gate keeps a deterministic (un-permuted) target instead of
+    the oscillating coin-flip that stalls symmetry-breaking (see
+    ``export/chain-perm-latch/``). Unanimity — not majority — is required.
     """
     mini_pos = pred.get("mini_rollout_pos")
     asym_id = features.get("asym_id")
@@ -455,19 +465,38 @@ def chain_perm_from_mini_rollout(
 
     from deepfold3.data.symmetry.chain_perm import compute_chain_permutation_tokens
 
-    # mini-rollout is ``[S_mini, N, M, 3]`` — use the first sample.
-    return compute_chain_permutation_tokens(
-        mini_pos[0],
-        gt_pos,
-        atom_mask.bool(),
-        asym_id,
-        entity_id,
-        token_to_rep_atom=features.get("token_to_rep_atom"),
-        mol_type=features.get("mol_type"),
-        seq_mask=features.get("seq_mask"),
-        sym_token_index=features.get("sym_token_index"),
-        inter_chain_bonds=_inter_chain_bonds_from_features(features),
-    )
+    # The K-sample vote reads the dedicated gate rollout (``chain_perm_gate_pos``,
+    # populated by ``forward_training`` when the gate is on); ``mini_rollout_pos``
+    # itself stays at ``mini_rollout_samples`` for the other consumers. Default
+    # (gate off / no gate positions) → single-sample from ``mini_rollout_pos``.
+    vote_pos = pred.get("chain_perm_gate_pos")
+    if vote_pos is None or int(stability_gate_k) <= 1:
+        vote_pos = mini_pos
+
+    def _assign(sample_idx: int) -> dict[int, int]:
+        return compute_chain_permutation_tokens(
+            vote_pos[sample_idx],
+            gt_pos,
+            atom_mask.bool(),
+            asym_id,
+            entity_id,
+            token_to_rep_atom=features.get("token_to_rep_atom"),
+            mol_type=features.get("mol_type"),
+            seq_mask=features.get("seq_mask"),
+            sym_token_index=features.get("sym_token_index"),
+            inter_chain_bonds=_inter_chain_bonds_from_features(features),
+        )
+
+    k = min(int(stability_gate_k), int(vote_pos.shape[0]))
+    if k <= 1:
+        return _assign(0)
+
+    # Stability gate: unanimous whole-assignment vote over K independent draws.
+    a0 = _assign(0)
+    for s in range(1, k):
+        if _assign(s) != a0:
+            return {}  # disagreement → identity (deterministic separating target)
+    return a0
 
 
 def resolve_gt_atom_symmetry(
@@ -1829,7 +1858,9 @@ def diffusion_only_loss(
     # Previously only the diffusion MSE saw the permutation, leaving the other
     # losses on un-permuted GT. Doing it here (single application point) means
     # the diffusion head's own chain perm is skipped below (``asym_id`` omitted).
-    chain_assign = chain_perm_from_mini_rollout(pred, features)
+    chain_assign = chain_perm_from_mini_rollout(
+        pred, features, stability_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1)
+    )
     asym_id_feat = features.get("asym_id")
     if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
         from deepfold3.data.symmetry.chain_perm import chain_permutation_index
@@ -2036,7 +2067,9 @@ def training_loss(
     # with no GT counterpart. ``seq_mask`` stays raw for the pred-side
     # representation regularisers below. ``c_index`` (if any) also permutes the
     # augmented GT in the non-chunked diffusion recompute path.
-    chain_assign = chain_perm_from_mini_rollout(pred, features)
+    chain_assign = chain_perm_from_mini_rollout(
+        pred, features, stability_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1)
+    )
     asym_id_feat = features.get("asym_id")
     c_index: torch.Tensor | None = None
     gt_seq_mask = seq_mask

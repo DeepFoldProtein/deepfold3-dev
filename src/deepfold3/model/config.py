@@ -777,6 +777,21 @@ class TrainingConfig:
     mini_rollout_steps: int = 20
     mini_rollout_samples: int = 1
 
+    # Chain-permutation stability gate (default off). When on, the shared chain
+    # permutation is resolved from ``chain_perm_gate_k`` INDEPENDENT mini-rollout
+    # samples and applied ONLY when all K samples agree on the full assignment;
+    # otherwise it falls back to identity (un-permuted GT). This suppresses the
+    # oscillating-target latch that stalls symmetric-multimer symmetry-breaking:
+    # while a homo-oligomer is collapsed the K noisy rollouts disagree on the
+    # coin-flip assignment → identity (a deterministic separating target); once
+    # the copies genuinely separate the K rollouts agree → the AF3 permutation
+    # fires. Sim (export/chain-perm-latch/): K=3 recovers the df3v2 latch zone,
+    # K=5 is safe to extreme rollout noise; majority voting does NOT work — the
+    # gate must be unanimous. K raises the mini-rollout to K samples (no_grad);
+    # the confidence head still sees only ``mini_rollout_samples`` of them.
+    chain_perm_stability_gate: bool = False
+    chain_perm_gate_k: int = 5
+
     # Loss weights
     alpha_diffusion: float = 4.0
     alpha_distogram: float = 0.03

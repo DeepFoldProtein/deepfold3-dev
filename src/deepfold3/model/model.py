@@ -490,6 +490,7 @@ class DeepFold3(nn.Module):
         loss_cfg=None,
         compute_confidence: bool = True,
         msa_precropped: bool = False,
+        chain_perm_gate_k: int = 1,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -598,7 +599,12 @@ class DeepFold3(nn.Module):
             diff_cfg = self.diffusion_head.cfg
             orig_steps, orig_samples = diff_cfg.steps, diff_cfg.num_samples
             diff_cfg.steps = mini_rollout_steps
-            diff_cfg.num_samples = mini_rollout_samples
+            # Chain-perm stability gate needs ``chain_perm_gate_k`` independent
+            # rollout draws; the confidence head still consumes only the first
+            # ``mini_rollout_samples`` of them (sliced below), so its behaviour is
+            # unchanged. gate_k <= mini_rollout_samples → no extra samples.
+            rollout_samples = max(mini_rollout_samples, chain_perm_gate_k)
+            diff_cfg.num_samples = rollout_samples
             was_training = self.diffusion_head.training
             self.diffusion_head.eval()
             try:
@@ -614,7 +620,15 @@ class DeepFold3(nn.Module):
                 if was_training:
                     self.diffusion_head.train()
 
-        pred["mini_rollout_pos"] = mini_result["atom_positions"].detach()
+        mini_full = mini_result["atom_positions"].detach()  # [B, rollout_samples, N, M, 3]
+        if chain_perm_gate_k > 1:
+            # Keep ``mini_rollout_pos`` at its original ``mini_rollout_samples``
+            # count (confidence / tm_true / atom-symmetry consumers assume it);
+            # stash the full K-sample rollout separately for the chain-perm vote.
+            pred["chain_perm_gate_pos"] = mini_full
+            pred["mini_rollout_pos"] = mini_full[:, :mini_rollout_samples]
+        else:
+            pred["mini_rollout_pos"] = mini_full
 
         # --- 3. Diffusion training step ---
         chunked = (
@@ -677,6 +691,8 @@ class DeepFold3(nn.Module):
                         "noise_levels": noise_levels_c[b],
                         "mini_rollout_pos": mini_pos_batched[b],
                     }
+                    if "chain_perm_gate_pos" in pred:
+                        chunk_pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
                     features_b = {
                         k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
                         for k, v in features.items()

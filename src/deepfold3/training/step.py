@@ -134,6 +134,7 @@ def training_step(
             loss_cfg=loss_cfg_arg,
             compute_confidence=cfg.alpha_confidence > 0,
             msa_precropped=cfg.msa_precrop,
+            chain_perm_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1),
         )
     if _timing:
         torch.cuda.synchronize(device)

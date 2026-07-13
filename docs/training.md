@@ -103,6 +103,26 @@ All training hyperparameters are in `TrainingConfig` (`src/deepfold3/model/confi
      - Cross-entropy on distance bin predictions
 ```
 
+### Chain permutation & the stability gate
+
+The chain permutation (AF3 §4.3) is resolved **once** from the mini-rollout and shared with every
+GT-based loss (diffusion MSE, smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE, tm_true) — `loss.py`
+`chain_perm_from_mini_rollout`. For a symmetric multimer whose rollout is still collapsed, the
+greedy centroid assignment is a **coin-flip**; across steps the relabelling oscillates and the
+symmetry-breaking gradient self-cancels, latching the assembly near the collapsed
+(symmetric-average) point. See `export/chain-perm-latch/` for the mechanism, the offline probe, and
+the simulation.
+
+The **stability gate** (`chain_perm_stability_gate`, default off; `chain_perm_gate_k`, default 5)
+mitigates this: the mini-rollout is run with `K = chain_perm_gate_k` independent samples and the
+permutation is applied **only when all K agree** on the whole-assembly assignment, else it falls
+back to identity (un-permuted GT). While copies overlap the K noisy rollouts disagree → a
+deterministic separating target; once they separate the K agree → the AF3 permutation fires. The
+simulation shows K=3 recovers the latch zone and K=5 is safe to extreme rollout noise; **unanimity,
+not majority, is required**. The K samples live under `pred["chain_perm_gate_pos"]`; the confidence
+/ tm_true / atom-symmetry consumers still see only `mini_rollout_samples` of them via
+`pred["mini_rollout_pos"]`.
+
 ### Loss Components
 
 | Loss            | Weight                             | Description                                                                                                                                                                    |

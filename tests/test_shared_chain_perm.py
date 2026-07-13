@@ -12,7 +12,12 @@ import torch
 
 from deepfold3.data import const
 from deepfold3.model.config import TrainingConfig
-from deepfold3.training.loss import diffusion_only_loss, resolve_gt_atom_symmetry, smooth_lddt_loss
+from deepfold3.training.loss import (
+    chain_perm_from_mini_rollout,
+    diffusion_only_loss,
+    resolve_gt_atom_symmetry,
+    smooth_lddt_loss,
+)
 
 
 def _swapped_asym_homodimer():
@@ -216,3 +221,45 @@ def test_inter_chain_bonds_none_without_bond_matrix():
     from deepfold3.training.loss import _inter_chain_bonds_from_features
 
     assert _inter_chain_bonds_from_features({"asym_id": torch.tensor([0, 1])}) is None
+
+
+# ---------------------------------------------------------------------------
+# Chain-permutation stability gate (K-rollout unanimity)
+# ---------------------------------------------------------------------------
+
+
+def test_stability_gate_unanimous_applies_permutation():
+    """K identical well-separated draws all vote the same swap → gate applies it."""
+    pred, features = _swapped_asym_homodimer()
+    swapped = pred["mini_rollout_pos"][0]  # drives assignment {0: 1, 1: 0}
+    pred["mini_rollout_pos"] = swapped.unsqueeze(0).repeat(3, 1, 1, 1)  # [3, N, M, 3]
+    assert chain_perm_from_mini_rollout(pred, features, stability_gate_k=3) == {0: 1, 1: 0}
+
+
+def test_stability_gate_disagreement_falls_back_to_identity():
+    """Draws that disagree on the assignment (coin-flip) → identity (un-permuted)."""
+    pred, features = _swapped_asym_homodimer()
+    swapped = pred["mini_rollout_pos"][0]  # -> {0: 1, 1: 0}
+    identity_match = features["atom_gt_positions"]  # pred == GT -> {0: 0, 1: 1}
+    pred["mini_rollout_pos"] = torch.stack([swapped, identity_match], dim=0)
+    assert chain_perm_from_mini_rollout(pred, features, stability_gate_k=2) == {}
+
+
+def test_stability_gate_k1_uses_first_sample_only():
+    """K=1 (gate off) ignores extra samples and matches legacy single-sample behaviour."""
+    pred, features = _swapped_asym_homodimer()
+    swapped = pred["mini_rollout_pos"][0]
+    pred["mini_rollout_pos"] = torch.stack([swapped, features["atom_gt_positions"]], dim=0)
+    assert chain_perm_from_mini_rollout(pred, features, stability_gate_k=1) == {0: 1, 1: 0}
+
+
+def test_stability_gate_reads_dedicated_gate_positions():
+    """Production wiring: the K-sample vote uses ``chain_perm_gate_pos`` while
+    ``mini_rollout_pos`` keeps its own (confidence-facing) sample count."""
+    pred, features = _swapped_asym_homodimer()
+    swapped = pred["mini_rollout_pos"][0]  # -> {0: 1, 1: 0}
+    # mini_rollout_pos left at 1 sample (as confidence/tm_true see it); the vote
+    # comes from the separate K-sample gate rollout (all swapped -> unanimous).
+    pred["mini_rollout_pos"] = features["atom_gt_positions"].unsqueeze(0)  # identity-looking
+    pred["chain_perm_gate_pos"] = swapped.unsqueeze(0).repeat(3, 1, 1, 1)  # [3, N, M, 3]
+    assert chain_perm_from_mini_rollout(pred, features, stability_gate_k=3) == {0: 1, 1: 0}

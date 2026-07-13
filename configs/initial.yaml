@@ -56,6 +56,12 @@ training:
   diffusion_chunk_size: 8
   mini_rollout_steps: 20
   mini_rollout_samples: 1
+  # Chain-permutation stability gate: resolve the shared chain permutation from
+  # K independent mini-rollout draws and apply it only on unanimous agreement,
+  # else fall back to identity (un-permuted GT). Breaks the symmetric-multimer
+  # oscillating-target latch.
+  chain_perm_stability_gate: true
+  chain_perm_gate_k: 3
   diffusion_mse_per_sample_symmetry: false
 
   alpha_diffusion: 4.0
