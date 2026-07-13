@@ -25,6 +25,7 @@ Usage::
     python bench/scripts/eval_ost.py --series df3v1 --step 90000 --category monomer_protein
     python bench/scripts/eval_ost.py --series df3v1 --step 90000 --category interface_protein_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -48,12 +49,25 @@ OST = "/home/jovyan/.conda/envs/foldbench/bin/ost"
 # even when topology is partly right (TM/GDT/DockQ use Ca superposition and
 # are unaffected). No-stereocheck lDDT tracks topology across our checkpoints
 # (NOT directly comparable to the FoldBench leaderboard's stereocheck-on lDDT).
-STRUCT_FLAGS = ["--fault-tolerant", "--min-pep-length", "4", "--min-nuc-length", "4",
-                "--lddt", "--lddt-no-stereochecks", "--rigid-scores", "--tm-score", "--dockq"]
+STRUCT_FLAGS = [
+    "--fault-tolerant",
+    "--min-pep-length",
+    "4",
+    "--min-nuc-length",
+    "4",
+    "--lddt",
+    "--lddt-no-stereochecks",
+    "--rigid-scores",
+    "--tm-score",
+    "--dockq",
+]
 
 INTERFACE_CATEGORIES = {
-    "interface_protein_protein", "interface_antibody_antigen",
-    "interface_protein_dna", "interface_protein_rna", "interface_protein_peptide",
+    "interface_protein_protein",
+    "interface_antibody_antigen",
+    "interface_protein_dna",
+    "interface_protein_rna",
+    "interface_protein_peptide",
 }
 DOCKQ_SUCCESS = 0.23
 
@@ -62,8 +76,7 @@ def run_ost(model: Path, ref: Path, out_json: Path) -> None:
     if out_json.exists():
         return
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [OST, "compare-structures", "-m", str(model), "-r", str(ref),
-           "-o", str(out_json), *STRUCT_FLAGS]
+    cmd = [OST, "compare-structures", "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS]
     subprocess.run(cmd, capture_output=True, check=False)
 
 
@@ -73,8 +86,15 @@ def parse_monomer(d: dict) -> dict:
 
 def parse_interface(d: dict, ic1: str, ic2: str) -> dict:
     """DockQ/iRMSD/lRMSD for the (ic1, ic2) interface (FoldBench matching),
-    plus the global lDDT."""
-    out = {"dockq": None, "irmsd": None, "lrmsd": None, "lddt": d.get("lddt")}
+    plus the global (whole-model) lDDT / TM-score / GDT-TS."""
+    out = {
+        "dockq": None,
+        "irmsd": None,
+        "lrmsd": None,
+        "lddt": d.get("lddt"),
+        "tm_score": d.get("tm_score"),
+        "oligo_gdtts": d.get("oligo_gdtts"),
+    }
     interfaces = d.get("dockq_interfaces") or []
     for i, iface in enumerate(interfaces):
         if ic1 in iface and ic2 in iface:
@@ -89,8 +109,7 @@ def load_interfaces(category: str) -> dict[str, list[tuple[str, str]]]:
     """pdb_id -> [(interface_chain_id_1, interface_chain_id_2), ...]."""
     out: dict[str, list[tuple[str, str]]] = {}
     for r in csv.DictReader(open(TARGETS_ROOT / f"{category}.csv")):
-        out.setdefault(r["pdb_id"], []).append(
-            (r["interface_chain_id_1"], r["interface_chain_id_2"]))
+        out.setdefault(r["pdb_id"], []).append((r["interface_chain_id_1"], r["interface_chain_id_2"]))
     return out
 
 
@@ -143,19 +162,32 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
 
     # 2. raw per-sample CSV
     if is_interface:
-        fields = ["pdb_id", "ic1", "ic2", "seed", "sample", "dockq", "irmsd", "lrmsd", "lddt"]
+        fields = [
+            "pdb_id",
+            "ic1",
+            "ic2",
+            "seed",
+            "sample",
+            "dockq",
+            "irmsd",
+            "lrmsd",
+            "lddt",
+            "tm_score",
+            "oligo_gdtts",
+        ]
     else:
         fields = ["pdb_id", "seed", "sample", "lddt", "tm_score", "oligo_gdtts", "rmsd"]
     with open(eval_dir / "raw" / f"{category}_ost.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader(); w.writerows(parsed)
+        w.writeheader()
+        w.writerows(parsed)
 
     # 3. aggregate
     if is_interface:
         by: dict[tuple, list] = {}
         for r in parsed:
             by.setdefault((r["pdb_id"], r["ic1"], r["ic2"]), []).append(r)
-        mean_dq, oracle_dq, mean_ld = [], [], []
+        mean_dq, oracle_dq, mean_ld, mean_tm, mean_gd = [], [], [], [], []
         succ_oracle = succ_mean = n = 0
         for _k, rs in by.items():
             dqs = [r["dockq"] for r in rs if isinstance(r["dockq"], (int, float))]
@@ -163,22 +195,33 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
                 continue
             n += 1
             md, od = sum(dqs) / len(dqs), max(dqs)
-            mean_dq.append(md); oracle_dq.append(od)
+            mean_dq.append(md)
+            oracle_dq.append(od)
             mean_ld.append(mean([r["lddt"] for r in rs]))
+            mean_tm.append(mean([r["tm_score"] for r in rs]))
+            mean_gd.append(mean([r["oligo_gdtts"] for r in rs]))
             succ_oracle += int(od >= DOCKQ_SUCCESS)
             succ_mean += int(md >= DOCKQ_SUCCESS)
         summary = {
-            "series": series, "step": step, "category": category, "n_interfaces": n,
+            "series": series,
+            "step": step,
+            "category": category,
+            "n_interfaces": n,
             "n_ost_failed": n_ost_failed,
             "success_rate_oracle": round(100 * succ_oracle / n, 2) if n else None,
             "success_rate_mean": round(100 * succ_mean / n, 2) if n else None,
-            "mean_dockq": mean(mean_dq), "oracle_dockq": mean(oracle_dq),
+            "mean_dockq": mean(mean_dq),
+            "oracle_dockq": mean(oracle_dq),
             "mean_lddt": mean(mean_ld),
+            "mean_tm_score": mean(mean_tm),
+            "mean_gdt_ts": mean(mean_gd),
         }
-        msg = (f"n={n}  succ@0.23 oracle={summary['success_rate_oracle']}% "
-               f"mean={summary['success_rate_mean']}%  "
-               f"mean_dockq={summary['mean_dockq']} oracle_dockq={summary['oracle_dockq']}  "
-               f"ost_failed={n_ost_failed}")
+        msg = (
+            f"n={n}  succ@0.23 oracle={summary['success_rate_oracle']}% "
+            f"mean={summary['success_rate_mean']}%  "
+            f"mean_dockq={summary['mean_dockq']} oracle_dockq={summary['oracle_dockq']}  "
+            f"ost_failed={n_ost_failed}"
+        )
     else:
         by = {}
         for r in parsed:
@@ -195,16 +238,24 @@ def evaluate(series: str, step: int, category: str, workers: int) -> None:
                 if vals:
                     agg[f"mean_{m}"].append(sum(vals) / len(vals))
                     agg[f"oracle_{m}"].append(max(vals))
-        summary = {"series": series, "step": step, "category": category, "n_scored": n,
-                   "n_ost_failed": n_ost_failed,
-                   **{k: mean(v) for k, v in agg.items()}}
-        msg = (f"n={n}  mean_lddt={summary['mean_lddt']} oracle_lddt={summary['oracle_lddt']}  "
-               f"mean_tm={summary['mean_tm_score']} mean_gdt={summary['mean_gdt_ts']}  "
-               f"ost_failed={n_ost_failed}")
+        summary = {
+            "series": series,
+            "step": step,
+            "category": category,
+            "n_scored": n,
+            "n_ost_failed": n_ost_failed,
+            **{k: mean(v) for k, v in agg.items()},
+        }
+        msg = (
+            f"n={n}  mean_lddt={summary['mean_lddt']} oracle_lddt={summary['oracle_lddt']}  "
+            f"mean_tm={summary['mean_tm_score']} mean_gdt={summary['mean_gdt_ts']}  "
+            f"ost_failed={n_ost_failed}"
+        )
 
     with open(eval_dir / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(summary))
-        w.writeheader(); w.writerow(summary)
+        w.writeheader()
+        w.writerow(summary)
     print(f"[eval] {series} step {step} {category}: {msg}")
     print(f"[eval] -> {eval_dir / 'summary.csv'}")
 

@@ -5,8 +5,9 @@ eval_ost.py) into a per-category trajectory CSV + plot:
 
   - monomer_*           : mean / oracle LDDT vs step, plus a per-DSSP-fold-class
                           LDDT breakdown (the alpha-vs-beta gap across training)
-  - interface_protein_* : DockQ CAPRI quality tiers (stacked bars) + whole-model
-                          lDDT (median + IQR) vs step
+  - interface_protein_* : 3 stacked panels — DockQ CAPRI quality tiers (bars) +
+                          whole-model lDDT + whole-model TM-score (median + IQR)
+                          vs step (GDT-TS is logged to CSV but not plotted)
 
 df3v1 has no confidence head, so aggregates are confidence-free (mean over
 samples + oracle best-of-N), already baked into each step's summary.
@@ -16,6 +17,7 @@ Usage::
     python bench/scripts/summarize.py --series df3v1 --category monomer_protein
     python bench/scripts/summarize.py --series df3v1 --category interface_protein_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -135,20 +137,20 @@ DOCKQ_TIERS = [
 # subset, so it's a target marker, not a like-for-like comparison. (n = paper
 # target count per category.)
 AF3_SUCCESS_RATE = {
-    "interface_protein_protein": 0.7293,   # n=279
+    "interface_protein_protein": 0.7293,  # n=279
     "interface_antibody_antigen": 0.4790,  # n=172
-    "interface_protein_dna": 0.7918,       # n=330
-    "interface_protein_rna": 0.6232,       # n=70
-    "interface_protein_peptide": 0.8298,   # n=51
-    "interface_protein_ligand": 0.6490,    # n=558
+    "interface_protein_dna": 0.7918,  # n=330
+    "interface_protein_rna": 0.6232,  # n=70
+    "interface_protein_peptide": 0.8298,  # n=51
+    "interface_protein_ligand": 0.6490,  # n=558
 }
 
 # AF3 monomer reference from the same table (full set), keyed by the metric
 # keys used in the monomer panels below (lddt / tm-score / gdt-ts).
 AF3_MONOMER = {
     "monomer_protein": {"lddt": 0.88, "tm": 0.94, "gdt": 0.92},  # n=334
-    "monomer_dna": {"lddt": 0.53, "tm": 0.31, "gdt": 0.58},      # n=14
-    "monomer_rna": {"lddt": 0.61, "tm": 0.41, "gdt": 0.53},      # n=15
+    "monomer_dna": {"lddt": 0.53, "tm": 0.31, "gdt": 0.58},  # n=14
+    "monomer_rna": {"lddt": 0.61, "tm": 0.41, "gdt": 0.53},  # n=15
 }
 
 # AF3 whole-complex lDDT per interface category (same table, full set) — the
@@ -192,9 +194,10 @@ def dockq_tier_fractions(series: str, category: str, mode: str = "oracle") -> li
     return out
 
 
-def interface_lddt_dist(series: str, category: str) -> list[dict]:
-    """Per step: across-target distribution (mean/median/IQR) of whole-model
-    lDDT (dedup the repeated interface rows, then mean over the target's samples)."""
+def interface_metric_dist(series: str, category: str, col: str = "lddt") -> list[dict]:
+    """Per step: across-target distribution (mean/median/IQR) of a whole-model
+    metric (``col`` = ``lddt`` or ``tm_score``). Dedup the repeated interface
+    rows, then mean over the target's (seed, sample) predictions."""
     out = []
     eval_root = BENCH / "runs" / series / "eval" / category
     for sd in sorted(eval_root.glob("step_*"), key=lambda p: int(_STEP.search(p.name).group(1))):
@@ -203,15 +206,21 @@ def interface_lddt_dist(series: str, category: str) -> list[dict]:
             continue
         by_t: dict = defaultdict(dict)
         for r in csv.DictReader(open(raw)):
-            v = fnum(r.get("lddt"))
+            v = fnum(r.get(col))
             if v is not None:
                 by_t[r["pdb_id"]][(r.get("seed"), r.get("sample"))] = v
         per_t = [sum(d.values()) / len(d) for d in by_t.values() if d]
         if not per_t:
             continue
-        out.append({"step": int(_STEP.search(sd.name).group(1)),
-                    "mean": sum(per_t) / len(per_t), "med": quantile(per_t, 0.5),
-                    "q25": quantile(per_t, 0.25), "q75": quantile(per_t, 0.75)})
+        out.append(
+            {
+                "step": int(_STEP.search(sd.name).group(1)),
+                "mean": sum(per_t) / len(per_t),
+                "med": quantile(per_t, 0.5),
+                "q25": quantile(per_t, 0.25),
+                "q75": quantile(per_t, 0.75),
+            }
+        )
     return out
 
 
@@ -222,28 +231,40 @@ def summarize(series: str, category: str, plot: bool) -> None:
         return
     out_root = BENCH / "runs" / series
     traj_csv = out_root / f"trajectory_{category}.csv"
-    fields = list(summaries[0].keys())
+    # Union of keys across steps (first-seen order): schemas can differ when the
+    # grid mixes evals from before/after a metric was added (e.g. mean_tm_score).
+    fields = list(dict.fromkeys(k for s in summaries for k in s))
     with open(traj_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader(); w.writerows(summaries)
+        w.writeheader()
+        w.writerows(summaries)
     print(f"[summary] {series}/{category}: {len(summaries)} steps -> {traj_csv}")
 
     if is_interface(category):
-        print(f"{'step':>8} {'n':>4} {'succ_oracle%':>12} {'mean_dockq':>11} {'oracle_dockq':>12}")
+        print(
+            f"{'step':>8} {'n':>4} {'succ_oracle%':>12} {'mean_dockq':>11} {'oracle_dockq':>12} "
+            f"{'mean_lddt':>10} {'mean_tm':>8} {'mean_gdt':>9}"
+        )
         for s in summaries:
-            print(f"{s['step']:>8} {s.get('n_interfaces',''):>4} "
-                  f"{str(s.get('success_rate_oracle')):>12} {str(s.get('mean_dockq')):>11} "
-                  f"{str(s.get('oracle_dockq')):>12}")
+            print(
+                f"{s['step']:>8} {s.get('n_interfaces', ''):>4} "
+                f"{str(s.get('success_rate_oracle')):>12} {str(s.get('mean_dockq')):>11} "
+                f"{str(s.get('oracle_dockq')):>12} {str(s.get('mean_lddt')):>10} "
+                f"{str(s.get('mean_tm_score')):>8} {str(s.get('mean_gdt_ts')):>9}"
+            )
     else:
         print(f"{'step':>8} {'n':>4} {'mean_lddt':>10} {'oracle_lddt':>11} {'mean_tm':>8}")
         for s in summaries:
-            print(f"{s['step']:>8} {s.get('n_scored',''):>4} {str(s.get('mean_lddt')):>10} "
-                  f"{str(s.get('oracle_lddt')):>11} {str(s.get('mean_tm_score')):>8}")
+            print(
+                f"{s['step']:>8} {s.get('n_scored', ''):>4} {str(s.get('mean_lddt')):>10} "
+                f"{str(s.get('oracle_lddt')):>11} {str(s.get('mean_tm_score')):>8}"
+            )
 
     if not plot:
         return
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -253,24 +274,29 @@ def summarize(series: str, category: str, plot: bool) -> None:
     colors = {"alpha": "tab:red", "beta": "tab:blue", "alpha_beta": "tab:green", "coil": "tab:gray"}
 
     if is_interface(category):
-        # Two panels: (1) DockQ CAPRI quality tiers stacked per benchmarked step,
-        # (2) whole-model lDDT median + IQR. x is the real training step (numeric,
-        # so gaps are to scale); both panels share it. Both use the [0, 1] range.
+        # Three stacked panels sharing a real-step x-axis (numeric, gaps to scale):
+        # (1) DockQ CAPRI quality tiers, (2) whole-model lDDT, (3) whole-model
+        # TM-score — each median + IQR across targets, all on the [0, 1] range.
         tiers = dockq_tier_fractions(series, category, mode="oracle")
-        ld = interface_lddt_dist(series, category)
-        fig, (axd, axl) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+        ld = interface_metric_dist(series, category, "lddt")
+        tm = interface_metric_dist(series, category, "tm_score")
+        fig, (axd, axl, axt) = plt.subplots(3, 1, figsize=(10, 13), sharex=True)
 
-        # Steps where the model hasn't folded (whole-model median lDDT < 0.5) get
-        # their success-rate column hatched over: early DockQ "successes" there
-        # are collapsed-blob artefacts (inflated fnat, no fnonnat penalty), so the
-        # bar height is not trustworthy. See memory/early_interface_dockq_blob_artifact.
-        LDDT_FOLD_THRESH = 0.5
+        # Steps where the model hasn't folded get their success-rate column
+        # hatched over: early DockQ "successes" there are collapsed-blob artefacts
+        # (inflated fnat, no fnonnat penalty), so the bar height is not
+        # trustworthy. See memory/early_interface_dockq_blob_artifact. The "folded"
+        # bar is half of AF3's own whole-complex lDDT for this category (harder
+        # interfaces like RNA get a lower bar than easier ones like Ab-Ag), so it
+        # scales with achievable difficulty rather than a flat 0.5.
+        af3ld_ref = AF3_INTERFACE_LDDT.get(category)
+        LDDT_FOLD_THRESH = 0.5 * af3ld_ref if af3ld_ref is not None else 0.5
         ld_by_step = {d["step"]: d["med"] for d in ld}
 
         # Bar width in step units = 72% of the smallest gap between benchmarked
         # steps, so bars never overlap even when the grid is irregular (1k/2k/5k).
-        all_steps = sorted({t["step"] for t in tiers} | {d["step"] for d in ld})
-        gaps = [b - a for a, b in zip(all_steps, all_steps[1:])]
+        all_steps = sorted({t["step"] for t in tiers} | {d["step"] for d in ld} | {d["step"] for d in tm})
+        gaps = [b - a for a, b in zip(all_steps, all_steps[1:], strict=False)]
         bar_w = 0.72 * min(gaps) if gaps else 800.0
 
         if tiers:
@@ -278,49 +304,83 @@ def summarize(series: str, category: str, plot: bool) -> None:
             bottom = [0.0] * len(steps)
             for name, lbl, _lo, _hi, col in DOCKQ_TIERS:
                 vals = [t[name] for t in tiers]
-                axd.bar(steps, vals, bottom=bottom, width=bar_w, color=col,
-                        edgecolor="white", linewidth=0.5, label=f"{name} ({lbl})")
-                bottom = [b + v for b, v in zip(bottom, vals)]
-            unfolded = [t["step"] for t in tiers
-                        if (ld_by_step.get(t["step"]) is not None
-                            and ld_by_step[t["step"]] < LDDT_FOLD_THRESH)]
+                axd.bar(
+                    steps,
+                    vals,
+                    bottom=bottom,
+                    width=bar_w,
+                    color=col,
+                    edgecolor="white",
+                    linewidth=0.5,
+                    label=f"{name} ({lbl})",
+                )
+                bottom = [b + v for b, v in zip(bottom, vals, strict=True)]
+            unfolded = [
+                t["step"]
+                for t in tiers
+                if (ld_by_step.get(t["step"]) is not None and ld_by_step[t["step"]] < LDDT_FOLD_THRESH)
+            ]
             for j, s in enumerate(unfolded):
-                axd.axvspan(s - bar_w / 2, s + bar_w / 2, facecolor="none", edgecolor="0.4",
-                            hatch="////", linewidth=0.0, zorder=9,
-                            label=f"lDDT < {LDDT_FOLD_THRESH:g} (unfolded — unreliable)"
-                            if j == 0 else None)
+                axd.axvspan(
+                    s - bar_w / 2,
+                    s + bar_w / 2,
+                    facecolor="none",
+                    edgecolor="0.4",
+                    hatch="////",
+                    linewidth=0.0,
+                    zorder=9,
+                    label=f"lDDT < ½·AF3 ({LDDT_FOLD_THRESH:.2f}) — unreliable" if j == 0 else None,
+                )
             af3 = AF3_SUCCESS_RATE.get(category)
             if af3 is not None:
                 # bar height (acceptable+medium+high) == success rate @0.23, so
                 # this line is directly comparable to the top of each stack.
-                axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8,
-                            label=f"AF3 success @0.23 ({af3:.0%})")
-            axd.set_ylim(0, 1.0); axd.set_ylabel("fraction of interfaces")
+                axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8, label=f"AF3 success @0.23 ({af3:.0%})")
+            axd.set_ylim(0, 1.0)
+            axd.set_ylabel("fraction of interfaces")
             axd.set_title(f"DockQ CAPRI quality tiers (best-of-N per interface)  n={tiers[-1]['n']}")
             axd.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, title="tier")
             axd.grid(axis="y", alpha=0.3)
 
-        if ld:
-            steps_l = [d["step"] for d in ld]
-            axl.fill_between(steps_l, [d["q25"] for d in ld], [d["q75"] for d in ld],
-                             color="k", alpha=0.12, lw=0, label="IQR (q25–q75)")
-            axl.plot(steps_l, [d["med"] for d in ld], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
-            axl.plot(steps_l, [d["mean"] for d in ld], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
-            af3ld = AF3_INTERFACE_LDDT.get(category)
-            if af3ld is not None:
-                axl.axhline(af3ld, color="#d7301f", ls="--", lw=1.8, zorder=7,
-                            label=f"AF3 lDDT ({af3ld:.2f})")
-            axl.legend(loc="upper left", fontsize=8)
+        def _dist_panel(ax, dist, ylabel, title, af3ref=None):
+            """median + mean + IQR band of a whole-model metric vs real step."""
+            if dist:
+                sx = [d["step"] for d in dist]
+                ax.fill_between(
+                    sx,
+                    [d["q25"] for d in dist],
+                    [d["q75"] for d in dist],
+                    color="k",
+                    alpha=0.12,
+                    lw=0,
+                    label="IQR (q25–q75)",
+                )
+                ax.plot(sx, [d["med"] for d in dist], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
+                ax.plot(sx, [d["mean"] for d in dist], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
+                if af3ref is not None:
+                    ax.axhline(af3ref, color="#d7301f", ls="--", lw=1.8, zorder=7, label=f"AF3 ({af3ref:.2f})")
+                ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_ylabel(ylabel)
+            ax.grid(alpha=0.3)
+            ax.set_title(title)
+
+        _dist_panel(
+            axl,
+            ld,
+            "lDDT (whole model)",
+            "whole-model lDDT (median + IQR across targets)",
+            AF3_INTERFACE_LDDT.get(category),
+        )
+        _dist_panel(axt, tm, "TM-score (whole model)", "whole-model TM-score (median + IQR across targets)")
         if all_steps:
-            # pad by a bar so edge bars aren't clipped. sharex applies to both.
-            axl.set_xlim(all_steps[0] - bar_w, all_steps[-1] + bar_w)
+            # pad by a bar so edge bars aren't clipped. sharex applies to all panels.
+            axt.set_xlim(all_steps[0] - bar_w, all_steps[-1] + bar_w)
             # tick each benchmarked step only when there are few; on a dense grid
             # let matplotlib pick round-number ticks so labels don't collide.
             if len(all_steps) <= 12:
-                axl.set_xticks(all_steps)
-        axl.set_ylim(-0.02, 1.02); axl.set_ylabel("lDDT (whole model)")
-        axl.set_xlabel("training step"); axl.grid(alpha=0.3)
-        axl.set_title("whole-model lDDT (median + IQR across targets)")
+                axt.set_xticks(all_steps)
+        axt.set_xlabel("training step")
         fig.suptitle(f"{series} — FoldBench-small {category}")
     else:
         # monomer: one stacked panel per metric (LDDT / TM-score / GDT-TS).
@@ -328,16 +388,16 @@ def summarize(series: str, category: str, plot: bool) -> None:
         # (q25–q75 across targets) — plus the median + mean trajectory and the
         # per-DSSP fold-class breakdown.
         classes, rows = fold_breakdown(series, category)
-        panels = [("lddt", "LDDT (no-stereocheck)"),
-                  ("tm", "TM-score"),
-                  ("gdt", "GDT-TS")]
+        panels = [("lddt", "LDDT (no-stereocheck)"), ("tm", "TM-score"), ("gdt", "GDT-TS")]
         fig, axes = plt.subplots(3, 1, figsize=(8.5, 13), sharex=True)
-        for ax, (mk, label) in zip(axes, panels):
-            pts = [(r["step"], r.get(f"{mk}_q25"), r.get(f"{mk}_q75"),
-                    r.get(f"{mk}_med"), r.get(f"{mk}_mean")) for r in rows]
+        for ax, (mk, label) in zip(axes, panels, strict=True):
+            pts = [
+                (r["step"], r.get(f"{mk}_q25"), r.get(f"{mk}_q75"), r.get(f"{mk}_med"), r.get(f"{mk}_mean"))
+                for r in rows
+            ]
             pts = [p for p in pts if None not in p]
             if pts:
-                xs, lo, hi, med, mn = (list(z) for z in zip(*pts))
+                xs, lo, hi, med, mn = (list(z) for z in zip(*pts, strict=True))
                 ax.fill_between(xs, lo, hi, color="k", alpha=0.12, lw=0, label="IQR (q25–q75)")
                 # markers on every line so a single benchmarked step still shows
                 # up as a point (a bare line needs >=2 points to render).
@@ -348,28 +408,51 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 ys = [p for p in ys if p[1] is not None]
                 if ys:
                     nlast = rows[-1].get(f"{c}_n", 0) if rows else 0
-                    ax.plot([p[0] for p in ys], [p[1] for p in ys], "-o",
-                            color=colors[c], alpha=0.7, lw=1.2, ms=3, label=f"{c} (n={nlast})")
+                    ax.plot(
+                        [p[0] for p in ys],
+                        [p[1] for p in ys],
+                        "-o",
+                        color=colors[c],
+                        alpha=0.7,
+                        lw=1.2,
+                        ms=3,
+                        label=f"{c} (n={nlast})",
+                    )
             af3v = AF3_MONOMER.get(category, {}).get(mk)
             if af3v is not None:
                 # AF3 reference (FoldBench full set), labelled at the right edge
                 # since each panel's value differs and only axes[0] shows a legend.
                 ax.axhline(af3v, color="#d7301f", ls="--", lw=1.8, zorder=7)
-                ax.text(0.995, af3v, f"AF3 {af3v:.2f}", transform=ax.get_yaxis_transform(),
-                        ha="right", va="bottom", fontsize=8, color="#d7301f", clip_on=False)
-            ax.set_ylabel(label); ax.set_title(label); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3)
+                ax.text(
+                    0.995,
+                    af3v,
+                    f"AF3 {af3v:.2f}",
+                    transform=ax.get_yaxis_transform(),
+                    ha="right",
+                    va="bottom",
+                    fontsize=8,
+                    color="#d7301f",
+                    clip_on=False,
+                )
+            ax.set_ylabel(label)
+            ax.set_title(label)
+            ax.set_ylim(-0.02, 1.02)
+            ax.grid(alpha=0.3)
         axes[-1].set_xlabel("training step")
         axes[0].legend(fontsize=8, ncol=2)
         fig.suptitle(f"{series} — FoldBench-small {category}  (median + IQR across targets)")
         if rows:
-            bf = (["step"]
-                  + [f"{mk}_{k}" for mk in ("lddt", "tm", "gdt")
-                     for k in ("n", "mean", "med", "q25", "q75")]
-                  + [f"{c}_{k}" for c in classes for k in ("n", "lddt", "tm", "gdt")])
+            bf = (
+                ["step"]
+                + [f"{mk}_{k}" for mk in ("lddt", "tm", "gdt") for k in ("n", "mean", "med", "q25", "q75")]
+                + [f"{c}_{k}" for c in classes for k in ("n", "lddt", "tm", "gdt")]
+            )
             with open(out_root / f"byclass_{category}.csv", "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=bf, extrasaction="ignore")
-                w.writeheader(); w.writerows(rows)
-    fig.tight_layout(); fig.savefig(png, dpi=130, bbox_inches="tight")
+                w.writeheader()
+                w.writerows(rows)
+    fig.tight_layout()
+    fig.savefig(png, dpi=130, bbox_inches="tight")
     print(f"[summary] plot -> {png}")
 
 
