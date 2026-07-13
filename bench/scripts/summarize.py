@@ -452,6 +452,12 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 w.writeheader()
                 w.writerows(rows)
     fig.tight_layout()
+    if is_interface(category):
+        # Centre the suptitle over the plot axes, not the full canvas: the interface
+        # panels' legends sit outside on the right, so bbox_inches="tight" widens the
+        # saved image on that side and a figure-centred suptitle reads as shifted right.
+        c = axd.get_position()
+        fig._suptitle.set_x(0.5 * (c.x0 + c.x1))
     fig.savefig(png, dpi=130, bbox_inches="tight")
     print(f"[summary] plot -> {png}")
 
