@@ -338,7 +338,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8, label=f"AF3 success @0.23 ({af3:.0%})")
             axd.set_ylim(0, 1.0)
             axd.set_ylabel("fraction of interfaces")
-            axd.set_title(f"DockQ CAPRI quality tiers (best-of-N per interface)  n={tiers[-1]['n']}")
+            axd.set_title(f"DockQ CAPRI quality tiers — oracle (best-of-N per interface)  n={tiers[-1]['n']}")
             axd.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, title="tier")
             axd.grid(axis="y", alpha=0.3)
 
