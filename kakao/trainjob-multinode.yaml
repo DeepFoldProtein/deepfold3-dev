@@ -39,6 +39,15 @@ spec:
     numProcPerNode: 1
     command:
       - mpirun
+      - "--mca"
+      - orte_keep_fqdn_hostnames
+      - "1"
+      - "--mca"
+      - routed
+      - direct
+      - "--mca"
+      - plm_rsh_args
+      - "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
       - "--hostfile"
       - /etc/mpi/hostfile
       - "-np"
