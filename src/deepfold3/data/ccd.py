@@ -771,6 +771,42 @@ def load_ligand_automorphisms(path: str | Path) -> dict[str, list[list[int]]]:
     return out
 
 
+def load_ligand_symmetry(
+    path: str | Path,
+) -> tuple[dict[str, list[list[int]]], dict[str, list[str]]]:
+    """Load the automorphism perms **and** the ordered ``atoms`` list in one parse.
+
+    Returns ``(automorphisms, atom_order)`` where ``automorphisms`` matches
+    :func:`load_ligand_automorphisms` and ``atom_order`` is the components.cif
+    atom order per code (the index space the perms live in) — the order
+    :func:`load_ccd_cache` throws away via ``set()``. The two are consumed
+    together by the featurizer's ligand / modified-residue symmetry path
+    (:func:`deepfold3.data.symmetry.atom_perms.compute_ligand_token_permutations`),
+    so this reads the (large, ref_pos-bearing) cache file once instead of twice.
+    Empty dicts for a missing file or the legacy list-of-names format.
+    """
+    import json
+
+    path = Path(path)
+    if not path.exists():
+        return {}, {}
+    with open(path) as f:
+        raw = json.load(f)
+
+    automorphisms: dict[str, list[list[int]]] = {}
+    atom_order: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        perms = v.get("automorphisms")
+        if perms:
+            automorphisms[k] = [[int(i) for i in p] for p in perms]
+        atoms = v.get("atoms")
+        if atoms:
+            atom_order[k] = list(atoms)
+    return automorphisms, atom_order
+
+
 def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:
     """Load atom names only. Prefer :func:`load_ccd_cache` to avoid re-parsing."""
     return load_ccd_cache(path)[0]

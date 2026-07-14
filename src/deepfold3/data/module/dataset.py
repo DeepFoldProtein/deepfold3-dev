@@ -214,14 +214,21 @@ class TrainingDataset(torch.utils.data.Dataset):
         # featurizer runs with ``ligand_perm_cache=None`` and ligand
         # symmetry is simply disabled.
         ligand_perm_cache: dict | None = None
+        # Order-preserving CCD ``atoms`` list per code (same index space as the
+        # automorphism perms). Lets the featurizer place ligand / modified-residue
+        # atoms by name → CCD index, correct regardless of structure atom order.
+        ccd_atom_order: dict | None = None
         if ccd_cache_path is not None:
-            from deepfold3.data.ccd import load_ligand_automorphisms
+            from deepfold3.data.ccd import load_ligand_symmetry
 
             try:
-                ligand_perm_cache = load_ligand_automorphisms(ccd_cache_path)
+                # Single parse of the (large, ref_pos-bearing) cache for both the
+                # automorphism perms and their atom-order index space.
+                ligand_perm_cache, ccd_atom_order = load_ligand_symmetry(ccd_cache_path)
                 logger.info(
-                    "Loaded %d ligand automorphism entries from %s",
+                    "Loaded %d ligand automorphism entries (+%d atom orders) from %s",
                     len(ligand_perm_cache),
+                    len(ccd_atom_order),
                     ccd_cache_path,
                 )
             except Exception:
@@ -240,6 +247,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             ligand_perm_cache=ligand_perm_cache,
             msa_crop_size=msa_crop_size,
             n_msa_crops=n_msa_crops,
+            ccd_atom_order=ccd_atom_order,
         )
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker

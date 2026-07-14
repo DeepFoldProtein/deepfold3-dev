@@ -42,6 +42,7 @@ class Featurizer:
         include_polymer_backbone_bonds: bool = False,
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
+        ccd_atom_order: dict[str, list[str]] | None = None,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
@@ -61,6 +62,11 @@ class Featurizer:
         # alongside ``atom_swap_pairs`` so the diffusion loss can apply
         # ligand-atom permutations as well.
         self.ligand_perm_cache = ligand_perm_cache
+        # Order-preserving CCD ``atoms`` list per code (same index space as the
+        # automorphism perms). Lets ``compute_ligand_token_permutations`` place
+        # each token by atom name → CCD index, so ligand / modified-residue
+        # symmetry resolves regardless of the structure's atom ordering.
+        self.ccd_atom_order = ccd_atom_order
         # Bond-loss scope. AF3 §5.3 / OpenFold-3 restrict ``L_bond`` to
         # polymer–ligand token bonds; the Protenix-style extended set (all
         # polymer backbone bonds + ligand intra-bonds) is preserved behind
@@ -684,6 +690,21 @@ class Featurizer:
             )
 
             atom_swap_pairs = compute_token_atom_symmetry_pairs(data.structure, tokens)
+            # ``compute_token_atom_symmetry_pairs`` emits the swap atom slots in
+            # *dense structure* order (index into ``structure.atoms[atom_idx+j]``),
+            # but the loss ``[N, M, 3]`` tensors place each atom at its
+            # CCD-canonical slot via ``atom_slot_remap`` (name -> ``REF_ATOMS``
+            # index). These diverge whenever a residue's atoms are stored in
+            # non-CCD order — e.g. AFDB writes ARG as ``...NE, NH1, NH2, CZ``,
+            # shifting NH1/NH2 by one slot — so the raw dense pairs would swap the
+            # wrong atoms (empirically 100% of AFDB ARG). Remap the slots through
+            # the same ``atom_slot_remap`` that placed the GT, so the swap table
+            # and the loss tensors share the CCD-slot space by construction. A
+            # no-op when the structure is already CCD-ordered (identity remap).
+            if len(atom_swap_pairs):
+                tk = atom_swap_pairs[:, 0]
+                atom_swap_pairs[:, 1] = atom_slot_remap[tk, atom_swap_pairs[:, 1]]
+                atom_swap_pairs[:, 2] = atom_slot_remap[tk, atom_swap_pairs[:, 2]]
             result["atom_swap_pairs"] = torch.from_numpy(atom_swap_pairs)
 
             # Ligand CCD automorphisms (AF3 §4.2): the whole permutation group,
@@ -692,7 +713,9 @@ class Featurizer:
             # atoms only. Empty when no cache is loaded or the crop has no
             # symmetric ligands. Handles 3-fold+ symmetries the pairwise path
             # dropped.
-            ligand_perms = compute_ligand_token_permutations(data.structure, tokens, self.ligand_perm_cache)
+            ligand_perms = compute_ligand_token_permutations(
+                data.structure, tokens, self.ligand_perm_cache, ccd_atom_order=self.ccd_atom_order
+            )
             result["ligand_perms"] = torch.from_numpy(ligand_perms)
 
             # Atomized standard residues (training regularizer) whose side chain
@@ -1515,7 +1538,17 @@ def _token_atom_name_map(
     structure_atoms: np.ndarray,
     M: int,
 ) -> dict[str, int]:
-    """Return a mapping from atom name → local atom index within a token.
+    """Return a mapping from atom name → **CCD-canonical slot** within a token.
+
+    The returned index is the slot the featurizer places the atom at in the
+    ``[N, M, 3]`` GT tensors — i.e. its position in ``const.REF_ATOMS`` for the
+    token's residue, matching ``atom_slot_remap`` (name -> ``REF_ATOMS`` index).
+    Callers (the nucleic backbone bond builder) use these as M-slots into
+    ``atom_gt_positions``, so returning the *dense structure position* here
+    would mis-place the bond atoms whenever the structure stores the residue in
+    non-CCD order (e.g. AFDB's atom convention) — the same class of bug the
+    intra-token symmetry remap fixes. Falls back to the dense position ``j`` for
+    residues without a ``REF_ATOMS`` entry or atom names absent from it.
 
     Normalizes the trailing ``*`` prime convention (``O3*``) to the canonical
     ``O3'`` form, so nucleic-acid atom lookups work regardless of the source
@@ -1525,6 +1558,9 @@ def _token_atom_name_map(
     """
     atom_idx = int(token["atom_idx"])
     atom_num = int(token["atom_num"])
+    res_name = const.RES_TYPE_INDEX_TO_NAME.get(int(token["res_type"]))
+    ref_names = const.REF_ATOMS.get(res_name) if res_name is not None else None
+    name_to_slot = {nm: k for k, nm in enumerate(ref_names)} if ref_names else None
     n = min(atom_num, M)
     out: dict[str, int] = {}
     total = len(structure_atoms)
@@ -1535,14 +1571,21 @@ def _token_atom_name_map(
         raw = structure_atoms[a_idx]["name"].decode("ascii", errors="replace").strip()
         if not raw:
             continue
-        out[raw] = j
+        # CCD-canonical slot (name -> REF_ATOMS index), matching atom_slot_remap;
+        # dense-position fallback for unknown residues / names or slots past M.
+        slot = j
+        if name_to_slot is not None:
+            s = name_to_slot.get(raw)
+            if s is not None and s < M:
+                slot = s
+        out[raw] = slot
         # Be defensive about the prime vs star convention used in legacy PDB
         # files: structure.py normalizes to one form, but we accept both so
         # lookups for "O3'" still find an "O3*" entry (and vice versa).
         if "*" in raw:
-            out[raw.replace("*", "'")] = j
+            out[raw.replace("*", "'")] = slot
         elif "'" in raw:
-            out[raw.replace("'", "*")] = j
+            out[raw.replace("'", "*")] = slot
     return out
 
 

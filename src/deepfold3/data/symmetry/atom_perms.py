@@ -181,28 +181,37 @@ def compute_ligand_token_permutations(
     tokens: np.ndarray,
     ligand_perm_cache: dict[str, list[list[int]]] | None,
     max_perms: int = _MAX_LIGAND_PERMS,
+    ccd_atom_order: dict[str, list[str]] | None = None,
 ) -> np.ndarray:
-    """Whole-permutation table for ligand CCD automorphisms (AF3 §4.2 / OF3).
+    """Whole-permutation table for CCD automorphisms of single-atom tokens (AF3 §4.2 / OF3).
+
+    Covers **ligands** and **modified polymer residues** (SEP/TPO/PTR/…) — every
+    per-atom (``atom_num == 1``) token whose residue has a CCD automorphism
+    group. Standard atomized residues (ASP/PHE/… when stochastically atomized)
+    keep the curated-table path in :func:`compute_atomized_residue_token_swap_pairs`
+    (backbone-safe by construction), so they are skipped here.
 
     Unlike a pairwise 2-cycle approach (which can only express involutions and
     decides them independently), this preserves the **full automorphism group**
-    so the loss can pick the single permutation minimising ligand RMSD
-    — the OF3 ``get_final_atom_permutation_index`` behaviour. It therefore
-    resolves 3-fold+ symmetries (e.g. PO4's three equivalent oxygens) and
-    correlated multi-atom swaps that the pairwise path cannot.
+    so the loss can pick the single permutation minimising RMSD — the OF3
+    ``get_final_atom_permutation_index`` behaviour. It resolves 3-fold+
+    symmetries (e.g. PO4's three equivalent oxygens) and correlated multi-atom
+    swaps that the pairwise path cannot.
 
-    For each ligand chain we look up its CCD automorphism group (from
-    ``build-ccd-cache --automorphisms``), map each permutation's atom indices
-    to current token indices via ``token['atom_in_res']`` (CCD-local index),
-    and emit one row per **moved** atom of each non-identity permutation:
-    ``(ligand_id, perm_id, dst_token, src_token)``. Fixed points are omitted —
-    they contribute equally to every permutation and cancel in the
-    identity-relative cost the loss minimises, so listing only moved atoms
-    keeps the table tiny (a transposition → 2 rows, a 3-cycle → 3).
+    Atoms are grouped per residue ``(asym_id, residue_index)`` and mapped into
+    the automorphism's index space (``build-ccd-cache --automorphisms``, indexed
+    by the CCD ``atoms`` order). When ``ccd_atom_order`` is supplied, each token
+    is placed by its **atom name** → CCD index — correct regardless of the
+    structure's own atom ordering (AFDB, missing atoms, non-CCD deposition). A
+    permutation whose moved atom is absent from the residue (missing atom, e.g.
+    an internal residue's C-terminal ``OXT``, or a cropped atom) is dropped, so
+    partial permutations never fire. Without ``ccd_atom_order`` it falls back to
+    the legacy ``token['atom_in_res']`` mapping (correct only when the structure
+    is already CCD-ordered).
 
-    A permutation is dropped if any of its moved atoms maps outside the crop
-    (``atom_in_res`` absent from the surviving tokens) — a partial permutation
-    is not a valid automorphism. Consumed by
+    One row per **moved** atom of each non-identity permutation is emitted:
+    ``(ligand_id, perm_id, dst_token, src_token)`` (fixed points cancel in the
+    identity-relative cost the loss minimises). Consumed by
     :func:`apply_ligand_token_permutation`.
     """
     import numpy as np
@@ -213,31 +222,73 @@ def compute_ligand_token_permutations(
     if not ligand_perm_cache:
         return empty
 
-    # Group cropped ligand tokens by asym_id; CCD-local atom index -> token idx.
-    ligand_groups: dict[int, dict[int, int]] = {}
+    atom_names_bytes = structure.atoms["name"]
+    # ``standard`` (skipped here) and ``RESIDUE_ATOM_SYMMETRY_GROUPS`` (the
+    # curated-table path) partition single-atom-token symmetry: every curated
+    # residue is a standard name, so no residue is double-handled or falls
+    # through a gap. Both operands are frozensets — no ``set()`` wrap needed.
+    standard = const.STANDARD_PROTEIN_RES3 | const.STANDARD_NUCLEIC_RES
+
+    # Group symmetry-eligible single-atom tokens per residue. Ligand tokens
+    # (MOL_NONPOLYMER) and modified polymer residues (single-atom polymer tokens,
+    # non-standard name) both qualify; whole-residue polymer tokens use the
+    # intra-token path, atomized standard residues the curated-table path.
+    groups: dict[tuple[int, int], list[int]] = {}
     for i, tok in enumerate(tokens):
-        if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
+        is_ligand = int(tok["mol_type"]) == const.MOL_NONPOLYMER
+        is_single_polymer = (not is_ligand) and int(tok["atom_num"]) == 1
+        if not (is_ligand or is_single_polymer):
             continue
-        ligand_groups.setdefault(int(tok["asym_id"]), {})[int(tok["atom_in_res"])] = i
-    if not ligand_groups:
+        groups.setdefault((int(tok["asym_id"]), int(tok["residue_index"])), []).append(i)
+    if not groups:
         return empty
 
-    chains = structure.chains
-    residues = structure.residues
+    # Resolve each group's residue (→ CCD code) by atom_idx via searchsorted over
+    # the contiguous, atom_idx-sorted residues array (O(R) once + O(log R) per
+    # group), rather than an O(R) Python scan per group. name→CCD-index maps are
+    # memoized per distinct code so repeated ligands / modified residues build
+    # them once.
+    res_starts = structure.residues["atom_idx"]
+    res_names = structure.residues["name"]
+    res_nums = structure.residues["atom_num"]
+    n_res = len(res_starts)
+    name_to_ccd_by_code: dict[str, dict[str, int] | None] = {}
 
     rows: list[tuple[int, int, int, int]] = []
     ligand_id = 0
-    for asym, local_to_token in ligand_groups.items():
-        chain_rows = chains[chains["asym_id"] == asym]
-        if len(chain_rows) == 0:
-            continue
-        res_idx = int(chain_rows[0]["res_idx"])
-        if res_idx >= len(residues):
-            continue
-        ccd_code = residues[res_idx]["name"].decode("ascii", errors="replace").strip().upper()
-        perms = ligand_perm_cache.get(ccd_code)
+    for token_idxs in groups.values():
+        # CCD code = the residue's real name (read from the structure, since the
+        # token res_type is UNK for ligands and modified/atomized residues).
+        first_atom = int(tokens[token_idxs[0]]["atom_idx"])
+        row = int(np.searchsorted(res_starts, first_atom, side="right")) - 1
+        if row < 0 or row >= n_res or first_atom >= int(res_starts[row]) + int(res_nums[row]):
+            continue  # atom outside any residue range
+        code = res_names[row].decode("ascii", errors="replace").strip().upper()
+        if code in standard:
+            continue  # atomized standard residue → curated-table path handles it
+        perms = ligand_perm_cache.get(code)
         if not perms or len(perms) <= 1:
             continue
+
+        # Map each token into the automorphism's CCD-index space. Prefer the
+        # name→CCD-index route (order-agnostic); fall back to atom_in_res.
+        if code not in name_to_ccd_by_code:
+            order = ccd_atom_order.get(code) if ccd_atom_order else None
+            name_to_ccd_by_code[code] = {nm: k for k, nm in enumerate(order)} if order else None
+        name_to_ccd = name_to_ccd_by_code[code]
+        ccd_to_token: dict[int, int] = {}
+        for i in token_idxs:
+            if name_to_ccd is not None:
+                nm = atom_names_bytes[int(tokens[i]["atom_idx"])].decode("ascii", errors="replace").strip()
+                k = name_to_ccd.get(nm)
+                if k is None:
+                    continue  # atom name not in the CCD set → cannot place it
+            else:
+                k = int(tokens[i]["atom_in_res"])  # legacy CCD-local index
+            ccd_to_token[k] = i
+        if len(ccd_to_token) < 2:
+            continue
+
         emitted_any = False
         n_kept = 0
         for perm_id, perm in enumerate(perms):
@@ -250,10 +301,10 @@ def compute_ligand_token_permutations(
             row_buf: list[tuple[int, int, int, int]] = []
             ok = True
             for k, pk in moved:
-                dst = local_to_token.get(k)
-                src = local_to_token.get(pk)
+                dst = ccd_to_token.get(k)
+                src = ccd_to_token.get(pk)
                 if dst is None or src is None:
-                    ok = False  # a moved atom fell outside the crop → invalid perm
+                    ok = False  # a moved atom is absent (missing/OXT/cropped) → invalid perm
                     break
                 row_buf.append((ligand_id, perm_id, dst, src))
             if not ok:
