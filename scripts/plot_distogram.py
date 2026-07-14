@@ -56,12 +56,23 @@ def _load_predicted_distogram(path: Path, chain_filter: str | None = None) -> tu
     """
     with open(path) as f:
         d = json.load(f)
-    if "distogram" not in d or "token_chain_ids" not in d:
+    if "token_chain_ids" not in d:
+        raise ValueError(f"{path} missing 'token_chain_ids'; regenerate with current deepfold3 inference")
+    # Distogram E[d] now lives in the per-seed codec npz beside the JSON; fall
+    # back to the legacy inline 'distogram' field for older outputs.
+    from deepfold3.io.confidences import load_logit_maps_from_json
+
+    maps = load_logit_maps_from_json(path)
+    if "distogram" in maps:
+        expected = np.asarray(maps["distogram"], dtype=np.float64)
+    elif "distogram" in d:
+        expected = np.asarray(d["distogram"], dtype=np.float64)
+    else:
         raise ValueError(
-            f"{path} missing keys (need 'distogram' + 'token_chain_ids'); regenerate with current deepfold3 inference"
+            f"{path}: no distogram found (need a sibling *_distogram.npz or an inline 'distogram'); "
+            "regenerate with current deepfold3 inference"
         )
     chains_all = np.asarray(d["token_chain_ids"], dtype=str)
-    expected = np.asarray(d["distogram"], dtype=np.float64)
     if expected.ndim != 2 or expected.shape[0] != expected.shape[1] or expected.shape[0] != len(chains_all):
         raise ValueError(f"{path}: distogram shape {expected.shape} inconsistent with chain count {len(chains_all)}")
     if chain_filter is not None:

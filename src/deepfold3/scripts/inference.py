@@ -23,13 +23,18 @@ Supported parameter formats:
 
 For ``--json`` input, the output directory is populated with one
 sub-directory per (seed, sample) pair named ``seed-{seed}_sample-{idx}/``
-containing ``model.cif`` and ``confidences.json``, plus a top-level
-``ranking_scores.csv`` and ``{job_name}_summary_confidences.json``
-mirroring the AlphaFold 3 output layout.
+containing ``model.cif``, ``confidences.json`` (scalars + per-atom pLDDT),
+and ``logits.npz`` (compressed raw PAE/PDE logits), plus a per-seed
+``seed-{seed}_distogram.npz`` (compressed raw distogram logits, shared across
+that seed's samples) and top-level ``ranking_scores.csv`` /
+``{job_name}_summary_confidences.json``. The dense PAE/PDE/distogram/contact
+matrices are no longer inlined into JSON — recover them with
+``deepfold3.io.confidences.load_logit_maps`` (or ``logit_codec.load_logits``).
 
 For ``--msa`` / ``--sequence`` input, a single mmCIF file with all
-samples stacked as MODEL blocks is written to ``--output``.
-Per-atom pLDDT is stored in the B-factor column.
+samples stacked as MODEL blocks is written to ``--output``, with
+``{stem}[_sample{s}]_logits.npz`` per sample and ``{stem}_distogram.npz``
+per seed alongside it. Per-atom pLDDT is stored in the B-factor column.
 """
 
 from __future__ import annotations
@@ -205,6 +210,17 @@ def _select_snapshot(ckpt: dict, choice: str) -> dict:
     default=False,
     help="Also write a PAE/PDE/contact-probability PNG next to each confidences JSON",
 )
+@click.option(
+    "--logits-scheme",
+    default="int8_softmax",
+    type=click.Choice(["float32", "float16", "int8", "int8_softmax", "int4_softmax"]),
+    show_default=True,
+    help=(
+        "Compression scheme for the raw head logits stored alongside each "
+        "prediction: per-sample logits.npz (PAE, PDE) + per-seed distogram.npz. "
+        "int8_softmax preserves softmax(logits) within ~1e-4 at ~1 byte/value."
+    ),
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -221,6 +237,7 @@ def inference(
     pdb_mmcif_dir: Path | None,
     optim: str | None,
     plot_confidences: bool,
+    logits_scheme: str,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -428,7 +445,9 @@ def inference(
 
     from deepfold3.io.confidences import (
         save_confidences_json,
+        save_distogram_logits,
         save_ranking_scores_csv,
+        save_sample_logits,
         save_summary_confidences_json,
     )
     from deepfold3.io.mmcif import save_mmcif
@@ -465,6 +484,15 @@ def inference(
         elapsed = time.perf_counter() - t0
         click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
 
+        # Trunk distogram logits are shared across all samples of this seed, so
+        # they are written once per seed (not duplicated per sample).
+        if json_input is not None:
+            distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
+        else:
+            distogram_npz = output_dir / f"{cif_path.stem}_distogram.npz"
+        if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(current_seed)):
+            click.echo(f"  saved  {distogram_npz.resolve()}")
+
         # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
         # per-sample directories.  Either way, save_confidences_json
         # returns the per-sample summary used for ranking.
@@ -492,15 +520,23 @@ def inference(
                     sample_idx=s,
                 )
                 conf_path = sample_dir / "confidences.json"
+                logits_npz = sample_dir / "logits.npz"
             else:
                 stem = cif_path.stem
-                conf_path = output_dir / (
-                    f"{stem}_confidences.json" if num_samples == 1 else f"{stem}_sample{s}_confidences.json"
-                )
+                suffix = "" if num_samples == 1 else f"_sample{s}"
+                conf_path = output_dir / f"{stem}{suffix}_confidences.json"
+                logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
 
             summary = save_confidences_json(conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed))
             summary = {**summary, "seed": int(current_seed), "sample": int(s)}
             summaries.append(summary)
+
+            # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
+            # float matrices that used to live in confidences.json.
+            if save_sample_logits(
+                logits_npz, model_output, sample_idx=s, scheme=logits_scheme, seed=int(current_seed)
+            ):
+                click.echo(f"  saved  {logits_npz.resolve()}")
 
             iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
             clash_str = ", CLASH" if summary["has_clash"] else ""
@@ -516,7 +552,9 @@ def inference(
                 from deepfold3.scripts.plot_confidences import plot_confidences_file
 
                 plot_path = conf_path.with_suffix(".png")
-                if plot_confidences_file(conf_path, plot_path):
+                if plot_confidences_file(
+                    conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz
+                ):
                     click.echo(f"  saved  {plot_path.resolve()}")
 
     # ------------------------------------------------------------------

@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from deepfold3.io.logit_codec import load_logits, save_logits
+from deepfold3.io.logit_codec import softmax as _np_softmax
 from deepfold3.model.config import ConfidenceConfig, DistogramConfig
 from deepfold3.model.model import DeepFold3Output
 
@@ -501,6 +503,212 @@ def compute_contact_probs(
     return (probs * contact_bins).sum(-1)  # [N, N]
 
 
+# ---------------------------------------------------------------------------
+# Raw logit persistence (codec .npz) + reconstruction of the derived maps.
+#
+# The heavy pairwise heads (pae, pde per sample; distogram per seed) are no
+# longer dumped as float matrices into confidences.json — they are stored as
+# quantized pre-softmax logits via ``logit_codec``. The derived expected-value
+# / contact-probability maps are recomputed on load, so nothing downstream is
+# lost while the on-disk footprint drops ~30x (int8_softmax, ~1 byte/value).
+# ---------------------------------------------------------------------------
+
+
+def save_sample_logits(
+    path: str | Path,
+    output: DeepFold3Output,
+    sample_idx: int = 0,
+    cfg: ConfidenceConfig | None = None,
+    scheme: str = "int8_softmax",
+    seed: int | None = None,
+) -> bool:
+    """Save one diffusion sample's per-pair logits (PAE, PDE) to a codec ``.npz``.
+
+    Args:
+        path: Output ``.npz`` path.
+        output: DeepFold3Output from ``model.forward()``.
+        sample_idx: Which diffusion sample to export.
+        cfg: ConfidenceConfig (bin edges are stamped into the npz attrs).
+        scheme: Codec scheme (see :data:`logit_codec.SCHEMES`).
+        seed: Diffusion seed, recorded in attrs for provenance.
+
+    Returns:
+        True if anything was written (PAE and/or PDE present), else False.
+    """
+    cfg = cfg or _DEFAULT_CFG
+    pae = None if output.pae is None else output.pae[sample_idx].detach().float().cpu().numpy()
+    pde = None if output.pde is None else output.pde[sample_idx].detach().float().cpu().numpy()
+    if pae is None and pde is None:
+        return False
+    attrs = {
+        "seed": None if seed is None else int(seed),
+        "sample": int(sample_idx),
+        "max_error_bin": float(cfg.max_error_bin),
+        "num_error_bins": int(cfg.num_distogram_bins),
+    }
+    save_logits(path, pae=pae, pde=pde, scheme=scheme, attrs=attrs)
+    return True
+
+
+def save_distogram_logits(
+    path: str | Path,
+    output: DeepFold3Output,
+    scheme: str = "int8_softmax",
+    seed: int | None = None,
+) -> bool:
+    """Save the trunk distogram logits to a codec ``.npz`` (one per seed).
+
+    The distogram head has no sample axis (``[N, N, num_bins]``); it is a
+    property of the trunk forward and is therefore shared across all diffusion
+    samples of a given seed. It is written once per seed rather than duplicated
+    into every sample directory.
+
+    Returns:
+        True if the distogram was present and written, else False.
+    """
+    if output.distogram is None:
+        return False
+    dg = output.distogram.detach().float().cpu().numpy()
+    attrs = {
+        "seed": None if seed is None else int(seed),
+        "first_break": float(DistogramConfig.first_break),
+        "last_break": float(DistogramConfig.last_break),
+        "num_bins": int(DistogramConfig.num_bins),
+    }
+    save_logits(path, distogram=dg, scheme=scheme, attrs=attrs)
+    return True
+
+
+def _np_expected(logits: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    """E[center] under softmax(logits) along the last axis (numpy)."""
+    probs = _np_softmax(logits, axis=-1)
+    return (probs * centers.astype(np.float32)).sum(-1)
+
+
+def _np_contact_probs(
+    distogram_logits: np.ndarray,
+    first_break: float,
+    last_break: float,
+    num_bins: int,
+    threshold: float = 8.0,
+) -> np.ndarray:
+    """P(distance < threshold) from distogram logits (numpy mirror of
+    :func:`compute_contact_probs`)."""
+    breaks = np.linspace(first_break, last_break, num_bins - 1)
+    probs = _np_softmax(distogram_logits, axis=-1)
+    last_gap = breaks[-1] - breaks[-2]
+    bin_upper = np.concatenate([breaks, breaks[-1:] + last_gap])
+    contact_bins = (bin_upper <= threshold).astype(np.float32)
+    return (probs * contact_bins).sum(-1)
+
+
+def load_logit_maps(
+    logits_npz: str | Path | None = None,
+    distogram_npz: str | Path | None = None,
+    cfg: ConfidenceConfig | None = None,
+    contact_threshold: float = 8.0,
+) -> dict[str, np.ndarray]:
+    """Reconstruct the derived expected-value maps from codec ``.npz`` files.
+
+    Recovers exactly the matrices that used to live in ``confidences.json``:
+    ``pae`` / ``pde`` expected error (Å) from the per-sample logits npz, and
+    ``distogram`` expected distance (Å) + ``contact_probs`` P(d<threshold) from
+    the per-seed distogram npz. Bin edges are read from each file's ``attrs``
+    (falling back to the current config). Missing files / heads are skipped.
+
+    Returns:
+        Dict with any of ``{"pae", "pde", "distogram", "contact_probs"}`` as
+        ``[N, N]`` float32 arrays.
+    """
+    cfg = cfg or _DEFAULT_CFG
+    out: dict[str, np.ndarray] = {}
+
+    if logits_npz is not None and Path(logits_npz).exists():
+        dec = load_logits(logits_npz)
+        meb = float(dec.attrs.get("max_error_bin", cfg.max_error_bin))
+        neb = int(dec.attrs.get("num_error_bins", cfg.num_distogram_bins))
+        centers = _error_bin_centers(meb, neb).numpy()
+        for head in ("pae", "pde"):
+            if head in dec.heads:
+                out[head] = _np_expected(dec.heads[head], centers)
+
+    if distogram_npz is not None and Path(distogram_npz).exists():
+        dec = load_logits(distogram_npz)
+        if "distogram" in dec.heads:
+            fb = float(dec.attrs.get("first_break", DistogramConfig.first_break))
+            lb = float(dec.attrs.get("last_break", DistogramConfig.last_break))
+            nb = int(dec.attrs.get("num_bins", DistogramConfig.num_bins))
+            dg = dec.heads["distogram"]
+            dcenters = _distogram_bin_centers(fb, lb, nb).numpy()
+            out["distogram"] = _np_expected(dg, dcenters)
+            out["contact_probs"] = _np_contact_probs(dg, fb, lb, nb, threshold=contact_threshold)
+
+    return out
+
+
+def discover_logit_npz(conf_path: str | Path) -> tuple[Path | None, Path | None]:
+    """Locate the per-sample ``logits.npz`` (PAE/PDE) and per-seed
+    ``*_distogram.npz`` for a ``confidences.json`` written by ``deepfold3
+    inference``, following either output layout.
+
+    JSON-input layout::
+
+        <out>/seed-{seed}_sample-{s}/confidences.json   # + logits.npz beside it
+        <out>/seed-{seed}_distogram.npz                 # one level up, per seed
+
+    MSA/sequence layout::
+
+        <out>/{stem}[_sample{s}]_confidences.json
+        <out>/{stem}[_sample{s}]_logits.npz
+        <out>/{stem}_distogram.npz                       # per seed, beside it
+
+    Returns ``(logits_npz, distogram_npz)`` with either element ``None`` if the
+    corresponding file is absent.
+    """
+    conf_path = Path(conf_path)
+
+    logits_npz = conf_path.with_name("logits.npz")
+    if not logits_npz.exists():
+        cand_name = conf_path.name.replace("_confidences.json", "_logits.npz")
+        if cand_name != conf_path.name:
+            logits_npz = conf_path.with_name(cand_name)
+    logits_npz = logits_npz if logits_npz.exists() else None
+
+    distogram_npz = None
+    dir_name = conf_path.parent.name  # e.g. seed-42_sample-0
+    if dir_name.startswith("seed-") and "_sample-" in dir_name:
+        seed_tag = dir_name.split("_sample-")[0]  # seed-42
+        cand = conf_path.parent.parent / f"{seed_tag}_distogram.npz"
+        distogram_npz = cand if cand.exists() else None
+    if distogram_npz is None:
+        stem = conf_path.name.split("_confidences.json")[0].split("_sample")[0]
+        cand = conf_path.with_name(f"{stem}_distogram.npz")
+        distogram_npz = cand if cand.exists() else None
+
+    return logits_npz, distogram_npz
+
+
+def load_logit_maps_from_json(
+    conf_path: str | Path,
+    cfg: ConfidenceConfig | None = None,
+    contact_threshold: float = 8.0,
+) -> dict[str, np.ndarray]:
+    """Convenience wrapper: discover the codec ``.npz`` files next to a
+    ``confidences.json`` and return the reconstructed pairwise maps.
+
+    Returns any of ``{"pae", "pde", "distogram", "contact_probs"}`` present.
+    Empty dict if no logit ``.npz`` files are found (e.g. an older run, or the
+    confidence/distogram heads were disabled).
+    """
+    logits_npz, distogram_npz = discover_logit_npz(conf_path)
+    return load_logit_maps(
+        logits_npz=logits_npz,
+        distogram_npz=distogram_npz,
+        cfg=cfg,
+        contact_threshold=contact_threshold,
+    )
+
+
 def save_confidences_json(
     path: str | Path,
     output: DeepFold3Output,
@@ -583,12 +791,9 @@ def save_confidences_json(
     else:
         mean_plddt = 0.0
 
-    # PAE
+    # PAE — pTM/ipTM only. The dense [N, N] PAE matrix is no longer written to
+    # JSON; the raw logits are persisted via ``save_sample_logits`` (codec npz).
     if output.pae is not None:
-        pae_full = compute_pae(output.pae, pair_mask, max_error_bin, num_bins)
-        pae_sample = pae_full[sample_idx].cpu()
-        result["pae"] = [[round(float(v), 2) for v in row] for row in pae_sample]
-
         # pTM and ipTM: normalize the j-sum over frame-bearing tokens
         # (tm_mask/tm_pair_mask), but size d0 on all valid tokens (seq_mask/
         # pair_mask), matching AF3 confidence_head._get_tmscore_adjusted_pae.
@@ -601,11 +806,10 @@ def save_confidences_json(
         ptm = 0.0
         iptm = float("nan")
 
-    # PDE
+    # PDE — scalar average_pde only; the dense [N, N] PDE matrix moves to the
+    # codec npz (``save_sample_logits``).
     if output.pde is not None:
-        pde_full, avg_pde = compute_pde(output.pde, pair_mask, max_error_bin, num_bins)
-        pde_sample = pde_full[sample_idx].cpu()
-        result["pde"] = [[round(float(v), 2) for v in row] for row in pde_sample]
+        _, avg_pde = compute_pde(output.pde, pair_mask, max_error_bin, num_bins)
         average_pde = float(avg_pde[sample_idx].item())
     else:
         average_pde = 0.0
@@ -621,12 +825,10 @@ def save_confidences_json(
                     atom_exp_resolved.append(round(float(er[i, j]), 3))
         result["atom_exp_resolved"] = atom_exp_resolved
 
-    # Distogram (per-pair expected distance) and contact probabilities
-    if output.distogram is not None:
-        distogram_expected = compute_distogram_expected(output.distogram)
-        result["distogram"] = [[round(float(v), 2) for v in row] for row in distogram_expected.cpu()]
-        contact_probs = compute_contact_probs(output.distogram)
-        result["contact_probs"] = [[round(float(v), 3) for v in row] for row in contact_probs.cpu()]
+    # Distogram (per-pair expected distance) + contact probabilities are no
+    # longer written to JSON — the raw trunk distogram logits are persisted once
+    # per seed via ``save_distogram_logits`` (codec npz), from which E[d] and
+    # contact maps are recomputed on load (``load_logit_maps``).
 
     # Clash detection
     polymer_mask = features["frames_mask"].to(device) if "frames_mask" in features else seq_mask.bool()

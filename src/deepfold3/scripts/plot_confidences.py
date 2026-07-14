@@ -13,16 +13,25 @@ import json
 from pathlib import Path
 
 import click
-import numpy as np
 
 from deepfold3.scripts import cli
 
 
-def plot_confidences_file(input_path: Path, output: Path, dpi: int = 150) -> bool:
+def plot_confidences_file(
+    input_path: Path,
+    output: Path,
+    dpi: int = 150,
+    logits_npz: Path | None = None,
+    distogram_npz: Path | None = None,
+) -> bool:
     """Render a PAE/PDE/contact-probability figure from a confidences JSON.
 
-    Returns True if the figure was written, False if the JSON had no plottable
-    fields (e.g. confidence head was disabled).
+    The dense pairwise maps live in the compressed logit ``.npz`` files, not the
+    JSON. ``logits_npz`` (per-sample PAE/PDE) and ``distogram_npz`` (per-seed)
+    are auto-discovered next to ``input_path`` when not passed explicitly.
+
+    Returns True if the figure was written, False if there was nothing plottable
+    (e.g. confidence head disabled / no logit npz found).
     """
     try:
         import matplotlib
@@ -32,6 +41,7 @@ def plot_confidences_file(input_path: Path, output: Path, dpi: int = 150) -> boo
     except ImportError as e:
         raise ImportError("matplotlib is required: pip install matplotlib") from e
 
+    from deepfold3.io.confidences import discover_logit_npz, load_logit_maps
     from deepfold3.model.config import ConfidenceConfig, DistogramConfig
 
     cfg = ConfidenceConfig()
@@ -41,17 +51,19 @@ def plot_confidences_file(input_path: Path, output: Path, dpi: int = 150) -> boo
     summary = data.get("summary", {})
     N = summary.get("num_tokens", 0)
 
+    if logits_npz is None and distogram_npz is None:
+        logits_npz, distogram_npz = discover_logit_npz(input_path)
+    maps = load_logit_maps(logits_npz=logits_npz, distogram_npz=distogram_npz, cfg=cfg)
+
     panels = []
-    if "pae" in data:
-        panels.append(("PAE", np.array(data["pae"]), 0.0, cfg.max_error_bin, "Greens", "Å"))
-    if "pde" in data:
-        panels.append(("PDE", np.array(data["pde"]), 0.0, cfg.max_error_bin, "Greens", "Å"))
-    if "distogram" in data:
-        panels.append(
-            ("Distogram (E[d])", np.array(data["distogram"]), 0.0, float(dgram_cfg.last_break), "viridis_r", "Å")
-        )
-    elif "contact_probs" in data:
-        panels.append(("Contact Probability (d < 8 Å)", np.array(data["contact_probs"]), 0.0, 1.0, "Reds", ""))
+    if "pae" in maps:
+        panels.append(("PAE", maps["pae"], 0.0, cfg.max_error_bin, "Greens", "Å"))
+    if "pde" in maps:
+        panels.append(("PDE", maps["pde"], 0.0, cfg.max_error_bin, "Greens", "Å"))
+    if "distogram" in maps:
+        panels.append(("Distogram (E[d])", maps["distogram"], 0.0, float(dgram_cfg.last_break), "viridis_r", "Å"))
+    elif "contact_probs" in maps:
+        panels.append(("Contact Probability (d < 8 Å)", maps["contact_probs"], 0.0, 1.0, "Reds", ""))
 
     if not panels:
         return False

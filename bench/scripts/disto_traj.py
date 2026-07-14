@@ -103,7 +103,17 @@ def _err(stepdir, target):
     if not os.path.exists(f):
         return None
     conf = json.load(open(f))
-    dg = np.array(conf["distogram"]); N = dg.shape[0]
+    # Trunk distogram E[d]: per-seed codec npz (current layout) with a fallback
+    # to the inline 'distogram' field for legacy confidences.json.
+    from deepfold3.io.confidences import load_logit_maps_from_json
+    maps = load_logit_maps_from_json(f)
+    if "distogram" in maps:
+        dg = np.asarray(maps["distogram"])
+    elif "distogram" in conf:
+        dg = np.asarray(conf["distogram"])
+    else:
+        return None
+    N = dg.shape[0]
     C = gt_per_token(stepdir, target, N)            # token index = residue order (monomer)
     v = ~np.isnan(C).any(1)
     D = np.sqrt(((C[:, None] - C[None]) ** 2).sum(-1))

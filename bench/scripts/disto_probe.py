@@ -21,10 +21,15 @@ def analyze(target, arm, step, contact_thr=0.5, seq_gap=6, dist_cut=8.0):
     base = f"tmp/bench/{target}/{arm}/step_{step}_n30"
     samples = sorted(glob.glob(f"{base}/seed-*_sample-*"))
     if not samples: return None
-    # trunk belief: contact_probs identical across samples (trunk deterministic) -> take sample-0
-    conf = json.load(open(f"{samples[0]}/confidences.json"))
-    cp = np.array(conf["contact_probs"])          # P(d<8) from distogram (trunk)
-    dg = np.array(conf["distogram"])              # expected dist (trunk)
+    # trunk belief: distogram identical across samples (trunk deterministic) -> take sample-0
+    cpath = f"{samples[0]}/confidences.json"
+    conf = json.load(open(cpath))
+    # contact_probs / expected dist come from the per-seed distogram codec npz
+    # (current layout), with a fallback to the inline fields for legacy JSON.
+    from deepfold3.io.confidences import load_logit_maps_from_json
+    maps = load_logit_maps_from_json(cpath)
+    cp = np.asarray(maps["contact_probs"] if "contact_probs" in maps else conf["contact_probs"])  # P(d<8)
+    dg = np.asarray(maps["distogram"] if "distogram" in maps else conf["distogram"])              # expected dist
     tchain = list(conf["token_chain_ids"]); tres = list(conf["token_res_ids"])
     N = len(tres)
     gt = coords(f"tmp/bench/{target}/_ref.cif")
