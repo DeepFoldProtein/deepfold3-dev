@@ -798,6 +798,15 @@ class TrainingConfig:
     alpha_confidence: float = 1e-4
     alpha_pae: float = 0.0
     alpha_bond: float = 0.0
+    # Feed the symmetry-swappable atom pairs (ASP OD1/OD2, PHE/TYR ring,
+    # ARG NH1/NH2, LEU/VAL gem-dimethyls, nucleic OP1/OP2, atomized/ligand
+    # 2-cycles) into the bond loss as extra distance constraints. Their target
+    # ``||gt_a - gt_b||`` is invariant to the a<->b labeling, so this is a
+    # coin-flip-free, per-pair-normalised (un-diluted) penalty that stops the
+    # symmetric-atom midpoint collapse the per-residue symmetry renaming
+    # otherwise leaves ~loss-free under diffusion MSE. Shares ``alpha_bond``
+    # (requires ``alpha_bond > 0``); no separate weight.
+    bond_include_symmetric: bool = False
     # Masked-MSA (BERT) cross-entropy weight. Auxiliary self-supervised
     # objective on the MSA representation; predicts the original residue
     # identity at masked (row, token) entries. Off by default. Requires
@@ -856,7 +865,24 @@ class TrainingConfig:
     #   * ``"NCACO+CB"`` — K=5 AF2 backbone + CB (default). Supervises
     #                     C=O direction (strand H-bond ladder) on top
     #                     of the local-stereocentre chirality channel.
+    #   * ``"ALL"``      — AF2 §4.2.7 full all-atom FAPE: every atom slot
+    #                     of each token is projected into the backbone
+    #                     frames (bypasses the K=5 subset). Gives the
+    #                     symmetric terminal atoms (ASP OD1/OD2, ARG
+    #                     NH1/NH2, PHE/TYR ring, LEU/VAL gem-dimethyls) —
+    #                     which the K sets never probe — a local-frame
+    #                     positional target, so they can no longer collapse
+    #                     onto their pair midpoint under the symmetry
+    #                     renaming (diffusion MSE / smooth_lddt leave that
+    #                     collapse ~free). Cost is O(N²·M) with
+    #                     M=MAX_ATOMS_PER_TOKEN=24 (~5× the K=5 path); use
+    #                     ``fape_chunk_size`` to bound peak memory.
     fape_atom_set: str = "NCACO+CB"
+    # Frame-axis chunk size for the FAPE loss (0 = process all N frames at
+    # once). Only affects peak memory, not the result (the (i, j, atom)
+    # reduction is a plain sum). Recommended for ``fape_atom_set="ALL"`` at
+    # large crops, e.g. 64.
+    fape_chunk_size: int = 0
     # Smooth LDDT weight. Set to None to disable entirely (AF3 Table 6:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0
@@ -1007,7 +1033,9 @@ class TrainingConfig:
         True  # all DDP ranks use the same num_recycles per microstep (avoids straggler at no_grad warmups)
     )
     batch_size_per_rank: int = 1  # number of samples per rank per microstep (effective = world × batch × accumulate)
-    epoch_size: int = 100_000  # sampler reseed-chunk size (infinite sampler: no epoch boundary; epoch is a derived log counter)
+    epoch_size: int = (
+        100_000  # sampler reseed-chunk size (infinite sampler: no epoch boundary; epoch is a derived log counter)
+    )
     eval_before: bool = False  # run one eval pass before the training loop starts (also fires on resume)
     max_checkpoints: int = 0  # keep N most recent checkpoints (0 = keep all)
     checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)

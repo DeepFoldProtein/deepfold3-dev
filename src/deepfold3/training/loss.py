@@ -964,7 +964,7 @@ def _frame_angle_mask(
 
 def _tm_score_from_error(
     error: torch.Tensor,  # [S, N, N] per-pair distance (Å)
-    mask: torch.Tensor,   # [S, N, N] float
+    mask: torch.Tensor,  # [S, N, N] float
     n_eff: int,
 ) -> torch.Tensor:
     """TM-like scalar in [0, 1] from a per-pair distance error tensor.
@@ -1027,10 +1027,10 @@ _FAPE_ATOM_SET_SLOTS: dict[str, tuple[int, ...]] = {
     # Featurizer K=5 layout: 0=N, 1=CA, 2=C, 3=CB (rep), 4=O. Option
     # names spell out the protein atom set; non-protein tokens take the
     # corresponding frame-atom slots (e.g. slot 1 = C3' for nucleic).
-    "CA": (1,),                    # K=1 — frame centre only
-    "NCAC+CB": (0, 1, 2, 3),       # K=4 — historical S3 (CB, no O)
-    "NCACO": (0, 1, 2, 4),         # K=4 — AF2 §4.2.7 backbone FAPE
-    "NCACO+CB": (0, 1, 2, 3, 4),   # K=5 — AF2 backbone + CB (current default)
+    "CA": (1,),  # K=1 — frame centre only
+    "NCAC+CB": (0, 1, 2, 3),  # K=4 — historical S3 (CB, no O)
+    "NCACO": (0, 1, 2, 4),  # K=4 — AF2 §4.2.7 backbone FAPE
+    "NCACO+CB": (0, 1, 2, 3, 4),  # K=5 — AF2 backbone + CB (current default)
 }
 
 
@@ -1047,10 +1047,7 @@ def _apply_fape_atom_set_mask(
     try:
         keep = _FAPE_ATOM_SET_SLOTS[atom_set]
     except KeyError as exc:
-        raise ValueError(
-            f"Unknown fape_atom_set={atom_set!r}; expected one of "
-            f"{sorted(_FAPE_ATOM_SET_SLOTS)}"
-        ) from exc
+        raise ValueError(f"Unknown fape_atom_set={atom_set!r}; expected one of {sorted(_FAPE_ATOM_SET_SLOTS)}") from exc
     K = mask.shape[-1]
     if len(keep) == K and all(k < K for k in keep):
         return mask
@@ -1062,20 +1059,23 @@ def _apply_fape_atom_set_mask(
 
 
 def fape_loss(
-    pred_pos: torch.Tensor,          # [S, N, M, 3]
-    gt_pos: torch.Tensor,            # [N, M, 3]
+    pred_pos: torch.Tensor,  # [S, N, M, 3]
+    gt_pos: torch.Tensor,  # [N, M, 3]
     fape_token_index: torch.Tensor,  # [N, K] — token id per fape-atom slot
-    fape_atom_index: torch.Tensor,   # [N, K] — atom slot within that token
-    fape_atom_mask: torch.Tensor,    # [N, K] bool — per-slot atom presence
+    fape_atom_index: torch.Tensor,  # [N, K] — atom slot within that token
+    fape_atom_mask: torch.Tensor,  # [N, K] bool — per-slot atom presence
     frame_atom_index: torch.Tensor,  # [N, 3] — (a, b, c) frame atom slots
-    frame_token_index: torch.Tensor, # [N, 3] — token id per frame atom
-    frames_mask: torch.Tensor,       # [N] bool (unused; pair_mask captures it)
-    seq_mask: torch.Tensor,          # [N] bool (kept for signature parity)
-    pair_mask: torch.Tensor,         # [N, N] bool — frame_i × token_j
+    frame_token_index: torch.Tensor,  # [N, 3] — token id per frame atom
+    frames_mask: torch.Tensor,  # [N] bool (unused; pair_mask captures it)
+    seq_mask: torch.Tensor,  # [N] bool (kept for signature parity)
+    pair_mask: torch.Tensor,  # [N, N] bool — frame_i × token_j
     clip_distance: float = 10.0,
     normalize: bool = True,
     angle_threshold: float = 25.0,
     eps: float = 1e-4,
+    atom_mask: torch.Tensor | None = None,  # [N, M] bool — required for all_atom_points
+    all_atom_points: bool = False,  # AF2 §4.2.7 full: project every atom slot per token
+    chunk_size: int = 0,  # chunk the frame (i) axis; 0 = all N frames at once
 ) -> torch.Tensor:
     """Frame-Aligned Point Error (AF2 §4.2.7), K-atoms-per-token form.
 
@@ -1140,6 +1140,17 @@ def fape_loss(
         angle_threshold: drop frames within this many degrees of
             colinearity (AF3 §4.3.2 / OF3 ``pae_loss``). Defaults ``25``.
         eps: numerical stabiliser inside the norm (smooth ``sqrt``).
+        atom_mask: ``[N, M]`` presence mask — used as the point set when
+            ``all_atom_points=True`` (required in that mode).
+        all_atom_points: AF2 §4.2.7 full FAPE. Project every atom slot of
+            each token (masked by ``atom_mask``) into the frames instead of
+            the K featurizer slots, so symmetric terminal atoms (OD/NH/ring)
+            get a local-frame target and cannot collapse onto their pair
+            midpoint. ``fape_token_index`` / ``fape_atom_index`` /
+            ``fape_atom_mask`` are ignored in this mode.
+        chunk_size: split the frame (i) axis into chunks of this size to
+            bound peak memory (0 = all N frames at once). Exact: the
+            (i, j, atom) reduction is a plain sum, so chunks accumulate.
 
     Returns:
         Scalar FAPE in pred dtype. Dimensionless when ``normalize=True``.
@@ -1155,7 +1166,7 @@ def fape_loss(
 
         # Frame atoms (shared between Gram-Schmidt + colinearity filter)
         pred_frames = pred32[:, frame_token_index, frame_atom_index]  # [S, N, 3, 3]
-        gt_frames = gt32[frame_token_index, frame_atom_index]          # [N, 3, 3]
+        gt_frames = gt32[frame_token_index, frame_atom_index]  # [N, 3, 3]
 
         def _build_frame_basis(frames: torch.Tensor):
             # frames: [..., N, 3, 3] → (R_t, b) with R_t = [e1; e2; e3] rows.
@@ -1173,51 +1184,69 @@ def fape_loss(
             return R_t, b
 
         pred_R_t, pred_b = _build_frame_basis(pred_frames)  # [S, N, 3, 3], [S, N, 3]
-        gt_R_t, gt_b = _build_frame_basis(gt_frames)        # [N, 3, 3],    [N, 3]
+        gt_R_t, gt_b = _build_frame_basis(gt_frames)  # [N, 3, 3],    [N, 3]
 
-        # Gather K projected atoms per token: [S, N, K, 3] / [N, K, 3]
-        pred_atoms = pred32[:, fape_token_index, fape_atom_index]  # [S, N_j, K, 3]
-        gt_atoms = gt32[fape_token_index, fape_atom_index]          # [N_j, K, 3]
+        # Point set projected into every frame. K-atom mode gathers the
+        # featurizer's [N, P=K] slots; all-atom mode (AF2 §4.2.7 full) uses
+        # every atom slot of each token (masked by ``atom_mask``) so that
+        # symmetric terminal atoms — absent from the K sets — get a
+        # local-frame target and cannot collapse onto their pair midpoint.
+        if all_atom_points:
+            if atom_mask is None:
+                raise ValueError("fape_loss(all_atom_points=True) requires atom_mask [N, M]")
+            pred_atoms = pred32  # [S, N_j, P=M, 3]
+            gt_atoms = gt32  # [N_j, P=M, 3]
+            point_mask = (atom_mask > 0).float()  # [N_j, P]
+        else:
+            pred_atoms = pred32[:, fape_token_index, fape_atom_index]  # [S, N_j, P=K, 3]
+            gt_atoms = gt32[fape_token_index, fape_atom_index]  # [N_j, P=K, 3]
+            point_mask = fape_atom_mask.float()  # [N_j, P]
 
-        # rel[s, i, j, k, :] = atoms[s, j, k, :] - b[s, i, :]
-        pred_rel = pred_atoms.unsqueeze(1) - pred_b.unsqueeze(2).unsqueeze(3)
-        gt_rel = gt_atoms.unsqueeze(0) - gt_b.unsqueeze(1).unsqueeze(2)
-
-        # Project: R_i^T @ rel → [S, N_i, N_j, K, 3]. Memory peak ~S·N²·K·3·4B
-        # (S=8, N=384, K=4 → ~57 MB per tensor; matmul fuses on cuBLAS).
-        pred_local = torch.matmul(
-            pred_R_t.unsqueeze(2).unsqueeze(2),  # [S, N_i, 1, 1, 3, 3]
-            pred_rel.unsqueeze(-1),               # [S, N_i, N_j, K, 3, 1]
-        ).squeeze(-1)                              # [S, N_i, N_j, K, 3]
-        gt_local = torch.matmul(
-            gt_R_t.unsqueeze(1).unsqueeze(1),     # [N_i, 1, 1, 3, 3]
-            gt_rel.unsqueeze(-1),                  # [N_i, N_j, K, 3, 1]
-        ).squeeze(-1)                              # [N_i, N_j, K, 3]
-
-        # Smooth norm: sqrt(d²+ε) keeps the backward bounded at d→0.
-        error_sq = ((pred_local - gt_local.unsqueeze(0)) ** 2).sum(-1)  # [S, N, N, K]
-        error = (error_sq + eps).sqrt()
-
-        # Mask: pair_mask × frame-angle × per-slot atom presence.
+        # Frame-angle gate on the i-axis (frame-providing token), pred & GT.
         pred_angle_ok = _frame_angle_mask(pred_frames, angle_threshold).float()  # [S, N]
-        gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).float()       # [N]
-        mask_pair = (
-            pair_mask.float().unsqueeze(0).expand(S, N, N)
-            * pred_angle_ok.unsqueeze(-1)
-            * gt_angle_ok.unsqueeze(0).unsqueeze(-1)
-        )  # [S, N, N]
-        mask = mask_pair.unsqueeze(-1) * fape_atom_mask.float().unsqueeze(0).unsqueeze(0)  # [S, N, N, K]
+        gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).float()  # [N]
+        pmf = pair_mask.float()  # [N_i, N_j]
 
-        clamped = error.clamp(max=clip_distance)
-        if normalize:
-            clamped = clamped / clip_distance
+        # Chunk over the frame axis i to bound the [S, C, N_j, P, 3] peak
+        # (all-atom P=M=24 is ~5× the K=5 path). The (i, j, atom) reduction is
+        # a plain sum, so chunk sums accumulate to the exact unchunked result.
+        cs = chunk_size if chunk_size and chunk_size > 0 else N
+        err_per_sample = pred32.new_zeros(S)
+        n_per_sample = pred32.new_zeros(S)
+        for i0 in range(0, N, cs):
+            i1 = min(i0 + cs, N)
+            # rel[s, i, j, p, :] = atoms[s, j, p, :] - b[s, i, :]
+            pred_rel = pred_atoms.unsqueeze(1) - pred_b[:, i0:i1].unsqueeze(2).unsqueeze(3)  # [S, C, N_j, P, 3]
+            gt_rel = gt_atoms.unsqueeze(0) - gt_b[i0:i1].unsqueeze(1).unsqueeze(2)  # [C, N_j, P, 3]
+            pred_local = torch.matmul(
+                pred_R_t[:, i0:i1].unsqueeze(2).unsqueeze(2),  # [S, C, 1, 1, 3, 3]
+                pred_rel.unsqueeze(-1),  # [S, C, N_j, P, 3, 1]
+            ).squeeze(-1)  # [S, C, N_j, P, 3]
+            gt_local = torch.matmul(
+                gt_R_t[i0:i1].unsqueeze(1).unsqueeze(1),  # [C, 1, 1, 3, 3]
+                gt_rel.unsqueeze(-1),  # [C, N_j, P, 3, 1]
+            ).squeeze(-1)  # [C, N_j, P, 3]
 
-        # Per-sample mean → mean across samples (matches ``pae_loss`` /
-        # OF3 convention; samples with sparse valid frames are not
-        # over-weighted by a global denominator).
-        err_per_sample = (clamped * mask).sum(dim=(-1, -2, -3))  # [S]
-        n_per_sample = mask.sum(dim=(-1, -2, -3)).clamp(min=1)    # [S]
-        loss = (err_per_sample / n_per_sample).mean()
+            # Smooth norm: sqrt(d²+ε) keeps the backward bounded at d→0.
+            error = (((pred_local - gt_local.unsqueeze(0)) ** 2).sum(-1) + eps).sqrt()  # [S, C, N_j, P]
+            clamped = error.clamp(max=clip_distance)
+            if normalize:
+                clamped = clamped / clip_distance
+
+            # Mask: pair_mask × frame-angle (i-axis) × per-point presence.
+            mask_pair = (
+                pmf[i0:i1].unsqueeze(0)  # [1, C, N_j]
+                * pred_angle_ok[:, i0:i1].unsqueeze(-1)  # [S, C, 1]
+                * gt_angle_ok[i0:i1].unsqueeze(0).unsqueeze(-1)  # [1, C, 1]
+            )  # [S, C, N_j]
+            mask = mask_pair.unsqueeze(-1) * point_mask.unsqueeze(0).unsqueeze(0)  # [S, C, N_j, P]
+
+            err_per_sample = err_per_sample + (clamped * mask).sum(dim=(-1, -2, -3))  # [S]
+            n_per_sample = n_per_sample + mask.sum(dim=(-1, -2, -3))  # [S]
+
+        # Per-sample mean → mean across samples (matches ``pae_loss`` / OF3
+        # convention; samples with sparse valid frames are not over-weighted).
+        loss = (err_per_sample / n_per_sample.clamp(min=1)).mean()
 
     return loss.to(out_dtype)
 
@@ -1403,17 +1432,77 @@ def bond_loss(
     return mse_per_sample.mean()
 
 
+def _augment_bond_indices_with_symmetric_pairs(
+    features: dict[str, torch.Tensor],
+    gt_pos: torch.Tensor,  # [N, M, 3] resolved GT
+    atom_mask: torch.Tensor,  # [N, M]
+    bond_atom_indices: torch.Tensor | None,  # [B, 4] or None
+    bond_gt_distances: torch.Tensor | None,  # [B] or None
+    bond_loss_mask: torch.Tensor | None,  # [B] or None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Append the symmetry-swappable atom pairs to the bond-loss inputs.
+
+    The pairs the per-residue symmetry renaming can swap (ASP OD1/OD2, PHE/TYR
+    ring, ARG NH1/NH2, gem-dimethyls, nucleic OP1/OP2, atomized/ligand 2-cycles)
+    collapse onto their pair midpoint because the renaming makes that ~loss-free
+    under diffusion MSE. Feeding them into :func:`bond_loss` — whose target
+    ``||gt_a - gt_b||`` is invariant to the a<->b labeling — adds a coin-flip-free,
+    per-pair-normalised (un-diluted) separation penalty. Returns
+    ``(indices [B', 4], gt_distances [B'], mask [B'])`` with the symmetric rows
+    appended (originals unchanged when no symmetry pairs exist).
+    """
+    dev = gt_pos.device
+    rows: list[torch.Tensor] = []
+    # atom_swap_pairs [P, 3] = (token, M_a, M_b): intra-token protein / nucleic.
+    asp = features.get("atom_swap_pairs")
+    if asp is not None and len(asp) > 0:
+        asp = asp.to(dev).long()
+        asp = asp[asp[:, 1] != asp[:, 2]]  # drop collate self-pad rows
+        if len(asp):
+            rows.append(torch.stack([asp[:, 0], asp[:, 1], asp[:, 0], asp[:, 2]], dim=1))
+    # ligand_swap_pairs [P, 2|3] = (token_a, token_b[, group]): inter-token, slot 0.
+    lsp = features.get("ligand_swap_pairs")
+    if lsp is not None and len(lsp) > 0:
+        lsp = lsp.to(dev).long()
+        lsp = lsp[lsp[:, 0] != lsp[:, 1]]
+        if len(lsp):
+            z = torch.zeros(lsp.shape[0], dtype=torch.long, device=dev)
+            rows.append(torch.stack([lsp[:, 0], z, lsp[:, 1], z], dim=1))
+
+    empty_idx = torch.zeros((0, 4), dtype=torch.long, device=dev)
+    empty_1d = torch.zeros((0,), device=dev)
+    if bond_atom_indices is not None and bond_atom_indices.shape[0] > 0:
+        base_idx = bond_atom_indices.to(dev).long()
+        base_gt = bond_gt_distances.to(dev)
+        base_mask = bond_loss_mask.to(dev).bool()
+    else:
+        base_idx, base_gt, base_mask = empty_idx, empty_1d, empty_1d.bool()
+
+    if not rows:
+        return base_idx, base_gt, base_mask
+
+    sym_idx = torch.cat(rows, dim=0)  # [P, 4]
+    t1, a1, t2, a2 = sym_idx[:, 0], sym_idx[:, 1], sym_idx[:, 2], sym_idx[:, 3]
+    sym_gt = (gt_pos[t1, a1] - gt_pos[t2, a2]).norm(dim=-1)  # [P] label-invariant
+    sym_mask = atom_mask[t1, a1].bool() & atom_mask[t2, a2].bool()  # [P]
+    return (
+        torch.cat([base_idx, sym_idx], dim=0),
+        torch.cat([base_gt, sym_gt], dim=0),
+        torch.cat([base_mask, sym_mask], dim=0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chirality (sign-target) loss — AF3-spec deviation
 # ---------------------------------------------------------------------------
 
 
 def chirality_loss(
-    pred_pos: torch.Tensor,             # [S, N, M, 3]
-    frame_token_index: torch.Tensor,    # [N, 3] long
-    frame_atom_index: torch.Tensor,     # [N, 3] long
-    chirality_atom_idx: torch.Tensor,   # [N] long
-    chirality_target: torch.Tensor,     # [N] float, in {-1, 0, +1}
+    pred_pos: torch.Tensor,  # [S, N, M, 3]
+    frame_token_index: torch.Tensor,  # [N, 3] long
+    frame_atom_index: torch.Tensor,  # [N, 3] long
+    chirality_atom_idx: torch.Tensor,  # [N] long
+    chirality_target: torch.Tensor,  # [N] float, in {-1, 0, +1}
 ) -> torch.Tensor:
     """Per-residue chirality quadratic on the Cβ projection onto the frame normal.
 
@@ -1506,7 +1595,10 @@ def chirality_loss(
 
 
 def _ca_pseudo_dihedral(
-    p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor, p4: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    p3: torch.Tensor,
+    p4: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Dihedral angle around the (p2, p3) axis using atan2.
@@ -1529,12 +1621,12 @@ def _ca_pseudo_dihedral(
 
 
 def backbone_chirality_loss(
-    pred_pos: torch.Tensor,    # [S, N, M, 3]
-    gt_pos: torch.Tensor,      # [N, M, 3]
-    atom_mask: torch.Tensor,   # [N, M] bool — gt atoms present
-    seq_mask: torch.Tensor,    # [N] bool
-    asym_id: torch.Tensor,     # [N] long
-    mol_type: torch.Tensor,    # [N] int
+    pred_pos: torch.Tensor,  # [S, N, M, 3]
+    gt_pos: torch.Tensor,  # [N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool — gt atoms present
+    seq_mask: torch.Tensor,  # [N] bool
+    asym_id: torch.Tensor,  # [N] long
+    mol_type: torch.Tensor,  # [N] int
     ca_slot: int = 1,
 ) -> torch.Tensor:
     """Backbone-trace chirality via Cα pseudo-dihedral sin matching.
@@ -1577,38 +1669,32 @@ def backbone_chirality_loss(
     if N < 4:
         return pred_pos.new_zeros(())
 
-    is_prot = (mol_type == 0)  # MOL_PROTEIN = 0
+    is_prot = mol_type == 0  # MOL_PROTEIN = 0
     # ``atom_mask`` may have been scaled by ``loss_weight_mask`` and is no
     # longer a strict bool; treat any nonzero weight as "atom present".
     ca_ok = atom_mask[:, ca_slot] > 0
     valid = seq_mask & is_prot & ca_ok
     # Same-chain quadruplet mask (all 4 share asym_id).
-    quad_chain_ok = (
-        (asym_id[:-3] == asym_id[1:-2])
-        & (asym_id[1:-2] == asym_id[2:-1])
-        & (asym_id[2:-1] == asym_id[3:])
-    )
-    quad_mask = (
-        valid[:-3] & valid[1:-2] & valid[2:-1] & valid[3:] & quad_chain_ok
-    )  # [N-3]
+    quad_chain_ok = (asym_id[:-3] == asym_id[1:-2]) & (asym_id[1:-2] == asym_id[2:-1]) & (asym_id[2:-1] == asym_id[3:])
+    quad_mask = valid[:-3] & valid[1:-2] & valid[2:-1] & valid[3:] & quad_chain_ok  # [N-3]
     if not bool(quad_mask.any().item()):
         return pred_pos.new_zeros(())
 
     with torch.amp.autocast(device_type=pred_pos.device.type, enabled=False):
         pred_ca = pred_pos.float()[:, :, ca_slot, :]  # [S, N, 3]
-        gt_ca = gt_pos.float()[:, ca_slot, :]          # [N, 3]
+        gt_ca = gt_pos.float()[:, ca_slot, :]  # [N, 3]
 
         p1, p2, p3, p4 = pred_ca[:, :-3], pred_ca[:, 1:-2], pred_ca[:, 2:-1], pred_ca[:, 3:]
         g1, g2, g3, g4 = gt_ca[:-3], gt_ca[1:-2], gt_ca[2:-1], gt_ca[3:]
 
-        pred_dih = _ca_pseudo_dihedral(p1, p2, p3, p4)        # [S, N-3]
+        pred_dih = _ca_pseudo_dihedral(p1, p2, p3, p4)  # [S, N-3]
         with torch.no_grad():
-            gt_dih = _ca_pseudo_dihedral(g1, g2, g3, g4)      # [N-3]
+            gt_dih = _ca_pseudo_dihedral(g1, g2, g3, g4)  # [N-3]
 
         sin_pred = torch.sin(pred_dih)
-        sin_gt = torch.sin(gt_dih).unsqueeze(0)                # [1, N-3]
+        sin_gt = torch.sin(gt_dih).unsqueeze(0)  # [1, N-3]
 
-        loss_per = (sin_pred - sin_gt) ** 2                    # [S, N-3]
+        loss_per = (sin_pred - sin_gt) ** 2  # [S, N-3]
         mask = quad_mask.float().unsqueeze(0).expand_as(loss_per)
         n_valid = mask.sum().clamp(min=1)
         loss = (loss_per * mask).sum() / n_valid
@@ -1951,14 +2037,15 @@ def diffusion_only_loss(
         else:
             total = total + cfg.alpha_diffusion * l_mse
 
-        if cfg.alpha_bond > 0 and "bond_atom_indices" in features:
-            l_bond = bond_loss(
-                denoised,
-                features["bond_atom_indices"],
-                features["bond_gt_distances"],
-                features["bond_loss_mask"],
-                noise_levels=noise_levels,
-            )
+        if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):
+            b_idx = features.get("bond_atom_indices")
+            b_gt = features.get("bond_gt_distances")
+            b_mask = features.get("bond_loss_mask")
+            if cfg.bond_include_symmetric:
+                b_idx, b_gt, b_mask = _augment_bond_indices_with_symmetric_pairs(
+                    features, gt_pos, atom_mask, b_idx, b_gt, b_mask
+                )
+            l_bond = bond_loss(denoised, b_idx, b_gt, b_mask, noise_levels=noise_levels)
             components["bond"] = l_bond.detach()
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
 
@@ -2010,23 +2097,44 @@ def diffusion_only_loss(
                 pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m.bool()
-            fape_mask_local = _apply_fape_atom_set_mask(
-                features["fape_atom_mask"].bool(), cfg.fape_atom_set
-            )
-            l_fape = fape_loss(
-                denoised,
-                gt_pos,
-                features["fape_token_index"],
-                features["fape_atom_index"],
-                fape_mask_local,
-                features["frame_atom_index"],
-                features["frame_token_index"],
-                frm_m,
-                seq_m,
-                pair_m,
-                clip_distance=cfg.fape_clip_distance,
-                normalize=cfg.fape_normalize,
-            )
+            if cfg.fape_atom_set.upper() == "ALL":
+                # AF2 §4.2.7 full: every atom slot is a point (the K-slot
+                # ``fape_*`` point indices are ignored); ``atom_mask`` gives
+                # presence. Frames still come from ``frame_*``.
+                l_fape = fape_loss(
+                    denoised,
+                    gt_pos,
+                    None,
+                    None,
+                    None,
+                    features["frame_atom_index"],
+                    features["frame_token_index"],
+                    frm_m,
+                    seq_m,
+                    pair_m,
+                    clip_distance=cfg.fape_clip_distance,
+                    normalize=cfg.fape_normalize,
+                    atom_mask=atom_mask,
+                    all_atom_points=True,
+                    chunk_size=cfg.fape_chunk_size,
+                )
+            else:
+                fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
+                l_fape = fape_loss(
+                    denoised,
+                    gt_pos,
+                    features["fape_token_index"],
+                    features["fape_atom_index"],
+                    fape_mask_local,
+                    features["frame_atom_index"],
+                    features["frame_token_index"],
+                    frm_m,
+                    seq_m,
+                    pair_m,
+                    clip_distance=cfg.fape_clip_distance,
+                    normalize=cfg.fape_normalize,
+                    chunk_size=cfg.fape_chunk_size,
+                )
             components["fape"] = l_fape.detach()
             total = total + cfg.alpha_fape * l_fape
 
@@ -2238,14 +2346,15 @@ def training_loss(
             total = total + cfg.alpha_diffusion * l_mse
 
         # Bond violation loss (stage 2 fine-tuning)
-        if cfg.alpha_bond > 0 and "bond_atom_indices" in features:
-            l_bond = bond_loss(
-                denoised,
-                features["bond_atom_indices"],
-                features["bond_gt_distances"],
-                features["bond_loss_mask"],
-                noise_levels=noise_levels,
-            )
+        if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):
+            b_idx = features.get("bond_atom_indices")
+            b_gt = features.get("bond_gt_distances")
+            b_mask = features.get("bond_loss_mask")
+            if cfg.bond_include_symmetric:
+                b_idx, b_gt, b_mask = _augment_bond_indices_with_symmetric_pairs(
+                    features, gt_pos, loss_atom_mask, b_idx, b_gt, b_mask
+                )
+            l_bond = bond_loss(denoised, b_idx, b_gt, b_mask, noise_levels=noise_levels)
             losses["bond"] = l_bond
             total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
 
@@ -2312,23 +2421,44 @@ def training_loss(
                 pair_m = frm_m.unsqueeze(-1) & loss_seq_mask.unsqueeze(-2)
             else:
                 pair_m = frm_m.unsqueeze(-1) & pair_m_feat.bool()
-            fape_mask_local = _apply_fape_atom_set_mask(
-                features["fape_atom_mask"].bool(), cfg.fape_atom_set
-            )
-            l_fape = fape_loss(
-                denoised,
-                gt_pos,
-                features["fape_token_index"],
-                features["fape_atom_index"],
-                fape_mask_local,
-                features["frame_atom_index"],
-                features["frame_token_index"],
-                frm_m,
-                loss_seq_mask,
-                pair_m,
-                clip_distance=cfg.fape_clip_distance,
-                normalize=cfg.fape_normalize,
-            )
+            if cfg.fape_atom_set.upper() == "ALL":
+                # AF2 §4.2.7 full: every atom slot is a point (the K-slot
+                # ``fape_*`` point indices are ignored); ``loss_atom_mask``
+                # gives presence. Frames still come from ``frame_*``.
+                l_fape = fape_loss(
+                    denoised,
+                    gt_pos,
+                    None,
+                    None,
+                    None,
+                    features["frame_atom_index"],
+                    features["frame_token_index"],
+                    frm_m,
+                    loss_seq_mask,
+                    pair_m,
+                    clip_distance=cfg.fape_clip_distance,
+                    normalize=cfg.fape_normalize,
+                    atom_mask=loss_atom_mask,
+                    all_atom_points=True,
+                    chunk_size=cfg.fape_chunk_size,
+                )
+            else:
+                fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
+                l_fape = fape_loss(
+                    denoised,
+                    gt_pos,
+                    features["fape_token_index"],
+                    features["fape_atom_index"],
+                    fape_mask_local,
+                    features["frame_atom_index"],
+                    features["frame_token_index"],
+                    frm_m,
+                    loss_seq_mask,
+                    pair_m,
+                    clip_distance=cfg.fape_clip_distance,
+                    normalize=cfg.fape_normalize,
+                    chunk_size=cfg.fape_chunk_size,
+                )
             losses["fape"] = l_fape
             total = total + cfg.alpha_fape * l_fape
 
