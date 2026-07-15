@@ -425,9 +425,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         remapped_col_idx = remap_msa_col_idx_to_slice(
             tokenized.tokens["asym_id"], tokenized.msa_col_idx, chain_msa_cols
         )
-        tokenized = replace(
-            tokenized, paired_msa=paired_msa, unpaired_msa=unpaired_msa, msa_col_idx=remapped_col_idx
-        )
+        tokenized = replace(tokenized, paired_msa=paired_msa, unpaired_msa=unpaired_msa, msa_col_idx=remapped_col_idx)
         timing["msa"], _t = time.perf_counter() - _t, time.perf_counter()
 
         # Load templates for surviving chains only: prefer per-sequence monomer

@@ -505,9 +505,7 @@ def finalize_standard_residue_atoms(
             )
 
             if is_std_named:
-                leaving = (
-                    const.PROTEIN_LEAVING_ATOMS if is_protein else const.NUCLEIC_LEAVING_ATOMS
-                )
+                leaving = const.PROTEIN_LEAVING_ATOMS if is_protein else const.NUCLEIC_LEAVING_ATOMS
                 observed_names: set[str] = set()
                 # Emit observed atoms (minus terminal leaving atoms).
                 for ai in range(r_atom_start, r_atom_start + r_atom_num):
@@ -541,9 +539,7 @@ def finalize_standard_residue_atoms(
                     new_atoms.append(tuple(atoms[ai]))
 
             res_atom_count_new = len(new_atoms) - res_atom_start_new
-            any_present = any(
-                bool(new_atoms[j][6]) for j in range(res_atom_start_new, len(new_atoms))
-            )
+            any_present = any(bool(new_atoms[j][6]) for j in range(res_atom_start_new, len(new_atoms)))
             new_residues.append(
                 (
                     res["name"],
@@ -574,9 +570,7 @@ def finalize_standard_residue_atoms(
         )
 
     atoms_arr = np.array(new_atoms, dtype=ATOM_DTYPE) if new_atoms else np.empty(0, dtype=ATOM_DTYPE)
-    residues_arr = (
-        np.array(new_residues, dtype=RESIDUE_DTYPE) if new_residues else np.empty(0, dtype=RESIDUE_DTYPE)
-    )
+    residues_arr = np.array(new_residues, dtype=RESIDUE_DTYPE) if new_residues else np.empty(0, dtype=RESIDUE_DTYPE)
     chains_arr = np.array(new_chains, dtype=CHAIN_DTYPE) if new_chains else np.empty(0, dtype=CHAIN_DTYPE)
 
     # Remap bonds to the new atom indices; drop bonds whose partner was removed.

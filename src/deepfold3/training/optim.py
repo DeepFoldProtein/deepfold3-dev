@@ -260,9 +260,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
                 "the shadow tracks x, not y. Per-step cost: 2 extra "
                 "param-sized lerps."
             )
-        strong_summary = "".join(
-            f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items())
-        )
+        strong_summary = "".join(f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items()))
         rank_zero_info(
             f"AdamWScheduleFree: warmup_steps={cfg.warmup_steps}, "
             f"weight_decay={cfg.weight_decay}, "
@@ -284,9 +282,7 @@ def build_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
         eps=cfg.eps,
         fused=use_fused_adam,
     )
-    strong_summary = "".join(
-        f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items())
-    )
+    strong_summary = "".join(f", {m:g}× wd: {p:.2f}M" for m, p in sorted(n_strong.items()))
     rank_zero_info(
         f"AdamW: fused={use_fused_adam}, weight_decay={cfg.weight_decay} "
         f"({n_decay:.1f}M decayed, {n_nodecay:.2f}M no-decay{strong_summary})"

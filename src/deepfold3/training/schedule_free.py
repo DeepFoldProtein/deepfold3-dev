@@ -143,9 +143,7 @@ class AdamWScheduleFree(Optimizer):
         if warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}")
         if decoupling_parameter is not None and decoupling_parameter <= 0:
-            raise ValueError(
-                f"decoupling_parameter must be > 0 or None, got {decoupling_parameter}"
-            )
+            raise ValueError(f"decoupling_parameter must be > 0 or None, got {decoupling_parameter}")
 
         defaults = dict(
             lr=lr,

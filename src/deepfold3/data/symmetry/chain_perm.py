@@ -772,5 +772,3 @@ def apply_chain_permutation_tokens(
     permuted = gt_pos.index_select(-3, index).detach()
     permuted_mask = (atom_mask.index_select(0, index) & keep.unsqueeze(-1)).detach()
     return permuted, permuted_mask
-
-

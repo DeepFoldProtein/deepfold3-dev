@@ -213,7 +213,11 @@ class Featurizer:
                             # cached, matching get_ref_atoms so the single-atom
                             # path uses the same conformer source as the dense path.
                             cache = _rfa._REF_POS_CACHE
-                            if cache is not None and res_name in cache and len(cache[res_name]) == len(entry.atom_names):
+                            if (
+                                cache is not None
+                                and res_name in cache
+                                and len(cache[res_name]) == len(entry.atom_names)
+                            ):
                                 positions = cache[res_name]
                             _ligand_ccd_cache[res_name] = (entry.atom_names, positions)
                         else:
@@ -512,9 +516,7 @@ class Featurizer:
         fape_token_index_np[:, 4] = np.arange(N, dtype=np.int64)
         # Per-slot atom presence via ref_mask gather.
         for k in range(K_FAPE):
-            fape_atom_mask_np[:, k] = ref_mask[
-                fape_token_index_np[:, k], fape_atom_index_np[:, k]
-            ]
+            fape_atom_mask_np[:, k] = ref_mask[fape_token_index_np[:, k], fape_atom_index_np[:, k]]
         is_protein_np = tokens["mol_type"] == const.MOL_PROTEIN
         fape_atom_mask_np[~is_protein_np, 4] = False
         # Atomized single-atom tokens have no local frame — drop all FAPE slots
@@ -524,9 +526,7 @@ class Featurizer:
         rep_tok = fape_token_index_np[:, 3]
         rep_atom_slot = fape_atom_index_np[:, 3]
         for k in range(3):
-            dup = (fape_token_index_np[:, k] == rep_tok) & (
-                fape_atom_index_np[:, k] == rep_atom_slot
-            )
+            dup = (fape_token_index_np[:, k] == rep_tok) & (fape_atom_index_np[:, k] == rep_atom_slot)
             fape_atom_mask_np[dup, 3] = False
 
         # ------------------------------------------------------------------
@@ -755,9 +755,7 @@ class Featurizer:
         # ------------------------------------------------------------------
         # Template features
         # ------------------------------------------------------------------
-        result.update(
-            self._build_template_features(templates, N, tokens, template_feats_per_chain, template_col_idx)
-        )
+        result.update(self._build_template_features(templates, N, tokens, template_feats_per_chain, template_col_idx))
 
         # ------------------------------------------------------------------
         # Token mask channels (for loss control)
@@ -1426,7 +1424,15 @@ class Featurizer:
                 if len(dst_pos) == 0:
                     continue
                 self._fill_template_slot(
-                    t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, dst_pos, src_idx, ca_row=t_ca[t]
+                    t_aatype[t],
+                    t_pb[t],
+                    t_pb_mask[t],
+                    t_frame[t],
+                    t_frame_mask[t],
+                    tmpl,
+                    dst_pos,
+                    src_idx,
+                    ca_row=t_ca[t],
                 )
 
         return {
@@ -1597,5 +1603,3 @@ def _find_res_name(data: Tokenized, atom_idx: int) -> str:
         if start <= atom_idx < end:
             return res["name"].decode("ascii", errors="replace").strip()
     return "UNK"
-
-

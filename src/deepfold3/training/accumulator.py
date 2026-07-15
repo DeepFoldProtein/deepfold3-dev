@@ -30,9 +30,7 @@ from deepfold3.training.distributed import DistInfo
 class AccumulationLoop:
     """Own the ``no_sync`` gating for both gradient accumulation and chunked diffusion."""
 
-    def __init__(
-        self, ddp_model: nn.Module, dist: DistInfo, num_steps: int, *, per_rank_clip: bool = False
-    ) -> None:
+    def __init__(self, ddp_model: nn.Module, dist: DistInfo, num_steps: int, *, per_rank_clip: bool = False) -> None:
         self.ddp_model = ddp_model
         self.dist = dist
         self.num_steps = num_steps

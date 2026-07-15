@@ -373,7 +373,10 @@ def train(
         all_records = [r for r in all_records if len(r.chains) <= max_total_chains]
         log.info(
             "max_total_chains=%d: %d → %d records (dropped %d giant assemblies)",
-            max_total_chains, before, len(all_records), before - len(all_records),
+            max_total_chains,
+            before,
+            len(all_records),
+            before - len(all_records),
         )
 
     # Train / eval split — two modes by priority:

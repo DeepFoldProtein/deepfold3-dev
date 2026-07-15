@@ -79,9 +79,7 @@ def remap_msa_col_idx_to_slice(
         sel = (asym_ids == aid) & (msa_col_idx >= 0)
         if not sel.any():
             continue
-        remapped[sel] = np.array(
-            [rank.get(int(v), -1) for v in msa_col_idx[sel]], dtype=msa_col_idx.dtype
-        )
+        remapped[sel] = np.array([rank.get(int(v), -1) for v in msa_col_idx[sel]], dtype=msa_col_idx.dtype)
     return remapped
 
 

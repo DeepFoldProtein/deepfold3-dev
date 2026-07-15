@@ -127,9 +127,7 @@ class WSDSScheduler(LambdaLR):
                 raise ValueError(f"wsds_decay_windows: end ({e}) must be > start ({s})")
         for (s1, e1), (s2, e2) in zip(windows[:-1], windows[1:], strict=False):
             if s2 < e1:
-                raise ValueError(
-                    f"wsds_decay_windows overlap: [{s1}, {e1}) and [{s2}, {e2})"
-                )
+                raise ValueError(f"wsds_decay_windows overlap: [{s1}, {e1}) and [{s2}, {e2})")
         self.windows = windows
         self.min_ratio = float(cfg.wsds_min_lr_ratio)
         if not 0.0 <= self.min_ratio <= 1.0:

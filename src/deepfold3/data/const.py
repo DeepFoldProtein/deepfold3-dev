@@ -73,14 +73,30 @@ MSA_GAP = 21
 # atom stripping + unresolved-atom materialization.
 STANDARD_PROTEIN_RES3: frozenset[str] = frozenset(
     {
-        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+        "ALA",
+        "ARG",
+        "ASN",
+        "ASP",
+        "CYS",
+        "GLN",
+        "GLU",
+        "GLY",
+        "HIS",
+        "ILE",
+        "LEU",
+        "LYS",
+        "MET",
+        "PHE",
+        "PRO",
+        "SER",
+        "THR",
+        "TRP",
+        "TYR",
+        "VAL",
         "UNK",
     }
 )
-STANDARD_NUCLEIC_RES: frozenset[str] = frozenset(
-    {"A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN"}
-)
+STANDARD_NUCLEIC_RES: frozenset[str] = frozenset({"A", "G", "C", "U", "N", "DA", "DG", "DC", "DT", "DN"})
 
 # Canonical polymer backbone bond atom sets (OF3
 # ``residues.PEPTIDE_BOND_ATOMS`` / ``PHOSPHODIESTER_BOND_ATOMS``). An

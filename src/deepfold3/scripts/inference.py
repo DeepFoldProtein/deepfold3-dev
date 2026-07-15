@@ -533,9 +533,7 @@ def inference(
 
             # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
             # float matrices that used to live in confidences.json.
-            if save_sample_logits(
-                logits_npz, model_output, sample_idx=s, scheme=logits_scheme, seed=int(current_seed)
-            ):
+            if save_sample_logits(logits_npz, model_output, sample_idx=s, scheme=logits_scheme, seed=int(current_seed)):
                 click.echo(f"  saved  {logits_npz.resolve()}")
 
             iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
@@ -552,9 +550,7 @@ def inference(
                 from deepfold3.scripts.plot_confidences import plot_confidences_file
 
                 plot_path = conf_path.with_suffix(".png")
-                if plot_confidences_file(
-                    conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz
-                ):
+                if plot_confidences_file(conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz):
                     click.echo(f"  saved  {plot_path.resolve()}")
 
     # ------------------------------------------------------------------

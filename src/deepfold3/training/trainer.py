@@ -572,10 +572,7 @@ class Trainer:
                 has_ema = True  # don't second-guess the load if introspection fails
             if not has_ema:
                 self.ema.reseed_from(self.model)
-                rank_zero_info(
-                    "[resume] EMA shadow re-seeded from loaded weights "
-                    "(source checkpoint has no 'ema' key)"
-                )
+                rank_zero_info("[resume] EMA shadow re-seeded from loaded weights (source checkpoint has no 'ema' key)")
 
         # Resume audit (warn-only): catalogue every yaml-controlled field
         # that's silently shadowed by checkpoint state on resume. lr is
@@ -595,9 +592,7 @@ class Trainer:
                 target_wd = decay_targets[gi] if gi < len(decay_targets) else 0.0
                 if abs(saved_wd - target_wd) > 1e-12:
                     label = ("decay", "no_decay")[gi] if gi < 2 else f"group_{gi}"
-                    mismatches.append(
-                        f"  weight_decay[{label}]: saved={saved_wd:.4g} != cfg={target_wd:.4g}"
-                    )
+                    mismatches.append(f"  weight_decay[{label}]: saved={saved_wd:.4g} != cfg={target_wd:.4g}")
 
             # Optimizer betas / eps (stored in param_groups; restored verbatim
             # by optimizer.load_state_dict). Saved as list; cfg keeps tuple.
@@ -638,17 +633,13 @@ class Trainer:
                 saved_val = getattr(sched, sched_attr)
                 target_val = getattr(self.cfg, cfg_attr)
                 if saved_val != target_val:
-                    mismatches.append(
-                        f"  scheduler.{sched_attr}: saved={saved_val} != cfg={target_val}"
-                    )
+                    mismatches.append(f"  scheduler.{sched_attr}: saved={saved_val} != cfg={target_val}")
             # WSDS-only: windows are list-of-tuples internally vs list-of-list in cfg.
             if hasattr(sched, "windows"):
                 saved_w = [tuple(p) for p in getattr(sched, "windows", [])]
                 target_w = [tuple(p) for p in getattr(self.cfg, "wsds_decay_windows", [])]
                 if saved_w != target_w:
-                    mismatches.append(
-                        f"  wsds_decay_windows: saved={saved_w} != cfg={target_w}"
-                    )
+                    mismatches.append(f"  wsds_decay_windows: saved={saved_w} != cfg={target_w}")
 
             if mismatches:
                 rank_zero_warn(
@@ -657,9 +648,7 @@ class Trainer:
                     "Fix the yaml or accept the saved value:\n" + "\n".join(mismatches)
                 )
             else:
-                rank_zero_info(
-                    "[resume] yaml-vs-checkpoint state audit: all shadowed fields match"
-                )
+                rank_zero_info("[resume] yaml-vs-checkpoint state audit: all shadowed fields match")
 
         cfg = self.cfg
         tokens_per_rank = cfg.max_tokens * cfg.batch_size_per_rank
@@ -749,9 +738,7 @@ class Trainer:
 
             probe_path = output_dir / "single_track_probe.jsonl"
             self._single_track_probe = SingleTrackProbe(self.model, probe_path)
-            rank_zero_info(
-                f"Single-track probe enabled → {probe_path} (every {cfg.single_track_probe_interval} steps)"
-            )
+            rank_zero_info(f"Single-track probe enabled → {probe_path} (every {cfg.single_track_probe_interval} steps)")
 
         # Per-PF-layer activation RMS sentinel. Attached on every rank (the
         # flush does a packed all_reduce so cross-rank averaging is correct).
@@ -811,9 +798,7 @@ class Trainer:
                     # Clear any stale flag from a skipped opt step (NaN/Inf)
                     # so non-probe microsteps don't accidentally accumulate.
                     probe.discard_step()
-                    last_microstep_in_window = (
-                        (self.state.global_step + 1) % self.cfg.accumulate_grad_batches
-                    ) == 0
+                    last_microstep_in_window = ((self.state.global_step + 1) % self.cfg.accumulate_grad_batches) == 0
                     target_step = self.state.effective_step + (1 if last_microstep_in_window else 0)
                     should_probe = (
                         last_microstep_in_window
@@ -1013,9 +998,7 @@ class Trainer:
                     if (
                         self._act_meter is not None
                         and self.cfg.act_rms_log_interval > 0
-                        and self.state.effective_step
-                        % (self.cfg.log_interval * self.cfg.act_rms_log_interval)
-                        == 0
+                        and self.state.effective_step % (self.cfg.log_interval * self.cfg.act_rms_log_interval) == 0
                     ):
                         act_rms = self._act_meter.flush_to_dict()
                         self._act_meter.reset()
@@ -1119,9 +1102,7 @@ class Trainer:
                 # The time-based and signal-based triggers are rank-0
                 # local; we broadcast a single bool so save fires
                 # synchronously on every rank (RNG-gather requirement).
-                need_ckpt = on_opt_step_boundary and (
-                    self.state.effective_step % self.cfg.checkpoint_interval == 0
-                )
+                need_ckpt = on_opt_step_boundary and (self.state.effective_step % self.cfg.checkpoint_interval == 0)
                 if on_opt_step_boundary and self.dist.is_main and not need_ckpt:
                     if (
                         cfg.checkpoint_every_hours > 0

@@ -256,9 +256,7 @@ class DeepFold3(nn.Module):
         # the downstream concat with ``raw_feat`` is shape- and dtype-clean.
         fp32_ace = self.cfg.precision.fp32_evo_cond_encoder
         amp_ctx = (
-            torch.amp.autocast(device_type=ref_pos.device.type, dtype=torch.float32)
-            if fp32_ace
-            else nullcontext()
+            torch.amp.autocast(device_type=ref_pos.device.type, dtype=torch.float32) if fp32_ace else nullcontext()
         )
         with amp_ctx:
             if use_ckpt:
@@ -408,9 +406,7 @@ class DeepFold3(nn.Module):
                     k = int(torch.randint(1, S_full + 1, (1,), generator=rng).item())
                     if k < pool_size:
                         perm_k = torch.randperm(pool_size - 1, generator=rng) + 1
-                        keep = torch.cat(
-                            [torch.zeros(1, dtype=torch.long), perm_k[: k - 1]]
-                        ).to(device)
+                        keep = torch.cat([torch.zeros(1, dtype=torch.long), perm_k[: k - 1]]).to(device)
                         active = torch.zeros(pool_size, dtype=msa_mask_sub.dtype, device=device)
                         active[keep] = 1
                         bcast_shape = [1] * msa_mask_sub.dim()
@@ -581,9 +577,7 @@ class DeepFold3(nn.Module):
         if self.masked_msa_head is not None and "bert_mask" in embeddings:
             msa_valid = embeddings["bert_msa_valid_mask"]
             if torch.is_grad_enabled() and self.cfg.optim.use_gradient_checkpointing:
-                msa_logits = torch_checkpoint(
-                    self.masked_msa_head, embeddings["msa"], embeddings["single"], msa_valid
-                )
+                msa_logits = torch_checkpoint(self.masked_msa_head, embeddings["msa"], embeddings["single"], msa_valid)
             else:
                 msa_logits = self.masked_msa_head(embeddings["msa"], embeddings["single"], msa_valid)
             pred["masked_msa_logits"] = msa_logits

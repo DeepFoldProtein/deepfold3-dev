@@ -284,9 +284,7 @@ class CacheManager:
         temp_path: Path | None = None
         try:
             with _FILE_LOCK:
-                fd, tmp_name = tempfile.mkstemp(
-                    dir=str(json_path.parent), prefix=f"{json_path.name}.", suffix=".tmp"
-                )
+                fd, tmp_name = tempfile.mkstemp(dir=str(json_path.parent), prefix=f"{json_path.name}.", suffix=".tmp")
                 temp_path = Path(tmp_name)
                 with os.fdopen(fd, "w") as f:
                     json.dump(existing, f, indent=2, default=str)

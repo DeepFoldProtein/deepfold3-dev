@@ -205,7 +205,12 @@ def build_pdb_cache(
             if done % 5000 == 0:
                 log.info(
                     "  %d/%d PDBs (built=%d, skipped=%d, errors=%d, chains=%d)",
-                    done, len(todo), built, skipped, errors, total_chains,
+                    done,
+                    len(todo),
+                    built,
+                    skipped,
+                    errors,
+                    total_chains,
                 )
     finally:
         if workers > 1:
@@ -213,6 +218,9 @@ def build_pdb_cache(
 
     log.info(
         "Done: %d PDBs built (%d chains), %d skipped (cached/missing), %d errors.",
-        built, total_chains, skipped, errors,
+        built,
+        total_chains,
+        skipped,
+        errors,
     )
     click.echo(f"Cached {total_chains} chains from {built} PDBs → {output} ({skipped} skipped, {errors} errors)")

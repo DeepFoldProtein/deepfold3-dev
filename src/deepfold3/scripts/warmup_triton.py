@@ -637,9 +637,7 @@ def main(
         max_tokens = int(train_cfg.get("max_tokens", 384))
         # Training fixes N = max_tokens (collate fixed_bucket_n), so default to
         # warming exactly that bucket; --buckets overrides for larger crops.
-        bucket_list = (
-            sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else [max_tokens]
-        )
+        bucket_list = sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else [max_tokens]
         batch = int(train_cfg.get("batch_size_per_rank", 2))
         # Match training's PER-CHUNK diffusion size, not the full batch. Training
         # splits diffusion_batch_size into diffusion_chunk_size-sized passes, so

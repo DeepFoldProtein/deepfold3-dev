@@ -340,11 +340,7 @@ class CheckpointManager:
         # Sampler state: same epoch + within-epoch index across ranks
         # (each rank yields its own shard of the same RNG-derived index
         # list, so identical sample_idx is the right resume target).
-        if (
-            train_sampler is not None
-            and "sampler" in ckpt
-            and hasattr(train_sampler, "load_state_dict")
-        ):
+        if train_sampler is not None and "sampler" in ckpt and hasattr(train_sampler, "load_state_dict"):
             train_sampler.load_state_dict(ckpt["sampler"])
         elif (
             train_sampler is not None
