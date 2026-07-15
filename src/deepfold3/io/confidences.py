@@ -889,10 +889,14 @@ def save_ranking_scores_csv(path: str | Path, summaries: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["seed", "sample", "ranking_score", "ptm", "iptm", "fraction_disordered", "has_clash"])
+        writer.writerow(
+            ["seed", "sample", "ranking_score", "ptm", "iptm", "mean_plddt", "fraction_disordered", "has_clash"]
+        )
         for row in sorted_rows:
             iptm = row.get("iptm")
             iptm_str = "" if iptm is None or (isinstance(iptm, float) and math.isnan(iptm)) else f"{iptm:.4f}"
+            plddt = row.get("mean_plddt")
+            plddt_str = "" if plddt is None or (isinstance(plddt, float) and math.isnan(plddt)) else f"{plddt:.2f}"
             writer.writerow(
                 [
                     row["seed"],
@@ -900,6 +904,7 @@ def save_ranking_scores_csv(path: str | Path, summaries: list[dict]) -> None:
                     f"{row['ranking_score']:.4f}",
                     f"{row['ptm']:.4f}",
                     iptm_str,
+                    plddt_str,
                     f"{row['fraction_disordered']:.4f}",
                     int(row["has_clash"]),
                 ]
