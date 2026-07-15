@@ -131,6 +131,8 @@ def _run_one_job(
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
     plot_confidences: bool,
+    save_distogram: bool = False,
+    logits_scheme: str = "int8_softmax",
     skip_existing: bool,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
@@ -146,6 +148,7 @@ def _run_one_job(
     from deepfold3.data.parse.json_input import parse_json_input
     from deepfold3.io.confidences import (
         save_confidences_json,
+        save_distogram_logits,
         save_ranking_scores_csv,
         save_summary_confidences_json,
     )
@@ -217,6 +220,13 @@ def _run_one_job(
             model_output = unpad_output(model_output, original_n)
             iter_feats = unpad_features(feats, original_n)
         click.echo(f"  done in {time.perf_counter() - t0:.1f}s")
+
+        # Trunk distogram is shared across this seed's samples (no sample axis),
+        # so write it once per seed rather than into every sample dir.
+        if save_distogram:
+            distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
+            if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(current_seed)):
+                click.echo(f"  saved  {distogram_npz.name}")
 
         for s in range(num_samples):
             sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
@@ -318,6 +328,22 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
 )
 @click.option("--plot-confidences", is_flag=True, default=False)
 @click.option(
+    "--save-distogram/--no-save-distogram",
+    default=False,
+    show_default=True,
+    help="Persist the per-seed trunk distogram (seed-*_distogram.npz, shared "
+    "across that seed's samples). Cheap ([N,N,64], one per seed); needed for "
+    "distogram post-analysis (e.g. cross-chain interface-contact prediction).",
+)
+@click.option(
+    "--logits-scheme",
+    default="int8_softmax",
+    type=click.Choice(["float32", "float16", "int8", "int8_softmax", "int4_softmax"]),
+    show_default=True,
+    help="Compression scheme for --save-distogram npz. int8_softmax preserves "
+    "softmax(logits) within ~1e-4 at ~1 byte/value.",
+)
+@click.option(
     "--skip-existing/--no-skip-existing",
     default=True,
     show_default=True,
@@ -337,6 +363,8 @@ def inference_batch(
     pdb_mmcif_dir: Path | None,
     optim: str,
     plot_confidences: bool,
+    save_distogram: bool,
+    logits_scheme: str,
     skip_existing: bool,
 ) -> None:
     """Run inference on many JSON inputs without reloading the model."""
@@ -406,6 +434,8 @@ def inference_batch(
             template_cache=template_cache,
             pdb_mmcif_dir=pdb_mmcif_dir,
             plot_confidences=plot_confidences,
+            save_distogram=save_distogram,
+            logits_scheme=logits_scheme,
             skip_existing=skip_existing,
         )
         n_done += 1
