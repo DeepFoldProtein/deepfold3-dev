@@ -28,9 +28,9 @@ Notes on individual residues:
   guanidinium NH, gem-dimethyls).
 
 Backbone atoms (N, CA, C, O, CB) are never permuted. Symmetry pairs are
-**precomputed once per Structure** at load time (see
-``compute_atom_symmetry_pairs``) and reused at every training step —
-the per-residue table is static so no per-step lookup is needed.
+computed per example from the token array by
+``compute_token_atom_symmetry_pairs`` — the per-residue table is static,
+so this is a cheap microsecond-scale lookup with no per-step caching.
 """
 
 from __future__ import annotations
@@ -94,46 +94,12 @@ def build_residue_symmetry_pairs(res_name: str, atom_names: list[str]) -> list[t
     return out
 
 
-def compute_atom_symmetry_pairs(structure) -> np.ndarray:
-    """Compute global ``(i, j)`` swap-pair indices for a Structure online.
-
-    Walks every residue, looks up its symmetry pairs from
-    :data:`RESIDUE_ATOM_SYMMETRY_GROUPS`, and converts them to **global**
-    atom-array indices. The result is a single ``[N_pairs, 2]`` int32
-    array consumed by :func:`apply_atom_permutation`.
-
-    Cheap enough to compute once per ``__getitem__`` (microseconds for a
-    few-hundred-residue chain) — there is no per-Structure cache. Ligand
-    atom symmetries (which require RDKit automorphism detection) are
-    handled by a separate CCD-keyed memo cache, since the same ligand
-    recurs across many structures.
-    """
-    import numpy as np
-
-    pair_list: list[tuple[int, int]] = []
-    atom_names_bytes = structure.atoms["name"]
-    for res in structure.residues:
-        res_name = res["name"].decode("ascii", errors="replace").strip()
-        if res_name not in RESIDUE_ATOM_SYMMETRY_GROUPS:
-            continue
-        a_start = int(res["atom_idx"])
-        a_num = int(res["atom_num"])
-        if a_num <= 0:
-            continue
-        atom_names = [atom_names_bytes[a_start + i].decode("ascii", errors="replace").strip() for i in range(a_num)]
-        local = build_residue_symmetry_pairs(res_name, atom_names)
-        pair_list.extend((a_start + a, a_start + b) for a, b in local)
-    if not pair_list:
-        return np.empty((0, 2), dtype=np.int32)
-    return np.asarray(pair_list, dtype=np.int32)
-
-
 def compute_token_atom_symmetry_pairs(structure, tokens: np.ndarray) -> np.ndarray:
     """Token-aware variant: emit ``(token_idx, M_a, M_b)`` swap triples.
 
     The training loss receives atoms in the per-token ``[N, M, 3]`` layout
     (one row per token, ``M=MAX_ATOMS_PER_TOKEN`` slots), not the flat
-    ``[N_atoms, 3]`` layout used by :func:`compute_atom_symmetry_pairs`.
+    ``[N_atoms, 3]`` layout.
     This helper walks each token, looks up its residue type from the
     token array (so it works post-crop where the residues table is
     intentionally not re-indexed), and converts the residue's symmetry
@@ -385,9 +351,7 @@ def apply_ligand_token_permutation(
     # A permutation is usable only if every one of its moved atoms is resolved
     # on both sides — else its cost is unreliable and applying it would write a
     # garbage GT coordinate into a resolved slot. Mark such groups invalid.
-    unres = torch.zeros(ng, dtype=delta.dtype, device=delta.device).index_add_(
-        -1, gid, (~m).to(delta.dtype)
-    )  # [G]
+    unres = torch.zeros(ng, dtype=delta.dtype, device=delta.device).index_add_(-1, gid, (~m).to(delta.dtype))  # [G]
     invalid_g = unres > 0
     if invalid_g.any():
         dcost = dcost.masked_fill(invalid_g, float("inf"))
@@ -559,8 +523,12 @@ def apply_ligand_token_swap(
     _uniq, inv = torch.unique(group, return_inverse=True)
     ng = int(_uniq.numel())
     lead = identity_cost.shape[:-1]
-    id_g = torch.zeros(*lead, ng, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(-1, inv, identity_cost)
-    sw_g = torch.zeros(*lead, ng, dtype=swapped_cost.dtype, device=swapped_cost.device).index_add_(-1, inv, swapped_cost)
+    id_g = torch.zeros(*lead, ng, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(
+        -1, inv, identity_cost
+    )
+    sw_g = torch.zeros(*lead, ng, dtype=swapped_cost.dtype, device=swapped_cost.device).index_add_(
+        -1, inv, swapped_cost
+    )
     do_swap = (sw_g < id_g).index_select(-1, inv) & pair_mask
 
     if not do_swap.any():
@@ -638,7 +606,9 @@ def apply_token_atom_permutation(
     uniq_tok, inv = torch.unique(tok_idx, return_inverse=True)  # inv: [P] → group id
     g = uniq_tok.numel()
     lead = identity_cost.shape[:-1]
-    id_g = torch.zeros(*lead, g, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(-1, inv, identity_cost)
+    id_g = torch.zeros(*lead, g, dtype=identity_cost.dtype, device=identity_cost.device).index_add_(
+        -1, inv, identity_cost
+    )
     sw_g = torch.zeros(*lead, g, dtype=swapped_cost.dtype, device=swapped_cost.device).index_add_(-1, inv, swapped_cost)
     do_swap = (sw_g < id_g).index_select(-1, inv) & pair_mask  # [..., P]
     if not do_swap.any():
@@ -649,84 +619,5 @@ def apply_token_atom_permutation(
 
     permuted[..., tok_idx, a_idx, :] = new_a
     permuted[..., tok_idx, b_idx, :] = new_b
-
-    return permuted.detach()
-
-
-def apply_atom_permutation(
-    pred_coords: torch.Tensor,  # [N_atoms, 3]
-    gt_coords: torch.Tensor,  # [N_atoms, 3]
-    gt_mask: torch.Tensor,  # [N_atoms] bool
-    swap_pairs: np.ndarray | torch.Tensor,  # [N_pairs, 2] int
-) -> torch.Tensor:
-    """Permute ground-truth coordinates of symmetric atoms to minimise MSE.
-
-    For each pair ``(i, j)``, the swap variant (identity or fully swapped)
-    with the lower per-atom squared distance to the prediction is chosen.
-    The permuted GT coordinates are returned — callers compute their loss
-    against the permuted GT, not against the raw prediction. Equivalent in
-    effect to swapping the prediction; we permute the GT to keep the
-    prediction tensor's autograd graph untouched.
-
-    Pairs are independent (each evaluated on its own two atoms only),
-    matching the AF3 §4.3 per-residue construction: every standard
-    residue has at most a single 2-atom or 4-atom swap group, and
-    ``compute_atom_symmetry_pairs`` emits each group as one or two
-    atomic pair entries that all map to the same swap decision in
-    practice (the per-pair decision converges to the per-group decision
-    because the swap atoms move together).
-
-    Parameters
-    ----------
-    pred_coords : torch.Tensor [N_atoms, 3]
-        Predicted coordinates (any device, any dtype, gradient-tracked OK).
-    gt_coords : torch.Tensor [N_atoms, 3]
-        Ground-truth coordinates aligned 1:1 with ``pred_coords``.
-    gt_mask : torch.Tensor [N_atoms], bool
-        True at atoms with valid (resolved) ground-truth positions.
-        Atoms with ``mask=False`` are excluded from the cost; if either
-        atom in a pair is masked the pair is skipped.
-    swap_pairs : array_like [N_pairs, 2]
-        Index pairs precomputed by :func:`compute_atom_symmetry_pairs`.
-
-    Returns
-    -------
-    torch.Tensor [N_atoms, 3]
-        ``gt_coords`` with symmetric atoms swapped where the swap reduced
-        the per-pair MSE. Detached from any input autograd graph.
-    """
-    import torch
-
-    if swap_pairs is None or len(swap_pairs) == 0:
-        return gt_coords.detach()
-
-    if not isinstance(swap_pairs, torch.Tensor):
-        swap_pairs_t = torch.as_tensor(swap_pairs, dtype=torch.long, device=gt_coords.device)
-    else:
-        swap_pairs_t = swap_pairs.to(dtype=torch.long, device=gt_coords.device)
-
-    permuted = gt_coords.clone()
-
-    a_idx = swap_pairs_t[:, 0]
-    b_idx = swap_pairs_t[:, 1]
-
-    valid = gt_mask[a_idx] & gt_mask[b_idx]
-    if not valid.any():
-        return permuted.detach()
-
-    pred_a = pred_coords[a_idx]
-    pred_b = pred_coords[b_idx]
-    gt_a = gt_coords[a_idx]
-    gt_b = gt_coords[b_idx]
-
-    identity_cost = (pred_a - gt_a).pow(2).sum(dim=-1) + (pred_b - gt_b).pow(2).sum(dim=-1)
-    swapped_cost = (pred_a - gt_b).pow(2).sum(dim=-1) + (pred_b - gt_a).pow(2).sum(dim=-1)
-    do_swap = valid & (swapped_cost < identity_cost)
-
-    if do_swap.any():
-        swap_a = a_idx[do_swap]
-        swap_b = b_idx[do_swap]
-        permuted[swap_a] = gt_coords[swap_b]
-        permuted[swap_b] = gt_coords[swap_a]
 
     return permuted.detach()
