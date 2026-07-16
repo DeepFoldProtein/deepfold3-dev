@@ -238,9 +238,7 @@ class TestWSDSScheduler:
 
     def test_decay_endpoints(self):
         # Window [100, 110), 10 steps
-        optimizer, scheduler = self._make_scheduler(
-            warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3
-        )
+        optimizer, scheduler = self._make_scheduler(warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3)
         lr_start = self._step_to(optimizer, scheduler, 100)  # s=0 → max_lr
         assert abs(lr_start - 1e-3) < 1e-9, f"At s=0 lr should be max: {lr_start}"
         lr_end = self._step_to(optimizer, scheduler, 109)  # s=9, L=10
@@ -248,17 +246,13 @@ class TestWSDSScheduler:
         assert abs(lr_end - 1e-3 / 9.1) < 1e-7, f"Near-end lr: {lr_end}"
 
     def test_resume_after_decay(self):
-        optimizer, scheduler = self._make_scheduler(
-            warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3
-        )
+        optimizer, scheduler = self._make_scheduler(warmup=5, windows=[[100, 110]], min_ratio=0.1, lr=1e-3)
         # Step 110: past the decay window → back to max_lr (no rollback)
         lr110 = self._step_to(optimizer, scheduler, 110)
         assert abs(lr110 - 1e-3) < 1e-9, f"Post-decay should resume at max_lr: {lr110}"
 
     def test_multiple_windows(self):
-        optimizer, scheduler = self._make_scheduler(
-            warmup=5, windows=[[100, 110], [200, 210]], min_ratio=0.5, lr=1e-3
-        )
+        optimizer, scheduler = self._make_scheduler(warmup=5, windows=[[100, 110], [200, 210]], min_ratio=0.5, lr=1e-3)
         # Stable between the two windows
         lr150 = self._step_to(optimizer, scheduler, 150)
         assert abs(lr150 - 1e-3) < 1e-9
@@ -269,9 +263,7 @@ class TestWSDSScheduler:
 
     def test_inverse_proportional_form(self):
         # 1/lr should be linear-in-step within a decay window
-        optimizer, scheduler = self._make_scheduler(
-            warmup=0, windows=[[0, 100]], min_ratio=0.01, lr=1.0
-        )
+        optimizer, scheduler = self._make_scheduler(warmup=0, windows=[[0, 100]], min_ratio=0.01, lr=1.0)
         # collect LR at steps 0, 25, 50, 75 → 1/lr should be linear
         lrs = []
         for step in (0, 25, 50, 75):
@@ -724,19 +716,16 @@ class TestCheckpointResume:
         yield the rest — total sequence must equal a single uncut iter.
         """
         from deepfold3.data.sample.weighted import WeightedClusterSampler
+
         records = _make_records(30)
-        sampler_a = WeightedClusterSampler(
-            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_a = WeightedClusterSampler(records=records, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_a.set_epoch(2)
 
         full = list(iter(sampler_a))  # consume entire epoch
         assert len(full) == 20
 
         # Re-run, stop midway, save state, hand off to a fresh sampler.
-        sampler_b = WeightedClusterSampler(
-            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_b = WeightedClusterSampler(records=records, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_b.set_epoch(2)
         prefix = []
         for i, idx in enumerate(iter(sampler_b)):
@@ -746,9 +735,7 @@ class TestCheckpointResume:
         snap = sampler_b.state_dict()
         assert snap["sample_idx"] == 7
 
-        sampler_c = WeightedClusterSampler(
-            records=records, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_c = WeightedClusterSampler(records=records, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_c.load_state_dict(snap)
         # Trainer always calls set_epoch before iter — must be a no-op
         # when epoch matches the loaded value.
@@ -761,10 +748,9 @@ class TestCheckpointResume:
     def test_sampler_set_epoch_resets_idx_only_on_change(self, tmp_path):
         """``set_epoch(e)`` resets ``sample_idx`` only when ``e`` changes."""
         from deepfold3.data.sample.weighted import WeightedClusterSampler
+
         records = _make_records(20)
-        sampler = WeightedClusterSampler(
-            records=records, epoch_size=10, num_replicas=1, rank=0, seed=1
-        )
+        sampler = WeightedClusterSampler(records=records, epoch_size=10, num_replicas=1, rank=0, seed=1)
         sampler.set_epoch(5)
         sampler.sample_idx = 4  # simulate having yielded 4 samples
         sampler.set_epoch(5)  # same epoch — must NOT reset
@@ -776,11 +762,10 @@ class TestCheckpointResume:
         """End-to-end: sampler state goes through CheckpointManager save/load."""
         from deepfold3.data.sample.weighted import WeightedClusterSampler
         from deepfold3.training.state import TrainState
+
         records = _make_records(30)
         cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
-        sampler = WeightedClusterSampler(
-            records=records, epoch_size=20, num_replicas=1, rank=0, seed=11
-        )
+        sampler = WeightedClusterSampler(records=records, epoch_size=20, num_replicas=1, rank=0, seed=11)
         sampler.set_epoch(2)
         # Consume 6 of 20.
         it = iter(sampler)
@@ -804,9 +789,7 @@ class TestCheckpointResume:
         )
 
         # Fresh sampler, same construction args, restore via the manager.
-        sampler2 = WeightedClusterSampler(
-            records=records, epoch_size=20, num_replicas=1, rank=0, seed=11
-        )
+        sampler2 = WeightedClusterSampler(records=records, epoch_size=20, num_replicas=1, rank=0, seed=11)
         new_state = TrainState()
         ckpt_mgr.load(
             path,
@@ -835,16 +818,12 @@ class TestCheckpointResume:
         records = _make_records(30)
         configs = [{"records": records, "dataset_len": 30, "weight": 1.0, "strategy": "uniform"}]
 
-        sampler_a = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_a = MultiDatasetSampler(dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_a.set_epoch(2)
         full = list(iter(sampler_a))
         assert len(full) == 20
 
-        sampler_b = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_b = MultiDatasetSampler(dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_b.set_epoch(2)
         prefix = []
         for i, idx in enumerate(iter(sampler_b)):
@@ -856,9 +835,7 @@ class TestCheckpointResume:
         assert snap["epoch"] == 2
         assert snap["seed"] == 7
 
-        sampler_c = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7
-        )
+        sampler_c = MultiDatasetSampler(dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=7)
         sampler_c.load_state_dict(snap)
         sampler_c.set_epoch(snap["epoch"])
         tail = list(iter(sampler_c))
@@ -872,9 +849,7 @@ class TestCheckpointResume:
 
         records = _make_records(20)
         configs = [{"records": records, "dataset_len": 20, "weight": 1.0, "strategy": "uniform"}]
-        sampler = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=1
-        )
+        sampler = MultiDatasetSampler(dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=1)
         sampler.set_epoch(5)
         sampler.sample_idx = 4
         sampler.set_epoch(5)  # same epoch — keep
@@ -895,17 +870,13 @@ class TestCheckpointResume:
         records = _make_records(40)
         configs = [{"records": records, "dataset_len": 40, "weight": 1.0, "strategy": "uniform"}]
 
-        finite = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3
-        )
+        finite = MultiDatasetSampler(dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3)
         finite.set_epoch(0)
         chunk0 = list(iter(finite))
         finite.set_epoch(1)
         chunk1 = list(iter(finite))
 
-        inf = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3, infinite=True
-        )
+        inf = MultiDatasetSampler(dataset_configs=configs, epoch_size=10, num_replicas=1, rank=0, seed=3, infinite=True)
         it = iter(inf)
         stream = [next(it) for _ in range(20)]  # spans two chunks, never raises
 
@@ -925,24 +896,18 @@ class TestCheckpointResume:
         records = _make_records(40)
         configs = [{"records": records, "dataset_len": 40, "weight": 1.0, "strategy": "uniform"}]
 
-        full = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
-        )
+        full = MultiDatasetSampler(dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True)
         it = iter(full)
         ref = [next(it) for _ in range(20)]
 
-        a = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
-        )
+        a = MultiDatasetSampler(dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True)
         it_a = iter(a)
         prefix = [next(it_a) for _ in range(11)]  # 8 + 3 → mid second chunk
         snap = a.state_dict()
         assert snap["epoch"] == 1
         assert snap["sample_idx"] == 3
 
-        b = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True
-        )
+        b = MultiDatasetSampler(dataset_configs=configs, epoch_size=8, num_replicas=1, rank=0, seed=5, infinite=True)
         b.load_state_dict(snap)
         b.set_epoch(snap["epoch"])  # trainer calls this; same epoch → no reset
         it_b = iter(b)
@@ -967,7 +932,11 @@ class TestCheckpointResume:
 
         # Old run: finite sampler, mid-epoch-E checkpoint at sample_idx I.
         old = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=6, num_replicas=1, rank=0, seed=9  # infinite=False
+            dataset_configs=configs,
+            epoch_size=6,
+            num_replicas=1,
+            rank=0,
+            seed=9,  # infinite=False
         )
         old.set_epoch(2)
         it_old = iter(old)
@@ -982,9 +951,7 @@ class TestCheckpointResume:
         epoch3 = list(iter(old))
 
         # New run: same checkpoint, resumed under the infinite sampler.
-        new = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=6, num_replicas=1, rank=0, seed=9, infinite=True
-        )
+        new = MultiDatasetSampler(dataset_configs=configs, epoch_size=6, num_replicas=1, rank=0, seed=9, infinite=True)
         new.load_state_dict(snap)
         new.set_epoch(snap["epoch"])
         it_new = iter(new)
@@ -1003,9 +970,7 @@ class TestCheckpointResume:
         configs = [{"records": records, "dataset_len": 30, "weight": 1.0, "strategy": "uniform"}]
 
         cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
-        sampler = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11
-        )
+        sampler = MultiDatasetSampler(dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11)
         sampler.set_epoch(2)
         it = iter(sampler)
         for _ in range(6):
@@ -1027,9 +992,7 @@ class TestCheckpointResume:
             train_sampler=sampler,
         )
 
-        sampler2 = MultiDatasetSampler(
-            dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11
-        )
+        sampler2 = MultiDatasetSampler(dataset_configs=configs, epoch_size=20, num_replicas=1, rank=0, seed=11)
         new_state = TrainState()
         ckpt_mgr.load(
             path,

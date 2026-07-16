@@ -398,14 +398,30 @@ def _two_cys_structure():
                 0,
                 [
                     (
-                        "CYS", 4, 1, True,
-                        [("N", 0, 0, 0, True), ("CA", 1, 0, 0, True), ("C", 2, 0, 0, True),
-                         ("CB", 3, 0, 0, True), ("SG", 4, 0, 0, True)],
+                        "CYS",
+                        4,
+                        1,
+                        True,
+                        [
+                            ("N", 0, 0, 0, True),
+                            ("CA", 1, 0, 0, True),
+                            ("C", 2, 0, 0, True),
+                            ("CB", 3, 0, 0, True),
+                            ("SG", 4, 0, 0, True),
+                        ],
                     ),
                     (
-                        "CYS", 4, 2, True,
-                        [("N", 0, 5, 0, True), ("CA", 1, 5, 0, True), ("C", 2, 5, 0, True),
-                         ("CB", 3, 5, 0, True), ("SG", 4, 5, 0, True)],
+                        "CYS",
+                        4,
+                        2,
+                        True,
+                        [
+                            ("N", 0, 5, 0, True),
+                            ("CA", 1, 5, 0, True),
+                            ("C", 2, 5, 0, True),
+                            ("CB", 3, 5, 0, True),
+                            ("SG", 4, 5, 0, True),
+                        ],
                     ),
                 ],
             ),
@@ -480,9 +496,7 @@ def _gap_cif(present: list[tuple[str, int, int]]) -> str:
         for elem, name in (("N", "N"), ("C", "CA"), ("C", "C")):
             aid += 1
             x += 1.5
-            header.append(
-                f"{'ATOM'} {aid} {elem} {name} . {comp} A 1 {label} {x:.1f} 0.0 0.0 1.0 0.0 {auth} A 1"
-            )
+            header.append(f"{'ATOM'} {aid} {elem} {name} . {comp} A 1 {label} {x:.1f} 0.0 0.0 1.0 0.0 {auth} A 1")
     return "\n".join(header) + "\n"
 
 

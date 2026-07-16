@@ -36,11 +36,18 @@ def _lig3(pred_x, gt_x=(0.0, 1.0, 2.0)):
 # (ligand_id, perm_id, dst_token, src_token). gt_new[dst] = gt[src].
 _S3_ROWS = np.array(
     [
-        (0, 0, 0, 1), (0, 0, 1, 2), (0, 0, 2, 0),  # 3-cycle (0 1 2)
-        (0, 1, 0, 2), (0, 1, 1, 0), (0, 1, 2, 1),  # 3-cycle (0 2 1)
-        (0, 2, 0, 1), (0, 2, 1, 0),                # swap (0 1)
-        (0, 3, 1, 2), (0, 3, 2, 1),                # swap (1 2)
-        (0, 4, 0, 2), (0, 4, 2, 0),                # swap (0 2)
+        (0, 0, 0, 1),
+        (0, 0, 1, 2),
+        (0, 0, 2, 0),  # 3-cycle (0 1 2)
+        (0, 1, 0, 2),
+        (0, 1, 1, 0),
+        (0, 1, 2, 1),  # 3-cycle (0 2 1)
+        (0, 2, 0, 1),
+        (0, 2, 1, 0),  # swap (0 1)
+        (0, 3, 1, 2),
+        (0, 3, 2, 1),  # swap (1 2)
+        (0, 4, 0, 2),
+        (0, 4, 2, 0),  # swap (0 2)
     ],
     dtype=np.int32,
 )
@@ -130,8 +137,11 @@ def test_compute_moved_atoms_only_identity_omitted():
     rows = compute_ligand_token_permutations(struct, toks, cache)
     got = {tuple(int(x) for x in r) for r in rows}
     expected = {
-        (0, 1, 0, 1), (0, 1, 1, 2), (0, 1, 2, 0),  # 3-cycle, all 3 moved
-        (0, 2, 1, 2), (0, 2, 2, 1),                # (1 2) swap, atoms 1,2 moved
+        (0, 1, 0, 1),
+        (0, 1, 1, 2),
+        (0, 1, 2, 0),  # 3-cycle, all 3 moved
+        (0, 2, 1, 2),
+        (0, 2, 2, 1),  # (1 2) swap, atoms 1,2 moved
     }
     assert got == expected  # identity (perm_id 0) emits no rows
 

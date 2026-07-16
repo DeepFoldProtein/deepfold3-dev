@@ -261,9 +261,10 @@ def test_symmetry_classes_group_isomorphic_glyco_units():
 def test_singleton_symmetry_classes_reduce_to_entity_id():
     # With no bonds, isomorphism of singletons == entity equality (today's path).
     comps, _ = connected_chain_components([0, 1], None)
-    assert assign_component_symmetry_classes(comps, {0: 0, 1: 0}, None)[0] == assign_component_symmetry_classes(
-        comps, {0: 0, 1: 0}, None
-    )[1]
+    assert (
+        assign_component_symmetry_classes(comps, {0: 0, 1: 0}, None)[0]
+        == assign_component_symmetry_classes(comps, {0: 0, 1: 0}, None)[1]
+    )
     same_ent = assign_component_symmetry_classes(comps, {0: 5, 1: 5}, None)
     assert same_ent[0] == same_ent[1]
     diff_ent = assign_component_symmetry_classes(comps, {0: 0, 1: 1}, None)

@@ -32,8 +32,7 @@ class TestAdaLNCondBiasInit:
         # Output stddev for unit-variance input should be ≈ β. (User-facing
         # property: ``W_b·x`` ≈ β for ``x ~ N(0, I)``.)
         d = 384
-        for name, W in [("attn_cond_bias", blk.attn_cond_bias.weight),
-                        ("ffn_cond_bias", blk.ffn_cond_bias.weight)]:
+        for name, W in [("attn_cond_bias", blk.attn_cond_bias.weight), ("ffn_cond_bias", blk.ffn_cond_bias.weight)]:
             x = torch.randn(2048, d)
             out = x @ W.T
             out_std = out.std().item()
@@ -54,8 +53,14 @@ class TestAdaLNCondBiasInit:
 
         beta = 2e-3
         tr = DiffusionTransformer(
-            c=768, c_single_cond=384, num_blocks=8, num_heads=16, num_intermediate_factor=2,
-            super_block_size=4, c_pair=128, cond_bias_init_beta=beta,
+            c=768,
+            c_single_cond=384,
+            num_blocks=8,
+            num_heads=16,
+            num_intermediate_factor=2,
+            super_block_size=4,
+            c_pair=128,
+            cond_bias_init_beta=beta,
         )
         for layer in tr.layers:
             assert layer.attn_cond_bias.weight.abs().max().item() > 0

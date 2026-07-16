@@ -376,8 +376,6 @@ def test_atomized_symmetry_pair_dropped_when_crop_removes_one_atom():
 
     cropped = Cropper()._reindex(out, kept)
     # OD1 survived, OD2 dropped.
-    assert any(
-        cropped.structure.atoms[int(t["atom_idx"])]["name"].decode().strip() == "OD1" for t in cropped.tokens
-    )
+    assert any(cropped.structure.atoms[int(t["atom_idx"])]["name"].decode().strip() == "OD1" for t in cropped.tokens)
     pairs = compute_atomized_residue_token_swap_pairs(cropped.structure, cropped.tokens)
     assert len(pairs) == 0
