@@ -487,6 +487,7 @@ class DeepFold3(nn.Module):
         compute_confidence: bool = True,
         msa_precropped: bool = False,
         chain_perm_gate_k: int = 1,
+        permute_gt_before_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -624,6 +625,36 @@ class DeepFold3(nn.Module):
         else:
             pred["mini_rollout_pos"] = mini_full
 
+        # --- 2b. Permute-then-noise (AF3 §4.2/4.3; matches OpenFold3/Protenix) ---
+        # Resolve chain + atom/ligand symmetry ONCE from the mini-rollout and apply
+        # it to the GT that gets NOISED below, so the denoiser's noised input and
+        # its MSE target share one atom labelling (no midpoint-collapse / chain
+        # latch from a swapped rollout). The losses re-derive the same permutation
+        # for the shared un-augmented GT and skip re-permuting ``gt_augmented``
+        # (guarded on ``features["__gt_prepermuted__"]``).
+        diffusion_gt_pos = features["atom_gt_positions"]
+        diffusion_gt_mask = features["atom_gt_mask"]
+        if permute_gt_before_noise and pred.get("mini_rollout_pos") is not None:
+            from deepfold3.training.loss import permute_gt_for_diffusion
+
+            B_gt = diffusion_gt_pos.shape[0]
+            perm_pos = diffusion_gt_pos.clone()
+            perm_mask = diffusion_gt_mask.clone()
+            for b in range(B_gt):
+                pred_b = {"mini_rollout_pos": pred["mini_rollout_pos"][b]}
+                if "chain_perm_gate_pos" in pred:
+                    pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
+                features_b = {
+                    k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_gt else v)
+                    for k, v in features.items()
+                }
+                gp, gm = permute_gt_for_diffusion(pred_b, features_b, stability_gate_k=chain_perm_gate_k)
+                perm_pos[b] = gp
+                perm_mask[b] = gm
+            diffusion_gt_pos = perm_pos
+            diffusion_gt_mask = perm_mask
+            features["__gt_prepermuted__"] = True
+
         # --- 3. Diffusion training step ---
         chunked = (
             diffusion_chunk_size > 0
@@ -664,8 +695,8 @@ class DeepFold3(nn.Module):
 
             for _ in range(num_chunks):
                 gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
-                    gt_positions=features["atom_gt_positions"],
-                    gt_mask=features["atom_gt_mask"],
+                    gt_positions=diffusion_gt_pos,
+                    gt_mask=diffusion_gt_mask,
                     embeddings=emb_det,
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
@@ -713,8 +744,8 @@ class DeepFold3(nn.Module):
             pred["__diffusion_logged__"] = logged
         else:
             gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
-                gt_positions=features["atom_gt_positions"],
-                gt_mask=features["atom_gt_mask"],
+                gt_positions=diffusion_gt_pos,
+                gt_mask=diffusion_gt_mask,
                 embeddings=embeddings,
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,

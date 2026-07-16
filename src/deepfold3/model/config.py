@@ -807,6 +807,17 @@ class TrainingConfig:
     # otherwise leaves ~loss-free under diffusion MSE. Shares ``alpha_bond``
     # (requires ``alpha_bond > 0``); no separate weight.
     bond_include_symmetric: bool = False
+    # Permute-then-noise (AF3 SI §4.2/4.3, matches OpenFold3/Protenix). When True,
+    # ``forward_training`` resolves the chain + intra-residue atom/ligand symmetry
+    # ONCE from the mini-rollout and applies it to the GT BEFORE the diffusion
+    # noising, so the denoiser's noised input and its MSE target share one atom
+    # labelling. DeepFold3's legacy path noised the un-permuted GT and permuted
+    # the target only at loss time (noise-then-permute) — when the rollout swaps a
+    # symmetric pair / chain, input and target conflict and the expected-loss
+    # minimiser is the pair/assembly midpoint (symmetric-atom collapse + homomer
+    # chain latch). Fixing the order removes that conflict at the root: makes
+    # ``bond_include_symmetric`` and the K-rollout chain-perm gate redundant.
+    permute_gt_before_noise: bool = False
     # Masked-MSA (BERT) cross-entropy weight. Auxiliary self-supervised
     # objective on the MSA representation; predicts the original residue
     # identity at masked (row, token) entries. Off by default. Requires

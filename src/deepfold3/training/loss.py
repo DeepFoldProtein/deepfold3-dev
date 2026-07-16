@@ -564,6 +564,45 @@ def resolve_gt_atom_symmetry(
     return out.reshape(*lead, n, m, 3)
 
 
+def permute_gt_for_diffusion(
+    pred: dict[str, torch.Tensor],
+    features: dict[str, torch.Tensor],
+    stability_gate_k: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve the chain + intra-residue atom/ligand symmetry ONCE from the
+    mini-rollout and return the permuted ``(gt_positions, gt_mask)`` — so the
+    diffusion noise is added to the SAME labelling the losses score against
+    (AF3 §4.2/4.3 permute-then-noise; OpenFold3 `model.py`, Protenix
+    `permute_label_to_match_mini_rollout`).
+
+    Per-example (``[N, M, 3]`` / ``[N, M]``). The chain permutation reorders the
+    token axis (reassigning each prediction slot to its matched GT chain — only
+    same-entity chains are ever swapped, so the slot's conditioning stays valid),
+    and the atom/ligand permutation swaps intra-token symmetric slots. No-op
+    passthrough when the mini-rollout / symmetry tables are absent. The loss then
+    re-derives the SAME permutation for the un-augmented shared GT and skips
+    re-permuting ``gt_augmented`` (guarded on ``features["__gt_prepermuted__"]``).
+    """
+    gt_pos = features["atom_gt_positions"]
+    atom_mask = features["atom_gt_mask"]
+
+    chain_assign = chain_perm_from_mini_rollout(pred, features, stability_gate_k=stability_gate_k)
+    asym_id_feat = features.get("asym_id")
+    if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
+        from deepfold3.data.symmetry.chain_perm import chain_permutation_index
+
+        c_index, c_keep = chain_permutation_index(
+            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
+        )
+        gt_pos = gt_pos.index_select(0, c_index)
+        atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
+
+    mini_ref = pred.get("mini_rollout_pos")
+    if mini_ref is not None:
+        gt_pos = resolve_gt_atom_symmetry(mini_ref[0], features, gt_pos, atom_mask)
+    return gt_pos, atom_mask
+
+
 def diffusion_mse_loss(
     pred_pos: torch.Tensor,  # [S, N, M, 3]
     gt_pos: torch.Tensor,  # [S, N, M, 3] (augmented GT per sample)
@@ -1957,7 +1996,10 @@ def diffusion_only_loss(
         gt_pos = gt_pos.index_select(0, c_index)
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         seq_mask = seq_mask & c_keep
-        gt_aug = gt_aug.index_select(-3, c_index)
+        # gt_aug is pre-permuted in forward_training when permute_gt_before_noise
+        # is on (noise added to the permuted GT); re-permuting it here would double.
+        if not features.get("__gt_prepermuted__"):
+            gt_aug = gt_aug.index_select(-3, c_index)
 
     # AF3 §4.2: resolve intra-residue / ligand atom symmetry ONCE from the
     # mini-rollout, applied to the shared (un-augmented) GT that smooth-lDDT /
@@ -1995,14 +2037,15 @@ def diffusion_only_loss(
         # no swap tables to the MSE. Opt-in: resolve per noise sample inside the
         # MSE (argmin vs each denoised sample). GT is already chain-permuted, so
         # the MSE skips its own chain perm (no ``asym_id``).
-        if cfg.diffusion_mse_per_sample_symmetry:
+        if cfg.diffusion_mse_per_sample_symmetry and not features.get("__gt_prepermuted__"):
             mse_kwargs = dict(
                 atom_swap_pairs=features.get("atom_swap_pairs"),
                 ligand_swap_pairs=features.get("ligand_swap_pairs"),
                 ligand_perms=features.get("ligand_perms"),
             )
         else:
-            if mini_ref is not None:
+            # Skip when pre-permuted in forward_training (gt_aug already atom-resolved).
+            if mini_ref is not None and not features.get("__gt_prepermuted__"):
                 gt_aug = resolve_gt_atom_symmetry(
                     mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, atom_mask
                 )
@@ -2296,21 +2339,23 @@ def training_loss(
         noise_levels = pred["noise_levels"]  # [S]
 
         # GT already chain-permuted above → permute the augmented GT the same way
-        # and skip the diffusion MSE's own chain perm (no ``asym_id``).
-        if c_index is not None:
+        # and skip the diffusion MSE's own chain perm (no ``asym_id``). Skip when
+        # pre-permuted in forward_training (gt_aug noised from the permuted GT).
+        if c_index is not None and not features.get("__gt_prepermuted__"):
             gt_aug = gt_aug.index_select(-3, c_index)
 
         # Atom/ligand symmetry (AF3 §4.2): default resolves gt_aug once from the
         # mini-rollout (same labelling as the shared GT); opt-in resolves per
         # noise sample inside the MSE.
-        if cfg.diffusion_mse_per_sample_symmetry:
+        if cfg.diffusion_mse_per_sample_symmetry and not features.get("__gt_prepermuted__"):
             mse_kwargs = dict(
                 atom_swap_pairs=features.get("atom_swap_pairs"),
                 ligand_swap_pairs=features.get("ligand_swap_pairs"),
                 ligand_perms=features.get("ligand_perms"),
             )
         else:
-            if mini_ref is not None:
+            # Skip when pre-permuted in forward_training (gt_aug already atom-resolved).
+            if mini_ref is not None and not features.get("__gt_prepermuted__"):
                 gt_aug = resolve_gt_atom_symmetry(
                     mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, loss_atom_mask
                 )

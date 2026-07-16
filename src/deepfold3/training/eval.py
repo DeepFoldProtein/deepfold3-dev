@@ -153,6 +153,7 @@ def run_eval(
                         seed=0,
                         msa_precropped=cfg.msa_precrop,
                         chain_perm_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1),
+                        permute_gt_before_noise=cfg.permute_gt_before_noise,
                     )
                     # Slice batch dim (always kept) before loss.
                     # Use actual batch size from the data (not cfg) — the

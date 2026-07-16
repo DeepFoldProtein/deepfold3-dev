@@ -15,6 +15,7 @@ from deepfold3.model.config import TrainingConfig
 from deepfold3.training.loss import (
     chain_perm_from_mini_rollout,
     diffusion_only_loss,
+    permute_gt_for_diffusion,
     resolve_gt_atom_symmetry,
     smooth_lddt_loss,
 )
@@ -83,6 +84,33 @@ def test_smooth_lddt_uses_permuted_gt_in_diffusion_only_loss():
 
     assert shared < raw - 0.05, f"shared-perm smooth_lddt ({shared:.3f}) should beat raw ({raw:.3f})"
     assert abs(shared - floor) < 1e-4, f"permuted GT should be a perfect match (floor {floor:.3f}), got {shared:.3f}"
+
+
+def test_permute_before_noise_matches_loss_side_permute():
+    """Permute-then-noise (AF3 §4.2/4.3): pre-permuting the GT in the forward and
+    flagging ``__gt_prepermuted__`` must give the SAME diffusion MSE / total as the
+    legacy loss-side permute — both feed one permuted GT into the loss, just at a
+    different point relative to noising. Guards against double-permute / stale skip.
+    """
+    cfg = TrainingConfig()
+
+    # Legacy: gt_augmented un-permuted, loss permutes it.
+    pred_old, feat_old = _swapped_asym_homodimer()
+    tot_old, comp_old = diffusion_only_loss(pred_old, feat_old, cfg)
+
+    # New: pre-permute the GT (as forward_training does) and set the flag; the
+    # loss must then skip re-permuting gt_augmented.
+    pred_new, feat_new = _swapped_asym_homodimer()
+    gp, _gm = permute_gt_for_diffusion({"mini_rollout_pos": pred_new["mini_rollout_pos"]}, feat_new, stability_gate_k=1)
+    pred_new["gt_augmented"] = gp.unsqueeze(0)  # forward would noise this
+    feat_new["__gt_prepermuted__"] = True
+    tot_new, comp_new = diffusion_only_loss(pred_new, feat_new, cfg)
+
+    assert torch.allclose(comp_old["diffusion_mse"], comp_new["diffusion_mse"], atol=1e-5)
+    assert torch.allclose(comp_old["smooth_lddt"], comp_new["smooth_lddt"], atol=1e-5)
+    assert torch.allclose(tot_old, tot_new, atol=1e-5)
+    # The pre-permuted GT equals the swapped rollout (chain assignment {0:1, 1:0}).
+    assert torch.allclose(gp, pred_new["mini_rollout_pos"][0], atol=1e-5)
 
 
 def test_identity_assignment_leaves_losses_unchanged():
@@ -196,9 +224,7 @@ def test_inter_chain_bonds_from_features_groups_ligand_attachment():
 
     N = 4
     asym = torch.tensor([0, 0, 1, 2])  # chain0 protein, chain1 ligand/glycan, chain2 protein
-    mol = torch.tensor(
-        [const.MOL_PROTEIN, const.MOL_PROTEIN, const.MOL_NONPOLYMER, const.MOL_PROTEIN]
-    )
+    mol = torch.tensor([const.MOL_PROTEIN, const.MOL_PROTEIN, const.MOL_NONPOLYMER, const.MOL_PROTEIN])
     bm = torch.zeros(N, N, 1)
     bm[1, 2, 0] = bm[2, 1, 0] = 1.0  # protein(chain0) — glycan(chain1)
     out = _inter_chain_bonds_from_features({"bond_matrix": bm, "asym_id": asym, "mol_type": mol})
