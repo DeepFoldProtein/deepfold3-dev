@@ -635,19 +635,20 @@ class DeepFold3(nn.Module):
         diffusion_gt_pos = features["atom_gt_positions"]
         diffusion_gt_mask = features["atom_gt_mask"]
         if permute_gt_before_noise and pred.get("mini_rollout_pos") is not None:
+            from deepfold3.training.collectives import slice_batch_dict
             from deepfold3.training.loss import permute_gt_for_diffusion
 
             B_gt = diffusion_gt_pos.shape[0]
-            perm_pos = diffusion_gt_pos.clone()
-            perm_mask = diffusion_gt_mask.clone()
+            # empty_like (not clone): every slice is overwritten in the loop below.
+            perm_pos = torch.empty_like(diffusion_gt_pos)
+            perm_mask = torch.empty_like(diffusion_gt_mask)
             for b in range(B_gt):
+                # Curated pred slice: the helper reads only these two keys, so avoid
+                # slicing the (large) trunk tensors that slice_batch_dict(pred) would.
                 pred_b = {"mini_rollout_pos": pred["mini_rollout_pos"][b]}
                 if "chain_perm_gate_pos" in pred:
                     pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
-                features_b = {
-                    k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_gt else v)
-                    for k, v in features.items()
-                }
+                features_b = slice_batch_dict(features, b, B_gt)
                 gp, gm = permute_gt_for_diffusion(pred_b, features_b, stability_gate_k=chain_perm_gate_k)
                 perm_pos[b] = gp
                 perm_mask[b] = gm
