@@ -805,7 +805,8 @@ class TrainingConfig:
     # coin-flip-free, per-pair-normalised (un-diluted) penalty that stops the
     # symmetric-atom midpoint collapse the per-residue symmetry renaming
     # otherwise leaves ~loss-free under diffusion MSE. Shares ``alpha_bond``
-    # (requires ``alpha_bond > 0``); no separate weight.
+    # (requires ``alpha_bond > 0``); no separate weight. Now REDUNDANT — the
+    # permute-then-noise ordering fix below is the root fix; keep False.
     bond_include_symmetric: bool = False
     # Permute-then-noise (AF3 SI §4.2/4.3, matches OpenFold3/Protenix). When True,
     # ``forward_training`` resolves the chain + intra-residue atom/ligand symmetry
@@ -817,7 +818,10 @@ class TrainingConfig:
     # minimiser is the pair/assembly midpoint (symmetric-atom collapse + homomer
     # chain latch). Fixing the order removes that conflict at the root: makes
     # ``bond_include_symmetric`` and the K-rollout chain-perm gate redundant.
-    permute_gt_before_noise: bool = False
+    # Default True (AF3/OF3/Protenix-conformant): empirically confirmed to clear the
+    # symmetric-atom collapse (better than bond_include_symmetric, bond loss off) and
+    # reverse the homomer docking plateau. Set False for the legacy noise-then-permute.
+    permute_gt_before_noise: bool = True
     # Masked-MSA (BERT) cross-entropy weight. Auxiliary self-supervised
     # objective on the MSA representation; predicts the original residue
     # identity at masked (row, token) entries. Off by default. Requires
