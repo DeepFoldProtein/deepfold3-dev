@@ -638,10 +638,16 @@ class DeepFold3(nn.Module):
             from deepfold3.training.collectives import slice_batch_dict
             from deepfold3.training.loss import permute_gt_for_diffusion
 
-            B_gt = diffusion_gt_pos.shape[0]
+            B_gt, N_tok = diffusion_gt_pos.shape[0], diffusion_gt_pos.shape[1]
+            device = diffusion_gt_pos.device
             # empty_like (not clone): every slice is overwritten in the loop below.
             perm_pos = torch.empty_like(diffusion_gt_pos)
             perm_mask = torch.empty_like(diffusion_gt_mask)
+            # Batched chain-perm index (identity default) stashed for the loss to
+            # reuse instead of re-deriving the assignment a second time — see
+            # loss._resolve_chain_perm_index.
+            cp_index = torch.arange(N_tok, dtype=torch.long, device=device).expand(B_gt, N_tok).contiguous()
+            cp_keep = torch.ones(B_gt, N_tok, dtype=torch.bool, device=device)
             for b in range(B_gt):
                 # Curated pred slice: the helper reads only these two keys, so avoid
                 # slicing the (large) trunk tensors that slice_batch_dict(pred) would.
@@ -649,12 +655,17 @@ class DeepFold3(nn.Module):
                 if "chain_perm_gate_pos" in pred:
                     pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
                 features_b = slice_batch_dict(features, b, B_gt)
-                gp, gm = permute_gt_for_diffusion(pred_b, features_b, stability_gate_k=chain_perm_gate_k)
+                gp, gm, ci, ck = permute_gt_for_diffusion(pred_b, features_b, stability_gate_k=chain_perm_gate_k)
                 perm_pos[b] = gp
                 perm_mask[b] = gm
+                if ci is not None:
+                    cp_index[b] = ci
+                    cp_keep[b] = ck
             diffusion_gt_pos = perm_pos
             diffusion_gt_mask = perm_mask
             features["__gt_prepermuted__"] = True
+            features["chain_perm_index"] = cp_index
+            features["chain_perm_keep"] = cp_keep
 
         # --- 3. Diffusion training step ---
         chunked = (

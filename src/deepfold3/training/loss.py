@@ -564,43 +564,74 @@ def resolve_gt_atom_symmetry(
     return out.reshape(*lead, n, m, 3)
 
 
-def permute_gt_for_diffusion(
+def _resolve_chain_perm_index(
     pred: dict[str, torch.Tensor],
     features: dict[str, torch.Tensor],
     stability_gate_k: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve the chain + intra-residue atom/ligand symmetry ONCE from the
-    mini-rollout and return the permuted ``(gt_positions, gt_mask)`` — so the
-    diffusion noise is added to the SAME labelling the losses score against
-    (AF3 §4.2/4.3 permute-then-noise; OpenFold3 `model.py`, Protenix
-    `permute_label_to_match_mini_rollout`).
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Chain-permutation index ``(c_index, c_keep)`` from the mini-rollout.
 
-    Per-example (``[N, M, 3]`` / ``[N, M]``). The chain permutation reorders the
-    token axis (reassigning each prediction slot to its matched GT chain — only
-    same-entity chains are ever swapped, so the slot's conditioning stays valid),
-    and the atom/ligand permutation swaps intra-token symmetric slots. No-op
-    passthrough when the mini-rollout / symmetry tables are absent. The loss then
-    re-derives the SAME permutation for the un-augmented shared GT and skips
-    re-permuting ``gt_augmented`` (guarded on ``features["__gt_prepermuted__"]``).
+    ``c_index[i]`` is the GT token feeding pred token ``i`` (``gt_new[i] =
+    gt[c_index[i]]``) and ``c_keep[i]`` is False when pred token ``i`` has no GT
+    counterpart. Returns ``(None, None)`` when there is no non-identity swap
+    (monomer, gate disagreement, or absent inputs) so callers skip the reorder.
+
+    Single derivation point for the three sites that reorder GT chains —
+    ``permute_gt_for_diffusion``, ``diffusion_only_loss``, ``training_loss``.
+    When ``forward_training`` already resolved the assignment for the
+    permute-then-noise GT it stashes the batched result in
+    ``features["chain_perm_index"]`` / ``["chain_perm_keep"]`` (identity-filled
+    for un-swapped examples); this reuses it instead of re-running the
+    ``chain_perm_from_mini_rollout`` match (~8 GPU→CPU syncs) a second time.
     """
-    gt_pos = features["atom_gt_positions"]
-    atom_mask = features["atom_gt_mask"]
+    cached = features.get("chain_perm_index")
+    if cached is not None:
+        return cached, features["chain_perm_keep"]
 
     chain_assign = chain_perm_from_mini_rollout(pred, features, stability_gate_k=stability_gate_k)
     asym_id_feat = features.get("asym_id")
     if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
         from deepfold3.data.symmetry.chain_perm import chain_permutation_index
 
-        c_index, c_keep = chain_permutation_index(
-            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
+        return chain_permutation_index(
+            asym_id_feat, chain_assign, features.get("sym_token_index"), device=features["atom_gt_positions"].device
         )
+    return None, None
+
+
+def permute_gt_for_diffusion(
+    pred: dict[str, torch.Tensor],
+    features: dict[str, torch.Tensor],
+    stability_gate_k: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Resolve the chain + intra-residue atom/ligand symmetry ONCE from the
+    mini-rollout and return the permuted ``(gt_positions, gt_mask, c_index,
+    c_keep)`` — so the diffusion noise is added to the SAME labelling the losses
+    score against (AF3 §4.2/4.3 permute-then-noise; OpenFold3 `model.py`,
+    Protenix `permute_label_to_match_mini_rollout`).
+
+    Per-example (``[N, M, 3]`` / ``[N, M]``). The chain permutation reorders the
+    token axis (reassigning each prediction slot to its matched GT chain — only
+    same-entity chains are ever swapped, so the slot's conditioning stays valid),
+    and the atom/ligand permutation swaps intra-token symmetric slots. No-op
+    passthrough when the mini-rollout / symmetry tables are absent. The returned
+    ``(c_index, c_keep)`` (``None`` when no swap) is stashed by
+    ``forward_training`` so the loss reuses the assignment instead of re-deriving
+    it, and skips re-permuting ``gt_augmented`` (guarded on
+    ``features["__gt_prepermuted__"]``).
+    """
+    gt_pos = features["atom_gt_positions"]
+    atom_mask = features["atom_gt_mask"]
+
+    c_index, c_keep = _resolve_chain_perm_index(pred, features, stability_gate_k)
+    if c_index is not None:
         gt_pos = gt_pos.index_select(0, c_index)
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
 
     mini_ref = pred.get("mini_rollout_pos")
     if mini_ref is not None:
         gt_pos = resolve_gt_atom_symmetry(mini_ref[0], features, gt_pos, atom_mask)
-    return gt_pos, atom_mask
+    return gt_pos, atom_mask, c_index, c_keep
 
 
 def diffusion_mse_loss(
@@ -1977,22 +2008,17 @@ def diffusion_only_loss(
     seq_mask = features["seq_mask"].bool()
     gt_aug = pred["gt_augmented"]
 
-    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
-    # apply it to the shared GT — the augmented GT the diffusion MSE scores AND
-    # the un-augmented GT that smooth-lDDT / FAPE / backbone-chirality score.
-    # Previously only the diffusion MSE saw the permutation, leaving the other
-    # losses on un-permuted GT. Doing it here (single application point) means
-    # the diffusion head's own chain perm is skipped below (``asym_id`` omitted).
-    chain_assign = chain_perm_from_mini_rollout(
+    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout, or
+    # reuse the assignment forward_training already stashed) and apply it to the
+    # shared GT — the augmented GT the diffusion MSE scores AND the un-augmented
+    # GT that smooth-lDDT / FAPE / backbone-chirality score. Previously only the
+    # diffusion MSE saw the permutation, leaving the other losses on un-permuted
+    # GT. Doing it here (single application point) means the diffusion head's own
+    # chain perm is skipped below (``asym_id`` omitted).
+    c_index, c_keep = _resolve_chain_perm_index(
         pred, features, stability_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1)
     )
-    asym_id_feat = features.get("asym_id")
-    if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
-        from deepfold3.data.symmetry.chain_perm import chain_permutation_index
-
-        c_index, c_keep = chain_permutation_index(
-            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
-        )
+    if c_index is not None:
         gt_pos = gt_pos.index_select(0, c_index)
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         seq_mask = seq_mask & c_keep
@@ -2210,26 +2236,20 @@ def training_loss(
     if center_idx is None:
         center_idx = rep_idx
 
-    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout) and
-    # score EVERY GT-based loss (smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE,
-    # tm_true) against the permuted GT — previously only the diffusion MSE saw
-    # it. Reorders the shared gt_pos / atom_mask so each pred chain lines up
-    # with its assigned GT chain; ``gt_seq_mask`` additionally drops pred tokens
-    # with no GT counterpart. ``seq_mask`` stays raw for the pred-side
-    # representation regularisers below. ``c_index`` (if any) also permutes the
-    # augmented GT in the non-chunked diffusion recompute path.
-    chain_assign = chain_perm_from_mini_rollout(
+    # AF3 §4.3: resolve the chain permutation ONCE (from the mini-rollout, or
+    # reuse the assignment forward_training already stashed) and score EVERY
+    # GT-based loss (smooth-lDDT, distogram, FAPE, pLDDT/PAE/PDE, tm_true)
+    # against the permuted GT — previously only the diffusion MSE saw it.
+    # Reorders the shared gt_pos / atom_mask so each pred chain lines up with its
+    # assigned GT chain; ``gt_seq_mask`` additionally drops pred tokens with no
+    # GT counterpart. ``seq_mask`` stays raw for the pred-side representation
+    # regularisers below. ``c_index`` (if any) also permutes the augmented GT in
+    # the non-chunked diffusion recompute path.
+    c_index, c_keep = _resolve_chain_perm_index(
         pred, features, stability_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1)
     )
-    asym_id_feat = features.get("asym_id")
-    c_index: torch.Tensor | None = None
     gt_seq_mask = seq_mask
-    if chain_assign and asym_id_feat is not None and not all(int(k) == int(v) for k, v in chain_assign.items()):
-        from deepfold3.data.symmetry.chain_perm import chain_permutation_index
-
-        c_index, c_keep = chain_permutation_index(
-            asym_id_feat, chain_assign, features.get("sym_token_index"), device=gt_pos.device
-        )
+    if c_index is not None:
         gt_pos = gt_pos.index_select(0, c_index)
         atom_mask = atom_mask.index_select(0, c_index) & c_keep.unsqueeze(-1)
         gt_seq_mask = seq_mask & c_keep

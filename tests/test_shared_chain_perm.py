@@ -13,6 +13,7 @@ import torch
 from deepfold3.data import const
 from deepfold3.model.config import TrainingConfig
 from deepfold3.training.loss import (
+    _resolve_chain_perm_index,
     chain_perm_from_mini_rollout,
     diffusion_only_loss,
     permute_gt_for_diffusion,
@@ -98,12 +99,17 @@ def test_permute_before_noise_matches_loss_side_permute():
     pred_old, feat_old = _swapped_asym_homodimer()
     tot_old, comp_old = diffusion_only_loss(pred_old, feat_old, cfg)
 
-    # New: pre-permute the GT (as forward_training does) and set the flag; the
-    # loss must then skip re-permuting gt_augmented.
+    # New: pre-permute the GT (as forward_training does), set the flag, and stash
+    # the resolved chain-perm index — the loss must skip re-permuting gt_augmented
+    # AND reuse the stashed index instead of re-deriving it.
     pred_new, feat_new = _swapped_asym_homodimer()
-    gp, _gm = permute_gt_for_diffusion({"mini_rollout_pos": pred_new["mini_rollout_pos"]}, feat_new, stability_gate_k=1)
+    gp, _gm, ci, ck = permute_gt_for_diffusion(
+        {"mini_rollout_pos": pred_new["mini_rollout_pos"]}, feat_new, stability_gate_k=1
+    )
     pred_new["gt_augmented"] = gp.unsqueeze(0)  # forward would noise this
     feat_new["__gt_prepermuted__"] = True
+    feat_new["chain_perm_index"] = ci  # forward stashes these; loss reuses them
+    feat_new["chain_perm_keep"] = ck
     tot_new, comp_new = diffusion_only_loss(pred_new, feat_new, cfg)
 
     assert torch.allclose(comp_old["diffusion_mse"], comp_new["diffusion_mse"], atol=1e-5)
@@ -111,6 +117,37 @@ def test_permute_before_noise_matches_loss_side_permute():
     assert torch.allclose(tot_old, tot_new, atol=1e-5)
     # The pre-permuted GT equals the swapped rollout (chain assignment {0:1, 1:0}).
     assert torch.allclose(gp, pred_new["mini_rollout_pos"][0], atol=1e-5)
+
+
+def test_cached_chain_perm_index_reused_over_rederivation():
+    """``_resolve_chain_perm_index`` must reuse a stashed ``chain_perm_index``
+    (as forward_training provides) instead of re-running the mini-rollout match,
+    and honour it: a wrong (identity) cache changes the loss, proving reuse.
+    """
+    cfg = TrainingConfig()
+
+    # (a) fresh: no cache → derives the real {0:1, 1:0} swap from the mini-rollout.
+    pred_a, feat_a = _swapped_asym_homodimer()
+    tot_fresh, _ = diffusion_only_loss(pred_a, feat_a, cfg)
+
+    # (b) cache the SAME index the forward would derive → identical loss (reuse is
+    # value-equivalent to re-deriving).
+    pred_b, feat_b = _swapped_asym_homodimer()
+    ci, ck = _resolve_chain_perm_index(pred_b, feat_b, stability_gate_k=1)
+    assert ci is not None, "the swapped homodimer must yield a non-identity swap"
+    feat_b["chain_perm_index"], feat_b["chain_perm_keep"] = ci, ck
+    tot_cached, _ = diffusion_only_loss(pred_b, feat_b, cfg)
+    assert torch.allclose(tot_fresh, tot_cached, atol=1e-5)
+
+    # (c) cache an IDENTITY index → the loss must honour the cache (skip the real
+    # swap, score against the raw labelling) → a worse, different loss. Proves the
+    # cache is actually consulted rather than the assignment silently re-derived.
+    pred_c, feat_c = _swapped_asym_homodimer()
+    n = feat_c["atom_gt_positions"].shape[0]
+    feat_c["chain_perm_index"] = torch.arange(n, dtype=torch.long)
+    feat_c["chain_perm_keep"] = torch.ones(n, dtype=torch.bool)
+    tot_identity, _ = diffusion_only_loss(pred_c, feat_c, cfg)
+    assert not torch.allclose(tot_fresh, tot_identity, atol=1e-3)
 
 
 def test_identity_assignment_leaves_losses_unchanged():
