@@ -54,7 +54,7 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
     """
     from deepfold3.model.config import ModelConfig, OptimConfig
     from deepfold3.model.model import DeepFold3
-    from deepfold3.scripts.inference import _select_snapshot
+    from deepfold3.scripts._common import load_pt_snapshot
 
     click.echo(f"[batch] loading parameters from {params} …")
     t0 = time.perf_counter()
@@ -69,14 +69,7 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
             ckpt_model_cfg = model_cfg_from_metadata(f.metadata())
         state_dict = load_file(str(params))
     elif params.suffix == ".pt":
-        ckpt = torch.load(str(params), map_location="cpu", weights_only=False)
-        state_dict = _select_snapshot(ckpt, snapshot)
-        if any(k.startswith("module.") for k in state_dict):
-            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-        if isinstance(ckpt, dict) and "model_cfg" in ckpt:
-            import copy
-
-            ckpt_model_cfg = copy.deepcopy(ckpt["model_cfg"])
+        state_dict, ckpt_model_cfg = load_pt_snapshot(params, snapshot)
     else:
         import warnings
 

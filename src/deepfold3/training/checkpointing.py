@@ -179,7 +179,7 @@ class CheckpointManager:
             # above, so model.state_dict() captures ``x`` (the SF averaged
             # iterate); plain AdamW captures the live params. EMA shadow,
             # when present, is always EMA of this snapshot — inference
-            # composes by overlay (see scripts/inference.py:_select_snapshot).
+            # composes by overlay (see scripts/_common.py:select_snapshot).
             snapshot_kind = "x" if isinstance(optimizer, AdamWScheduleFree) else "live"
             blob: dict = {
                 "model": model.state_dict(),

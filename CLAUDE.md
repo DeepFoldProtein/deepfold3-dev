@@ -43,6 +43,7 @@ deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensor
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
+deepfold3 export    --checkpoint runs/exp1/checkpoint_final.pt --output weights.safetensors --snapshot average
 deepfold3 plot      --input out_confidences.json --output confidences.png
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-ids 1pfe,8qy0
 deepfold3 prepare   --mmcif-dir /scratch/pdb/mmCIF --output /data/training --pdb-id-file pdb_ids.txt --workers 16
