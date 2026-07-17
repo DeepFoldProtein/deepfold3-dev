@@ -452,6 +452,15 @@ def inference_batch(
             bucket=bucket,
         )
         n_done += 1
+        # Release this job's cached blocks back to the driver before the next
+        # target. Bucketing folds varied N (=> varied allocation sizes), and
+        # per-shape Triton autotune allocates scratch, so cached blocks
+        # fragment across a long shard and intermittently OOM the next (large)
+        # target. The job's tensors are already freed by refcounting on return
+        # (inference_mode => no autograd graph / cycles), so empty_cache alone
+        # suffices — no gc.collect needed.
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
 
     elapsed = time.perf_counter() - t_total
     click.echo(f"[batch] finished: {n_done} done, {n_skipped} skipped  ({elapsed:.1f}s total)")

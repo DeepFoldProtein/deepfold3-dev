@@ -228,6 +228,11 @@ cd {REPO}
 
 T={cpus}
 export OMP_NUM_THREADS=$T MKL_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T NUMEXPR_NUM_THREADS=$T
+# expandable_segments lets the CUDA caching allocator grow/reuse one segment
+# instead of fragmenting into many fixed blocks — the standard fix for the
+# intermittent fragmentation OOM that varied bucket sizes + Triton autotune
+# scratch cause across a long shard.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Shared cross-node caches (keyed by GPU arch): warmup once, reuse everywhere.
 export DEEPFOLD3_TRITON_CACHE_DIR={CACHE_ROOT}/deepfold3-triton
 export TRITON_CACHE_DIR={CACHE_ROOT}/triton
