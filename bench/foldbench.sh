@@ -65,34 +65,39 @@ $PY bench/scripts/slurm_sweep.py --series "$SERIES" --steps "$STEPS" \
     --categories "$CATEGORIES" --gpu-type "$GPU_TYPE" \
     --seed "$SEEDS" --num-samples "$NUM_SAMPLES" $SHARDS_ARG
 
-# 3. Gather sweep array job-ids to build the eval dependency
-DEP=""
-for step in $STEPS_SP; do
-  jf="bench/runs/$SERIES/pred/_slurm/step_${step}/jobid.txt"
-  [ -f "$jf" ] && DEP="${DEP}:$(tr -d '[:space:]' < "$jf")"
-done
-
 if [ "$NO_EVAL" = 1 ]; then
   echo "== NO_EVAL=1: sweep submitted; run eval later with:"
   echo "   sbatch --cpus-per-task=32 --partition=normal --wrap \"bench/scripts/eval_summarize.sh $SERIES '$STEPS_SP' '$CATS'\""
   exit 0
 fi
 
-# 4. Submit the eval + summarize job, gated on the sweep finishing.
-EVAL_SBATCH="$LOGDIR/eval_${SERIES}.sbatch"
-cat > "$EVAL_SBATCH" <<EOF
+# 3. Submit ONE eval+summarize job per category, each gated (afterany) on just
+#    that category's sweep arrays. So each category is OST-scored and its
+#    trajectory replotted as soon as its folding finishes — results appear
+#    incrementally (monomer_protein first) instead of only after the whole sweep.
+JOBIDS="bench/runs/$SERIES/pred/_slurm/jobids.tsv"
+if [ ! -s "$JOBIDS" ]; then
+  echo "!! no $JOBIDS — nothing submitted? skipping eval." >&2; exit 1
+fi
+# categories in submission (priority) order
+CATS_SUBMITTED=$(awk -F'\t' '!seen[$1]++{print $1}' "$JOBIDS")
+for cat in $CATS_SUBMITTED; do
+  dep=$(awk -F'\t' -v c="$cat" '$1==c{printf ":%s",$3}' "$JOBIDS")
+  csteps=$(awk -F'\t' -v c="$cat" '$1==c{print $2}' "$JOBIDS" | sort -u | tr '\n' ' ')
+  evalcats="$cat"; [ "$cat" = all ] && evalcats="$CATS"   # single-array fallback
+  EVAL_SBATCH="$LOGDIR/eval_${SERIES}_${cat}.sbatch"
+  cat > "$EVAL_SBATCH" <<EOF
 #!/bin/bash
-#SBATCH --job-name=fb_eval_${SERIES}
+#SBATCH --job-name=fbeval_${cat}
 #SBATCH --partition=normal
 #SBATCH --cpus-per-task=32
-#SBATCH --output=${REPO}/${LOGDIR}/eval_summarize_%j.out
+#SBATCH --output=${REPO}/${LOGDIR}/eval_${cat}_%j.out
 #SBATCH --open-mode=append
 set -uo pipefail
-bash ${REPO}/bench/scripts/eval_summarize.sh "$SERIES" "$STEPS_SP" "$CATS" 32
+bash ${REPO}/bench/scripts/eval_summarize.sh "$SERIES" "$csteps" "$evalcats" 32
 EOF
-
-DEPFLAG=""; [ -n "$DEP" ] && DEPFLAG="--dependency=afterany${DEP}"
-echo "-- submitting eval job ${DEPFLAG:+(after sweep$DEP)}"
-sbatch $DEPFLAG "$EVAL_SBATCH"
+  echo "-- eval[$cat] after$dep"
+  sbatch --dependency=afterany${dep} "$EVAL_SBATCH"
+done
 
 echo "== submitted. Watch with:  squeue -u \$USER   |  tail -f $LOGDIR/*.out =="

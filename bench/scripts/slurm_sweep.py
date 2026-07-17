@@ -208,20 +208,22 @@ def write_sbatch(
     seeds: list[int],
     max_concurrent: int | None,
     save_distogram: bool,
+    tag: str = "",
 ) -> Path:
     gres = f"gpu:{gpu_type}:1" if gpu_type and gpu_type != "any" else "gpu:1"
     array = f"0-{n_shards - 1}" + (f"%{max_concurrent}" if max_concurrent else "")
     seed_flags = " ".join(f"--seed {s}" for s in seeds)
     disto = "--save-distogram" if save_distogram else "--no-save-distogram"
+    suffix = f"_{tag}" if tag else ""
     sbatch = shard_dir / "sweep.sbatch"
     sbatch.write_text(
         f"""#!/bin/bash
-#SBATCH --job-name=fb_{series}_{step}
+#SBATCH --job-name=fb_{series}_{step}{suffix}
 #SBATCH --partition={partition}
 #SBATCH --gres={gres}
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --array={array}
-#SBATCH --output={log_dir}/sweep_step{step}_shard_%a.out
+#SBATCH --output={log_dir}/sweep_step{step}{suffix}_shard_%a.out
 #SBATCH --open-mode=append
 set -euo pipefail
 cd {REPO}
@@ -267,22 +269,28 @@ exit $rc
     return sbatch
 
 
-def submit_step(args, step: int, categories: list[str]) -> None:
+def submit_step(args, step: int, categories: list[str], tag: str = "") -> str | None:
+    """Submit one sweep array for ``categories`` at ``step``.
+
+    ``tag`` namespaces the shard dir / job name / logs so several arrays for the
+    same step (one per category, in per-category mode) don't collide. Returns
+    the Slurm array job id (str) or None (skipped / dry-run / failure)."""
     ckpt = resolve_ckpt(args.series, step)
     if ckpt is None:
         print(f"[slurm-sweep] SKIP step {step}: no ckpt at ckpts/{args.series}/step_{step}.{{safetensors,pt}}", file=sys.stderr)
-        return
+        return None
 
     by_cat = collect_jobs(args.series, step, categories)
     n_targets = sum(len(c) for _c, c in by_cat)
     if not n_targets:
-        print(f"[slurm-sweep] step {step}: no targets — did you run build_inputs?", file=sys.stderr)
-        return
+        print(f"[slurm-sweep] step {step} [{tag or 'all'}]: no targets — did you run build_inputs?", file=sys.stderr)
+        return None
 
     n_shards = min(args.shards, n_targets)
     shards = shard_balanced(by_cat, n_shards)
 
-    shard_dir = BENCH / "runs" / args.series / "pred" / "_slurm" / f"step_{step}"
+    base = BENCH / "runs" / args.series / "pred" / "_slurm" / f"step_{step}"
+    shard_dir = base / tag if tag else base
     log_dir = BENCH / "runs" / args.series / "logs"
     shard_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -296,17 +304,16 @@ def submit_step(args, step: int, categories: list[str]) -> None:
         args.gpu_type, args.cpus_per_task, args.partition,
         args.num_samples, args.num_recycles,
         [int(s) for s in args.seed.split(",") if s != ""],
-        args.max_concurrent, not args.no_distogram,
+        args.max_concurrent, not args.no_distogram, tag,
     )
     order = " > ".join(c for c, _ in by_cat)
     print(
-        f"[slurm-sweep] step {step}: {n_targets} targets over {len(by_cat)} cats "
-        f"-> {n_shards} shards (~{n_targets // n_shards}/shard), gpu={args.gpu_type}, "
-        f"cpus/task={args.cpus_per_task}\n              priority: {order}\n              sbatch={sbatch}"
+        f"[slurm-sweep] step {step} [{tag or 'all'}]: {n_targets} targets over {len(by_cat)} cats "
+        f"-> {n_shards} shards (~{n_targets // n_shards}/shard)\n              priority: {order}"
     )
     if args.dry_run:
         print(f"[slurm-sweep] --dry-run: not submitting. Inspect {sbatch}")
-        return
+        return None
     out = subprocess.run(["sbatch", str(sbatch)], capture_output=True, text=True)
     sys.stdout.write(out.stdout)
     sys.stderr.write(out.stderr)
@@ -316,7 +323,8 @@ def submit_step(args, step: int, categories: list[str]) -> None:
     jobid = out.stdout.strip().split()[-1] if out.stdout.strip() else ""
     if jobid.isdigit():
         (shard_dir / "jobid.txt").write_text(jobid + "\n")
-        print(f"[slurm-sweep] step {step}: array job {jobid} (jobid.txt written)")
+        return jobid
+    return None
 
 
 def main() -> None:
@@ -338,6 +346,11 @@ def main() -> None:
     ap.add_argument("--max-concurrent", type=int, default=None,
                     help="Cap simultaneously-running array tasks (Slurm '%%N'). Default: unlimited (GPU-bound).")
     ap.add_argument("--no-distogram", action="store_true", help="Disable --save-distogram.")
+    ap.add_argument("--per-category", dest="per_category", action="store_true", default=True,
+                    help="Submit one array per (step, category) instead of one big array per step, "
+                    "so each category can be scored + plotted as soon as it finishes (default).")
+    ap.add_argument("--single-array", dest="per_category", action="store_false",
+                    help="One array per step over all categories (evaluate only after the whole sweep).")
     ap.add_argument("--dry-run", action="store_true", help="Write shards + sbatch but do not submit.")
     args = ap.parse_args()
 
@@ -353,14 +366,39 @@ def main() -> None:
         half = (census["cpus_per_node"] or 64) // 2
         per_node = census["max_gpus_per_node"] or 1
         args.cpus_per_task = max(1, half // per_node)
+    mode = "per-category" if args.per_category else "single-array"
     print(
         f"[slurm-sweep] cluster census (partition={args.partition}): {census['by_type']}\n"
         f"[slurm-sweep] using gpu_type={args.gpu_type} total_gpus={census['total_gpus']} "
         f"-> shards={args.shards}, cpus/task={args.cpus_per_task}\n"
-        f"[slurm-sweep] series={args.series} steps={steps} (latest-first) categories={len(cats)}"
+        f"[slurm-sweep] series={args.series} steps={steps} (latest-first) categories={len(cats)} mode={mode}"
     )
-    for step in steps:
-        submit_step(args, step, cats)
+
+    # (category, step, jobid) records — the eval driver reads this to gate each
+    # category's OST-eval on just that category's arrays (incremental results).
+    records: list[tuple[str, int, str]] = []
+    if args.per_category:
+        # Submit in priority order: each category (both steps) before the next,
+        # so job-id order makes Slurm drain monomer_protein first, then ppi, …
+        # (Slurm backfills later categories onto idle GPUs, so utilization holds).
+        for cat in cats:
+            for step in steps:
+                jid = submit_step(args, step, [cat], tag=cat)
+                if jid:
+                    records.append((cat, step, jid))
+    else:
+        for step in steps:
+            jid = submit_step(args, step, cats, tag="")
+            if jid:
+                records.append(("all", step, jid))
+
+    if not args.dry_run:
+        jobids = BENCH / "runs" / args.series / "pred" / "_slurm" / "jobids.tsv"
+        jobids.parent.mkdir(parents=True, exist_ok=True)
+        with open(jobids, "w") as f:
+            for cat, step, jid in records:
+                f.write(f"{cat}\t{step}\t{jid}\n")
+        print(f"[slurm-sweep] {len(records)} arrays submitted -> {jobids}")
 
 
 if __name__ == "__main__":
