@@ -5,11 +5,10 @@ on ``Trainer`` conflated dataset discovery, sampler choice, multi-DS
 assembly, and eval sampler logic. Splitting it makes each concern
 testable in isolation.
 
-Load-bearing side effect: when the primary dataset uses
-:class:`WeightedClusterSampler`, the sampler's ``rows`` table is
-attached to ``train_ds.sampling_rows`` so ``TrainingDataset.__getitem__``
-can resolve each sampled index back to (record, chain/interface
-anchor). This closes the AF3 §2.5.1 loop. See
+AF3 §2.5.1 sampling is two-stage: the sampler draws **records** by the cluster
+marginal (``WeightedClusterSampler`` / ``MultiDatasetSampler``), and each
+weighted dataset draws the crop's chain/interface **anchor** at load time
+(constructed with ``anchor_sampling=True``). See ``data/sample/weighted.py`` and
 ``memory/feedback_chain_selection_training_time.md``.
 """
 
@@ -95,17 +94,17 @@ def _apply_cutoff(records: list, cutoff: str, *, keep_after: bool) -> list:
 def build_train_sampler(records: list, train_ds: TrainingDataset, cfg: TrainingConfig, dist: DistInfo):
     """Build training sampler — cluster-weighted or plain distributed.
 
-    For :class:`WeightedClusterSampler` also attach ``sampler.rows``
-    to ``train_ds.sampling_rows`` so the dataset's ``__getitem__``
-    can resolve sampled indices back to their chain / interface
-    anchor — closes the AF3 §2.5.1 loop.
+    :class:`WeightedClusterSampler` draws **records** by the AF3 §2.5.1 cluster
+    marginal; the crop's chain / interface **anchor** is drawn at load time by
+    ``train_ds`` (constructed with ``anchor_sampling=True``) — the two-stage
+    decomposition in ``data/sample/weighted.py``.
     """
     has_real_clusters = any(isinstance(c.cluster_id, int) for r in records for c in r.chains)
 
     if has_real_clusters:
         from deepfold3.data.sample.weighted import WeightedClusterSampler
 
-        sampler = WeightedClusterSampler(
+        return WeightedClusterSampler(
             records=records,
             epoch_size=cfg.epoch_size,
             num_replicas=dist.world_size,
@@ -113,8 +112,6 @@ def build_train_sampler(records: list, train_ds: TrainingDataset, cfg: TrainingC
             seed=cfg.seed,
             infinite=True,  # single long-lived iterator (no epoch-boundary prefetch drain)
         )
-        train_ds.sampling_rows = sampler.rows
-        return sampler
 
     if dist.is_distributed:
         return DistributedSampler(
@@ -302,6 +299,9 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
+                # Weighted datasets draw the crop anchor at load time (AF3 §2.5.1
+                # conditional); uniform ones let the cropper self-seed.
+                anchor_sampling=(spec.strategy == "weighted"),
                 **_spec_kwargs(of3_kwargs, spec),
             )
         else:
@@ -312,6 +312,7 @@ def build_dataloaders(
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
                 monomer_template_struct_space=spec.monomer_template_struct_space,
+                anchor_sampling=(spec.strategy == "weighted"),
                 **_spec_kwargs(ds_kwargs, spec),
             )
         return ds, recs
@@ -324,6 +325,9 @@ def build_dataloaders(
             data_dir=Path(cfg.data_dir),
             is_distillation=False,
             name="main",
+            # Primary PDB set is always cluster-weighted → draw the crop anchor
+            # at load time (AF3 §2.5.1 conditional). See build_train_sampler.
+            anchor_sampling=True,
             **ds_kwargs,
         )
 

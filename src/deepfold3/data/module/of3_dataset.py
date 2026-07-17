@@ -24,7 +24,7 @@ import torch.utils.data
 from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
-from deepfold3.data.module.dataset import _retry_getitem
+from deepfold3.data.module.dataset import _build_record_anchors, _draw_crop_anchor, _retry_getitem
 from deepfold3.data.prepare.openfold3 import convert_of3_structure
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
@@ -355,6 +355,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
+        anchor_sampling: bool = False,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs.
@@ -370,6 +371,10 @@ class OF3Dataset(torch.utils.data.Dataset):
         self.max_template_date = max_template_date
         # See ``TrainingDataset.exclude_loss_mol_types`` for semantics.
         self.exclude_loss_mol_types = tuple(int(m) for m in (exclude_loss_mol_types or ()))
+        # Two-stage AF3 §2.5.1 anchor sampling (weighted datasets only). OF3
+        # sets are monomeric so the anchor is the single chain, but the branch
+        # is kept for parity with ``TrainingDataset``. See ``_draw_crop_anchor``.
+        self._record_anchors = _build_record_anchors(records, anchor_sampling)
 
         self.tokenizer = Tokenizer()
         self.cropper = Cropper(
@@ -433,7 +438,8 @@ class OF3Dataset(torch.utils.data.Dataset):
 
             arr = TokenMask.loss_weight_excluding_mol_types(tokenized.tokens, self.exclude_loss_mol_types)
             tokenized = tokenized.with_mask(TokenMask({MASK_LOSS_WEIGHT: arr}))
-        tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms)
+        crop_anchor = _draw_crop_anchor(self._record_anchors, idx)
+        tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         feats = self.featurizer.process(
             tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
         )

@@ -255,7 +255,14 @@ Records are loaded via `discover_records()` from `data/prepare/manifest.py`: rea
 
 **Train/eval split**: records are shuffled with a fixed seed (42) then split 95/5 (at least 1 eval record). The seeded shuffle ensures reproducible splits regardless of manifest ordering.
 
-**Sampling**: If records have cluster IDs (from wwPDB `clusters-by-entity-40.txt`), `WeightedClusterSampler` applies AF3 §2.5.1 cluster-balanced weights with per-chain and per-interface rows: `w = β[type] × Σ(α[mol] × count) / N_clust` with α(protein)=3, α(nucleic)=3, α(ligand)=1, β(chain)=0.5, β(interface)=1.0. For chains, `N_clust` is the chain cluster size. For interfaces, `N_clust` is the **interface cluster** size per AF3 §2.5.3 — interfaces share a cluster iff their constituent chain pairs map to the same pair of chain clusters. Synthetic epoch size of 10,000 samples. Falls back to uniform `DistributedSampler` if no cluster data.
+**Sampling (two-stage, AF3 §2.5.1)**: Per-anchor cluster-balanced sampling is factored into a **record marginal × anchor conditional** decomposition — mathematically identical to a flat per-anchor table by the chain rule (`p(record)·p(anchor|record) = w_a / W`), but keeping the sampler per-record (DDP-simple) and moving the anchor choice next to the cropper that consumes it:
+
+1. **Record marginal** (the sampler): `WeightedClusterSampler` (single-dataset) / `MultiDatasetSampler` (multi-dataset) draw a *record* with probability `∝ compute_cluster_weights` = `Σ_{a∈record} w_a`, and yield record indices.
+2. **Anchor conditional** (the dataset, at load time): a weighted dataset (`anchor_sampling=True`) draws one of the record's chain/interface anchors with probability `w_a / Σ w_a` in `_draw_crop_anchor`, seeding the crop (chain → contiguous/spatial seed; interface → interface-seeded spatial crop). Uniform datasets skip this and let the cropper self-seed.
+
+Per-anchor weight `w = β[type] × Σ(α[mol] × count) / N_clust` with α(protein)=3, α(nucleic)=3, α(ligand)=1, β(chain)=0.5, β(interface)=1.0. For chains, `N_clust` is the chain cluster size. For interfaces, `N_clust` is the **interface cluster** size per AF3 §2.5.3 — interfaces share a cluster iff their constituent chain pairs map to the same pair of chain clusters. Both stages use the **same** α/β so the chain-rule identity holds exactly. Synthetic epoch size of 10,000 samples. Falls back to uniform `DistributedSampler` if no cluster data (anchor sampling still active on the dataset, so anchors remain mol-type-weighted).
+
+The one behavioural note vs a flat per-anchor sampler: `_draw_crop_anchor` seeds its RNG from `(worker-epoch, idx)` only, so repeated draws of the *same* record within one `epoch_size` chunk reuse the same anchor. This is unbiased across chunks (each chunk reseeds) and negligible in practice (epoch_size ≪ dataset size → same-record repeats within a chunk are rare); full per-draw anchor diversity would require the sampler to carry the flat table.
 
 **Cropping**: Three strategies with weighted random selection — contiguous (20%), spatial KD-tree (40%), interface-seeded (40%). Interface cropping seeds from tokens within 15 Å of another chain, then expands spatially.
 
@@ -351,7 +358,7 @@ deepfold3 train --data-dir /data/pdb --output runs/exp1 \
 | `strategy`        | `"uniform"` | `"weighted"` (cluster-balanced) or `"uniform"`                 |
 | `is_distillation` | `false`     | If true, disables confidence/distogram losses for this dataset |
 
-The primary dataset (`--data-dir`) always uses cluster-weighted sampling when cluster IDs are available. Extra datasets are combined via `ConcatDataset` + `MultiDatasetSampler`, which draws samples from each dataset proportionally to weights.
+The primary dataset (`--data-dir`) always uses cluster-weighted sampling when cluster IDs are available. Extra datasets are combined via `ConcatDataset` + `MultiDatasetSampler`, which draws *records* from each dataset proportionally to weights (per-dataset probability × per-record cluster marginal); each `weighted` sub-dataset then draws its crop anchor at load time (the two-stage decomposition above), while `uniform` sub-datasets let the cropper self-seed.
 
 **Resume-aware sampler state**: both `WeightedClusterSampler` (single-dataset path) and `MultiDatasetSampler` implement `state_dict` / `load_state_dict`, exposing `epoch + sample_idx + seed`. `CheckpointManager.save` snapshots the sampler under `blob["sampler"]`; on resume the iterator fast-forwards past indices already trained on, so within-epoch position is exact (no record duplication). `set_epoch` only resets `sample_idx` when the epoch number actually changes — the trainer's `set_epoch(state.epoch)` at the top of the loop does not clobber a freshly-loaded position. A seed mismatch between yaml and saved state emits a runtime warning (the per-epoch RNG derives from `seed + epoch`).
 

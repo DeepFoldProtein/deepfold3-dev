@@ -1,32 +1,39 @@
-"""Cluster-balanced weighted sampler for training data.
+"""Cluster-balanced weighted sampling for training data.
 
-Implements AlphaFold 3 §2.5.1 cluster-balanced sampling. The sampling
-table is **flattened** so each ``(record, anchor)`` candidate is its own row:
+Implements AlphaFold 3 §2.5.1 cluster-balanced sampling as a **two-stage
+decomposition** of the per-anchor joint distribution ``p(record, anchor) ∝ w_a``:
 
-* one row per **valid chain** of every record
-  ``w_chain     = beta_chain / N_clust * alpha(mol_type)``
-* one row per **valid interface** of every record
-  ``w_interface = beta_interface / N_clust * (alpha(c1.mol_type) + alpha(c2.mol_type))``
+1. **Record marginal** (the sampler): draw a record with probability
+   ``p(record) = Σ_{a∈record} w_a / W`` — exactly :func:`compute_cluster_weights`.
+2. **Anchor conditional** (the dataset, at load time): given the record, draw a
+   chain/interface anchor with probability ``p(a | record) = w_a / Σ_{a∈record} w_a``
+   — from :func:`build_record_anchor_tables`.
 
-For chains, ``N_clust`` is the number of valid chains sharing the same
-chain cluster ID.
+By the chain rule ``p(record)·p(a|record) = w_a / W``, so this reproduces the
+AF3 §2.5.1 flat per-anchor table's joint **exactly**, while keeping the sampler
+per-record (DDP-simple) and moving the anchor choice next to the cropper that
+consumes it. Per-anchor weights:
 
-For interfaces, ``N_clust`` is the number of valid interfaces sharing
-the same **interface cluster ID**, defined per AF3 §2.5.3 as the
-(unordered) pair of constituent chain cluster IDs:
+* per **valid chain**   ``w_chain     = beta_chain / N_clust * alpha(mol_type)``
+* per **valid interface** ``w_interface = beta_interface / N_clust *
+  (alpha(c1.mol_type) + alpha(c2.mol_type))``
+
+For chains, ``N_clust`` is the number of valid chains sharing the same chain
+cluster ID. For interfaces, ``N_clust`` is the number of valid interfaces
+sharing the same **interface cluster ID**, defined per AF3 §2.5.3 as the
+(unordered) pair of constituent chain cluster IDs
 ``C_interface = frozenset({C_chain_1, C_chain_2})``.
 
-Sampling a row tells the dataloader BOTH which record to load AND which
-chain/interface should anchor the crop. This is critical: a 20-chain
-multimer should generate ~20 chain-anchor draws and many interface
-draws so each chain/interface gets training time, instead of being
-collapsed into a single per-record weight that the cropper then ignores.
+The anchor a record draws seeds the crop (chain → contiguous/spatial seed pool,
+interface → interface-seeded spatial crop). A 20-chain multimer still earns
+~Σ-of-anchors draw mass and, across draws, sees each chain/interface in
+proportion to its cluster-balanced weight — instead of collapsing to a single
+per-record weight the cropper then self-seeds with a size bias.
 """
 
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
 
 import numpy as np
 from torch.utils.data import Sampler
@@ -34,21 +41,9 @@ from torch.utils.data import Sampler
 from deepfold3.data import const
 from deepfold3.data.types import Record
 
-
-@dataclass(frozen=True)
-class SamplingRow:
-    """One row in the flattened ``(record, anchor)`` sampling table.
-
-    ``anchor_kind`` is ``"chain"`` (anchor_a is the chain id, anchor_b is
-    -1) or ``"interface"`` (anchor_a, anchor_b are the two chain ids).
-    The dataloader uses ``anchor_kind`` + ``anchor_a`` (+ ``anchor_b``)
-    to seed the cropper.
-    """
-
-    record_idx: int
-    anchor_kind: str  # "chain" | "interface"
-    anchor_a: int
-    anchor_b: int = -1
+# A crop anchor threaded from the record's anchor draw into the cropper:
+# ``("chain", chain_id, -1)`` or ``("interface", chain_1_id, chain_2_id)``.
+CropAnchor = tuple[str, int, int]
 
 
 def _mol_type_alpha(mol_type: int, alpha_prot: float, alpha_nucl: float, alpha_lig: float) -> float:
@@ -102,69 +97,102 @@ def _compute_interface_cluster_sizes(records: list[Record]) -> dict:
     return dict(counter)
 
 
-def build_sampling_rows(
+def _record_anchor_rows(
+    rec: Record,
+    chain_cluster_sizes: dict,
+    iface_cluster_sizes: dict,
+    alpha_prot: float,
+    alpha_nucl: float,
+    alpha_lig: float,
+    beta_chain: float,
+    beta_interface: float,
+) -> tuple[list[CropAnchor], list[float]]:
+    """One record's ``(anchors, weights)`` — the shared AF3 §2.5.1 weight core.
+
+    ``anchors`` is a list of :data:`CropAnchor` tuples (one per valid chain and
+    valid interface); ``weights`` are the matching per-anchor ``w_a`` (chain →
+    ``beta_chain·alpha/N_clust``, interface → ``beta_interface·(alpha1+alpha2)/N_clust``).
+    Used both to build the per-record anchor conditional
+    (:func:`build_record_anchor_tables`) and to aggregate the record marginal
+    (:func:`compute_cluster_weights`).
+    """
+    # chain_map only resolves interface endpoints — skip it for monomers.
+    chain_map = {c.chain_id: c for c in rec.chains} if rec.interfaces else {}
+    anchors: list[CropAnchor] = []
+    weights: list[float] = []
+
+    for chain in rec.chains:
+        if not chain.valid:
+            continue
+        cs = max(chain_cluster_sizes.get(chain.cluster_id, 1), 1)
+        alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
+        w = beta_chain * alpha / cs
+        if w > 0:
+            anchors.append(("chain", int(chain.chain_id), -1))
+            weights.append(w)
+
+    for iface in rec.interfaces:
+        if not iface.valid:
+            continue
+        c1 = chain_map.get(iface.chain_1)
+        c2 = chain_map.get(iface.chain_2)
+        if c1 is None or c2 is None or not c1.valid or not c2.valid:
+            continue
+        alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
+            c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
+        )
+        # AF3 §2.5.3: N_clust = size of interface cluster (pair of chain clusters)
+        icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
+        cs = max(iface_cluster_sizes.get(icid, 1), 1)
+        w = beta_interface * alpha_sum / cs
+        if w > 0:
+            anchors.append(("interface", int(c1.chain_id), int(c2.chain_id)))
+            weights.append(w)
+
+    return anchors, weights
+
+
+def build_record_anchor_tables(
     records: list[Record],
     alpha_prot: float = 3.0,
     alpha_nucl: float = 3.0,
     alpha_lig: float = 1.0,
     beta_chain: float = 0.5,
     beta_interface: float = 1.0,
-) -> tuple[list[SamplingRow], np.ndarray]:
-    """Flatten records into one sampling row per chain + interface.
+) -> dict[int, tuple[list[CropAnchor], list[float]]]:
+    """Per-record anchor conditional for load-time (two-stage) anchor sampling.
 
-    Returns ``(rows, weights)`` where ``weights`` is a normalised
-    probability distribution of length ``len(rows)``. Records with no
-    valid chains contribute no rows.
+    Returns ``{record_idx: (anchors, weights)}`` where ``anchors`` is a list of
+    :data:`CropAnchor` tuples and ``weights`` the matching per-anchor ``w_a``
+    (unnormalised — ``random.choices`` renormalises). Records with no valid
+    anchor are **omitted**, so the caller leaves ``crop_anchor=None`` and the
+    cropper self-seeds.
 
-    Chain cluster sizes are counted across all valid chains. Interface
-    cluster sizes are counted across all valid interfaces, using the
-    AF3 §2.5.3 interface cluster ID = unordered pair of chain cluster IDs.
+    The weights are the same ``w_a`` used by the flat AF3 §2.5.1 table, so
+    drawing a record by :func:`compute_cluster_weights` (marginal) and then an
+    anchor from this table (conditional) reproduces the flat table's joint
+    ``p(record, anchor) ∝ w_a`` exactly. Must use the **same** ``alpha_*`` /
+    ``beta_*`` as the record-marginal sampler for the identity to hold.
     """
     chain_cluster_sizes = _compute_chain_cluster_sizes(records)
     iface_cluster_sizes = _compute_interface_cluster_sizes(records)
-    rows: list[SamplingRow] = []
-    weight_list: list[float] = []
+    tables: dict[int, tuple[list[CropAnchor], list[float]]] = {}
 
     for record_idx, rec in enumerate(records):
-        chain_map = {c.chain_id: c for c in rec.chains}
+        anchors, weights = _record_anchor_rows(
+            rec,
+            chain_cluster_sizes,
+            iface_cluster_sizes,
+            alpha_prot,
+            alpha_nucl,
+            alpha_lig,
+            beta_chain,
+            beta_interface,
+        )
+        if anchors:
+            tables[record_idx] = (anchors, weights)
 
-        for chain in rec.chains:
-            if not chain.valid:
-                continue
-            cs = max(chain_cluster_sizes.get(chain.cluster_id, 1), 1)
-            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
-            w = beta_chain * alpha / cs
-            if w > 0:
-                rows.append(SamplingRow(record_idx, "chain", chain.chain_id))
-                weight_list.append(w)
-
-        for iface in rec.interfaces:
-            if not iface.valid:
-                continue
-            c1 = chain_map.get(iface.chain_1)
-            c2 = chain_map.get(iface.chain_2)
-            if c1 is None or c2 is None or not c1.valid or not c2.valid:
-                continue
-            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
-                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
-            )
-            # AF3 §2.5.3: N_clust = size of interface cluster (pair of chain clusters)
-            icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
-            cs = max(iface_cluster_sizes.get(icid, 1), 1)
-            w = beta_interface * alpha_sum / cs
-            if w > 0:
-                rows.append(SamplingRow(record_idx, "interface", c1.chain_id, c2.chain_id))
-                weight_list.append(w)
-
-    if not rows:
-        # Degenerate fallback: one uniform row per record so the dataloader
-        # can still iterate (e.g. tests with no valid chains).
-        rows = [SamplingRow(i, "chain", -1) for i in range(len(records))]
-        weight_list = [1.0] * len(records)
-
-    weights = np.asarray(weight_list, dtype=np.float64)
-    total = weights.sum()
-    return rows, weights / total if total > 0 else np.ones(len(rows)) / len(rows)
+    return tables
 
 
 def compute_cluster_weights(
@@ -175,51 +203,44 @@ def compute_cluster_weights(
     beta_chain: float = 0.5,
     beta_interface: float = 1.0,
 ) -> np.ndarray:
-    """Per-record weights (legacy helper).
+    """Per-record draw distribution — the AF3 §2.5.1 record marginal.
 
-    Aggregates the chain + interface weights of every record into a single
-    record-level draw probability. Kept for backward compatibility with
-    callers that don't need the per-anchor flat layout. New code should
-    use :func:`build_sampling_rows` instead.
+    Each record's weight is ``Σ_{a∈record} w_a`` (the aggregate of its chain +
+    interface anchor weights), so drawing a record here and then an anchor from
+    :func:`build_record_anchor_tables` reproduces the flat per-anchor joint
+    exactly (chain rule). Returns a normalised distribution of length
+    ``len(records)``; records with no valid anchor get weight 0.
     """
     chain_cluster_sizes = _compute_chain_cluster_sizes(records)
     iface_cluster_sizes = _compute_interface_cluster_sizes(records)
     weights = np.zeros(len(records), dtype=np.float64)
 
     for i, rec in enumerate(records):
-        w = 0.0
-        chain_map = {c.chain_id: c for c in rec.chains}
-        for chain in rec.chains:
-            if not chain.valid:
-                continue
-            cs = max(chain_cluster_sizes.get(chain.cluster_id, 1), 1)
-            alpha = _mol_type_alpha(chain.mol_type, alpha_prot, alpha_nucl, alpha_lig)
-            w += beta_chain * alpha / cs
-        for iface in rec.interfaces:
-            if not iface.valid:
-                continue
-            c1 = chain_map.get(iface.chain_1)
-            c2 = chain_map.get(iface.chain_2)
-            if c1 is None or c2 is None or not c1.valid or not c2.valid:
-                continue
-            alpha_sum = _mol_type_alpha(c1.mol_type, alpha_prot, alpha_nucl, alpha_lig) + _mol_type_alpha(
-                c2.mol_type, alpha_prot, alpha_nucl, alpha_lig
-            )
-            icid = _interface_cluster_id(c1.cluster_id, c2.cluster_id)
-            cs = max(iface_cluster_sizes.get(icid, 1), 1)
-            w += beta_interface * alpha_sum / cs
-        weights[i] = w
+        _, w_list = _record_anchor_rows(
+            rec,
+            chain_cluster_sizes,
+            iface_cluster_sizes,
+            alpha_prot,
+            alpha_nucl,
+            alpha_lig,
+            beta_chain,
+            beta_interface,
+        )
+        weights[i] = float(sum(w_list))
     total = weights.sum()
     return weights / total if total > 0 else np.ones(len(records)) / len(records)
 
 
 class WeightedClusterSampler(Sampler[int]):
-    """Cluster-balanced sampler that yields **flat sampling row indices**.
+    """Cluster-balanced sampler that yields **record indices** (AF3 §2.5.1 marginal).
 
-    The yielded ``int`` is an index into ``self.rows``; the dataset is
-    expected to look up ``rows[idx]`` and dispatch the cropper using the
-    row's ``anchor_kind`` / ``anchor_a`` / ``anchor_b``. Compatible with
-    DDP — each rank takes ``indices[rank::num_replicas]``.
+    Draws records with probability ``∝`` :func:`compute_cluster_weights` (the
+    per-record aggregate of chain + interface anchor weights). The chain /
+    interface anchor that seeds the crop is drawn **at load time** inside the
+    dataset via :func:`build_record_anchor_tables` — the two-stage decomposition
+    that reproduces the flat per-anchor joint exactly (see module docstring),
+    so the sampler no longer carries a flat row table. Compatible with DDP —
+    each rank takes ``indices[rank::num_replicas]``.
 
     Args:
         records: List of Record objects with chain/interface metadata.
@@ -259,7 +280,9 @@ class WeightedClusterSampler(Sampler[int]):
         # at the top of the loop.
         self.sample_idx = 0
 
-        self.rows, self.weights = build_sampling_rows(
+        # Per-record marginal p(record) ∝ Σ_{a∈record} w_a; ``len(self.weights)``
+        # is the record count (the draw population).
+        self.weights = compute_cluster_weights(
             records,
             alpha_prot=alpha_prot,
             alpha_nucl=alpha_nucl,
@@ -275,7 +298,7 @@ class WeightedClusterSampler(Sampler[int]):
             # the prefetch buffer drains, so the first batch of the new epoch
             # waits (a ``data_wait`` spike). Use ``infinite=True`` to avoid it.
             rng = np.random.default_rng(self.seed + self.epoch)
-            indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
+            indices = rng.choice(len(self.weights), size=self.epoch_size, replace=True, p=self.weights)
             shard = indices[self.rank :: self.num_replicas]
             for i in range(self.sample_idx, len(shard)):
                 self.sample_idx = i + 1
@@ -297,7 +320,7 @@ class WeightedClusterSampler(Sampler[int]):
         pos = self.sample_idx
         while True:
             rng = np.random.default_rng(self.seed + epoch)
-            indices = rng.choice(len(self.rows), size=self.epoch_size, replace=True, p=self.weights)
+            indices = rng.choice(len(self.weights), size=self.epoch_size, replace=True, p=self.weights)
             shard = indices[self.rank :: self.num_replicas]
             while pos < len(shard):
                 self.epoch = epoch
@@ -348,8 +371,8 @@ class WeightedEvalSampler(Sampler[int]):
     (potentially huge) eval set while still covering sequence families
     proportionally.
 
-    Yielded indices are plain record indices (no ``sampling_rows``
-    indirection) since eval doesn't need per-anchor crop control.
+    Yielded indices are plain record indices and eval datasets skip the
+    load-time anchor draw — eval doesn't need per-anchor crop control.
 
     Compatible with DDP — each rank takes ``indices[rank::num_replicas]``.
     """

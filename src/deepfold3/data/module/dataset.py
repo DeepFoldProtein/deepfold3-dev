@@ -114,6 +114,51 @@ def _retry_getitem(
     return load_fn(idx)
 
 
+def _per_sample_rng(idx: int, salt: int) -> random.Random:
+    """Deterministic per-(worker-epoch, idx) RNG, reproducible under a fixed global seed.
+
+    Mixes the worker's per-epoch ``torch.initial_seed()`` with ``idx`` and a
+    stream-specific ``salt`` — distinct salts decorrelate independent draws for
+    the same sample (e.g. anchor choice vs. the large-assembly pre-crop). A bare
+    ``random.Random()`` would draw OS entropy and never reproduce.
+    """
+    return random.Random((torch.initial_seed() ^ (idx * salt)) & 0xFFFFFFFF)
+
+
+def _build_record_anchors(records: list, anchor_sampling: bool) -> dict | None:
+    """A dataset's per-record AF3 §2.5.1 anchor conditional, or ``None`` if disabled.
+
+    Weighted datasets (``anchor_sampling=True``) get a cluster-weighted
+    chain/interface table so ``_draw_crop_anchor`` can seed the crop at load
+    time; uniform datasets pass ``False`` and let the cropper self-seed.
+    """
+    if not anchor_sampling:
+        return None
+    from deepfold3.data.sample.weighted import build_record_anchor_tables
+
+    return build_record_anchor_tables(records)
+
+
+def _draw_crop_anchor(record_anchors: dict | None, idx: int) -> tuple[str, int, int] | None:
+    """Second stage of two-stage AF3 §2.5.1 sampling — draw record ``idx``'s crop anchor.
+
+    Draws one of the record's chain/interface anchors with probability
+    ``w_a / Σ w_a`` (from ``record_anchors``) to seed the crop; ``None`` (no
+    table, or no valid anchor) leaves the cropper to self-seed. The per-idx seed
+    means repeated draws of the same record within one ``epoch_size`` chunk
+    reuse the anchor — unbiased across chunks (each reseeds). See
+    ``data/sample/weighted.py`` for the decomposition.
+    """
+    if record_anchors is None:
+        return None
+    table = record_anchors.get(idx)
+    if table is None:
+        return None
+    anchors, weights = table
+    rng = _per_sample_rng(idx, 0x85EBCA6B)
+    return anchors[rng.choices(range(len(anchors)), weights=weights, k=1)[0]]
+
+
 class TrainingDataset(torch.utils.data.Dataset):
     """PyTorch dataset for DeepFold3 training.
 
@@ -150,7 +195,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         atomize_prob: float = 0.0,
         atomize_source: str = "random",
         atomize_max_residues: int = 0,
-        sampling_rows: list | None = None,
+        anchor_sampling: bool = False,
         name: str = "",
         ccd_cache_path: str | Path | None = None,
         exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
@@ -167,12 +212,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         # guaranteed unique across extra datasets, so the trainer emits
         # ``{name}:{record.id}`` when ``name`` is set.
         self.name = name
-        # Optional flat sampling-row table from ``WeightedClusterSampler``.
-        # When set, ``__getitem__`` interprets the index as a row id and
-        # routes the row's anchor (chain or interface) into the cropper.
-        # When unset (DistributedSampler / no sampler) the index is a
-        # plain record index.
-        self.sampling_rows = sampling_rows
+        # Two-stage AF3 §2.5.1 anchor sampling (weighted datasets). The
+        # sampler draws the record by the cluster marginal; this per-record
+        # anchor conditional (chain/interface + ``w_a``) is drawn at load time
+        # in ``_load_sample`` to seed the crop. ``None`` → the cropper
+        # self-seeds (uniform / DistributedSampler datasets). See
+        # ``data/sample/weighted.py`` for the decomposition.
+        self._record_anchors = _build_record_anchors(records, anchor_sampling)
         self.data_dir = Path(data_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
@@ -282,28 +328,19 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.slow_sample_log_threshold_s = float(slow_sample_log_threshold_s)
 
     def __len__(self) -> int:
-        if self.sampling_rows is not None:
-            return len(self.sampling_rows)
         return len(self.records)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return _retry_getitem(self, idx, self._load_sample, self._sample_id)
 
     def _sample_id(self, idx: int) -> str:
-        if self.sampling_rows is not None:
-            return self.records[self.sampling_rows[idx].record_idx].id
         return self.records[idx].id
 
     def _load_sample(self, idx: int) -> dict[str, torch.Tensor]:
-        # Resolve idx → record + optional crop anchor
-        crop_anchor: tuple[str, int, int] | None = None
-        if self.sampling_rows is not None:
-            row = self.sampling_rows[idx]
-            record = self.records[row.record_idx]
-            if row.anchor_a >= 0:
-                crop_anchor = (row.anchor_kind, int(row.anchor_a), int(row.anchor_b))
-        else:
-            record = self.records[idx]
+        # Resolve idx → record; draw its crop anchor (AF3 §2.5.1 conditional,
+        # weighted datasets only — else None and the cropper self-seeds).
+        record = self.records[idx]
+        crop_anchor: tuple[str, int, int] | None = _draw_crop_anchor(self._record_anchors, idx)
 
         # Per-phase wall-clock breakdown for Tier-4 slow-sample diagnostics.
         timing: dict[str, float] = {}
@@ -328,8 +365,9 @@ class TrainingDataset(torch.utils.data.Dataset):
 
             all_ids = {int(a) for a in structure.chains["asym_id"]}
             # Deterministic under a fixed global seed (determinism mode), varies
-            # per sample and per epoch (torch worker seed reseeded per epoch).
-            precrop_rng = random.Random((torch.initial_seed() ^ (idx * 0x9E3779B1)) & 0xFFFFFFFF)
+            # per sample and per epoch (torch worker seed reseeded per epoch). A
+            # distinct salt from the anchor draw decorrelates the two streams.
+            precrop_rng = _per_sample_rng(idx, 0x9E3779B1)
             kept = select_interface_chains(
                 structure,
                 anchor=crop_anchor,

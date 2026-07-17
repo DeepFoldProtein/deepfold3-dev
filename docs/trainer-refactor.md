@@ -75,7 +75,7 @@ Scheduler gating lives inside `WrappedOptimizer.step_or_skip` (not a separate `W
 
 ### Phase 6 — Data loaders ✅
 
-[`data.py`](../src/deepfold3/training/data.py) (360 LOC) owns `build_dataloaders` + train/eval sampler construction. The `train_ds.sampling_rows = sampler.rows` side-effect is preserved. `skip_first_batches` was not ported — mid-epoch resume is deferred (epoch-boundary resume suffices for current training runs).
+[`data.py`](../src/deepfold3/training/data.py) owns `build_dataloaders` + train/eval sampler construction. Weighted datasets are constructed with `anchor_sampling=True`, so the AF3 §2.5.1 crop anchor is drawn at load time (the two-stage decomposition in `data/sample/weighted.py`) rather than carried in a sampler-side row table. `skip_first_batches` was not ported — mid-epoch resume is deferred (epoch-boundary resume suffices for current training runs).
 
 ### Phase 7 — Evaluation ✅
 

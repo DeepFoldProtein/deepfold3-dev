@@ -1050,3 +1050,131 @@ class TestCheckpointResume:
                 train_cfg=cfg,
                 dist_info=dist_info,
             )
+
+
+def _make_anchor_records():
+    """Heteromeric, multi-anchor records with varied cluster sizes.
+
+    Cluster "A" is shared across 4 chains (downweighted); "B"/"C" are unique.
+    Interfaces {A,C} recur (het2 has two), so their interface-cluster size is 2.
+    """
+    from deepfold3.data.types import ChainInfo, InterfaceInfo, Record
+
+    def _rec(rid, chains, ifaces):
+        return Record(
+            id=rid,
+            chains=[
+                ChainInfo(chain_id=c, chain_name=chr(65 + c), mol_type=0, cluster_id=cl, msa_id=c, num_residues=64)
+                for (c, cl) in chains
+            ],
+            interfaces=[InterfaceInfo(chain_1=a, chain_2=b) for (a, b) in ifaces],
+        )
+
+    return [
+        _rec("het1", [(0, "A"), (1, "B")], [(0, 1)]),
+        _rec("het2", [(0, "A"), (1, "A"), (2, "C")], [(0, 2), (1, 2)]),
+        _rec("mono", [(0, "A")], []),
+    ]
+
+
+class TestTwoStageAnchorSampling:
+    """AF3 §2.5.1 two-stage decomposition: record marginal × anchor conditional."""
+
+    def test_chain_rule_joint_matches_flat_table(self):
+        """p(R)·p(a|R) reproduces the flat per-anchor joint p(R,a) ∝ w_a exactly."""
+        from deepfold3.data.sample.weighted import build_record_anchor_tables, compute_cluster_weights
+
+        records = _make_anchor_records()
+        tables = build_record_anchor_tables(records)
+        p_record = compute_cluster_weights(records)
+
+        # Flat reference: normalise all per-anchor weights globally.
+        flat = {(ri, a): wa for ri, (anchors, ws) in tables.items() for a, wa in zip(anchors, ws, strict=True)}
+        total = sum(flat.values())
+        flat_joint = {k: v / total for k, v in flat.items()}
+
+        # Two-stage: marginal times per-record conditional.
+        two_stage = {}
+        for ri, (anchors, ws) in tables.items():
+            s = float(sum(ws))
+            for a, wa in zip(anchors, ws, strict=True):
+                two_stage[(ri, a)] = p_record[ri] * (wa / s)
+
+        assert set(flat_joint) == set(two_stage)
+        assert max(abs(flat_joint[k] - two_stage[k]) for k in flat_joint) < 1e-12
+
+    def test_conditional_is_cluster_weighted(self):
+        """Within het2, the unique-cluster chain outweighs the shared-cluster ones."""
+        from deepfold3.data.sample.weighted import build_record_anchor_tables
+
+        records = _make_anchor_records()
+        anchors, weights = build_record_anchor_tables(records)[1]  # het2
+        w = dict(zip(anchors, weights, strict=True))
+        # chain 2 (cluster "C", size 1) vs chains 0/1 (cluster "A", size 4)
+        assert w[("chain", 2, -1)] > w[("chain", 0, -1)]
+        assert w[("chain", 0, -1)] == w[("chain", 1, -1)]
+        # interfaces (beta_interface=1.0, two mol types) dominate a single chain
+        assert w[("interface", 0, 2)] > w[("chain", 2, -1)]
+
+    def test_records_without_anchors_are_omitted(self):
+        """A record with no valid chain contributes no table entry (cropper self-seeds)."""
+        from deepfold3.data.sample.weighted import build_record_anchor_tables
+        from deepfold3.data.types import ChainInfo, Record
+
+        records = [
+            Record(
+                id="dead",
+                chains=[
+                    ChainInfo(
+                        chain_id=0, chain_name="A", mol_type=0, cluster_id=0, msa_id=0, num_residues=64, valid=False
+                    )
+                ],
+                interfaces=[],
+            ),
+            _make_anchor_records()[0],
+        ]
+        tables = build_record_anchor_tables(records)
+        assert 0 not in tables and 1 in tables
+
+    def test_draw_crop_anchor_deterministic_and_none(self):
+        """_draw_crop_anchor: deterministic per idx, None when no table / no anchor."""
+        import torch
+
+        from deepfold3.data.module.dataset import _draw_crop_anchor
+        from deepfold3.data.sample.weighted import build_record_anchor_tables
+
+        tables = build_record_anchor_tables(_make_anchor_records())
+        torch.manual_seed(0)
+        first = _draw_crop_anchor(tables, 1)
+        torch.manual_seed(0)
+        assert _draw_crop_anchor(tables, 1) == first  # reproducible under fixed seed
+        assert first[0] in ("chain", "interface")
+        assert _draw_crop_anchor(None, 0) is None  # uniform dataset
+        assert _draw_crop_anchor(tables, 999) is None  # record absent from table
+
+    def test_weighted_sampler_yields_record_indices(self):
+        """WeightedClusterSampler now yields record indices in [0, n_records)."""
+        from deepfold3.data.sample.weighted import WeightedClusterSampler
+
+        records = _make_anchor_records()
+        sampler = WeightedClusterSampler(records=records, epoch_size=40, num_replicas=1, rank=0, seed=3)
+        idxs = list(iter(sampler))
+        assert len(idxs) == 40
+        assert all(0 <= i < len(records) for i in idxs)
+
+    def test_weighted_sampler_ddp_shards_are_disjoint_and_complete(self):
+        """Union of per-rank shards equals the single global draw (no overlap, no loss)."""
+        import numpy as np
+
+        from deepfold3.data.sample.weighted import WeightedClusterSampler
+
+        records = _make_anchor_records()
+        world, ep, seed = 4, 80, 9
+        shards = [
+            list(iter(WeightedClusterSampler(records=records, epoch_size=ep, num_replicas=world, rank=r, seed=seed)))
+            for r in range(world)
+        ]
+        weights = WeightedClusterSampler(records=records, epoch_size=ep, seed=seed).weights
+        glob = np.random.default_rng(seed).choice(len(records), size=ep, replace=True, p=weights)
+        assert sum(len(s) for s in shards) == ep
+        assert sorted(sum(shards, [])) == sorted(glob.tolist())
