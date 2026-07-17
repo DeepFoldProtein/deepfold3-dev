@@ -127,6 +127,7 @@ def _run_one_job(
     save_distogram: bool = False,
     logits_scheme: str = "int8_softmax",
     skip_existing: bool,
+    bucket: bool = False,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
     branch of ``inference``.
@@ -174,7 +175,14 @@ def _run_one_job(
     click.echo(f"  {N} tokens, {S} MSA sequences, {T} templates  ({time.perf_counter() - t0:.1f}s)")
 
     original_n = N
-    use_bucket = model_cfg.optim.use_torch_compile
+    # Bucket-pad N up to the next BUCKET_SIZES entry. torch.compile *requires*
+    # this (static shapes), but the fused Triton kernels benefit just as much:
+    # they autotune on M = batch·N², so every distinct token count is a fresh
+    # ~60 s autotune. Quantizing N to ~13 buckets collapses hundreds of shapes
+    # to a handful, so a sweep autotunes each bucket once (and warmup-triton can
+    # pre-warm them) instead of recompiling per target. Enabled by --bucket or
+    # whenever torch.compile is on.
+    use_bucket = bucket or model_cfg.optim.use_torch_compile
     if use_bucket:
         from deepfold3.model.bucket import next_bucket, pad_features
 
@@ -342,6 +350,16 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     show_default=True,
     help="Skip jobs whose output dir already has any seed-* subdir.",
 )
+@click.option(
+    "--bucket/--no-bucket",
+    default=True,
+    show_default=True,
+    help="Pad token count N up to the next bucket size before the forward. The "
+    "fused Triton kernels autotune on M=batch*N^2, so bucketing collapses "
+    "hundreds of distinct N to ~13 shapes — each autotuned once (and "
+    "pre-warmable via warmup-triton) instead of a ~60s re-autotune per target. "
+    "Recommended for multi-target sweeps; auto-on when torch.compile is used.",
+)
 def inference_batch(
     inputs_file: Path | None,
     json_paths: tuple[Path, ...],
@@ -359,6 +377,7 @@ def inference_batch(
     save_distogram: bool,
     logits_scheme: str,
     skip_existing: bool,
+    bucket: bool,
 ) -> None:
     """Run inference on many JSON inputs without reloading the model."""
     if not inputs_file and not json_paths:
@@ -430,6 +449,7 @@ def inference_batch(
             save_distogram=save_distogram,
             logits_scheme=logits_scheme,
             skip_existing=skip_existing,
+            bucket=bucket,
         )
         n_done += 1
 
