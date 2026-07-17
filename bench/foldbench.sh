@@ -94,7 +94,7 @@ for cat in $CATS_SUBMITTED; do
 #SBATCH --output=${REPO}/${LOGDIR}/eval_${cat}_%j.out
 #SBATCH --open-mode=append
 set -uo pipefail
-bash ${REPO}/bench/scripts/eval_summarize.sh "$SERIES" "$csteps" "$evalcats" 32
+bash ${REPO}/bench/scripts/eval_summarize.sh "$SERIES" "$csteps" "$evalcats" 8
 EOF
   echo "-- eval[$cat] after$dep"
   sbatch --dependency=afterany${dep} "$EVAL_SBATCH"

@@ -95,7 +95,9 @@ def detect_cluster(partition: str, gpu_type: str) -> dict:
     try:
         out = subprocess.run(
             ["sinfo", "-h", "-N", "-p", partition, "-o", "%n|%G|%t|%c"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {"gpu_type": gpu_type, "total_gpus": 0, "max_gpus_per_node": 0, "cpus_per_node": 0, "by_type": {}}
@@ -277,7 +279,10 @@ def submit_step(args, step: int, categories: list[str], tag: str = "") -> str | 
     the Slurm array job id (str) or None (skipped / dry-run / failure)."""
     ckpt = resolve_ckpt(args.series, step)
     if ckpt is None:
-        print(f"[slurm-sweep] SKIP step {step}: no ckpt at ckpts/{args.series}/step_{step}.{{safetensors,pt}}", file=sys.stderr)
+        print(
+            f"[slurm-sweep] SKIP step {step}: no ckpt at ckpts/{args.series}/step_{step}.{{safetensors,pt}}",
+            file=sys.stderr,
+        )
         return None
 
     by_cat = collect_jobs(args.series, step, categories)
@@ -300,11 +305,21 @@ def submit_step(args, step: int, categories: list[str], tag: str = "") -> str | 
                 f.write(f"{jp}\t{od}\n")
 
     sbatch = write_sbatch(
-        args.series, step, ckpt, shard_dir, log_dir, n_shards,
-        args.gpu_type, args.cpus_per_task, args.partition,
-        args.num_samples, args.num_recycles,
+        args.series,
+        step,
+        ckpt,
+        shard_dir,
+        log_dir,
+        n_shards,
+        args.gpu_type,
+        args.cpus_per_task,
+        args.partition,
+        args.num_samples,
+        args.num_recycles,
         [int(s) for s in args.seed.split(",") if s != ""],
-        args.max_concurrent, not args.no_distogram, tag,
+        args.max_concurrent,
+        not args.no_distogram,
+        tag,
     )
     order = " > ".join(c for c, _ in by_cat)
     print(
@@ -331,26 +346,53 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--series", default="df3v3")
     ap.add_argument("--steps", required=True, help="Comma list, e.g. 5000,6000. Submitted latest-first.")
-    ap.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES),
-                    help="Comma list or 'all' (= the 8 swept categories). Default: all 8.")
-    ap.add_argument("--shards", type=int, default=None,
-                    help="Array tasks = max concurrent GPUs used per step. Default: auto (total GPUs of the chosen type in the partition, from sinfo).")
-    ap.add_argument("--gpu-type", default="auto",
-                    help="Slurm GRES gpu type ('auto' = most abundant in partition, an explicit type e.g. 'RTX4090', or 'any' for untyped).")
-    ap.add_argument("--cpus-per-task", type=int, default=None,
-                    help="CPUs per GPU task. Default: auto (~half a node's cores split across its GPUs, so a full node stays near half-CPU).")
+    ap.add_argument(
+        "--categories",
+        default=",".join(DEFAULT_CATEGORIES),
+        help="Comma list or 'all' (= the 8 swept categories). Default: all 8.",
+    )
+    ap.add_argument(
+        "--shards",
+        type=int,
+        default=None,
+        help="Array tasks = max concurrent GPUs used per step. Default: auto (total GPUs of the chosen type in the partition, from sinfo).",
+    )
+    ap.add_argument(
+        "--gpu-type",
+        default="auto",
+        help="Slurm GRES gpu type ('auto' = most abundant in partition, an explicit type e.g. 'RTX4090', or 'any' for untyped).",
+    )
+    ap.add_argument(
+        "--cpus-per-task",
+        type=int,
+        default=None,
+        help="CPUs per GPU task. Default: auto (~half a node's cores split across its GPUs, so a full node stays near half-CPU).",
+    )
     ap.add_argument("--partition", default="normal")
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--num-recycles", type=int, default=10)
     ap.add_argument("--seed", default="42,43,44,45", help="Comma list of model seeds (FoldBench uses 4).")
-    ap.add_argument("--max-concurrent", type=int, default=None,
-                    help="Cap simultaneously-running array tasks (Slurm '%%N'). Default: unlimited (GPU-bound).")
+    ap.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        help="Cap simultaneously-running array tasks (Slurm '%%N'). Default: unlimited (GPU-bound).",
+    )
     ap.add_argument("--no-distogram", action="store_true", help="Disable --save-distogram.")
-    ap.add_argument("--per-category", dest="per_category", action="store_true", default=True,
-                    help="Submit one array per (step, category) instead of one big array per step, "
-                    "so each category can be scored + plotted as soon as it finishes (default).")
-    ap.add_argument("--single-array", dest="per_category", action="store_false",
-                    help="One array per step over all categories (evaluate only after the whole sweep).")
+    ap.add_argument(
+        "--per-category",
+        dest="per_category",
+        action="store_true",
+        default=True,
+        help="Submit one array per (step, category) instead of one big array per step, "
+        "so each category can be scored + plotted as soon as it finishes (default).",
+    )
+    ap.add_argument(
+        "--single-array",
+        dest="per_category",
+        action="store_false",
+        help="One array per step over all categories (evaluate only after the whole sweep).",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Write shards + sbatch but do not submit.")
     args = ap.parse_args()
 

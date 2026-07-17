@@ -69,6 +69,7 @@ def _ost_cmd() -> list[str]:
         return shlex.split(override)
     return ["apptainer", "run", "--bind", OST_BIND, OST_SIF, "compare-structures"]
 
+
 # Same OST command for both modes (--dockq already covers interfaces).
 # --lddt-no-stereochecks: df3v1 is mid-training and emits bad local geometry;
 # OST's default lDDT stereocheck DELETES those atoms, collapsing lDDT to ~0

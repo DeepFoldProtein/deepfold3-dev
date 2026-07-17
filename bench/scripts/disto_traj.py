@@ -144,8 +144,10 @@ def _err(stepdir, target):
     base = np.triu(np.ones_like(D, bool), 1) & (v[:, None] & v[None]) & (D < 8.0)
     reg = base & (seq >= 6) & (seq < 24)  # intra-domain beta-register
     allc = base & (seq >= 6)  # incl inter-domain packing
+
     def mae(m):
         return float(np.median(np.abs(dg[m] - D[m]))) if m.sum() else None
+
     return mae(reg), mae(allc)
 
 

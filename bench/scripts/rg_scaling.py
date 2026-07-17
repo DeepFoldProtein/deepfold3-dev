@@ -195,10 +195,10 @@ def plot(records, ref_fit, ref_pairs, series, category, out_png):
         label=rf"FoldBench fit $R_g={ref_fit[1]:.2f}\,N^{{{ref_fit[0]:.3f}}}$",
     )
     # per-step fit lines (slope rotates over training); scatter for first & last step
-    for r in records:
+    for r in (records[-1],):
         col = cmap(norm(r["step"]))
         axA.plot(nx, r["a"] * nx ** r["b"], "-", color=col, lw=1.6, alpha=0.9, zorder=3)
-    for r in (records[0], records[-1]):
+    for r in records:  # (records[0], records[-1]):
         p = np.array(r["pairs"])
         axA.scatter(p[:, 0], p[:, 1], s=10, color=cmap(norm(r["step"])), alpha=0.5, edgecolor="none", zorder=2)
     axA.set_xscale("log")

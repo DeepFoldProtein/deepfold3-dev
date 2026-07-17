@@ -101,7 +101,10 @@ def run_step(
 ) -> None:
     params = resolve_ckpt(series, step)
     if params is None:
-        print(f"[sweep] SKIP step {step}: no checkpoint at {BENCH / 'ckpts' / series}/step_{step}.{{safetensors,pt}}", file=sys.stderr)
+        print(
+            f"[sweep] SKIP step {step}: no checkpoint at {BENCH / 'ckpts' / series}/step_{step}.{{safetensors,pt}}",
+            file=sys.stderr,
+        )
         return
     in_dir = BENCH / "inputs" / category
     pred_root = BENCH / "runs" / series / "pred" / category / f"step_{step}"
