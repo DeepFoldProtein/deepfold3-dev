@@ -26,14 +26,24 @@ is computed once per target and cached.
 usage: python bench/scripts/disto_traj.py [ARM_LEFT] [ARM_RIGHT]
        (default base df3v1 vs crop640) -> tmp/bench/ss_analysis_full/distoMAE_trajectory.png
 """
-import json, glob, re, os, sys
-import numpy as np, gemmi
-import matplotlib; matplotlib.use("Agg")
+
+import glob
+import json
+import os
+import re
+import sys
+
+import gemmi
+import matplotlib
+import numpy as np
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 from check_chirality import needleman_wunsch  # noqa: E402
+
 
 def _cb(res):
     # distogram rep atom = CB (Gly->CA); NOT CA — distogram_loss is CB-CB.
@@ -41,9 +51,12 @@ def _cb(res):
     p = at.get("CA") if res.name == "GLY" else (at.get("CB") or at.get("CA"))
     return None if p is None else np.array([p.x, p.y, p.z])
 
+
 def ref_chains(cif):
     """Per protein chain: (1-letter seq, CB coords [n,3]). Rep atom = CB (Gly->CA)."""
-    st = gemmi.read_structure(cif); st.setup_entities(); out = []
+    st = gemmi.read_structure(cif)
+    st.setup_entities()
+    out = []
     for ch in st[0]:
         seq, xyz = [], []
         for res in ch:
@@ -54,14 +67,18 @@ def ref_chains(cif):
             if p is None:
                 continue
             code = info.one_letter_code.upper()
-            seq.append(code if code.isalpha() else "X"); xyz.append(p)
+            seq.append(code if code.isalpha() else "X")
+            xyz.append(p)
         if seq:
             out.append(("".join(seq), np.asarray(xyz)))
     return out
 
+
 def pred_seq(model_cif):
     """Predicted protein residue 1-letter seq in token order (monomer chain)."""
-    st = gemmi.read_structure(model_cif); st.setup_entities(); seq = []
+    st = gemmi.read_structure(model_cif)
+    st.setup_entities()
+    seq = []
     for ch in st[0]:
         for res in ch:
             info = gemmi.find_tabulated_residue(res.name)
@@ -71,7 +88,10 @@ def pred_seq(model_cif):
             seq.append(code if code.isalpha() else "X")
     return "".join(seq)
 
+
 _GT_CACHE = {}
+
+
 def gt_per_token(stepdir, target, N):
     """GT CB coord per token [N,3] (NaN where unaligned), via NW to best ref chain.
 
@@ -89,10 +109,11 @@ def gt_per_token(stepdir, target, N):
         _GT_CACHE[target] = (len(ps), best)
     npred, best = _GT_CACHE[target]
     C = np.full((N, 3), np.nan)
-    if npred == N and best:                 # monomer-protein token layout
+    if npred == N and best:  # monomer-protein token layout
         for ti, ri in best[0]:
             C[ti] = best[1][ri]
     return C
+
 
 def _err(stepdir, target):
     """Return (distoMAE_reg, distoMAE_allcontact) in A, or None."""
@@ -106,6 +127,7 @@ def _err(stepdir, target):
     # Trunk distogram E[d]: per-seed codec npz (current layout) with a fallback
     # to the inline 'distogram' field for legacy confidences.json.
     from deepfold3.io.confidences import load_logit_maps_from_json
+
     maps = load_logit_maps_from_json(f)
     if "distogram" in maps:
         dg = np.asarray(maps["distogram"])
@@ -114,16 +136,18 @@ def _err(stepdir, target):
     else:
         return None
     N = dg.shape[0]
-    C = gt_per_token(stepdir, target, N)            # token index = residue order (monomer)
+    C = gt_per_token(stepdir, target, N)  # token index = residue order (monomer)
     v = ~np.isnan(C).any(1)
     D = np.sqrt(((C[:, None] - C[None]) ** 2).sum(-1))
     tr = np.arange(N)
-    seq = np.abs(np.subtract.outer(tr, tr))         # |i-j| token index == residue sep
+    seq = np.abs(np.subtract.outer(tr, tr))  # |i-j| token index == residue sep
     base = np.triu(np.ones_like(D, bool), 1) & (v[:, None] & v[None]) & (D < 8.0)
-    reg = base & (seq >= 6) & (seq < 24)            # intra-domain beta-register
-    allc = base & (seq >= 6)                        # incl inter-domain packing
-    mae = lambda m: float(np.median(np.abs(dg[m] - D[m]))) if m.sum() else None
+    reg = base & (seq >= 6) & (seq < 24)  # intra-domain beta-register
+    allc = base & (seq >= 6)  # incl inter-domain packing
+    def mae(m):
+        return float(np.median(np.abs(dg[m] - D[m]))) if m.sum() else None
     return mae(reg), mae(allc)
+
 
 def traj(arm, target):
     out = []
@@ -136,9 +160,11 @@ def traj(arm, target):
             out.append((int(m.group(1)), e[0], e[1]))
     return sorted(out)
 
+
 ARM_LEFT = sys.argv[1] if len(sys.argv) > 1 else "df3-25e5-c10-g35"
 ARM_RIGHT = sys.argv[2] if len(sys.argv) > 2 else "df3-stage1-crop640-average"
-targets = ["9EDF", "9OT9", "29MW"]; col = {"9EDF": "tab:green", "9OT9": "tab:orange", "29MW": "tab:red"}
+targets = ["9EDF", "9OT9", "29MW"]
+col = {"9EDF": "tab:green", "9OT9": "tab:orange", "29MW": "tab:red"}
 fig, ax = plt.subplots(1, 2, figsize=(13, 4.6), gridspec_kw={"width_ratios": [3, 2]})
 print("=== distoMAE register-band 6-23 (intra-domain B; trunk dist error vs native, lower=better) ===\n")
 for t in targets:
@@ -148,12 +174,18 @@ for t in targets:
             axi.plot([x[0] for x in d], [x[1] for x in d], "-o", ms=3, color=col[t], label=t)
     L = traj(ARM_LEFT, t)
     if L:
-        print(f"{t}  {ARM_LEFT}  distoMAE_reg: {L[0][1]:.2f} -> {L[-1][1]:.2f} A  "
-              f"(steps {L[0][0]}..{L[-1][0]}, min {min(x[1] for x in L):.2f}); "
-              f"all-contact last {L[-1][2]:.2f}")
-for axi, title in zip(ax, [ARM_LEFT, ARM_RIGHT]):
-    axi.set_xlabel("training step"); axi.set_ylabel("distoMAE register-band (A)")
-    axi.set_title(title); axi.legend(fontsize=8); axi.grid(alpha=0.3)
+        print(
+            f"{t}  {ARM_LEFT}  distoMAE_reg: {L[0][1]:.2f} -> {L[-1][1]:.2f} A  "
+            f"(steps {L[0][0]}..{L[-1][0]}, min {min(x[1] for x in L):.2f}); "
+            f"all-contact last {L[-1][2]:.2f}"
+        )
+for axi, title in zip(ax, [ARM_LEFT, ARM_RIGHT], strict=False):
+    axi.set_xlabel("training step")
+    axi.set_ylabel("distoMAE register-band (A)")
+    axi.set_title(title)
+    axi.legend(fontsize=8)
+    axi.grid(alpha=0.3)
 plt.tight_layout()
 out = "tmp/bench/ss_analysis_full/distoMAE_trajectory.png"
-plt.savefig(out, dpi=130); print("\nwrote", out)
+plt.savefig(out, dpi=130)
+print("\nwrote", out)

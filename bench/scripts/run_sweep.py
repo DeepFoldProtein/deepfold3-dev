@@ -27,6 +27,7 @@ Usage::
     # the full 5k-grid trajectory, latest first
     python bench/scripts/run_sweep.py --series df3v1 --steps all --category monomer_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,8 +74,16 @@ def shard_round_robin(targets: list[tuple[str, int]], n: int) -> list[list[str]]
     return shards
 
 
-def run_step(series: str, step: int, category: str, gpus: list[int],
-             num_samples: int, num_recycles: int, seeds: list[int], snapshot: str) -> None:
+def run_step(
+    series: str,
+    step: int,
+    category: str,
+    gpus: list[int],
+    num_samples: int,
+    num_recycles: int,
+    seeds: list[int],
+    snapshot: str,
+) -> None:
     params = BENCH / "ckpts" / series / f"step_{step}.pt"
     if not params.exists():
         print(f"[sweep] SKIP step {step}: no checkpoint at {params}", file=sys.stderr)
@@ -86,12 +95,14 @@ def run_step(series: str, step: int, category: str, gpus: list[int],
 
     targets = small_targets(category)
     shards = shard_round_robin(targets, len(gpus))
-    print(f"[sweep] {series} step {step} | {category} | {len(targets)} targets "
-          f"-> {len(gpus)} GPUs ({[len(s) for s in shards]})")
+    print(
+        f"[sweep] {series} step {step} | {category} | {len(targets)} targets "
+        f"-> {len(gpus)} GPUs ({[len(s) for s in shards]})"
+    )
 
     procs = []
     t0 = time.perf_counter()
-    for gpu, shard in zip(gpus, shards):
+    for gpu, shard in zip(gpus, shards, strict=False):
         if not shard:
             continue
         shard_file = shard_dir / f"gpu{gpu}.txt"
@@ -105,24 +116,33 @@ def run_step(series: str, step: int, category: str, gpus: list[int],
         env = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": str(gpu),
-            "OMP_NUM_THREADS": t, "MKL_NUM_THREADS": t,
-            "OPENBLAS_NUM_THREADS": t, "NUMEXPR_NUM_THREADS": t,
+            "OMP_NUM_THREADS": t,
+            "MKL_NUM_THREADS": t,
+            "OPENBLAS_NUM_THREADS": t,
+            "NUMEXPR_NUM_THREADS": t,
         }
         cmd = [
-            DF3, "inference-batch",
-            "--inputs-file", str(shard_file),
-            "--params", str(params),
-            "--snapshot", snapshot,
-            "--optim", "inference",
-            "--num-samples", str(num_samples),
-            "--num-recycles", str(num_recycles),
+            DF3,
+            "inference-batch",
+            "--inputs-file",
+            str(shard_file),
+            "--params",
+            str(params),
+            "--snapshot",
+            snapshot,
+            "--optim",
+            "inference",
+            "--num-samples",
+            str(num_samples),
+            "--num-recycles",
+            str(num_recycles),
             "--skip-existing",
+            "--save-distogram",  # per-seed trunk distogram for interface/contact post-analysis
         ]
         for sd in seeds:
             cmd += ["--seed", str(sd)]
         print(f"  GPU {gpu}: {len(shard)} targets -> {log.name}")
-        procs.append((gpu, subprocess.Popen(cmd, env=env,
-                                             stdout=open(log, "w"), stderr=subprocess.STDOUT)))
+        procs.append((gpu, subprocess.Popen(cmd, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT)))
         time.sleep(3)  # stagger model-build / first-compile across workers
 
     rc = 0
@@ -131,21 +151,23 @@ def run_step(series: str, step: int, category: str, gpus: list[int],
         rc |= r
         print(f"  GPU {gpu}: exit {r}")
     dt = time.perf_counter() - t0
-    print(f"[sweep] step {step} done in {dt/60:.1f} min (rc={rc})")
+    print(f"[sweep] step {step} done in {dt / 60:.1f} min (rc={rc})")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--series", default="df3v1")
     ap.add_argument("--category", default="monomer_protein")
-    ap.add_argument("--steps", default="90000",
-                    help="'all' (5k grid, latest first), or comma list e.g. 90000,85000")
+    ap.add_argument("--steps", default="90000", help="'all' (5k grid, latest first), or comma list e.g. 90000,85000")
     ap.add_argument("--gpus", default="0,1,2,3", help="comma list of GPU ids")
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--num-recycles", type=int, default=10)
-    ap.add_argument("--seed", default="42",
-                    help="Comma list of model seeds, e.g. 42,43,44,45. Each target is folded "
-                         "once per seed (FoldBench uses 4). Default: 42.")
+    ap.add_argument(
+        "--seed",
+        default="42",
+        help="Comma list of model seeds, e.g. 42,43,44,45. Each target is folded "
+        "once per seed (FoldBench uses 4). Default: 42.",
+    )
     ap.add_argument("--snapshot", default="average", choices=["auto", "average", "shadow", "fast"])
     args = ap.parse_args()
 
@@ -156,12 +178,13 @@ def main() -> None:
     else:
         steps = [int(s) for s in args.steps.split(",") if s != ""]
 
-    print(f"[sweep] series={args.series} steps={steps} gpus={gpus} "
-          f"samples={args.num_samples} recycles={args.num_recycles} "
-          f"seeds={seeds} snapshot={args.snapshot}")
+    print(
+        f"[sweep] series={args.series} steps={steps} gpus={gpus} "
+        f"samples={args.num_samples} recycles={args.num_recycles} "
+        f"seeds={seeds} snapshot={args.snapshot}"
+    )
     for step in steps:
-        run_step(args.series, step, args.category, gpus,
-                 args.num_samples, args.num_recycles, seeds, args.snapshot)
+        run_step(args.series, step, args.category, gpus, args.num_samples, args.num_recycles, seeds, args.snapshot)
 
 
 if __name__ == "__main__":

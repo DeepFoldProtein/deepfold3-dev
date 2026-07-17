@@ -9,8 +9,11 @@ eval_ost.py) into a per-category trajectory CSV + plot:
                           whole-model lDDT + whole-model TM-score (median + IQR)
                           vs step (GDT-TS is logged to CSV but not plotted)
 
-df3v1 has no confidence head, so aggregates are confidence-free (mean over
-samples + oracle best-of-N), already baked into each step's summary.
+Each step's summary carries three aggregates: mean (over samples), oracle
+(best-of-N), and conf (confidence top-1 = the highest-ranking_score sample).
+The confidence top-1 line is drawn whenever the raw CSV carries ranking_score
+(runs that train a confidence head, df3v2+); it is simply absent for older,
+confidence-head-free evals.
 
 Usage::
 
@@ -85,17 +88,31 @@ def fold_breakdown(series: str, category: str):
             continue
         step = int(_STEP.search(sd.name).group(1))
         metrics = {"lddt": "lddt", "tm": "tm_score", "gdt": "oligo_gdtts"}
-        # per-target mean of each metric over samples
-        per_t = defaultdict(lambda: defaultdict(list))
+        # per-target metric values keyed by (seed, sample), plus ranking_score
+        per_ts = defaultdict(lambda: defaultdict(dict))
+        rank_ts: dict = defaultdict(dict)
         for r in csv.DictReader(open(raw)):
+            sk = (r.get("seed"), r.get("sample"))
             for mk, col in metrics.items():
                 v = fnum(r.get(col))
                 if v is not None:
-                    per_t[r["pdb_id"]][mk].append(v)
+                    per_ts[r["pdb_id"]][mk][sk] = v
+            rs = fnum(r.get("ranking_score"))
+            if rs is not None:
+                rank_ts[r["pdb_id"]][sk] = rs
         # per-target mean over samples, then group by DSSP fold class
         tgt_mean: dict[str, dict[str, float]] = {}
-        for pdb, md in per_t.items():
-            tgt_mean[pdb] = {mk: sum(md[mk]) / len(md[mk]) for mk in metrics if md[mk]}
+        # per-target confidence top-1 (ranking_score-selected sample); empty when
+        # the raw CSV predates the ranking_score column (pre-confidence-head evals)
+        tgt_conf: dict[str, dict[str, float]] = {}
+        for pdb, md in per_ts.items():
+            tgt_mean[pdb] = {mk: sum(md[mk].values()) / len(md[mk]) for mk in metrics if md[mk]}
+            ranks = rank_ts.get(pdb, {})
+            if ranks:
+                best_sk = max(ranks, key=ranks.get)
+                cvals = {mk: md[mk][best_sk] for mk in metrics if best_sk in md.get(mk, {})}
+                if cvals:
+                    tgt_conf[pdb] = cvals
         by_cls = defaultdict(lambda: defaultdict(list))
         for pdb, mm in tgt_mean.items():
             cls = fold.get(pdb, "unknown")
@@ -110,6 +127,8 @@ def fold_breakdown(series: str, category: str):
             rec[f"{mk}_med"] = round(quantile(allvals, 0.5), 4) if allvals else None
             rec[f"{mk}_q25"] = round(quantile(allvals, 0.25), 4) if allvals else None
             rec[f"{mk}_q75"] = round(quantile(allvals, 0.75), 4) if allvals else None
+            cvals = [mm[mk] for mm in tgt_conf.values() if mk in mm]
+            rec[f"{mk}_conf"] = round(quantile(cvals, 0.5), 4) if cvals else None
         for c in classes:
             rec[f"{c}_n"] = len(by_cls[c].get("lddt", []))
             for mk in metrics:
@@ -194,10 +213,17 @@ def dockq_tier_fractions(series: str, category: str, mode: str = "oracle") -> li
     return out
 
 
-def interface_metric_dist(series: str, category: str, col: str = "lddt") -> list[dict]:
+def interface_metric_dist(series: str, category: str, col: str = "lddt", select: str = "mean") -> list[dict]:
     """Per step: across-target distribution (mean/median/IQR) of a whole-model
     metric (``col`` = ``lddt`` or ``tm_score``). Dedup the repeated interface
-    rows, then mean over the target's (seed, sample) predictions."""
+    rows to per-(seed, sample) values, then reduce over the target's samples:
+
+    - ``select='mean'`` : mean over samples (the confidence-free floor).
+    - ``select='conf'`` : the confidence top-1 sample's value (highest
+      ``ranking_score``). Yields nothing when the raw CSV predates the
+      ranking_score column (pre-confidence-head evals), so the conf line is
+      simply absent for those steps.
+    """
     out = []
     eval_root = BENCH / "runs" / series / "eval" / category
     for sd in sorted(eval_root.glob("step_*"), key=lambda p: int(_STEP.search(p.name).group(1))):
@@ -205,11 +231,27 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt") -> list
         if not raw.exists():
             continue
         by_t: dict = defaultdict(dict)
+        by_rank: dict = defaultdict(dict)
         for r in csv.DictReader(open(raw)):
+            sk = (r.get("seed"), r.get("sample"))
             v = fnum(r.get(col))
             if v is not None:
-                by_t[r["pdb_id"]][(r.get("seed"), r.get("sample"))] = v
-        per_t = [sum(d.values()) / len(d) for d in by_t.values() if d]
+                by_t[r["pdb_id"]][sk] = v
+            rs = fnum(r.get("ranking_score"))
+            if rs is not None:
+                by_rank[r["pdb_id"]][sk] = rs
+        per_t = []
+        for pdb, d in by_t.items():
+            if not d:
+                continue
+            if select == "conf":
+                ranks = by_rank.get(pdb, {})
+                cand = [(ranks[sk], sk) for sk in d if sk in ranks]
+                if not cand:
+                    continue
+                per_t.append(d[max(cand)[1]])
+            else:
+                per_t.append(sum(d.values()) / len(d))
         if not per_t:
             continue
         out.append(
@@ -242,22 +284,23 @@ def summarize(series: str, category: str, plot: bool) -> None:
 
     if is_interface(category):
         print(
-            f"{'step':>8} {'n':>4} {'succ_oracle%':>12} {'mean_dockq':>11} {'oracle_dockq':>12} "
-            f"{'mean_lddt':>10} {'mean_tm':>8} {'mean_gdt':>9}"
+            f"{'step':>8} {'n':>4} {'succ_orac%':>10} {'succ_conf%':>10} {'oracle_dq':>10} "
+            f"{'conf_dq':>8} {'mean_dq':>8} {'mean_lddt':>10} {'mean_tm':>8}"
         )
         for s in summaries:
             print(
                 f"{s['step']:>8} {s.get('n_interfaces', ''):>4} "
-                f"{str(s.get('success_rate_oracle')):>12} {str(s.get('mean_dockq')):>11} "
-                f"{str(s.get('oracle_dockq')):>12} {str(s.get('mean_lddt')):>10} "
-                f"{str(s.get('mean_tm_score')):>8} {str(s.get('mean_gdt_ts')):>9}"
+                f"{str(s.get('success_rate_oracle')):>10} {str(s.get('success_rate_conf')):>10} "
+                f"{str(s.get('oracle_dockq')):>10} {str(s.get('conf_dockq')):>8} "
+                f"{str(s.get('mean_dockq')):>8} {str(s.get('mean_lddt')):>10} "
+                f"{str(s.get('mean_tm_score')):>8}"
             )
     else:
-        print(f"{'step':>8} {'n':>4} {'mean_lddt':>10} {'oracle_lddt':>11} {'mean_tm':>8}")
+        print(f"{'step':>8} {'n':>4} {'mean_lddt':>10} {'conf_lddt':>10} {'oracle_lddt':>11} {'mean_tm':>8}")
         for s in summaries:
             print(
                 f"{s['step']:>8} {s.get('n_scored', ''):>4} {str(s.get('mean_lddt')):>10} "
-                f"{str(s.get('oracle_lddt')):>11} {str(s.get('mean_tm_score')):>8}"
+                f"{str(s.get('conf_lddt')):>10} {str(s.get('oracle_lddt')):>11} {str(s.get('mean_tm_score')):>8}"
             )
 
     if not plot:
@@ -275,11 +318,16 @@ def summarize(series: str, category: str, plot: bool) -> None:
 
     if is_interface(category):
         # Three stacked panels sharing a real-step x-axis (numeric, gaps to scale):
-        # (1) DockQ CAPRI quality tiers, (2) whole-model lDDT, (3) whole-model
-        # TM-score — each median + IQR across targets, all on the [0, 1] range.
+        # (1) DockQ CAPRI quality tiers, (2) whole-model lDDT + inter-chain ilddt
+        # overlaid, (3) whole-model TM-score — each median + IQR across targets, on
+        # the [0, 1] range. ilddt (collapse-sensitive) is only present from the step
+        # it was added to eval_ost (≥10k), so its overlay line starts there.
         tiers = dockq_tier_fractions(series, category, mode="oracle")
         ld = interface_metric_dist(series, category, "lddt")
         tm = interface_metric_dist(series, category, "tm_score")
+        il = interface_metric_dist(series, category, "ilddt")
+        ld_conf = interface_metric_dist(series, category, "lddt", select="conf")
+        tm_conf = interface_metric_dist(series, category, "tm_score", select="conf")
         fig, (axd, axl, axt) = plt.subplots(3, 1, figsize=(10, 13), sharex=True)
 
         # Steps where the model hasn't folded get their success-rate column
@@ -336,14 +384,66 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 # bar height (acceptable+medium+high) == success rate @0.23, so
                 # this line is directly comparable to the top of each stack.
                 axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8, label=f"AF3 success @0.23 ({af3:.0%})")
+            # Confidence top-1 success @0.23 (ranking_score-selected sample) — the
+            # deployed number; its gap below the oracle stack top measures how good
+            # the confidence head's ranking is. Present only once a run trains the
+            # confidence head (success_rate_conf), so the line starts there.
+            conf_succ = [(int(s["step"]), fnum(s.get("success_rate_conf"))) for s in summaries]
+            conf_succ = [(st, v / 100.0) for st, v in conf_succ if v is not None]
+            if conf_succ:
+                axd.plot(
+                    [p[0] for p in conf_succ],
+                    [p[1] for p in conf_succ],
+                    "-s",
+                    color="#2166ac",
+                    lw=2,
+                    ms=5,
+                    zorder=11,
+                    label="confidence top-1 success @0.23",
+                )
             axd.set_ylim(0, 1.0)
             axd.set_ylabel("fraction of interfaces")
             axd.set_title(f"DockQ CAPRI quality tiers — oracle (best-of-N per interface)  n={tiers[-1]['n']}")
-            axd.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, title="tier")
+            # Secondary axis: oracle QS-score (collapse-sensitive interface quality)
+            # over the DockQ tiers — makes the decoupling visible (blob-inflated DockQ
+            # success vs real interface quality). QS is present only from the step it
+            # was added to eval_ost (≥10k), so the line starts there.
+            axq = axd.twinx()
+            qs = [(int(s["step"]), fnum(s.get("oracle_qs_score"))) for s in summaries]
+            qs = [(st, v) for st, v in qs if v is not None]
+            qs_handle = None
+            if qs:
+                (qs_handle,) = axq.plot(
+                    [p[0] for p in qs],
+                    [p[1] for p in qs],
+                    "-D",
+                    color="black",
+                    lw=2,
+                    ms=4,
+                    zorder=10,
+                    label="oracle QS-score",
+                )
+                axq.set_ylim(0, 1.0)  # match the left axis so QS reads on the same [0,1] scale
+                axq.set_ylabel("oracle QS-score", color="black")
+                axq.tick_params(axis="y", labelcolor="black")
+            else:
+                axq.set_yticks([])
+            # Legend moved right of the QS axis so the two don't overlap.
+            handles, labels = axd.get_legend_handles_labels()
+            if qs_handle is not None:
+                handles.append(qs_handle)
+                labels.append("oracle QS-score")
+            axd.legend(handles, labels, loc="center left", bbox_to_anchor=(1.14, 0.5), fontsize=8, title="tier / QS")
             axd.grid(axis="y", alpha=0.3)
 
-        def _dist_panel(ax, dist, ylabel, title, af3ref=None):
-            """median + mean + IQR band of a whole-model metric vs real step."""
+        def _dist_panel(ax, dist, ylabel, title, af3ref=None, overlay=None, conf=None):
+            """median + mean + IQR band of a whole-model metric vs real step.
+
+            ``overlay=(dist, label, color)`` draws a second metric (e.g. inter-chain
+            ilddt) in colour on the same axes — median line + IQR band.
+            ``conf`` is the confidence-top-1 distribution (same shape as ``dist``);
+            its across-target median is drawn as a distinct line (deployed number).
+            """
             if dist:
                 sx = [d["step"] for d in dist]
                 ax.fill_between(
@@ -359,6 +459,26 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 ax.plot(sx, [d["mean"] for d in dist], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
                 if af3ref is not None:
                     ax.axhline(af3ref, color="#d7301f", ls="--", lw=1.8, zorder=7, label=f"AF3 ({af3ref:.2f})")
+            if conf:
+                cx = [d["step"] for d in conf]
+                ax.plot(
+                    cx,
+                    [d["med"] for d in conf],
+                    "-s",
+                    color="#2166ac",
+                    lw=2,
+                    ms=4,
+                    zorder=8,
+                    label="confidence top-1 (median)",
+                )
+            if overlay is not None and overlay[0]:
+                odist, olabel, ocol = overlay
+                ox = [d["step"] for d in odist]
+                ax.fill_between(ox, [d["q25"] for d in odist], [d["q75"] for d in odist], color=ocol, alpha=0.15, lw=0)
+                ax.plot(
+                    ox, [d["med"] for d in odist], "-D", color=ocol, lw=2, ms=4, label=f"{olabel} (median)", zorder=6
+                )
+            if dist or (overlay is not None and overlay[0]):
                 ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
             ax.set_ylim(-0.02, 1.02)
             ax.set_ylabel(ylabel)
@@ -368,11 +488,19 @@ def summarize(series: str, category: str, plot: bool) -> None:
         _dist_panel(
             axl,
             ld,
-            "lDDT (whole model)",
-            "whole-model lDDT (median + IQR across targets)",
+            "lDDT",
+            "whole-model lDDT (black) + inter-chain ilddt (red, collapse-sensitive, ≥10k) — median + IQR",
             AF3_INTERFACE_LDDT.get(category),
+            overlay=(il, "inter-chain ilddt", "tab:red"),
+            conf=ld_conf,
         )
-        _dist_panel(axt, tm, "TM-score (whole model)", "whole-model TM-score (median + IQR across targets)")
+        _dist_panel(
+            axt,
+            tm,
+            "TM-score (whole model)",
+            "whole-model TM-score (median + IQR across targets)",
+            conf=tm_conf,
+        )
         if all_steps:
             # pad by a bar so edge bars aren't clipped. sharex applies to all panels.
             axt.set_xlim(all_steps[0] - bar_w, all_steps[-1] + bar_w)
@@ -403,6 +531,21 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 # up as a point (a bare line needs >=2 points to render).
                 ax.plot(xs, med, "-o", color="k", lw=2.5, ms=4, label="median", zorder=6)
                 ax.plot(xs, mn, "--o", color="0.35", lw=1.6, ms=3, label="mean", zorder=5)
+            # confidence top-1 (ranking_score-selected sample) across-target median —
+            # the deployed number; absent for pre-confidence-head steps.
+            cpts = [(r["step"], r.get(f"{mk}_conf")) for r in rows]
+            cpts = [p for p in cpts if p[1] is not None]
+            if cpts:
+                ax.plot(
+                    [p[0] for p in cpts],
+                    [p[1] for p in cpts],
+                    "-s",
+                    color="#2166ac",
+                    lw=2,
+                    ms=4,
+                    label="confidence top-1 (median)",
+                    zorder=7,
+                )
             for c in classes:
                 ys = [(r["step"], r.get(f"{c}_{mk}")) for r in rows]
                 ys = [p for p in ys if p[1] is not None]
@@ -444,7 +587,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
         if rows:
             bf = (
                 ["step"]
-                + [f"{mk}_{k}" for mk in ("lddt", "tm", "gdt") for k in ("n", "mean", "med", "q25", "q75")]
+                + [f"{mk}_{k}" for mk in ("lddt", "tm", "gdt") for k in ("n", "mean", "med", "q25", "q75", "conf")]
                 + [f"{c}_{k}" for c in classes for k in ("n", "lddt", "tm", "gdt")]
             )
             with open(out_root / f"byclass_{category}.csv", "w", newline="") as f:

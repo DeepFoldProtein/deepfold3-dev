@@ -20,6 +20,7 @@ Usage:
     python bench/scripts/ss_confusion.py --series df3v1 --category monomer_protein --step 100000
     python bench/scripts/ss_confusion.py --series df3v1 --step 100000 --top-bad 15
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,9 +38,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 from check_chirality import needleman_wunsch  # noqa: E402
 from dssp_f1 import DSSP_8, run_dssp  # noqa: E402
 
-SS3_MAP = {"H": "α", "G": "α", "I": "α", "P": "α",
-           "E": "β", "B": "β",
-           "T": "c", "S": "c", "-": "c"}
+SS3_MAP = {"H": "α", "G": "α", "I": "α", "P": "α", "E": "β", "B": "β", "T": "c", "S": "c", "-": "c"}
 THREE = ("α", "β", "c")
 
 
@@ -48,9 +47,7 @@ def _aligned_ss(pred_cif: Path, ref_res):
     pred_res = run_dssp(pred_cif, cache=False)
     if not pred_res:
         return None
-    pairs = needleman_wunsch("".join(a for a, _ in ref_res),
-                             "".join(a for a, _ in pred_res),
-                             include_mismatches=False)
+    pairs = needleman_wunsch("".join(a for a, _ in ref_res), "".join(a for a, _ in pred_res), include_mismatches=False)
     if not pairs:
         return None
     ref_ss = "".join(ref_res[i][1] for i, _ in pairs)
@@ -70,8 +67,7 @@ def _target_job_inner(args):
     pred_root = Path(pred_root_str)
     tdir = pred_root / pdb
     sample_dirs = [tdir / f"seed-{seed}_sample-{i}" for i in range(n_samples)]
-    pending = [d for d in sample_dirs
-               if (d / "model.cif").exists() and not (d / "ss_strings.json").exists()]
+    pending = [d for d in sample_dirs if (d / "model.cif").exists() and not (d / "ss_strings.json").exists()]
     ref_res = run_dssp(GT_ROOT / f"{pdb}.cif", cache=False) if pending else None
     c8 = defaultdict(int)
     c3 = defaultdict(int)
@@ -99,16 +95,14 @@ def _target_job_inner(args):
             except OSError:
                 pass
         rss, pss = ss
-        for rc, pc in zip(rss, pss):
+        for rc, pc in zip(rss, pss, strict=False):
             c8[(rc, pc)] += 1
             c3[(SS3_MAP[rc], SS3_MAP[pc])] += 1
         n_used += 1
     if n_used == 0:
         return (pdb, None, None)
     # serialize defaultdicts as "ref|pred" -> count
-    return (pdb,
-            {f"{a}|{b}": v for (a, b), v in c8.items()},
-            {f"{a}|{b}": v for (a, b), v in c3.items()})
+    return (pdb, {f"{a}|{b}": v for (a, b), v in c8.items()}, {f"{a}|{b}": v for (a, b), v in c3.items()})
 
 
 def _norm_rows(conf, classes):
@@ -144,8 +138,11 @@ def run(series, category, step, n_samples, seed, workers, top_bad):
     sdir = BENCH / "runs" / series / "pred" / category / f"step_{step}"
     if not sdir.exists():
         raise SystemExit(f"no predictions at {sdir}")
-    jobs = [(step, t.name, n_samples, seed, str(sdir))
-            for t in sorted(sdir.iterdir()) if t.is_dir() and not t.name.startswith("_")]
+    jobs = [
+        (step, t.name, n_samples, seed, str(sdir))
+        for t in sorted(sdir.iterdir())
+        if t.is_dir() and not t.name.startswith("_")
+    ]
     print(f"[ss_conf] {len(jobs)} targets, {n_samples} samples, {workers} workers, step {step} ...")
 
     conf3 = defaultdict(int)
@@ -161,22 +158,28 @@ def run(series, category, step, n_samples, seed, workers, top_bad):
                 continue
             tc3 = defaultdict(int)
             for k, v in c3s.items():
-                a, b = k.split("|"); conf3[(a, b)] += v; tc3[(a, b)] += v
+                a, b = k.split("|")
+                conf3[(a, b)] += v
+                tc3[(a, b)] += v
             for k, v in c8s.items():
-                a, b = k.split("|"); conf8[(a, b)] += v
+                a, b = k.split("|")
+                conf8[(a, b)] += v
             predA = sum(tc3[(g, "α")] for g in THREE)
             per_target[pdb] = {
                 "Pα": (tc3[("α", "α")] / predA) if predA else float("nan"),
-                "pred_α": predA, "n_res": sum(tc3.values()),
-                "α_from_β": tc3[("β", "α")], "α_from_c": tc3[("c", "α")],
+                "pred_α": predA,
+                "n_res": sum(tc3.values()),
+                "α_from_β": tc3[("β", "α")],
+                "α_from_c": tc3[("c", "α")],
             }
             done += 1
             if done % 50 == 0:
                 print(f"  {done}/{len(jobs)}")
 
     n_res = sum(conf3.values())
-    print(f"\n=== {series} {category} step {step} — pooled residues n={n_res:,} "
-          f"({len(per_target)} targets scored) ===\n")
+    print(
+        f"\n=== {series} {category} step {step} — pooled residues n={n_res:,} ({len(per_target)} targets scored) ===\n"
+    )
 
     # 3-state matrices
     print("RAW COUNTS (row=ref, col=pred)")
@@ -208,12 +211,13 @@ def run(series, category, step, n_samples, seed, workers, top_bad):
     predA = sum(conf3.get((g, "α"), 0) for g in THREE)
     fpA = predA - conf3.get(("α", "α"), 0)
     if predA:
-        print(f"\nhelix over-prediction: of {predA:,} predicted-α, {fpA:,} wrong ({fpA/predA:.1%}) "
-              f"→ from coil={conf3.get(('c','α'),0)/fpA:.0%}, from β={conf3.get(('β','α'),0)/fpA:.0%}")
+        print(
+            f"\nhelix over-prediction: of {predA:,} predicted-α, {fpA:,} wrong ({fpA / predA:.1%}) "
+            f"→ from coil={conf3.get(('c', 'α'), 0) / fpA:.0%}, from β={conf3.get(('β', 'α'), 0) / fpA:.0%}"
+        )
 
     # per-target helix-precision tail (which targets drive FP-helix)
-    tail = sorted((v for v in per_target.items() if v[1]["pred_α"] >= 20),
-                  key=lambda kv: kv[1]["Pα"])[:top_bad]
+    tail = sorted((v for v in per_target.items() if v[1]["pred_α"] >= 20), key=lambda kv: kv[1]["Pα"])[:top_bad]
     print(f"\nworst {len(tail)} targets by helix precision (pred-α≥20 res):")
     print(f"  {'target':>18} {'Pα':>5} {'pred_α':>7} {'α←β':>5} {'α←coil':>7}")
     for pdb, v in tail:
@@ -227,7 +231,10 @@ def run(series, category, step, n_samples, seed, workers, top_bad):
         print(f"  {c}:  P={p:.3f}  R={r:.3f}  F1={f:.3f}")
 
     out = {
-        "series": series, "category": category, "step": step, "n_res": n_res,
+        "series": series,
+        "category": category,
+        "step": step,
+        "n_res": n_res,
         "n_targets": len(per_target),
         "conf3": {f"{a}|{b}": conf3[(a, b)] for a in THREE for b in THREE},
         "conf8": {f"{a}|{b}": conf8.get((a, b), 0) for a in DSSP_8 for b in DSSP_8},
@@ -251,8 +258,7 @@ def main():
     ap.add_argument("--workers", type=int, default=48)
     ap.add_argument("--top-bad", type=int, default=15)
     args = ap.parse_args()
-    run(args.series, args.category, args.step, args.n_samples, args.seed,
-        args.workers, args.top_bad)
+    run(args.series, args.category, args.step, args.n_samples, args.seed, args.workers, args.top_bad)
 
 
 if __name__ == "__main__":

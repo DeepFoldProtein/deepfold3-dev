@@ -24,6 +24,7 @@ Usage:
     python bench/scripts/ss_coherence.py --series df3v1 --category monomer_protein --step 110000 --workers 48
     python bench/scripts/ss_coherence.py --series df3v1 --category monomer_protein --steps all --workers 48
 """
+
 from __future__ import annotations
 
 import argparse
@@ -182,8 +183,7 @@ def _one(args) -> dict | None:
     # representative curve = the sample with median L
     med_idx = int(np.argsort(Ls)[len(Ls) // 2])
     xs, ys = curves[med_idx]
-    return {"pdb": pdb, "L": float(np.median(Ls)), "L_samples": Ls,
-            "xs": xs, "ys": ys, "n_aln": len(aln[0])}
+    return {"pdb": pdb, "L": float(np.median(Ls)), "L_samples": Ls, "xs": xs, "ys": ys, "n_aln": len(aln[0])}
 
 
 def load_lddt(series, category, step) -> dict[str, float]:
@@ -249,10 +249,17 @@ def compute_step(series, category, step, seed, n_samples, workers) -> list[dict]
     rows = []
     for r in results:
         n_res, fold = dssp.get(r["pdb"], (r["n_aln"], "unknown"))
-        rows.append({"pdb": r["pdb"], "n_res": n_res, "fold_class": fold,
-                     "lddt": lddt.get(r["pdb"], float("nan")), "L": r["L"],
-                     "xs": ";".join(str(v) for v in r["xs"]),
-                     "ys": ";".join(f"{v:.3f}" for v in r["ys"])})
+        rows.append(
+            {
+                "pdb": r["pdb"],
+                "n_res": n_res,
+                "fold_class": fold,
+                "lddt": lddt.get(r["pdb"], float("nan")),
+                "L": r["L"],
+                "xs": ";".join(str(v) for v in r["xs"]),
+                "ys": ";".join(f"{v:.3f}" for v in r["ys"]),
+            }
+        )
     rows.sort(key=lambda r: r["pdb"])
     with open(cache, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["pdb", "n_res", "fold_class", "lddt", "L", "xs", "ys"])
@@ -279,21 +286,25 @@ def report_step(series, category, step, rows):
     fin = np.isfinite(L)
     finN = fin & (nr > 0)
     print(f"\n=== coherence length  {series} {category} step {step}  (n={fin.sum()}) ===")
-    print(f"  L (sep@dRMSD={TAU:g}Å): median={np.median(L[fin]):.1f}  "
-          f"range {L[fin].min():.0f}-{L[fin].max():.0f}")
-    print(f"  corr(log L, lDDT)={_corr(np.log(L[fin]), ld[fin]):+.2f}   "
-          f"corr(log L, length)={_corr(np.log(L[finN]), np.log(nr[finN])):+.2f}")
+    print(f"  L (sep@dRMSD={TAU:g}Å): median={np.median(L[fin]):.1f}  range {L[fin].min():.0f}-{L[fin].max():.0f}")
+    print(
+        f"  corr(log L, lDDT)={_corr(np.log(L[fin]), ld[fin]):+.2f}   "
+        f"corr(log L, length)={_corr(np.log(L[finN]), np.log(nr[finN])):+.2f}"
+    )
     print(f"  {'size bin':>10} | {'n':>4} | {'med L':>6} | {'med lDDT':>8} | {'med len':>7}")
     for name, lo, hi in SIZE_BINS:
         m = finN & (nr >= lo) & (nr < hi)
         if m.sum():
-            print(f"  {name:>10} | {m.sum():>4} | {np.median(L[m]):>6.1f} | "
-                  f"{np.nanmedian(ld[m]):>8.3f} | {np.median(nr[m]):>7.0f}")
+            print(
+                f"  {name:>10} | {m.sum():>4} | {np.median(L[m]):>6.1f} | "
+                f"{np.nanmedian(ld[m]):>8.3f} | {np.median(nr[m]):>7.0f}"
+            )
 
 
 def plot_step(series, category, step, rows, out_dir):
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -305,37 +316,43 @@ def plot_step(series, category, step, rows, out_dir):
     for r in fin:
         if not r["ys"]:
             continue
-        ax[0].plot(r["xs"], r["ys"], "-", lw=0.5, alpha=0.25,
-                   color=colors.get(size_bin(r["n_res"]), "gray"))
+        ax[0].plot(r["xs"], r["ys"], "-", lw=0.5, alpha=0.25, color=colors.get(size_bin(r["n_res"]), "gray"))
     ax[0].axhline(TAU, ls="--", color="k", lw=1, label=f"τ={TAU:g}Å")
-    ax[0].set_xscale("log"); ax[0].set_xlabel("sequence separation s (res)")
-    ax[0].set_ylabel("dRMSD(s)  (Å)"); ax[0].set_ylim(0, 25)
+    ax[0].set_xscale("log")
+    ax[0].set_xlabel("sequence separation s (res)")
+    ax[0].set_ylabel("dRMSD(s)  (Å)")
+    ax[0].set_ylim(0, 25)
     ax[0].set_title(f"{series} step {step}: dRMSD spectra (green=small / orange=med / red=large)")
-    ax[0].legend(); ax[0].grid(alpha=0.3)
+    ax[0].legend()
+    ax[0].grid(alpha=0.3)
     # (b) L vs lDDT
-    L = np.array([r["L"] for r in fin]); ld = np.array([r["lddt"] for r in fin])
+    L = np.array([r["L"] for r in fin])
+    ld = np.array([r["lddt"] for r in fin])
     nr = np.array([max(r["n_res"], 1) for r in fin])
     sc = ax[1].scatter(L, ld, c=np.log10(nr), cmap="viridis", s=14, alpha=0.7)
-    ax[1].set_xscale("log"); ax[1].set_xlabel("coherence length L (res)")
-    ax[1].set_ylabel("lDDT"); ax[1].grid(alpha=0.3)
+    ax[1].set_xscale("log")
+    ax[1].set_xlabel("coherence length L (res)")
+    ax[1].set_ylabel("lDDT")
+    ax[1].grid(alpha=0.3)
     ax[1].set_title(f"corr(log L, lDDT) = {_corr(np.log(L), ld):+.2f}")
     fig.colorbar(sc, ax=ax[1], label="log10 length")
     fig.tight_layout()
     png = out_dir / f"coherence_step{step}_{category}.png"
-    fig.savefig(png, dpi=130); plt.close(fig)
+    fig.savefig(png, dpi=130)
+    plt.close(fig)
     print(f"[coherence] per-step figure -> {png}")
 
 
 def plot_trajectory(series, category, out_dir):
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         return
     cache_dir = out_dir / "coherence"
-    steps = sorted(int(re.search(r"L_step(\d+)\.csv", p).group(1))
-                   for p in glob.glob(str(cache_dir / "L_step*.csv")))
+    steps = sorted(int(re.search(r"L_step(\d+)\.csv", p).group(1)) for p in glob.glob(str(cache_dir / "L_step*.csv")))
     if not steps:
         return
     series_L = {name: [] for name, _, _ in SIZE_BINS}
@@ -350,20 +367,21 @@ def plot_trajectory(series, category, out_dir):
             m = fin & (nr >= lo) & (nr < hi)
             series_L[name].append(np.median(L[m]) if m.any() else np.nan)
     fig, ax = plt.subplots(figsize=(10, 6))
-    style = {"all": ("k", 2.5), "small": ("tab:green", 1.5),
-             "medium": ("tab:orange", 1.5), "large": ("tab:red", 1.5)}
-    labels = {"all": "all", "small": "small (<200 res)",
-              "medium": "medium (200–400 res)", "large": "large (≥400 res)"}
+    style = {"all": ("k", 2.5), "small": ("tab:green", 1.5), "medium": ("tab:orange", 1.5), "large": ("tab:red", 1.5)}
+    labels = {"all": "all", "small": "small (<200 res)", "medium": "medium (200–400 res)", "large": "large (≥400 res)"}
     for name in ["all", "small", "medium", "large"]:
         c, lw = style[name]
         ax.plot(steps, series_L[name], "-o", color=c, lw=lw, ms=4, label=labels[name])
-    ax.set_xlabel("training step"); ax.set_ylabel(f"median coherence length L (res, sep@dRMSD={TAU:g}Å)")
+    ax.set_xlabel("training step")
+    ax.set_ylabel(f"median coherence length L (res, sep@dRMSD={TAU:g}Å)")
     ax.set_yscale("log")
     ax.set_title(f"{series} {category} — coherence-length trajectory by chain size")
-    ax.legend(); ax.grid(alpha=0.3, which="both")
+    ax.legend()
+    ax.grid(alpha=0.3, which="both")
     fig.tight_layout()
     png = out_dir / f"coherence_trajectory_{category}.png"
-    fig.savefig(png, dpi=130); plt.close(fig)
+    fig.savefig(png, dpi=130)
+    plt.close(fig)
     print(f"[coherence] trajectory figure ({len(steps)} steps) -> {png}")
 
 
@@ -383,8 +401,7 @@ def main():
 
     if args.steps is not None:
         if args.steps == "all":
-            steps = sorted(int(re.search(r"step_(\d+)", d).group(1))
-                           for d in glob.glob(str(pred_base / "step_*")))
+            steps = sorted(int(re.search(r"step_(\d+)", d).group(1)) for d in glob.glob(str(pred_base / "step_*")))
         else:
             steps = [int(s) for s in args.steps.split(",")]
         for sp in steps:

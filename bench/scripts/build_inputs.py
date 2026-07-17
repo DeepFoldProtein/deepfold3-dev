@@ -26,6 +26,7 @@ Usage::
     python bench/scripts/build_inputs.py --category monomer_protein
     python bench/scripts/build_inputs.py --category monomer_protein --max-tokens 1024
 """
+
 from __future__ import annotations
 
 import argparse
@@ -61,8 +62,7 @@ INTERFACE_CATEGORIES = {
 # FoldBench-small cap: <=1024 tokens for every category (fits a single B200
 # forward comfortably; NA monomers are short anyway). Override with --max-tokens.
 FOLDBENCH_SMALL_MAX_TOKENS = 1024
-DEFAULT_MAX_TOKENS = {c: FOLDBENCH_SMALL_MAX_TOKENS
-                      for c in list(MONOMER_KIND) + list(INTERFACE_CATEGORIES)}
+DEFAULT_MAX_TOKENS = {c: FOLDBENCH_SMALL_MAX_TOKENS for c in list(MONOMER_KIND) + list(INTERFACE_CATEGORIES)}
 
 
 def read_query_sequence(a3m_path: Path) -> str:
@@ -125,6 +125,7 @@ def build_monomer_input(pdb_id: str, chain_id: str, kind: str) -> tuple[dict, in
 # Interface (multi-chain) inputs
 # ---------------------------------------------------------------------------
 
+
 def _chain_sort_key(cid: str) -> tuple:
     """`A` < `A-2` < `B`. Integer copy suffix defaults to 1."""
     parts = cid.split("-")
@@ -140,11 +141,10 @@ def enumerate_chain_groups(pdb_id: str) -> list[dict]:
     canonical chain id. This is the set of polymer chains in the assembly.
     """
     a3m_dir = MSA_ROOT / "a3m"
-    files = sorted(a3m_dir.glob(f"{pdb_id}__*.a3m"),
-                   key=lambda p: _chain_sort_key(p.stem[len(pdb_id) + 2:]))
+    files = sorted(a3m_dir.glob(f"{pdb_id}__*.a3m"), key=lambda p: _chain_sort_key(p.stem[len(pdb_id) + 2 :]))
     by_seq: dict[str, dict] = {}
     for f in files:
-        cid = f.stem[len(pdb_id) + 2:]
+        cid = f.stem[len(pdb_id) + 2 :]
         seq = read_query_sequence(f)
         if seq in by_seq:
             by_seq[seq]["chain_ids"].append(cid)
@@ -306,8 +306,15 @@ def build_category(category: str, max_tokens: int | None, limit: int | None) -> 
             continue
 
         in_small = max_tokens is None or n_tok <= max_tokens
-        manifest.append({"pdb_id": pdb_id, "category": category, "chain_id": chain_id,
-                         "num_tokens": n_tok, "in_small": int(in_small)})
+        manifest.append(
+            {
+                "pdb_id": pdb_id,
+                "category": category,
+                "chain_id": chain_id,
+                "num_tokens": n_tok,
+                "in_small": int(in_small),
+            }
+        )
         if not in_small:
             n_skipped += 1
             continue
@@ -319,16 +326,18 @@ def build_category(category: str, max_tokens: int | None, limit: int | None) -> 
         w = csv.DictWriter(f, fieldnames=["pdb_id", "category", "chain_id", "num_tokens", "in_small"])
         w.writeheader()
         w.writerows(manifest)
-    print(f"[{category}] {n_written} inputs written (cap {max_tokens}), "
-          f"{n_skipped} over cap, {n_failed} failed | {manifest_path}")
+    print(
+        f"[{category}] {n_written} inputs written (cap {max_tokens}), "
+        f"{n_skipped} over cap, {n_failed} failed | {manifest_path}"
+    )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--category", required=True,
-                    choices=sorted(MONOMER_KIND) + sorted(INTERFACE_CATEGORIES))
-    ap.add_argument("--max-tokens", type=int, default=None,
-                    help="FoldBench-small token cap. Default: 1024 (all categories).")
+    ap.add_argument("--category", required=True, choices=sorted(MONOMER_KIND) + sorted(INTERFACE_CATEGORIES))
+    ap.add_argument(
+        "--max-tokens", type=int, default=None, help="FoldBench-small token cap. Default: 1024 (all categories)."
+    )
     ap.add_argument("--limit", type=int, default=None, help="Debug: first N targets only.")
     args = ap.parse_args()
     cap = args.max_tokens if args.max_tokens is not None else DEFAULT_MAX_TOKENS[args.category]

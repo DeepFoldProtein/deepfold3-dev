@@ -15,6 +15,7 @@ ss_f1.json next to model.cif (resumable).
 Usage:
     python bench/scripts/ss_f1.py --series df3v1 --category monomer_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,9 +34,17 @@ sys.path.insert(0, str(REPO / "scripts"))
 from check_chirality import needleman_wunsch  # noqa: E402
 from dssp_f1 import DSSP_8, per_class_metrics, run_dssp  # noqa: E402
 
-SS3_MAP = {"H": "helix", "G": "helix", "I": "helix", "P": "helix",
-           "E": "strand", "B": "strand",
-           "T": "coil", "S": "coil", "-": "coil"}
+SS3_MAP = {
+    "H": "helix",
+    "G": "helix",
+    "I": "helix",
+    "P": "helix",
+    "E": "strand",
+    "B": "strand",
+    "T": "coil",
+    "S": "coil",
+    "-": "coil",
+}
 THREE = ("helix", "strand", "coil")
 ALL_STEPS = list(range(10000, 95000, 5000))
 
@@ -44,9 +53,7 @@ def measure(pred_cif: Path, ref_res) -> dict | None:
     pred_res = run_dssp(pred_cif, cache=False)
     if not pred_res:
         return None
-    pairs = needleman_wunsch("".join(a for a, _ in ref_res),
-                             "".join(a for a, _ in pred_res),
-                             include_mismatches=False)
+    pairs = needleman_wunsch("".join(a for a, _ in ref_res), "".join(a for a, _ in pred_res), include_mismatches=False)
     if not pairs:
         return None
     ref_ss = [ref_res[i][1] for i, _ in pairs]
@@ -81,8 +88,7 @@ def _target_job_inner(args):
     pred_root = Path(pred_root_str)
     tdir = pred_root / pdb
     sample_dirs = [tdir / f"seed-{seed}_sample-{i}" for i in range(n_samples)]
-    pending = [d for d in sample_dirs
-               if (d / "model.cif").exists() and not (d / "ss_f1.json").exists()]
+    pending = [d for d in sample_dirs if (d / "model.cif").exists() and not (d / "ss_f1.json").exists()]
     ref_res = run_dssp(GT_ROOT / f"{pdb}.cif", cache=False) if pending else None
     rows = []
     for d in sample_dirs:
@@ -133,14 +139,18 @@ def run(series, category, n_samples, seed, workers, steps):
             done += 1
             if done % 500 == 0:
                 print(f"  {done}/{len(jobs)}")
-    fields = ["step", "n_targets", "macro_f1_8", "macro_f1_3"] + \
-             [f"f1_8_{c}" for c in DSSP_8] + [f"f1_3_{c}" for c in THREE]
+    fields = (
+        ["step", "n_targets", "macro_f1_8", "macro_f1_3"] + [f"f1_8_{c}" for c in DSSP_8] + [f"f1_3_{c}" for c in THREE]
+    )
     rows = []
     for step in sorted(per_step):
         ts = per_step[step]
-        rec = {"step": step, "n_targets": len(ts),
-               "macro_f1_8": round(_cmean(ts, "macro_8"), 4),
-               "macro_f1_3": round(_cmean(ts, "macro_3"), 4)}
+        rec = {
+            "step": step,
+            "n_targets": len(ts),
+            "macro_f1_8": round(_cmean(ts, "macro_8"), 4),
+            "macro_f1_3": round(_cmean(ts, "macro_3"), 4),
+        }
         for c in DSSP_8:
             rec[f"f1_8_{c}"] = round(_cmean(ts, f"f1_8_{c}"), 4)
         for c in THREE:
@@ -151,18 +161,22 @@ def run(series, category, n_samples, seed, workers, steps):
     out_csv = out_dir / f"ss_f1_{category}.csv"
     with open(out_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader(); w.writerows(rows)
+        w.writeheader()
+        w.writerows(rows)
     print(f"[ss_f1] {len(rows)} steps -> {out_csv}")
     print(f"{'step':>7} {'macro3':>7} {'macro8':>7} {'helix':>7} {'strand':>7} {'coil':>7}")
     for r in rows:
-        print(f"{r['step']:>7} {r['macro_f1_3']:>7} {r['macro_f1_8']:>7} "
-              f"{r['f1_3_helix']:>7} {r['f1_3_strand']:>7} {r['f1_3_coil']:>7}")
+        print(
+            f"{r['step']:>7} {r['macro_f1_3']:>7} {r['macro_f1_8']:>7} "
+            f"{r['f1_3_helix']:>7} {r['f1_3_strand']:>7} {r['f1_3_coil']:>7}"
+        )
     _plot(series, category, rows)
 
 
 def _plot(series, category, rows):
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -172,16 +186,22 @@ def _plot(series, category, rows):
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
     axes[0].plot(steps, [r["macro_f1_3"] for r in rows], "-o", color="k", lw=2.5, label="macro F1 (3-state)")
     axes[0].plot(steps, [r["macro_f1_8"] for r in rows], "-s", color="tab:gray", lw=2, label="macro F1 (8-state)")
-    axes[0].set_title("SS macro-F1 vs step"); axes[0].set_ylabel("macro F1")
+    axes[0].set_title("SS macro-F1 vs step")
+    axes[0].set_ylabel("macro F1")
     cols = {"helix": "tab:red", "strand": "tab:blue", "coil": "tab:gray"}
     for c in THREE:
         axes[1].plot(steps, [r[f"f1_3_{c}"] for r in rows], "-o", color=cols[c], label=c)
-    axes[1].set_title("3-state per-class F1 vs step"); axes[1].set_ylabel("F1")
+    axes[1].set_title("3-state per-class F1 vs step")
+    axes[1].set_ylabel("F1")
     for ax in axes:
-        ax.set_xlabel("training step"); ax.set_ylim(-0.02, 1.02); ax.grid(alpha=0.3); ax.legend()
+        ax.set_xlabel("training step")
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left")
     fig.suptitle(f"{series} -- FoldBench-small {category}  DSSP secondary-structure F1")
     png = BENCH / "runs" / series / "ss_analysis" / f"ss_f1_{category}.png"
-    fig.tight_layout(); fig.savefig(png, dpi=130)
+    fig.tight_layout()
+    fig.savefig(png, dpi=130)
     print(f"[ss_f1] plot -> {png}")
 
 
@@ -195,7 +215,9 @@ def main():
     ap.add_argument("--steps", default="all")
     args = ap.parse_args()
     if args.steps == "all":
-        import glob, re
+        import glob
+        import re
+
         sdirs = glob.glob(str(BENCH / "runs" / args.series / "pred" / args.category / "step_*"))
         steps = sorted(int(re.search(r"step_(\d+)", d).group(1)) for d in sdirs)
     else:

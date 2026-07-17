@@ -12,6 +12,7 @@ Run `ss_f1.py` first to (re)generate the CSV. This script only reads it.
 Usage:
     python bench/scripts/ss_f1_8state.py --series df3v1 --category monomer_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,15 +25,15 @@ BENCH = Path(__file__).resolve().parents[1]
 # Families share a hue; styles disambiguate codes within a family.
 DSSP_8 = ["H", "E", "G", "I", "T", "S", "B", "P", "-"]
 META = {
-    "H": ("H  α-helix",      "helix",  "tab:red",    "-"),
-    "G": ("G  3_10-helix",   "helix",  "darkorange", "--"),
-    "I": ("I  π-helix",      "helix",  "saddlebrown", ":"),
-    "P": ("P  PPII",         "helix",  "magenta",    "-."),
-    "E": ("E  β-strand",     "strand", "tab:blue",   "-"),
-    "B": ("B  β-bridge",     "strand", "tab:cyan",   "--"),
-    "T": ("T  turn",         "coil",   "tab:green",  "-"),
-    "S": ("S  bend",         "coil",   "olive",      "--"),
-    "-": ("-  coil/loop",    "coil",   "tab:gray",   ":"),
+    "H": ("H  α-helix", "helix", "tab:red", "-"),
+    "G": ("G  3_10-helix", "helix", "darkorange", "--"),
+    "I": ("I  π-helix", "helix", "saddlebrown", ":"),
+    "P": ("P  PPII", "helix", "magenta", "-."),
+    "E": ("E  β-strand", "strand", "tab:blue", "-"),
+    "B": ("B  β-bridge", "strand", "tab:cyan", "--"),
+    "T": ("T  turn", "coil", "tab:green", "-"),
+    "S": ("S  bend", "coil", "olive", "--"),
+    "-": ("-  coil/loop", "coil", "tab:gray", ":"),
 }
 
 
@@ -49,6 +50,7 @@ def load(csv_path: Path):
 def plot(series_name, category, csv_path, out_png):
     try:
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
@@ -58,15 +60,13 @@ def plot(series_name, category, csv_path, out_png):
     families = ["helix", "strand", "coil"]
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.4), sharex=True, sharey=True)
 
-    for ax, fam in zip(axes, families):
+    for ax, fam in zip(axes, families, strict=False):
         codes = [c for c in DSSP_8 if META[c][1] == fam]
         for c in codes:
             label, _, colour, ls = META[c]
-            ax.plot(steps, series[c], ls, color=colour, lw=2.2,
-                    marker="o", ms=4, label=label)
+            ax.plot(steps, series[c], ls, color=colour, lw=2.2, marker="o", ms=4, label=label)
         # macro-F1 (8-state) as a shared dashed reference on every panel
-        ax.plot(steps, macro8, color="k", lw=1.2, ls=(0, (1, 1)),
-                alpha=0.5, label="macro-F1 (8)")
+        ax.plot(steps, macro8, color="k", lw=1.2, ls=(0, (1, 1)), alpha=0.5, label="macro-F1 (8)")
         ax.set_title(f"{fam}-like states")
         ax.set_xlabel("training step")
         ax.grid(alpha=0.3)
@@ -75,9 +75,8 @@ def plot(series_name, category, csv_path, out_png):
     axes[0].set_ylim(-0.02, 1.02)  # sharey=True → applies to all panels
 
     fig.suptitle(
-        f"{series_name} — FoldBench-small {category} "
-        f"(n={n_tgt})   DSSP 8-state per-class F1 vs step",
-        fontsize=13)
+        f"{series_name} — FoldBench-small {category} (n={n_tgt})   DSSP 8-state per-class F1 vs step", fontsize=13
+    )
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=130)

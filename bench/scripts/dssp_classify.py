@@ -21,6 +21,7 @@ Usage::
 
     python bench/scripts/dssp_classify.py --category monomer_protein
 """
+
 from __future__ import annotations
 
 import argparse
@@ -73,8 +74,12 @@ def _job(pdb_id: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--category", default="monomer_protein")
-    ap.add_argument("--small-only", action="store_true", default=True,
-                    help="Only targets in the FoldBench-small manifest (default).")
+    ap.add_argument(
+        "--small-only",
+        action="store_true",
+        default=True,
+        help="Only targets in the FoldBench-small manifest (default).",
+    )
     ap.add_argument("--workers", type=int, default=32)
     args = ap.parse_args()
 
@@ -97,6 +102,7 @@ def main() -> None:
         w.writerows(out_rows)
 
     from collections import Counter
+
     dist = Counter(r["fold_class"] for r in out_rows)
     print(f"[dssp] -> {out_csv}")
     print(f"[dssp] fold-class distribution: {dict(dist)}")

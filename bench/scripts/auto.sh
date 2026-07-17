@@ -24,8 +24,8 @@
 #   STEP_OFFSET   series-global step shift (default 0)
 set -u
 cd "$(dirname "$0")/../.."
-SERIES="${SERIES:-df3v2}"
-TRAIN_DIR="${1:-runs/df3-stage0-r6}"
+SERIES="${SERIES:-df3v3}"
+TRAIN_DIR="${1:-runs/df3-stage0-r10}"
 POLL="${2:-3600}"            # ~1 h
 # STEP_OFFSET shifts the benchmarked step number (raw checkpoint step N is
 # logged as N+OFFSET) so a fork that restarts the step counter (e.g. stage1
@@ -39,7 +39,7 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
 # node: 8-GPU box -> 0..7, 4-GPU box -> 0..3). Override with GPUS=0,1 to reserve.
 GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
-GPUS="${GPUS:-0,1,2,3}"
+GPUS="${GPUS:-0}"
 # Note: interface_protein_ligand is omitted by default — eval_ost has no
 # ligand-aware scorer, so it would be mis-scored as a monomer. Add it to
 # CATEGORIES only alongside a proper ligand metric.

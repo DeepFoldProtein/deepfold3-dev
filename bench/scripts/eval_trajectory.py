@@ -19,6 +19,7 @@ Usage::
     uv run python bench/scripts/eval_trajectory.py --series df3v1 \\
         --category monomer_protein --inflection 110000
 """
+
 from __future__ import annotations
 
 import argparse
@@ -101,6 +102,7 @@ def write_bands_csv(rows, out_csv):
 
 def make_plot(rows, prefix, inflection, series, category):
     import matplotlib  # noqa: PLC0415
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
@@ -111,8 +113,7 @@ def make_plot(rows, prefix, inflection, series, category):
         orac = [r.get(ocol) for r in rows]
         ax.plot(steps, mean, color=color, lw=1.6, marker=".", ms=4, label="mean")
         if any(o is not None for o in orac):
-            ax.plot(steps, orac, color=color, lw=1.0, ls="--", marker=".", ms=4, alpha=0.7,
-                    label="oracle (best-of-N)")
+            ax.plot(steps, orac, color=color, lw=1.0, ls="--", marker=".", ms=4, alpha=0.7, label="oracle (best-of-N)")
         ax.axvline(inflection, color="red", ls="--", alpha=0.6)
         pre, npre = slope_per_1k(steps, mean, steps[0], inflection)
         post, npost = slope_per_1k(steps, mean, inflection, steps[-1])
@@ -143,8 +144,9 @@ def main():
     ap.add_argument("--series", default="df3v1")
     ap.add_argument("--category", default="monomer_protein")
     ap.add_argument("--eval-root", type=Path, default=REPO / "bench" / "runs")
-    ap.add_argument("--inflection", type=int, default=110000,
-                    help="Step to split pre/post slopes and mark on the figure.")
+    ap.add_argument(
+        "--inflection", type=int, default=110000, help="Step to split pre/post slopes and mark on the figure."
+    )
     args = ap.parse_args()
 
     eval_dir = args.eval_root / args.series / "eval" / args.category
@@ -152,8 +154,7 @@ def main():
     if not rows:
         raise SystemExit(f"no summary.csv under {eval_dir}")
     steps = [r["step"] for r in rows]
-    print(f"{args.series}/{args.category}: {len(rows)} steps {steps[0]}..{steps[-1]}, "
-          f"n_scored={rows[-1]['n_scored']}")
+    print(f"{args.series}/{args.category}: {len(rows)} steps {steps[0]}..{steps[-1]}, n_scored={rows[-1]['n_scored']}")
 
     write_trajectory_csv(rows, eval_dir / "trajectory.csv")
     write_bands_csv(rows, eval_dir / "trajectory_bands.csv")

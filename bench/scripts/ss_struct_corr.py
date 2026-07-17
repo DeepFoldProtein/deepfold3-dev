@@ -15,13 +15,12 @@ Plots scatter grid (per-target) + a Pearson heatmap to ss_analysis/.
 Usage:
     python bench/scripts/ss_struct_corr.py --series df3v1 --category monomer_protein --step 100000
 """
+
 from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -31,7 +30,6 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[2]
 BENCH = REPO / "bench"
 sys.path.insert(0, str(BENCH / "scripts"))
-from ss_confusion import THREE  # noqa: E402
 
 SS3 = {"H": "α", "G": "α", "I": "α", "P": "α", "E": "β", "B": "β", "T": "c", "S": "c", "-": "c"}
 SS_METRICS = ["macro_3", "macro_8", "f1_helix", "f1_strand", "f1_coil", "helix_fp"]
@@ -51,7 +49,8 @@ def _spearman(x, y):
     m = np.isfinite(x) & np.isfinite(y)
     if m.sum() < 3:
         return float("nan")
-    rx = np.argsort(np.argsort(x[m])); ry = np.argsort(np.argsort(y[m]))
+    rx = np.argsort(np.argsort(x[m]))
+    ry = np.argsort(np.argsort(y[m]))
     return float(np.corrcoef(rx, ry)[0, 1])
 
 
@@ -61,7 +60,7 @@ def _helix_fp(ss_path):
     except (OSError, json.JSONDecodeError):
         return float("nan")
     predA = corr = 0
-    for rc, pc in zip(d["r"], d["p"]):
+    for rc, pc in zip(d["r"], d["p"], strict=False):
         if SS3[pc] == "α":
             predA += 1
             if SS3[rc] == "α":
@@ -75,8 +74,10 @@ def load_step(series, category, step, n_samples=5, seed=42):
     for r in csv.DictReader(open(raw)):
         try:
             struct[(r["pdb_id"], int(r["sample"]))] = {
-                "lddt": float(r["lddt"]), "tm_score": float(r["tm_score"]),
-                "oligo_gdtts": float(r["oligo_gdtts"])}
+                "lddt": float(r["lddt"]),
+                "tm_score": float(r["tm_score"]),
+                "oligo_gdtts": float(r["oligo_gdtts"]),
+            }
         except (ValueError, KeyError):
             pass
     pred_root = BENCH / "runs" / series / "pred" / category / f"step_{step}"
@@ -87,12 +88,17 @@ def load_step(series, category, step, n_samples=5, seed=42):
             f1 = json.load(open(sd / "ss_f1.json"))
         except (OSError, json.JSONDecodeError):
             continue
-        rec = {"pdb": pdb, "sample": smp,
-               "macro_3": f1.get("macro_3"), "macro_8": f1.get("macro_8"),
-               "f1_helix": f1.get("f1_3", {}).get("helix"),
-               "f1_strand": f1.get("f1_3", {}).get("strand"),
-               "f1_coil": f1.get("f1_3", {}).get("coil"),
-               "helix_fp": _helix_fp(sd / "ss_strings.json"), **st}
+        rec = {
+            "pdb": pdb,
+            "sample": smp,
+            "macro_3": f1.get("macro_3"),
+            "macro_8": f1.get("macro_8"),
+            "f1_helix": f1.get("f1_3", {}).get("helix"),
+            "f1_strand": f1.get("f1_3", {}).get("strand"),
+            "f1_coil": f1.get("f1_3", {}).get("coil"),
+            "helix_fp": _helix_fp(sd / "ss_strings.json"),
+            **st,
+        }
         recs.append(rec)
     return recs
 
@@ -134,11 +140,16 @@ def trajectory_corr(series, category):
             continue
         s = next(csv.DictReader(open(summ)))
         steps.append(sp)
-        rows.append({
-            "macro_3": float(ss[sp]["macro_f1_3"]),
-            "f1_helix": float(ss[sp]["f1_3_helix"]), "f1_strand": float(ss[sp]["f1_3_strand"]),
-            "lddt": float(s["mean_lddt"]), "tm_score": float(s["mean_tm_score"]),
-            "oligo_gdtts": float(s["mean_gdt_ts"])})
+        rows.append(
+            {
+                "macro_3": float(ss[sp]["macro_f1_3"]),
+                "f1_helix": float(ss[sp]["f1_3_helix"]),
+                "f1_strand": float(ss[sp]["f1_3_strand"]),
+                "lddt": float(s["mean_lddt"]),
+                "tm_score": float(s["mean_tm_score"]),
+                "oligo_gdtts": float(s["mean_gdt_ts"]),
+            }
+        )
     print(f"\n=== TRAJECTORY (across {len(steps)} steps) — per-step mean SS vs mean struct, Pearson r ===")
     hdr = "SS \\ struct"
     print(f"{hdr:>12} | " + " | ".join(f"{s:>10}" for s in ST_METRICS))
@@ -150,23 +161,36 @@ def trajectory_corr(series, category):
 
 def _plot(series, category, tgt, traj_steps, traj_rows, out_dir):
     try:
-        import matplotlib; matplotlib.use("Agg")
+        import matplotlib
+
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         return
     fig = plt.figure(figsize=(16, 10))
-    pairs = [("macro_3", "tm_score"), ("f1_strand", "tm_score"), ("helix_fp", "tm_score"),
-             ("macro_3", "lddt"), ("f1_strand", "oligo_gdtts"), ("f1_helix", "lddt")]
+    pairs = [
+        ("macro_3", "tm_score"),
+        ("f1_strand", "tm_score"),
+        ("helix_fp", "tm_score"),
+        ("macro_3", "lddt"),
+        ("f1_strand", "oligo_gdtts"),
+        ("f1_helix", "lddt"),
+    ]
     for i, (ss, stm) in enumerate(pairs):
         ax = fig.add_subplot(2, 3, i + 1)
-        x = [t[ss] for t in tgt]; y = [t[stm] for t in tgt]
+        x = [t[ss] for t in tgt]
+        y = [t[stm] for t in tgt]
         ax.scatter(x, y, s=10, alpha=0.5)
         r = _pearson(x, y)
-        ax.set_xlabel(ss); ax.set_ylabel(stm); ax.set_title(f"{ss} vs {stm}  (r={r:+.2f}, per-target)")
+        ax.set_xlabel(ss)
+        ax.set_ylabel(stm)
+        ax.set_title(f"{ss} vs {stm}  (r={r:+.2f}, per-target)")
         ax.grid(alpha=0.3)
     fig.suptitle(f"{series} {category} — SS quality vs structural accuracy (per-target, latest step)")
     png = out_dir / f"ss_struct_corr_{category}.png"
-    fig.tight_layout(); fig.savefig(png, dpi=130); plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(png, dpi=130)
+    plt.close(fig)
     print(f"[corr] scatter -> {png}")
 
 
@@ -190,7 +214,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / f"ss_struct_corr_pertarget_{args.category}_step{args.step}.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["pdb"] + SS_METRICS + ST_METRICS)
-        w.writeheader(); w.writerows(tgt)
+        w.writeheader()
+        w.writerows(tgt)
     _plot(args.series, args.category, tgt, traj_steps, traj_rows, out_dir)
 
 
