@@ -40,10 +40,9 @@ training:
   wandb_project: deepfold3-stage1
 
   alpha_bond: 0.0
-  # Permute-then-noise ordering fix
-  permute_gt_before_noise: true
-  bond_include_symmetric: false   # was true
-  chain_perm_gate_k: 1            # was 3
+  bond_include_symmetric: false # was true
+  permute_gt_before_noise: true # Permute-then-noise ordering fix
+  chain_perm_gate_k: 3 # was 1
 
   # alpha_fape: 1.0            # off by default (0.0); tune against alpha_diffusion=4.0
   # fape_atom_set: ALL         # all-atom points
@@ -64,11 +63,11 @@ datasets:
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
-    weight: 0.35  # 0.45 -> 0.35: the freed 0.10 goes to afdb_nvda
+    weight: 0.35 # 0.45 -> 0.35: the freed 0.10 goes to afdb_nvda
     strategy: uniform
     is_distillation: true
     format: of3
-    max_template_date: "2018-04-30"  # AF2 distillation cutoff (AF3 §2.4)
+    max_template_date: "2018-04-30" # AF2 distillation cutoff (AF3 §2.4)
     crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
 
   - name: short_monomers
@@ -86,6 +85,6 @@ datasets:
     strategy: weighted
     is_distillation: true
     format: df3
-    monomer_template_struct_space: true  # Foldseek struct-space monomer templates
-    max_template_date: "2018-04-30"      # AFDB = AF2 predictions; AF2 template cutoff (AF3 §2.4)
+    monomer_template_struct_space: true # Foldseek struct-space monomer templates
+    max_template_date: "2018-04-30" # AFDB = AF2 predictions; AF2 template cutoff (AF3 §2.4)
     crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
