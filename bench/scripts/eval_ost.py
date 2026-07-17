@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import shlex
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -48,7 +50,24 @@ REPO = Path(__file__).resolve().parents[2]
 BENCH = REPO / "bench"
 GT_ROOT = BENCH / "data" / "ground_truths"
 TARGETS_ROOT = BENCH / "data" / "targets"
-OST = "/home/jovyan/.conda/envs/foldbench/bin/ost"
+
+# OST invocation. This cluster has no conda `ost`; OpenStructure ships as an
+# apptainer image (ost.sif) whose runscript is `ost`, so `apptainer run <sif>
+# compare-structures ...` is the entry point. Both knobs are env-overridable:
+#   OST_SIF  — path to the .sif (default: the casp17 foldbench image)
+#   OST_CMD  — full command prefix up to and including the OST subcommand
+#              (e.g. "ost" for a native binary, or a custom apptainer line).
+# The bind mounts must cover wherever models/refs/outputs live (/store, /gpfs).
+OST_SIF = os.environ.get("OST_SIF", "/store/deepfold/casp17_sync/benchmark/foldbench/ost.sif")
+OST_BIND = os.environ.get("OST_BIND", "/gpfs,/store")
+
+
+def _ost_cmd() -> list[str]:
+    """Command prefix ending in the ``compare-structures`` subcommand."""
+    override = os.environ.get("OST_CMD")
+    if override:
+        return shlex.split(override)
+    return ["apptainer", "run", "--bind", OST_BIND, OST_SIF, "compare-structures"]
 
 # Same OST command for both modes (--dockq already covers interfaces).
 # --lddt-no-stereochecks: df3v1 is mid-training and emits bad local geometry;
@@ -90,7 +109,7 @@ def run_ost(model: Path, ref: Path, out_json: Path, force: bool = False) -> None
     if out_json.exists() and not force:
         return
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [OST, "compare-structures", "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS]
+    cmd = [*_ost_cmd(), "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS]
     subprocess.run(cmd, capture_output=True, check=False)
 
 

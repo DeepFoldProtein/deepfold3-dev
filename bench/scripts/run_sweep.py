@@ -52,6 +52,21 @@ DF3 = str(REPO / ".venv" / "bin" / "deepfold3")
 ALL_STEPS = list(range(90000, 5000, -5000))  # 90000, 85000, ..., 10000
 
 
+def resolve_ckpt(series: str, step: int) -> Path | None:
+    """Return the checkpoint for (series, step), or None if absent.
+
+    Accepts either an exported ``.safetensors`` (inference weights, already
+    EMA-averaged — ``--snapshot`` is a no-op for these) or a raw ``.pt``
+    training checkpoint. ``.safetensors`` wins if both exist.
+    """
+    base = BENCH / "ckpts" / series
+    for ext in (".safetensors", ".pt"):
+        p = base / f"step_{step}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
 def small_targets(category: str) -> list[tuple[str, int]]:
     """Return [(pdb_id, num_tokens), ...] for the FoldBench-small subset,
     sorted by token count descending (for length-balanced sharding)."""
@@ -84,9 +99,9 @@ def run_step(
     seeds: list[int],
     snapshot: str,
 ) -> None:
-    params = BENCH / "ckpts" / series / f"step_{step}.pt"
-    if not params.exists():
-        print(f"[sweep] SKIP step {step}: no checkpoint at {params}", file=sys.stderr)
+    params = resolve_ckpt(series, step)
+    if params is None:
+        print(f"[sweep] SKIP step {step}: no checkpoint at {BENCH / 'ckpts' / series}/step_{step}.{{safetensors,pt}}", file=sys.stderr)
         return
     in_dir = BENCH / "inputs" / category
     pred_root = BENCH / "runs" / series / "pred" / category / f"step_{step}"

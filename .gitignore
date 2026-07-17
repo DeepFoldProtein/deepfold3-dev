@@ -186,6 +186,7 @@ bench/ckpts/
 bench/data/
 bench/inputs/
 bench/runs/
+bench/cache/     # shared Triton autotune + JIT cache (regenerated per GPU arch)
 
 # Large optional Triton test fixtures (checkpoints; tests skip when absent)
 tests/triton/_fixtures/*.pt
