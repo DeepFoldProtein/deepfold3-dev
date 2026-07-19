@@ -374,6 +374,14 @@ ChainInfo(
 
 Unpaired MSAs are deduplicated by sequence (shared across records with identical chain sequences). Paired MSAs are per-record because the pairing depends on which chains co-occur in the same complex.
 
+#### Missing MSA → Self-MSA Fallback
+
+Every chain that contributes MSA columns ends up in `unpaired_msa`, even when no MSA exists on disk. `TrainingDataset._self_msa_from_tokens` synthesizes a depth-1 MSA from the chain's own tokens; `InferenceInput.from_sequence` / `from_json` do the same via `_sequence_to_msa`. This is not a rare path — MSA search is protein-only, so **every nucleic chain** takes it, as do peptides too short to search.
+
+The fallback reads `res_type` directly: it and the MSA vocabulary are the same 32-class space (AF3 Table 5, _"one-hot encoding of the processed MSA, using the same classes as restype"_) — ALA..VAL 0–19, UNK/X 20, gap 21, RNA 22–25, DNA 26–29, unknown-nucleic 30 — so no lookup is needed and modified-residue handling stays identical to the rest of the featurizer.
+
+Without it a chain is simply absent from `unpaired_msa`, and the featurizer leaves its columns at `MSA_GAP` with `msa_mask=True` — the model never sees the query sequence, and the chain's `profile` / `deletion_mean` are all-zero. The load still logs (`MSA file missing (self-MSA fallback)`) so genuine coverage gaps stay visible.
+
 #### Full-Width MSA Construction (Featurizer)
 
 The featurizer merges per-chain paired and unpaired MSAs into a single **full-width** `[S, N]` tensor where `N` spans all tokens across all chains:

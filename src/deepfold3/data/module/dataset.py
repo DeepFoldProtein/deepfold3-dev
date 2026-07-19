@@ -38,6 +38,7 @@ from deepfold3.data.types import (
     Input,
     Record,
     Structure,
+    Tokenized,
 )
 
 if TYPE_CHECKING:
@@ -530,7 +531,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         # only, sliced to the cropped columns at load time. The sliced MSAs are
         # re-indexed 0..k-1, so ``msa_col_idx`` must be rebased to match or the
         # featurizer gathers stale (mis-aligned / dropped) columns.
-        paired_msa, unpaired_msa = self._load_cropped_msa(record, surviving_asym, chain_msa_cols)
+        paired_msa, unpaired_msa = self._load_cropped_msa(record, tokenized, surviving_asym, chain_msa_cols)
         # Original (pre-rebase) chain-local column per token == the per-chain
         # template array's query index; keep it for correct template placement
         # before rebasing msa_col_idx for the sliced MSA gather.
@@ -603,6 +604,7 @@ class TrainingDataset(torch.utils.data.Dataset):
     def _load_cropped_msa(
         self,
         record: Record,
+        tokenized: Tokenized,
         surviving_asym: set[int],
         chain_msa_cols: dict[int, np.ndarray],
     ) -> tuple[dict[int, MSA], dict[int, MSA]]:
@@ -613,6 +615,10 @@ class TrainingDataset(torch.utils.data.Dataset):
         MSA is column-sliced to exactly the tokens that survived — equivalent to
         the cropper's former post-load slice, but without ever loading the MSAs
         of chains the crop discarded.
+
+        A chain with no MSA on disk falls back to a single-sequence MSA built
+        from its own tokens (:meth:`_self_msa_from_tokens`), matching what the
+        inference path already does via ``_sequence_to_msa``.
         """
         msa_dir = self.data_dir / "msa"
         unpaired_msa: dict[int, MSA] = {}
@@ -629,13 +635,19 @@ class TrainingDataset(torch.utils.data.Dataset):
                 m = self._load_msa_sliced(msa_path, cols)
                 if m is not None:
                     unpaired_msa[cid] = m
-            else:
-                # A corrupt MSA warns; a missing one used to be silent. The
-                # chain then trains on all-GAP columns marked msa_mask=True —
-                # not even the query sequence — so a wrong ``msa_id`` convention
-                # or an un-materialized MSA tree degrades a whole dataset to
-                # "no MSA" with nothing in the log to say so.
-                _count_drop("MSA file missing", f"{record.id} chain {cid}: {msa_path}")
+            if cid not in unpaired_msa:
+                # No MSA on disk (or it was empty / corrupt). Without a fallback
+                # the chain is simply absent from ``unpaired_msa``, and the
+                # featurizer leaves its columns at MSA_GAP with msa_mask=True —
+                # the model never even sees the query sequence, and the chain's
+                # profile / deletion_mean are all-zero. Inference never hits this
+                # (``from_sequence`` / ``from_json`` fall back to
+                # ``_sequence_to_msa``), so leaving it unhandled here is a pure
+                # train/inference skew. Nucleic chains take this path by
+                # construction — MSA search is protein-only — as do peptides too
+                # short to search.
+                unpaired_msa[cid] = self._self_msa_from_tokens(tokenized, cid, cols)
+                _count_drop("MSA file missing (self-MSA fallback)", f"{record.id} chain {cid}: {msa_path}")
             if chain_info.paired_msa_id is not None:
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():
@@ -643,6 +655,43 @@ class TrainingDataset(torch.utils.data.Dataset):
                     if m is not None:
                         paired_msa[cid] = m
         return paired_msa, unpaired_msa
+
+    @staticmethod
+    def _self_msa_from_tokens(tokenized: Tokenized, cid: int, cols: np.ndarray) -> MSA:
+        """Single-sequence MSA for one chain, read off its own tokens.
+
+        ``res_type`` and the MSA vocabulary are the *same* 32-class space (AF3
+        Table 5: "one-hot encoding of the processed MSA, using the same classes
+        as restype") — ALA..VAL 0-19, UNK/X 20, gap 21, RNA 22-25, DNA 26-29,
+        unknown-nucleic 30 — so token types are already MSA class indices and
+        need no lookup. Building the row from tokens rather than from a 1-letter
+        sequence also keeps modified-residue handling identical to the rest of
+        the featurizer, which the string round-trip would have to re-derive.
+
+        Returns a row already in *cropped-column* space (``cols``), matching what
+        :meth:`_load_msa_sliced` returns, so the caller's rebased ``msa_col_idx``
+        gathers it correctly. Columns no token claims stay ``MSA_GAP``.
+        """
+        pos = np.where(tokenized.tokens["asym_id"] == cid)[0]
+        tok_cols = tokenized.msa_col_idx[pos]
+        keep = tok_cols >= 0  # ligand / column-less tokens
+        pos, tok_cols = pos[keep], tok_cols[keep]
+
+        # col → res_type, then gather in the caller's column order. ``cols`` is
+        # ordered by first appearance, not sorted, so index rather than align.
+        width = int(tok_cols.max()) + 1 if len(tok_cols) else 0
+        lut = np.full(max(width, 1), const.MSA_GAP, dtype=np.int8)
+        if len(tok_cols):
+            lut[tok_cols] = tokenized.tokens["res_type"][pos].astype(np.int8)
+        in_range = cols < width
+        row = np.full(len(cols), const.MSA_GAP, dtype=np.int8)
+        row[in_range] = lut[cols[in_range]]
+
+        return MSA(
+            sequences=row[None],
+            mask=np.ones((1, len(cols)), dtype=bool),
+            deletion_matrix=np.zeros((1, len(cols)), dtype=np.int8),
+        )
 
     @staticmethod
     def _load_msa_sliced(path: Path, cols: np.ndarray) -> MSA | None:
