@@ -23,6 +23,7 @@ from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols, remap_msa_col_idx_to_slice
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
+from deepfold3.data.io_cache import read_npz
 from deepfold3.data.masking import TokenMask
 from deepfold3.data.msa.paths import paired_msa_path, unpaired_msa_path
 from deepfold3.data.parse.pdb_chain_cache import PdbChainCache, template_features_from_chain
@@ -647,7 +648,7 @@ class TrainingDataset(torch.utils.data.Dataset):
     def _load_msa_sliced(path: Path, cols: np.ndarray) -> MSA | None:
         """Load an MSA npz and column-slice it to ``cols`` (cropped columns)."""
         try:
-            with np.load(path, allow_pickle=False) as data:
+            with read_npz(path) as data:
                 seqs = data["sequences"]
                 if seqs.shape[0] == 0 or seqs.shape[1] == 0:
                     logger.warning("Empty MSA %s (shape %s) — skipping", path, seqs.shape)

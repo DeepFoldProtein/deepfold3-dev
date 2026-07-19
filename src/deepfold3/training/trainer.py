@@ -13,8 +13,10 @@ Example::
 from __future__ import annotations
 
 import dataclasses
+import gc
 import logging
 import math
+import os
 import time
 from functools import partial
 from pathlib import Path
@@ -26,6 +28,7 @@ import yaml
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 
+from deepfold3.data.io_cache import set_drop_page_cache
 from deepfold3.data.module.collate import collate_fn
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.model.model import DeepFold3
@@ -149,6 +152,31 @@ class Trainer:
         """Seed all RNGs with a per-rank offset."""
         seed_everything(self.cfg.seed, self.dist.rank, deterministic=self.cfg.deterministic)
 
+    def _init_memory_policy(self) -> None:
+        """Host-memory policy for a long DDP run under a container cgroup.
+
+        Two pressures, both proportional to samples consumed rather than to
+        wall-clock, which is why they surface as step-periodic stalls:
+
+        * **Page cache.** Records are drawn at random from 10^6–10^7-structure
+          datasets, so a cached NPZ is never read again — the cache only grows
+          until allocations start hitting direct reclaim. Training opts every
+          dataset-path read into ``POSIX_FADV_DONTNEED``; offline CLIs sharing
+          those loaders keep normal caching.
+        * **Copy-on-write.** Dataloader workers fork from this process and
+          inherit its heap. CPython writes to an object's GC header on every
+          collection pass, so a full collection in a worker un-shares pages
+          across the whole inherited heap. ``gc.freeze`` at the fork point
+          moves everything allocated so far into a permanent generation the
+          collector never visits. Registering it via ``register_at_fork``
+          rather than calling it inline catches objects created after setup
+          (a resumed checkpoint blob, tracker state) that an inline call
+          would miss. Refcount updates still dirty individual objects on
+          first touch, so this bounds the growth rather than eliminating it.
+        """
+        set_drop_page_cache(True)
+        os.register_at_fork(before=gc.freeze)
+
     # ------------------------------------------------------------------
     # Model and optimizer setup
     # ------------------------------------------------------------------
@@ -200,6 +228,7 @@ class Trainer:
             max_checkpoints=self.cfg.max_checkpoints,
             strict=self.cfg.load_strict,
             device=self.dist.device,
+            staging_dir=self.cfg.checkpoint_staging_dir or None,
         )
 
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
@@ -477,6 +506,7 @@ class Trainer:
     def _run_inner(self, resume_from: str | Path | None) -> None:
         self._init_distributed()
         self._seed_everything()
+        self._init_memory_policy()
 
         self._init_model()
         self._init_trackers()
@@ -1195,6 +1225,10 @@ class Trainer:
         # (the rank-0 write gate is inside the manager).
         if not shutdown.requested:
             self._save_checkpoint(output_dir / "checkpoint_final.pt")
+        # Staged checkpoints publish on a background thread; drain it before
+        # teardown so the last one reaches shared storage (and any failure is
+        # raised here rather than lost on exit).
+        self.ckpt_manager.wait_for_publish()
         if self.dist.is_main:
             logger.info(
                 f"Training {'interrupted' if shutdown.requested else 'complete'} at step {self.state.effective_step}"

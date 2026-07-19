@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from deepfold3.data.io_cache import read_npz
+
 if TYPE_CHECKING:
     from deepfold3.data.masking import TokenMask
 
@@ -139,7 +141,7 @@ class Structure:
 
     @classmethod
     def load(cls, path: Path) -> Structure:
-        data = np.load(path, allow_pickle=False)
+        data = read_npz(path)
         atoms_raw = data["atoms"]
         # Backward compatibility: old files lack the b_factor field
         if atoms_raw.dtype != ATOM_DTYPE:
@@ -211,7 +213,7 @@ class Structure:
     def load_split(cls, directory: Path) -> Structure:
         """Load structure from split files: coords.npz + meta.json."""
         directory = Path(directory)
-        coords = np.load(directory / "coords.npz", allow_pickle=False)
+        coords = read_npz(directory / "coords.npz")
         with open(directory / "meta.json") as f:
             meta = json.load(f)
 
@@ -297,7 +299,7 @@ class MSA:
 
     @classmethod
     def load(cls, path: Path) -> MSA:
-        data = np.load(path, allow_pickle=False)
+        data = read_npz(path)
         return cls(
             sequences=data["sequences"],
             mask=data["mask"],

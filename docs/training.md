@@ -196,6 +196,19 @@ During training, the number of recycles is randomly sampled per microstep: `n �
 - Bucket-padded collation (`bucket_pad=True`) for deterministic kernel shapes across microsteps
 - Launch with `torchrun` for multi-GPU
 
+### Host Memory Policy
+
+`Trainer._init_memory_policy` sets two process-wide policies at startup. Both target host-memory pressure that grows with *samples consumed* rather than wall-clock, which is why the resulting stalls recur on a step-tied period (see `export/burst-periodic-stall/`) and reset when the job restarts. Under DDP, one rank in direct reclaim holds all ranks at the next collective.
+
+| Policy | Mechanism | Scope |
+| --- | --- | --- |
+| Page cache | `set_drop_page_cache(True)` makes `data/io_cache.py:read_npz` read whole + `POSIX_FADV_DONTNEED` | Every dataset-path NPZ read (`Structure.load`, `MSA.load`, `TokenMask.load`, OF3 loaders). Records are drawn at random from 10⁶–10⁷-structure datasets, so a cached NPZ is never re-read. |
+| Copy-on-write | `os.register_at_fork(before=gc.freeze)` | Dataloader workers fork from the trainer and inherit its heap; a GC pass in a worker writes to every object's GC header and un-shares those pages. Bounds the growth — refcount updates still dirty objects on first touch. |
+
+The page-cache policy is **off by default**, so offline CLIs (`prepare`, `import-of3`, `refilter`, `build-masks`, …) that share those loaders keep normal caching and readahead. Loaders with genuine reuse must not use `read_npz` — `data/parse/pdb_chain_cache.py` runs at a ~99.8% hit rate, and dropping its pages would turn every hit into a re-read.
+
+The large immutable CCD tables are memoized per process (`ccd.py:load_ligand_symmetry`, `lru_cache`): each parse retains ~0.6 GB and every `TrainingDataset` in a rank asks for the same file (3 under the current configs).
+
 ### Gradient Management
 
 - Gradient clipping: L2 norm (default 10.0)
@@ -519,6 +532,8 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 **Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, scheduler instance attributes (`warmup_steps`, `start_decay_after`, `decay_every`, `decay_factor`, `cosine_max_steps`, `cosine_min_lr_ratio`, `wsds_decay_windows`) — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only; only `lr` is force-overridden. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
 
 **Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
+
+**Staged writes** (`checkpoint_staging_dir`, default `""`): the blob is multiple GB and rank 0 writes it from the training thread, so every other rank sits in the next collective until it lands. Pointing `checkpoint_staging_dir` at node-local disk makes the blocking write local and moves the shared-storage copy to a single background thread (`CheckpointManager._publish`: `copyfile` → `fsync` → `fadvise(DONTNEED)` → atomic `os.replace`, then rotation). At most one publish is in flight; `wait_for_publish` drains it before the next save and at shutdown. Do **not** point this at a memory-backed mount (`/dev/shm`) — that charges the checkpoint to the memory cgroup, which is the pressure staging exists to relieve.
 
 **Fused kernel portability**: `DeepFold3.state_dict()` automatically filters out derived fused kernel parameters (identified by `OptimConfig.FUSED_STATE_DICT_MARKERS`). On load, `load_state_dict()` re-syncs fused params from base weights. This means checkpoints saved with fused kernels enabled can be loaded without them, and vice versa.
 

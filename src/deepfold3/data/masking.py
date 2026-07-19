@@ -12,6 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from deepfold3.data.io_cache import read_npz
+
 # Reserved channel names — use these constants to avoid stringly-typed coupling.
 MASK_FIXED = "fixed"
 MASK_REGION = "region"
@@ -55,7 +57,7 @@ class TokenMask:
         if isinstance(path, np.lib.npyio.NpzFile):
             npz = path
         else:
-            npz = np.load(path, allow_pickle=False)
+            npz = read_npz(path)
         return cls({k: npz[k] for k in npz.files})
 
     @staticmethod

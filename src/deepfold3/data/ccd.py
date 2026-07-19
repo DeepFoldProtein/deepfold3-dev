@@ -14,6 +14,7 @@ Call :func:`set_ccd_components_path` before any lookups to use the bulk file.
 
 from __future__ import annotations
 
+import functools
 import logging
 import tempfile
 import urllib.request
@@ -771,26 +772,18 @@ def load_ligand_automorphisms(path: str | Path) -> dict[str, list[list[int]]]:
     return out
 
 
-def load_ligand_symmetry(
-    path: str | Path,
+@functools.cache
+def _load_ligand_symmetry_cached(
+    resolved: str,
 ) -> tuple[dict[str, list[list[int]]], dict[str, list[str]]]:
-    """Load the automorphism perms **and** the ordered ``atoms`` list in one parse.
+    """Parse the ligand-symmetry cache at an already-resolved path.
 
-    Returns ``(automorphisms, atom_order)`` where ``automorphisms`` matches
-    :func:`load_ligand_automorphisms` and ``atom_order`` is the components.cif
-    atom order per code (the index space the perms live in) — the order
-    :func:`load_ccd_cache` throws away via ``set()``. The two are consumed
-    together by the featurizer's ligand / modified-residue symmetry path
-    (:func:`deepfold3.data.symmetry.atom_perms.compute_ligand_token_permutations`),
-    so this reads the (large, ref_pos-bearing) cache file once instead of twice.
-    Empty dicts for a missing file or the legacy list-of-names format.
+    Split out purely so :func:`functools.lru_cache` keys on the canonical
+    path string; see :func:`load_ligand_symmetry` for the semantics.
     """
     import json
 
-    path = Path(path)
-    if not path.exists():
-        return {}, {}
-    with open(path) as f:
+    with open(resolved) as f:
         raw = json.load(f)
 
     automorphisms: dict[str, list[list[int]]] = {}
@@ -804,7 +797,33 @@ def load_ligand_symmetry(
         atoms = v.get("atoms")
         if atoms:
             atom_order[k] = list(atoms)
+
     return automorphisms, atom_order
+
+
+def load_ligand_symmetry(
+    path: str | Path,
+) -> tuple[dict[str, list[list[int]]], dict[str, list[str]]]:
+    """Load the automorphism perms **and** the ordered ``atoms`` list in one parse.
+
+    Returns ``(automorphisms, atom_order)`` where ``automorphisms`` matches
+    :func:`load_ligand_automorphisms` and ``atom_order`` is the components.cif
+    atom order per code (the index space the perms live in) — the order
+    :func:`load_ccd_cache` throws away via ``set()``. The two are consumed
+    together by the featurizer's ligand / modified-residue symmetry path
+    (:func:`deepfold3.data.symmetry.atom_perms.compute_ligand_token_permutations`),
+    so this reads the (large, ref_pos-bearing) cache file once instead of twice.
+    Empty dicts for a missing file or the legacy list-of-names format.
+
+    Memoized per process. Every ``TrainingDataset`` in a rank asks for the same
+    cache (train + distillation + eval = 3 under the current configs) and each
+    parse retains ~0.6 GB of Python lists, so the memo saves ~1.2 GB per rank —
+    ×8 ranks per node. **Callers must treat the result as immutable.**
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}, {}
+    return _load_ligand_symmetry_cached(str(path.resolve()))
 
 
 def load_atom_name_cache(path: str | Path) -> dict[str, set[str]]:

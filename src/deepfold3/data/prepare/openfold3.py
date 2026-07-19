@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from deepfold3.data import const
+from deepfold3.data.io_cache import read_npz
 from deepfold3.data.prepare.structure import _compute_interfaces, _hash_sequence
 from deepfold3.data.types import (
     ATOM_DTYPE,
@@ -84,7 +85,7 @@ def convert_of3_structure(npz_path: Path, pdb_id: str | None = None) -> tuple[St
     if pdb_id is None:
         pdb_id = npz_path.stem.split(".")[0].lower()
 
-    data = np.load(npz_path, allow_pickle=False)
+    data = read_npz(npz_path)
 
     coord = data["coord"]  # [N, 3]
     n_atoms = coord.shape[0]

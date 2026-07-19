@@ -14,8 +14,11 @@ from a step-exact resume is visible in the log.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
+import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from deepfold3.data.io_cache import drop_from_page_cache
 from deepfold3.model.config import ModelConfig, TrainingConfig
 from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
@@ -133,10 +137,55 @@ class CheckpointManager:
     one and call methods directly.
     """
 
-    def __init__(self, *, max_checkpoints: int = 0, strict: bool, device: torch.device) -> None:
+    def __init__(
+        self,
+        *,
+        max_checkpoints: int = 0,
+        strict: bool,
+        device: torch.device,
+        staging_dir: str | Path | None = None,
+    ) -> None:
         self.max_checkpoints = max_checkpoints
         self.strict = strict
         self.device = device
+        self.staging_dir = Path(staging_dir) if staging_dir else None
+        # ``max_workers=1`` is the no-overlap guarantee: a second save queues
+        # behind the first instead of racing it for staging disk.
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish") if self.staging_dir else None
+        self._publish_future: Future | None = None
+
+    # ----- staged write helpers -----
+
+    def wait_for_publish(self) -> None:
+        """Block until any in-flight background publish has finished.
+
+        Called before the next save and at shutdown, so the process never
+        exits mid-publish. Re-raises a background failure on the caller.
+        """
+        if self._publish_future is not None:
+            pending, self._publish_future = self._publish_future, None
+            pending.result()
+
+    def _publish(self, staged: Path, final: Path) -> None:
+        """Copy ``staged`` → ``final``, then rotate. Runs off the training thread.
+
+        The copy goes to a ``.tmp`` sibling and is renamed into place, so a
+        crash mid-publish leaves no half-written ``checkpoint_*.pt`` for
+        ``find_latest`` to pick up on resume. ``copyfile`` dispatches to
+        ``sendfile`` on Linux, so the bytes never pass through this process.
+        """
+        tmp = final.with_suffix(final.suffix + ".tmp")
+        shutil.copyfile(staged, tmp)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+            # Nothing on this node reads the published copy again.
+            drop_from_page_cache(f.fileno())
+        os.replace(tmp, final)
+        # Releases the staged pages too, so no DONTNEED is needed on the source.
+        staged.unlink(missing_ok=True)
+        logger.info(f"Published checkpoint to {final}")
+        if self.max_checkpoints > 0:
+            self._rotate(final.parent)
 
     # ----- save path -----
 
@@ -173,6 +222,18 @@ class CheckpointManager:
         if not dist_info.is_main:
             return
 
+        self.wait_for_publish()
+
+        # With a staging dir the blocking write goes to node-local disk and the
+        # much slower shared-storage write moves to a background thread. Every
+        # other rank is parked in the next collective for the blocking part, so
+        # that is the section that costs the whole world its step time.
+        if self.staging_dir is not None:
+            self.staging_dir.mkdir(parents=True, exist_ok=True)
+            write_path = self.staging_dir / path.name
+        else:
+            write_path = path
+
         with optimizer_eval_mode(optimizer):
             # snapshot_kind: descriptor for what's in ``blob["model"]`` to aid
             # inference-time selection. Schedule-Free flips into eval mode
@@ -204,11 +265,18 @@ class CheckpointManager:
             # work from the same shard so resume re-shards uniformly).
             if train_sampler is not None and hasattr(train_sampler, "state_dict"):
                 blob["sampler"] = train_sampler.state_dict()
-            torch.save(blob, path)
-        logger.info(f"Saved checkpoint to {path}")
 
-        if self.max_checkpoints > 0:
-            self._rotate(path.parent)
+            torch.save(blob, write_path)
+
+        # Outside ``optimizer_eval_mode``: the blob is on disk, so params can
+        # go back to ``y`` before the (slow) publish starts.
+        if write_path != path:
+            logger.info(f"Staged checkpoint to {write_path}; publishing to {path} in background")
+            self._publish_future = self._pool.submit(self._publish, write_path, path)
+        else:
+            logger.info(f"Saved checkpoint to {path}")
+            if self.max_checkpoints > 0:
+                self._rotate(path.parent)
 
     def _rotate(self, output_dir: Path) -> None:
         """Keep only the N most recent ``checkpoint_*.pt`` files.

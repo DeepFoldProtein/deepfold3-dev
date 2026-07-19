@@ -99,9 +99,9 @@ training:
   fused_ce_chunk_n: 32
 
   dtype: bf16
-  num_workers: 8
+  num_workers: 4
   eval_num_workers: 2
-  prefetch_factor: 4
+  prefetch_factor: 2
   pin_memory: true
   drop_last: true
   # Per-chain template cache (memory LRU + hierarchical sharded disk). Build
@@ -144,7 +144,17 @@ training:
   log_interval: 10
   log_microsteps: false
   uniform_recycle: true
-  max_checkpoints: 0
+  # Keep the N most recent checkpoints (checkpoint_final / checkpoint_best are
+  # never rotated). At 5.9 GB each and one per 500 steps, 0 (keep all) grew a
+  # single 60 h run to ~135 GB — free space on the shared PVC is one of the
+  # things that makes the multi-GB rank-0 write slower over a job's lifetime.
+  # NOTE: rotation is applied on the next save, so lowering this deletes the
+  # oldest checkpoints of an existing run.
+  max_checkpoints: 20
+  # See TrainingConfig.checkpoint_staging_dir. Deployment note: the trainjob
+  # mounts only PVCs plus a memory-backed /dev/shm, so the container overlay
+  # (e.g. /tmp) is the only node-local candidate — verify free space first.
+  checkpoint_staging_dir: ""
   # Always-on per-PF-layer activation RMS sentinel. Logs
   # ``act_rms/pf_in_{single,pair}`` + ``act_rms/pf_{00..47}_{single,pair}``
   # to WandB every ``log_interval`` steps. Compute is two reductions per
@@ -190,7 +200,7 @@ datasets:
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
-    weight: 0.30
+    weight: 0.40
     strategy: uniform
     is_distillation: true
     format: of3
@@ -214,7 +224,7 @@ datasets:
 
   - name: afdb_nvda
     data_dir: /data/distillation/afdb_nvda
-    weight: 0.15
+    weight: 0.05
     strategy: weighted
     is_distillation: true
     format: df3

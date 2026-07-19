@@ -24,6 +24,7 @@ import torch.utils.data
 from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
+from deepfold3.data.io_cache import read_npz
 from deepfold3.data.module.dataset import _build_record_anchors, _draw_crop_anchor, _retry_getitem
 from deepfold3.data.prepare.openfold3 import convert_of3_structure
 from deepfold3.data.tokenize.tokenizer import Tokenizer
@@ -70,7 +71,7 @@ def convert_of3_alignment(npz_path: Path, max_seqs: int = 0) -> MSA:
     Returns:
         DeepFold3 MSA with int8-encoded sequences.
     """
-    data = np.load(npz_path, allow_pickle=True)
+    data = read_npz(npz_path, allow_pickle=True)
 
     msa_parts: list[np.ndarray] = []
     del_parts: list[np.ndarray] = []
@@ -156,7 +157,7 @@ def load_of3_templates(npz_path: Path) -> list[OF3TemplateHit]:
     Returns:
         List of OF3TemplateHit objects.
     """
-    data = np.load(npz_path, allow_pickle=True)
+    data = read_npz(npz_path, allow_pickle=True)
     hits: list[OF3TemplateHit] = []
     for key in data.keys():
         item = data[key].item()

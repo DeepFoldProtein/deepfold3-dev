@@ -1055,6 +1055,13 @@ class TrainingConfig:
     )
     eval_before: bool = False  # run one eval pass before the training loop starts (also fires on resume)
     max_checkpoints: int = 0  # keep N most recent checkpoints (0 = keep all)
+    # Node-local directory to write the checkpoint to first; a background
+    # thread then publishes it to ``output_dir``. Takes the multi-GB write to
+    # shared storage off the training thread, where it stalls every other rank
+    # at the next collective. "" = write straight to ``output_dir`` (blocking).
+    # The path must be node-local disk — a memory-backed emptyDir (/dev/shm)
+    # would trade the stall for exactly the cgroup pressure this avoids.
+    checkpoint_staging_dir: str = ""
     checkpoint_every_hours: float = 1.0  # time-based checkpoint interval (0 = disabled)
     auto_resume: bool = False  # auto-detect latest checkpoint in output_dir
 
