@@ -144,13 +144,12 @@ training:
   log_interval: 10
   log_microsteps: false
   uniform_recycle: true
-  # Keep the N most recent checkpoints (checkpoint_final / checkpoint_best are
-  # never rotated). At 5.9 GB each and one per 500 steps, 0 (keep all) grew a
-  # single 60 h run to ~135 GB — free space on the shared PVC is one of the
-  # things that makes the multi-GB rank-0 write slower over a job's lifetime.
-  # NOTE: rotation is applied on the next save, so lowering this deletes the
-  # oldest checkpoints of an existing run.
-  max_checkpoints: 20
+  # 0 = keep every checkpoint. Deliberate: per-checkpoint spectral analysis and
+  # step-specific evals both need the history, and rotation is applied on the
+  # next save, so setting this deletes an existing run's older checkpoints.
+  # Sizing, if space ever forces the question: 5.9 GB each, one per 500 steps,
+  # ~135 GB per 60 h run.
+  max_checkpoints: 0
   # See TrainingConfig.checkpoint_staging_dir. Deployment note: the trainjob
   # mounts only PVCs plus a memory-backed /dev/shm, so the container overlay
   # (e.g. /tmp) is the only node-local candidate — verify free space first.
