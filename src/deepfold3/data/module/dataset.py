@@ -643,11 +643,18 @@ class TrainingDataset(torch.utils.data.Dataset):
                 # profile / deletion_mean are all-zero. Inference never hits this
                 # (``from_sequence`` / ``from_json`` fall back to
                 # ``_sequence_to_msa``), so leaving it unhandled here is a pure
-                # train/inference skew. Nucleic chains take this path by
-                # construction — MSA search is protein-only — as do peptides too
-                # short to search.
+                # train/inference skew.
                 unpaired_msa[cid] = self._self_msa_from_tokens(tokenized, cid, cols)
-                _count_drop("MSA file missing (self-MSA fallback)", f"{record.id} chain {cid}: {msa_path}")
+                # Warn for protein only. MSA search is protein-only, so a nucleic
+                # chain having no MSA is by construction, not a coverage gap —
+                # and it is the common case (on the patchr set, ~76% of chains
+                # reaching this branch are DNA/RNA), so warning on it buries the
+                # protein chains that genuinely should have had an MSA. Short
+                # peptides below the search length still warn: they are cheap to
+                # ignore and indistinguishable here from a real materialization
+                # gap. Revisit if an RNA MSA pipeline lands.
+                if chain_info.mol_type == const.MOL_PROTEIN:
+                    _count_drop("MSA file missing (self-MSA fallback)", f"{record.id} chain {cid}: {msa_path}")
             if chain_info.paired_msa_id is not None:
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():

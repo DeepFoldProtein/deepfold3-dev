@@ -380,7 +380,9 @@ Every chain that contributes MSA columns ends up in `unpaired_msa`, even when no
 
 The fallback reads `res_type` directly: it and the MSA vocabulary are the same 32-class space (AF3 Table 5, _"one-hot encoding of the processed MSA, using the same classes as restype"_) — ALA..VAL 0–19, UNK/X 20, gap 21, RNA 22–25, DNA 26–29, unknown-nucleic 30 — so no lookup is needed and modified-residue handling stays identical to the rest of the featurizer.
 
-Without it a chain is simply absent from `unpaired_msa`, and the featurizer leaves its columns at `MSA_GAP` with `msa_mask=True` — the model never sees the query sequence, and the chain's `profile` / `deletion_mean` are all-zero. The load still logs (`MSA file missing (self-MSA fallback)`) so genuine coverage gaps stay visible.
+Without it a chain is simply absent from `unpaired_msa`, and the featurizer leaves its columns at `MSA_GAP` with `msa_mask=True` — the model never sees the query sequence, and the chain's `profile` / `deletion_mean` are all-zero.
+
+The fallback logs `MSA file missing (self-MSA fallback)` **for protein chains only**. A nucleic chain with no MSA is by construction, not a coverage gap, and it is the common case — warning on it would bury the protein chains that genuinely should have had one. Revisit if an RNA MSA pipeline lands.
 
 #### Full-Width MSA Construction (Featurizer)
 
