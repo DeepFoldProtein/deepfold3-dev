@@ -46,6 +46,35 @@ def scaled_backward(scaler: GradScaler, loss: torch.Tensor, accumulate: int) -> 
     scaler.scale(loss / accumulate).backward()
 
 
+def aggregate_sample_losses(
+    per_sample: list[dict[str, torch.Tensor]],
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    """Mean each reported loss term over the samples that actually emitted it.
+
+    Not every batch element emits every key: a distillation sample returns
+    early before the confidence block, and ``tm_true`` / ``bond`` / ``fape``
+    are feature- or alpha-gated. Dividing every key by the batch size
+    under-reported those by ``n_present / batch_size`` — at
+    ``batch_size_per_rank: 2`` with a ~50% distillation mix that halved the
+    logged pLDDT / PAE / PDE / exp_resolved.
+
+    Args:
+        per_sample: One loss dict per batch element.
+
+    Returns:
+        ``(means, counts)`` — the per-key mean and the number of samples that
+        contributed to it. ``counts`` is passed on to the meters so the
+        cross-rank average is weighted by contribution too.
+    """
+    sums: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = {}
+    for ld in per_sample:
+        for k, v in ld.items():
+            sums[k] = sums[k] + v if k in sums else v
+            counts[k] = counts.get(k, 0) + 1
+    return {k: v / counts[k] for k, v in sums.items()}, counts
+
+
 def pick_num_recycles(cfg: TrainingConfig, global_step: int) -> int:
     """Sample ``num_recycles`` for this microstep.
 
@@ -77,10 +106,12 @@ def training_step(
     accumulator: AccumulationLoop,
     scaler: GradScaler,
     device: torch.device,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], int]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, int], int, float, float]:
     """Run one forward pass + compute losses for all batch elements.
 
-    Returns ``(total_loss, loss_dict, num_recycles)``. The chunked
+    Returns ``(total_loss, loss_dict, loss_counts, num_recycles, fwd_wall,
+    loss_wall)``, where ``loss_counts[k]`` is how many batch elements emitted
+    key ``k`` — see :func:`aggregate_sample_losses`. The chunked
     diffusion path back-props each chunk internally via
     ``scaled_backward``; those per-chunk backwards run under
     ``accumulator.chunk_context`` so DDP doesn't all_reduce per chunk
@@ -148,19 +179,18 @@ def training_step(
     loss_fn = fp32_guard(model_cfg.precision.fp32_loss)(training_loss)
     batch_size = cfg.batch_size_per_rank
     losses_list: list[torch.Tensor] = []
-    loss_dict_acc: dict[str, torch.Tensor] = {}
+    per_sample_losses: list[dict[str, torch.Tensor]] = []
     for b in range(batch_size):
         pred_b = slice_batch_dict(pred, b, batch_size)
         features_b = slice_batch_dict(features, b, batch_size)
         loss_b, ld_b = loss_fn(pred_b, features_b, cfg)
         losses_list.append(loss_b)
-        for k, v in ld_b.items():
-            if k in loss_dict_acc:
-                loss_dict_acc[k] = loss_dict_acc[k] + v
-            else:
-                loss_dict_acc[k] = v
+        per_sample_losses.append(ld_b)
+    # ``total_loss`` keeps the plain batch mean — a sample that contributes 0
+    # to some term is still a real sample of the objective. Only the REPORTED
+    # per-term values get a per-key denominator.
     total_loss = torch.stack(losses_list).mean()
-    loss_dict = {k: v / batch_size for k, v in loss_dict_acc.items()}
+    loss_dict, loss_dict_counts = aggregate_sample_losses(per_sample_losses)
 
     if _timing:
         torch.cuda.synchronize(device)
@@ -168,7 +198,13 @@ def training_step(
         loss_wall = time.monotonic() - t1  # loss section: chain-perm CPU + aux-loss GPU
     else:
         fwd_wall = loss_wall = 0.0
-    return total_loss, loss_dict, num_recycles, fwd_wall, loss_wall
+    return total_loss, loss_dict, loss_dict_counts, num_recycles, fwd_wall, loss_wall
 
 
-__all__ = ["prepare_features", "scaled_backward", "pick_num_recycles", "training_step"]
+__all__ = [
+    "aggregate_sample_losses",
+    "pick_num_recycles",
+    "prepare_features",
+    "scaled_backward",
+    "training_step",
+]

@@ -293,12 +293,20 @@ class Trainer:
     # Training step
     # ------------------------------------------------------------------
 
-    def _training_step(self, features: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Thin wrapper around :func:`training_step` — keeps the call sites tidy."""
+    def _training_step(
+        self, features: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, int]]:
+        """Thin wrapper around :func:`training_step` — keeps the call sites tidy.
+
+        Returns ``(total_loss, loss_dict, loss_counts)``. ``loss_counts`` is the
+        number of batch elements that actually emitted each key, so the meters
+        can weight the cross-rank average by contribution instead of treating a
+        rank that reported one sample the same as one that reported two.
+        """
         # MUST pass the DDP-wrapped model so that DDP's ``_pre_forward`` runs
         # and primes the reducer for the upcoming backward — otherwise the
         # bucket AllReduce is never scheduled and ranks train independently.
-        total_loss, loss_dict, num_recycles, fwd_wall, loss_wall = training_step(
+        total_loss, loss_dict, loss_counts, num_recycles, fwd_wall, loss_wall = training_step(
             self.ddp_model,
             features,
             cfg=self.cfg,
@@ -312,7 +320,7 @@ class Trainer:
         # Tier-4c phase breakdown (0.0 unless slow_step_log_threshold_s > 0).
         self._last_fwd_wall = fwd_wall
         self._last_loss_wall = loss_wall
-        return total_loss, loss_dict
+        return total_loss, loss_dict, loss_counts
 
     def _chunked_diffusion_active(self) -> bool:
         return is_chunked_diffusion_active(self.cfg)
@@ -827,7 +835,7 @@ class Trainer:
                     dtype=self.cfg.torch_dtype,
                     enabled=(self.cfg.dtype != "fp32"),
                 ):
-                    loss, loss_dict = self._training_step(features)
+                    loss, loss_dict, loss_counts = self._training_step(features)
                 if self._act_meter is not None:
                     self._act_meter.enabled = False
 
@@ -879,7 +887,9 @@ class Trainer:
                     else torch.tensor(cfg.max_tokens * cfg.batch_size_per_rank, device=self.dist.device)
                 )
                 loss_dict["_tokens"] = n_tokens
-                meters.update(loss_dict, n=1)
+                # Per-key n: a key emitted by only one of two batch elements
+                # must not be averaged as if both had reported it.
+                meters.update(loss_dict, n=loss_counts)
 
                 # CPU wall-clock of the microstep — kept only for the per-step
                 # SLOW_STEP threshold + log_microsteps below, which need an

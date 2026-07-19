@@ -35,26 +35,38 @@ class DistributedAverageMeters:
         self._sums: dict[str, torch.Tensor] = {}  # f64 device tensors
         self._counts: dict[str, int] = {}  # finite-contribution count, per key
 
-    def update(self, values: dict[str, torch.Tensor], n: int = 1) -> None:
+    def update(self, values: dict[str, torch.Tensor], n: int | dict[str, int] = 1) -> None:
         """Accumulate a step's metrics. Non-finite values are dropped.
 
         Detached, cast to f64, squeezed to scalar (the per-batch loss loop
         with ``batch_per_rank > 1`` produces 0-d or 1-element tensors).
+
+        Args:
+            values: Metric name → scalar value for this step.
+            n: Weight for this sample. Pass a dict to weight per key, which is
+                what the training loop does: not every batch element emits
+                every key (a distillation sample skips the confidence terms),
+                so a rank that contributed one sample must not be averaged
+                against one that contributed two as if they were equal.
+                Missing keys default to 1.
         """
         for k, v in values.items():
+            n_k = n.get(k, 1) if isinstance(n, dict) else n
+            if n_k <= 0:
+                continue
             v_f64 = v.detach().to(torch.float64).squeeze()
             if not bool(torch.isfinite(v_f64).all()):
                 # NaN/Inf from a skipped window — drop it. Without this,
                 # one bad microstep poisons every subsequent ``sync`` until
                 # ``reset`` runs at the next log boundary.
                 continue
-            v_f64_n = v_f64 * n
+            v_f64_n = v_f64 * n_k
             if k in self._sums:
                 self._sums[k] += v_f64_n
-                self._counts[k] += n
+                self._counts[k] += n_k
             else:
                 self._sums[k] = v_f64_n.clone()
-                self._counts[k] = n
+                self._counts[k] = n_k
 
     @property
     def count(self) -> int:

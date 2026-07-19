@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -1178,3 +1179,57 @@ class TestTwoStageAnchorSampling:
         glob = np.random.default_rng(seed).choice(len(records), size=ep, replace=True, p=weights)
         assert sum(len(s) for s in shards) == ep
         assert sorted(sum(shards, [])) == sorted(glob.tolist())
+
+
+# --- per-key loss reporting -------------------------------------------------
+
+
+def test_aggregate_sample_losses_uses_per_key_denominator():
+    """A key emitted by one of two samples must not be halved.
+
+    ``training_loss`` returns early for distillation samples, so in a mixed
+    batch only the PDB sample reports plddt/pae/pde/exp_resolved. Dividing
+    those by ``batch_size`` under-reported them by n_present/batch_size.
+    """
+    import torch
+
+    from deepfold3.training.step import aggregate_sample_losses
+
+    pdb_sample = {"total": torch.tensor(2.0), "plddt": torch.tensor(3.0)}
+    distill_sample = {"total": torch.tensor(4.0)}  # no confidence keys
+
+    means, counts = aggregate_sample_losses([pdb_sample, distill_sample])
+
+    assert counts == {"total": 2, "plddt": 1}
+    assert means["total"].item() == 3.0  # (2 + 4) / 2 — every sample reported
+    assert means["plddt"].item() == 3.0  # 3 / 1, NOT 3 / 2
+
+
+def test_meters_weight_by_per_key_count():
+    """Cross-rank averaging must weight by how many samples contributed."""
+    import torch
+
+    from deepfold3.training.meters import DistributedAverageMeters
+
+    m = DistributedAverageMeters(torch.device("cpu"))
+    # Step 1: both batch elements reported plddt, mean 2.0
+    m.update({"plddt": torch.tensor(2.0)}, n={"plddt": 2})
+    # Step 2: only one did, value 8.0
+    m.update({"plddt": torch.tensor(8.0)}, n={"plddt": 1})
+
+    averaged, _ = m.sync()
+    # Weighted by contribution: (2*2 + 8*1) / 3 == 4.0, not the unweighted 5.0
+    assert averaged["plddt"] == pytest.approx(4.0)
+
+
+def test_meters_scalar_n_still_supported():
+    """The int form must keep working for callers that pass a single weight."""
+    import torch
+
+    from deepfold3.training.meters import DistributedAverageMeters
+
+    m = DistributedAverageMeters(torch.device("cpu"))
+    m.update({"loss": torch.tensor(1.0)})
+    m.update({"loss": torch.tensor(3.0)})
+    averaged, _ = m.sync()
+    assert averaged["loss"] == pytest.approx(2.0)
