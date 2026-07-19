@@ -397,6 +397,8 @@ def test_featurize_emits_batch_uniform_contract_keys():
     feats = Featurizer(max_msa_seqs=8).process(tok, training=True, random_rot=False)
 
     assert not len(tok.bonds), "fixture must be bond-free to exercise the old skip path"
-    # ``resolution`` is attached by the dataset, not the featurizer.
-    expected = _REQUIRED_KEYS - {"resolution"}
+    # ``resolution`` and ``is_distillation`` are attached by the dataset
+    # (they are record/dataset properties), not by the featurizer.
+    dataset_attached = {"resolution", "is_distillation"}
+    expected = _REQUIRED_KEYS - dataset_attached
     assert expected <= feats.keys(), f"featurizer dropped {expected - feats.keys()}"

@@ -74,11 +74,30 @@ _REQUIRED_KEYS = {
     "atom_gt_mask",
     "msa",
     "msa_mask",
-    # Batch-uniform contract (see above); all three are emitted unconditionally.
+    # Batch-uniform contract (see above); all four are emitted unconditionally.
+    # ``is_distillation`` and ``resolution`` are 0-dim, the case collate_fn
+    # drops batch-wide — losing the distillation flag would apply the
+    # confidence loss to predicted structures.
     "resolution",
+    "is_distillation",
     "bond_matrix",
     "template_mask",
 }
+
+# Aggregate counters for data that is dropped without failing the run: a
+# resampled record, a missing MSA, a template that would not load. Each event
+# is individually survivable, which is exactly why a systematic outage (one
+# dataset with the wrong msa_id convention, a misconfigured cache dir) can run
+# for hours with a healthy-looking loss curve. Counting them per worker and
+# reporting on a widening schedule surfaces the outage without flooding the log.
+_drop_counts: dict[str, int] = {}
+
+
+def _count_drop(kind: str, detail: str, *, exc_info: bool = False) -> None:
+    """Record a silently-dropped item and warn on a widening schedule."""
+    n = _drop_counts[kind] = _drop_counts.get(kind, 0) + 1
+    if n in (1, 10, 100) or n % 1000 == 0:
+        logger.warning("%s [worker total: %d] — %s", kind, n, detail, exc_info=exc_info)
 
 
 def _validate_features(feats: dict[str, torch.Tensor]) -> str | None:
@@ -96,8 +115,18 @@ def _validate_features(feats: dict[str, torch.Tensor]) -> str | None:
     return None
 
 
-# Exceptions that indicate bad data (retry-worthy), not programming bugs.
-_DATA_ERRORS = (OSError, EOFError, ValueError, zipfile.BadZipFile, RuntimeError, KeyError)
+# Exceptions that genuinely indicate bad data on disk: unreadable file, short
+# read, corrupt archive, malformed array contents.
+_DATA_ERRORS = (OSError, EOFError, ValueError, zipfile.BadZipFile)
+
+# Exceptions that are far more likely to be OUR bug than bad data — a KeyError
+# from a tokenizer/CCD lookup, a RuntimeError from the cropper or featurizer.
+# They are still caught, because one malformed record must not kill a multi-day
+# run, but they are reported at ERROR *with a traceback*: logged as bare
+# ``str(e)`` they read as ``Sample 7abc (attempt 1): 'ARG'`` and are
+# indistinguishable from data noise, which is how a bug that rejects an entire
+# subset of the dataset stays invisible.
+_SUSPECT_ERRORS = (RuntimeError, KeyError)
 
 
 def _retry_getitem(
@@ -113,6 +142,12 @@ def _retry_getitem(
     successfully loaded features (even if validation failed) so the
     DataLoader always gets a tensor dict — never an unhandled exception
     that would desync DDP ranks.
+
+    Note the replacement index is drawn UNIFORMLY, which discards the
+    cluster-balanced weighting the sampler just applied. That is a deliberate
+    simplification (the dataset has no handle on the sampler), but it means a
+    high retry rate skews the training distribution toward uniform-over-records
+    — another reason the retry counter below matters.
     """
     orig_id = id_fn(idx)
     last_feats: dict[str, torch.Tensor] | None = None
@@ -124,14 +159,28 @@ def _retry_getitem(
             if reason is None:
                 return feats
             logger.warning("Sample %s (attempt %d): %s", sid, attempt, reason)
+            _count_drop("sample failed validation, resampling", f"{sid}: {reason}")
             last_feats = feats
+        except _SUSPECT_ERRORS as e:
+            # Almost certainly a bug in our own pipeline — carry the traceback.
+            logger.error("Sample %s (attempt %d): %s", sid, attempt, e, exc_info=True)
+            _count_drop("sample raised a suspect error, resampling", f"{sid}: {type(e).__name__}: {e}")
         except _DATA_ERRORS as e:
             logger.warning("Sample %s (attempt %d): %s", sid, attempt, e)
+            _count_drop("sample raised a data error, resampling", f"{sid}: {type(e).__name__}: {e}")
         idx = random.randint(0, len(dataset) - 1)
     logger.error("Sample %s: all %d retries exhausted, returning degenerate feats", orig_id, max_attempts)
     if last_feats is not None:
         return last_feats
-    return load_fn(idx)
+    # Last resort. Guarded: an escaping exception kills this worker, and the
+    # peers then block in the next collective until the NCCL watchdog fires —
+    # the exact desync the docstring above promises not to cause. Re-raise only
+    # if we have nothing at all to hand back.
+    try:
+        return load_fn(idx)
+    except (*_SUSPECT_ERRORS, *_DATA_ERRORS) as e:
+        logger.error("Sample %s: final fallback load also failed: %s", orig_id, e, exc_info=True)
+        raise
 
 
 def _per_sample_rng(idx: int, salt: int) -> random.Random:
@@ -579,6 +628,13 @@ class TrainingDataset(torch.utils.data.Dataset):
                 m = self._load_msa_sliced(msa_path, cols)
                 if m is not None:
                     unpaired_msa[cid] = m
+            else:
+                # A corrupt MSA warns; a missing one used to be silent. The
+                # chain then trains on all-GAP columns marked msa_mask=True —
+                # not even the query sequence — so a wrong ``msa_id`` convention
+                # or an un-materialized MSA tree degrades a whole dataset to
+                # "no MSA" with nothing in the log to say so.
+                _count_drop("MSA file missing", f"{record.id} chain {cid}: {msa_path}")
             if chain_info.paired_msa_id is not None:
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
                 if paired_path.exists():
@@ -660,6 +716,14 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         # Effective release-date cutoff (fail-closed when unestablished).
         cutoff = self._effective_template_cutoff(record)
+        if cutoff is None:
+            # Fail-closed is correct (never leak a future template), but it
+            # drops 100% of this record's templates. Records whose manifest was
+            # never enriched have structure_info=None, so with no
+            # max_template_date / default_template_cutoff_date configured this
+            # silently disables templates for the entire run — indistinguishable
+            # from the leakage fix working as intended.
+            _count_drop("no template cutoff establishable, dropping all templates", record.id)
 
         result: dict[int, list[TemplateFeatures]] = {}
         for chain_info in record.chains:
@@ -674,8 +738,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                 continue
             try:
                 hits = load_monomer_template_hits(tpl_path)
-            except Exception:
-                logger.debug("Failed to load monomer template index for %s", chain_info.msa_id)
+            except Exception as e:
+                _count_drop("monomer template index failed to load", f"{chain_info.msa_id}: {e}", exc_info=True)
                 continue
 
             # Date cutoff (fail-closed) + drop self-hits. A hit is kept only when
@@ -716,13 +780,11 @@ class TrainingDataset(torch.utils.data.Dataset):
                         chain_info.num_residues,
                         indices_are_struct=self.monomer_template_struct_space,
                     )
-                except Exception:
-                    logger.debug(
-                        "Failed to extract monomer template %s chain %s for %s/%s",
-                        hit.template_pdb_id,
-                        hit.template_chain_id,
-                        record.id,
-                        chain_info.chain_name,
+                except Exception as e:
+                    _count_drop(
+                        "monomer template extraction failed",
+                        f"{hit.template_pdb_id}_{hit.template_chain_id} for {record.id}/{chain_info.chain_name}: {e}",
+                        exc_info=True,
                     )
                     continue
                 chain_feats.append(feats)
@@ -753,14 +815,16 @@ class TrainingDataset(torch.utils.data.Dataset):
         tpl_path = template_path(self.data_dir / "templates", record.id)
         try:
             hits = load_template_hits(tpl_path)
-        except Exception:
-            logger.debug("Failed to load template index for %s", record.id)
+        except Exception as e:
+            _count_drop("multimer template index failed to load", f"{record.id}: {e}", exc_info=True)
             return None
 
         # Runtime date cutoff (fail-closed) + self-hit drop. A hit is kept only
         # when a cutoff exists and its (max-across-chains) release date is known
         # and within it — the prepare-time JSON never applied this.
         cutoff = self._effective_template_cutoff(record)
+        if cutoff is None:
+            _count_drop("no template cutoff establishable, dropping all templates", record.id)
         record_id_upper = record.id.upper()
         hits = [
             h
@@ -803,12 +867,11 @@ class TrainingDataset(torch.utils.data.Dataset):
                 try:
                     query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
                     feats = template_features_from_chain(ct, query_to_seqres, chain_info.num_residues)
-                except Exception:
-                    logger.debug(
-                        "Failed to extract template %s chain %s for %s",
-                        hit.template_pdb_id,
-                        aln.template_chain_id,
-                        record.id,
+                except Exception as e:
+                    _count_drop(
+                        "multimer template extraction failed",
+                        f"{hit.template_pdb_id}_{aln.template_chain_id} for {record.id}: {e}",
+                        exc_info=True,
                     )
                     continue
                 result.setdefault(chain_info.chain_id, []).append(feats)
