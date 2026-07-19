@@ -751,14 +751,18 @@ class Featurizer:
             )
             result.update(bond_feats)
 
-        # Bond matrix: only allocated when ligand bonds exist (polymer-only → skip)
+        # Bond matrix. Emitted unconditionally (all-zero when the crop has no
+        # ligand bonds) so every sample carries the same key set: both consumers
+        # already treat all-zeros as "no bonds" — ``bond_embedding`` is a
+        # ``LinearNoBias`` so zeros map to exact zeros, and
+        # ``_inter_chain_bonds_from_features`` returns None on an empty index.
+        bond_matrix = torch.zeros(N, N, 1)
         if len(data.bonds) > 0:
-            bond_matrix = torch.zeros(N, N, 1)
             t1 = data.bonds["token_1"].astype(np.intp)
             t2 = data.bonds["token_2"].astype(np.intp)
             bond_matrix[t1, t2, 0] = 1.0
             bond_matrix[t2, t1, 0] = 1.0
-            result["bond_matrix"] = bond_matrix
+        result["bond_matrix"] = bond_matrix
 
         # ------------------------------------------------------------------
         # Template features

@@ -58,7 +58,27 @@ _DISK_TOKEN_MASKS_ENABLED = False
 
 # Essential feature keys that every sample must contain for the model forward
 # pass and loss computation to produce a valid gradient.
-_REQUIRED_KEYS = {"res_type", "seq_mask", "atom_gt_positions", "atom_gt_mask", "msa", "msa_mask"}
+#
+# This is also the enforcement point for the batch-uniform key contract. A key
+# that only *some* samples of a batch carry is not merely absent downstream:
+# ``collate_fn`` zero-fills it (wrong for a mask — reads as "everything masked
+# out") and drops 0-dim keys batch-wide (taking the value away from the samples
+# that did have it). Neither failure raises. Listing a key here turns "one
+# dataset class forgot to emit it" into a loud per-sample warning instead, and
+# it covers every class that loads through ``_retry_getitem`` — including
+# ``OF3Dataset``. Add new features here rather than relying on convention.
+_REQUIRED_KEYS = {
+    "res_type",
+    "seq_mask",
+    "atom_gt_positions",
+    "atom_gt_mask",
+    "msa",
+    "msa_mask",
+    # Batch-uniform contract (see above); all three are emitted unconditionally.
+    "resolution",
+    "bond_matrix",
+    "template_mask",
+}
 
 
 def _validate_features(feats: dict[str, torch.Tensor]) -> str | None:

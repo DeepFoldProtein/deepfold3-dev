@@ -379,3 +379,24 @@ def test_atomized_symmetry_pair_dropped_when_crop_removes_one_atom():
     assert any(cropped.structure.atoms[int(t["atom_idx"])]["name"].decode().strip() == "OD1" for t in cropped.tokens)
     pairs = compute_atomized_residue_token_swap_pairs(cropped.structure, cropped.tokens)
     assert len(pairs) == 0
+
+
+def test_featurize_emits_batch_uniform_contract_keys():
+    """Every ``_REQUIRED_KEYS`` entry must survive a real featurize call.
+
+    ``bond_matrix`` and ``template_mask`` used to be emitted only when the
+    sample had ligand bonds / templates. A key that only some samples of a
+    batch carry is silently mangled by ``collate_fn`` (zero-filled, or dropped
+    batch-wide for 0-dim keys), so they are now unconditional and listed in
+    ``_REQUIRED_KEYS``. This peptide has neither bonds nor templates — exactly
+    the case that used to omit them.
+    """
+    from deepfold3.data.module.dataset import _REQUIRED_KEYS
+
+    tok = _tokenize(_build_ala_asp_structure())
+    feats = Featurizer(max_msa_seqs=8).process(tok, training=True, random_rot=False)
+
+    assert not len(tok.bonds), "fixture must be bond-free to exercise the old skip path"
+    # ``resolution`` is attached by the dataset, not the featurizer.
+    expected = _REQUIRED_KEYS - {"resolution"}
+    assert expected <= feats.keys(), f"featurizer dropped {expected - feats.keys()}"
