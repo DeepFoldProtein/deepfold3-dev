@@ -932,7 +932,18 @@ def plddt_loss(
     n_atoms = flat_mask.sum().clamp(min=1)
 
     # Compute per-atom LDDT for all samples at once [S, N, M]
-    lddt_all = _compute_per_atom_lddt_batched(pred_pos, gt_pos, atom_mask, mol_type=mol_type, rep_idx=rep_idx)
+    lddt_all, lddt_valid = _compute_per_atom_lddt_batched(
+        pred_pos, gt_pos, atom_mask, mol_type=mol_type, rep_idx=rep_idx
+    )
+    if not lddt_valid:
+        # No usable neighbour set — e.g. a ligand-only crop, where the j axis is
+        # restricted to protein/nucleic representative atoms and comes out
+        # empty. The all-zero LDDT this returns is "unknown", not "confidence
+        # 0"; binning it would train pLDDT to predict the minimum-confidence bin
+        # for every atom, which is a confidently wrong target rather than a
+        # missing one. Drop the term, keeping the graph connected so the
+        # grad-receiving parameter set is unchanged for DDP static_graph.
+        return (logits_r.float().sum() * 0.0).to(logits.dtype)
     target = (lddt_all * num_bins).clamp(0, num_bins - 1).long()  # [S, N, M]
 
     log_probs = F.log_softmax(logits_r.float(), dim=-1)  # fp32 for stability
@@ -1853,7 +1864,7 @@ def _compute_per_atom_lddt_batched(
     rep_idx: torch.Tensor | None = None,  # [N] int — rep atom slot in [0, M)
     inclusion_radius_protein: float = 15.0,
     inclusion_radius_nucleotide: float = 30.0,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, bool]:
     """Compute per-atom LDDT score in [0, 1], batched over S.
 
     With ``mol_type`` and ``rep_idx``, applies AF3 §4.3.1 conventions:
@@ -1863,7 +1874,12 @@ def _compute_per_atom_lddt_batched(
     no j atoms. Without those features, falls back to a flat
     ``inclusion_radius`` over all pairs.
 
-    Returns [S, N, M] LDDT scores.
+    Returns ``([S, N, M] LDDT scores, scores_are_meaningful)``. The flag is
+    False when the crop has no atom that can serve as an i (nothing resolved)
+    or as a j (no protein/nucleic representative atom — e.g. a ligand-only
+    crop). In those cases the returned tensor is all-zeros, which is NOT an
+    LDDT of 0: callers must drop the term rather than treat it as a target,
+    or they train pLDDT toward the minimum-confidence bin for every atom.
     """
     S = pred_pos.shape[0]
     N, M = atom_mask.shape
@@ -1871,7 +1887,7 @@ def _compute_per_atom_lddt_batched(
 
     i_mask = atom_mask.reshape(-1).bool()  # [N*M]
     if i_mask.sum() < 1:
-        return result
+        return result, False
 
     if mol_type is None or rep_idx is None:
         # Legacy / fallback: flat radius, all-vs-all over resolved atoms.
@@ -1891,7 +1907,7 @@ def _compute_per_atom_lddt_batched(
 
         full = torch.zeros(S, atom_mask.numel(), device=pred_pos.device, dtype=pred_pos.dtype)
         full[:, i_mask] = scores
-        return full.reshape(S, N, M)
+        return full.reshape(S, N, M), True
 
     # OF3-style: per-pair-type radius, j restricted to rep atoms of
     # standard polymer tokens (protein/nucleic; ligands skipped).
@@ -1910,7 +1926,7 @@ def _compute_per_atom_lddt_batched(
     j_mask = (is_prot_atom_j | is_nuc_atom_j).reshape(-1)  # [N*M]
 
     if j_mask.sum() < 1:
-        return result
+        return result, False
 
     gt_flat = gt_pos.reshape(-1, 3)
     gt_flat_i = gt_flat[i_mask]  # [Ai, 3]
@@ -1940,7 +1956,7 @@ def _compute_per_atom_lddt_batched(
 
     full = torch.zeros(S, atom_mask.numel(), device=pred_pos.device, dtype=pred_pos.dtype)
     full[:, i_mask] = scores
-    return full.reshape(S, N, M)
+    return full.reshape(S, N, M), True
 
 
 # Backward compat alias

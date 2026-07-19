@@ -462,6 +462,51 @@ class TestTrainingLoss:
         assert "distogram" in losses
 
 
+def test_plddt_zeroes_term_when_no_valid_neighbours():
+    """A ligand-only crop must drop the pLDDT term, not target bin 0.
+
+    ``_compute_per_atom_lddt_batched`` restricts the neighbour (j) axis to
+    protein/nucleic representative atoms, so a ligand-only crop has none and
+    the returned LDDT is all-zero. Binning that would train pLDDT to predict
+    the minimum-confidence bin for every atom — a confidently wrong target
+    rather than a missing one.
+    """
+    from deepfold3.training.loss import _compute_per_atom_lddt_batched, plddt_loss
+
+    torch.manual_seed(0)
+    n_samples, n_tokens, n_atoms, num_bins = 2, 6, 4, 50
+    atom_mask = torch.ones(n_tokens, n_atoms, dtype=torch.bool)
+    rep_idx = torch.zeros(n_tokens, dtype=torch.long)
+    gt = torch.randn(n_tokens, n_atoms, 3)
+    pred = torch.randn(n_samples, n_tokens, n_atoms, 3)
+
+    ligand_only = torch.full((n_tokens,), 3, dtype=torch.long)  # mol_type 3 = ligand
+    _, valid = _compute_per_atom_lddt_batched(pred, gt, atom_mask, mol_type=ligand_only, rep_idx=rep_idx)
+    assert not valid, "fixture must have an empty j axis to exercise the guard"
+
+    logits = torch.randn(n_samples, n_tokens, n_atoms * num_bins, requires_grad=True)
+    loss = plddt_loss(logits, pred, gt, atom_mask, num_bins=num_bins, mol_type=ligand_only, rep_idx=rep_idx)
+    assert loss.item() == 0.0
+    # Graph stays connected so DDP sees the same grad-receiving params.
+    loss.backward()
+    assert logits.grad is not None and torch.equal(logits.grad, torch.zeros_like(logits.grad))
+
+    # A protein crop must still produce a real term.
+    protein = torch.zeros(n_tokens, dtype=torch.long)
+    _, valid_p = _compute_per_atom_lddt_batched(pred, gt, atom_mask, mol_type=protein, rep_idx=rep_idx)
+    assert valid_p
+    loss_p = plddt_loss(
+        torch.randn(n_samples, n_tokens, n_atoms * num_bins),
+        pred,
+        gt,
+        atom_mask,
+        num_bins=num_bins,
+        mol_type=protein,
+        rep_idx=rep_idx,
+    )
+    assert loss_p.item() > 0.0
+
+
 def test_independent_alphas_survive_alpha_diffusion_zero():
     """FAPE / chirality must not be gated on ``alpha_diffusion``.
 
