@@ -662,6 +662,17 @@ class WrappedOptimizer:
             else:
                 grad_norms_per_rank = grad_norm.view(1)
             grad_finite_per_rank = torch.isfinite(grad_norms_per_rank)
+            # Cross-rank PRE-clip summary, free from the gather above. Without
+            # it the only logged grad norm is rank 0's local one, so a large
+            # but finite spike on any other rank is unobservable: it is clipped
+            # to ``grad_clip_norm`` and ``last_grad_norm_global`` is measured
+            # after that clip. Computed from the finite entries only, so a NaN
+            # on one rank does not wipe out the summary for the others (the
+            # skip path below reports those separately).
+            _finite_norms = grad_norms_per_rank[grad_finite_per_rank]
+            if _finite_norms.numel() > 0:
+                state.last_grad_norm_rank_mean = _finite_norms.mean().detach()
+                state.last_grad_norm_rank_max = _finite_norms.max().detach()
             if not bool(grad_finite_per_rank.all().item()):
                 return self._skip_for_bad_grad(
                     state,

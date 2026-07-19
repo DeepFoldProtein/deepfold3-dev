@@ -42,6 +42,13 @@ class TrainState:
             per-rank-clip mode (``None`` otherwise). This is the norm of the
             averaged, already-clipped gradient the optimizer actually steps
             on — bounded by ``grad_clip_norm``.
+        last_grad_norm_rank_mean / last_grad_norm_rank_max: PRE-clip norms
+            reduced across ranks, from the all-gather the NaN consensus
+            already performs (no extra collective). ``last_grad_norm`` is
+            rank-local and only rank 0's copy is ever logged, so a large but
+            finite blow-up on any other rank was invisible: it gets clipped to
+            ``grad_clip_norm`` and ``last_grad_norm_global`` is measured after
+            that clip, so neither existing metric can reveal it.
         last_num_recycles: Number of recycles sampled for the last
             microstep (for microstep logging).
     """
@@ -53,6 +60,8 @@ class TrainState:
     consecutive_nan_skips: int = 0
     last_grad_norm: torch.Tensor | None = None
     last_grad_norm_global: torch.Tensor | None = None
+    last_grad_norm_rank_mean: torch.Tensor | None = None
+    last_grad_norm_rank_max: torch.Tensor | None = None
     last_num_recycles: int = 0
 
 

@@ -859,9 +859,19 @@ class Trainer:
                 # skip and leave ``on_opt_step_boundary`` False), so no finite
                 # guard is needed. GPU ops → no per-step CPU sync.
                 if on_opt_step_boundary and self.state.last_grad_norm is not None:
-                    _gn = self.state.last_grad_norm.detach().to(torch.float64)
-                    gn_sum += _gn
-                    gn_max = torch.maximum(gn_max, _gn)
+                    # Prefer the cross-rank pre-clip summary. ``last_grad_norm``
+                    # is this rank's own norm and only rank 0's is logged, so
+                    # using it would hide a spike on any other rank. Falls back
+                    # to the local value single-process, where they coincide.
+                    _mean_src = self.state.last_grad_norm_rank_mean
+                    _max_src = self.state.last_grad_norm_rank_max
+                    gn_sum += (
+                        (_mean_src if _mean_src is not None else self.state.last_grad_norm).detach().to(torch.float64)
+                    )
+                    _gn_max_step = (
+                        (_max_src if _max_src is not None else self.state.last_grad_norm).detach().to(torch.float64)
+                    )
+                    gn_max = torch.maximum(gn_max, _gn_max_step)
                     gn_count += 1
                     if self.state.last_grad_norm_global is not None:
                         gn_global_sum += self.state.last_grad_norm_global.detach().to(torch.float64)
