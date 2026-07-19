@@ -403,3 +403,46 @@ class TestBatchedDistogram:
         assert disto.shape == (B, N, N, 64)
         # Should be symmetric
         torch.testing.assert_close(disto, disto.transpose(-3, -2), atol=1e-5, rtol=1e-5)
+
+
+# --- feature-dict contract: a key must be present on every sample -----------
+#
+# collate_fn cannot repair a key that only some samples carry. For a 0-dim
+# (scalar) key it drops the key from the WHOLE batch, so even the samples that
+# had it lose it. Datasets therefore emit such keys unconditionally, with an
+# explicit sentinel for "unknown".
+
+
+def test_collate_drops_scalar_key_missing_from_any_sample():
+    """Documents the hazard that forces the unconditional-emission contract."""
+    batch = [
+        {"res_type": torch.zeros(4, dtype=torch.long), "resolution": torch.tensor(2.5)},
+        {"res_type": torch.zeros(4, dtype=torch.long)},  # scalar key absent
+    ]
+    out = collate_fn(batch)
+    assert "resolution" not in out, "collate no longer drops partial scalars — update the contract docs"
+
+
+def test_collate_keeps_scalar_key_present_on_every_sample():
+    """With the contract honoured, each sample keeps its own scalar."""
+    from deepfold3.data import const
+
+    batch = [
+        {"res_type": torch.zeros(4, dtype=torch.long), "resolution": torch.tensor(2.5)},
+        {"res_type": torch.zeros(4, dtype=torch.long), "resolution": torch.tensor(const.RESOLUTION_UNKNOWN)},
+    ]
+    out = collate_fn(batch)
+    assert out["resolution"].tolist() == [2.5, const.RESOLUTION_UNKNOWN]
+
+
+def test_resolution_unknown_sentinel_is_gated_out():
+    """The sentinel must fall outside the confidence-loss resolution window.
+
+    ``RESOLUTION_UNKNOWN`` marks a record with no metadata; the AF3 §4.3 gate
+    must exclude it rather than wave it through.
+    """
+    from deepfold3.data import const
+    from deepfold3.model.config import TrainingConfig
+
+    cfg = TrainingConfig()
+    assert not (cfg.min_resolution <= const.RESOLUTION_UNKNOWN <= cfg.max_resolution)

@@ -6,6 +6,8 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Literal
 
+from deepfold3.data import const
+
 
 def _backfill_dataclass(obj, default) -> None:
     """Recursively add fields present on a fresh ``default`` but absent on
@@ -1147,6 +1149,15 @@ class TrainingConfig:
             raise ValueError(f"accumulate_grad_batches must be >= 1, got {self.accumulate_grad_batches}")
         if self.max_recycles < 0:
             raise ValueError(f"max_recycles must be >= 0, got {self.max_recycles}")
+        # Records with no resolution metadata are emitted as
+        # ``const.RESOLUTION_UNKNOWN`` (0.0) and rely on this window excluding
+        # them. A min_resolution of 0.0 would silently promote every such
+        # record into the confidence loss instead.
+        if self.min_resolution <= const.RESOLUTION_UNKNOWN:
+            raise ValueError(
+                f"min_resolution must be > {const.RESOLUTION_UNKNOWN} (the 'unknown resolution' "
+                f"sentinel), got {self.min_resolution}"
+            )
 
     @property
     def torch_dtype(self):

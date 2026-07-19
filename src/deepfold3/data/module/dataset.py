@@ -509,9 +509,14 @@ class TrainingDataset(torch.utils.data.Dataset):
                     breakdown,
                 )
 
-        # Add resolution from manifest metadata (enables confidence loss gating)
-        if record.structure_info and record.structure_info.resolution is not None:
-            feats["resolution"] = torch.tensor(record.structure_info.resolution, dtype=torch.float32)
+        # Resolution from manifest metadata (drives the AF3 §4.3 confidence-loss
+        # gate). Emitted UNCONDITIONALLY — see ``const.RESOLUTION_UNKNOWN``: a
+        # 0-dim key that only some samples carry is dropped from the whole batch
+        # by ``collate_fn``, taking the gate down with it.
+        resolution = None if record.structure_info is None else record.structure_info.resolution
+        feats["resolution"] = torch.tensor(
+            const.RESOLUTION_UNKNOWN if resolution is None else resolution, dtype=torch.float32
+        )
 
         # Distillation flag: disables confidence/distogram losses
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)

@@ -284,6 +284,15 @@ MAX_ATOMS_PER_TOKEN = 24
 MAX_MSA_ROWS = 16_384  # Total MSA rows (query + paired + unpaired)
 MAX_PAIRED_MSA_ROWS = 8_191  # Maximum paired cross-chain rows (excluding query)
 
+# Sentinel for "this record has no resolution metadata". Every dataset emits a
+# ``resolution`` feature unconditionally — a key present in only some samples of
+# a batch is dropped batch-wide by ``collate_fn`` (0-dim keys cannot be filled),
+# which would silently disable the AF3 §4.3 confidence-loss resolution gate for
+# the samples that *did* carry one. 0.0 is unreachable as a real resolution and
+# falls below ``TrainingConfig.min_resolution``, so the existing range check
+# treats "unknown" as "not eligible for confidence loss".
+RESOLUTION_UNKNOWN = 0.0
+
 # Canonical reference atom lists per residue type (for fallback when CCD unavailable)
 # Only heavy atoms; trimmed / padded to MAX_ATOMS_PER_TOKEN during featurization
 REF_ATOMS: dict[str, list[str]] = {

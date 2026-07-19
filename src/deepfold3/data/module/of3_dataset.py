@@ -455,6 +455,11 @@ class OF3Dataset(torch.utils.data.Dataset):
         # 6. Distillation flag
         feats["is_distillation"] = torch.tensor(self.is_distillation, dtype=torch.bool)
 
+        # OF3 sets carry no resolution metadata, but the key is part of the
+        # batch-uniform contract (``dataset._REQUIRED_KEYS``), so emit the
+        # sentinel rather than omitting it. See ``const.RESOLUTION_UNKNOWN``.
+        feats["resolution"] = torch.tensor(const.RESOLUTION_UNKNOWN, dtype=torch.float32)
+
         # NaN-skip diagnostic (same protocol as TrainingDataset): prefix
         # with dataset name when set so extras don't collide on raw PDB ids.
         feats["_record_id"] = f"{self.name}:{record.id}" if self.name else record.id

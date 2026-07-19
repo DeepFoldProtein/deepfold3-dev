@@ -2678,6 +2678,10 @@ def training_loss(
     # for DDP ``static_graph=True`` with ``find_unused_parameters=False``: the
     # set of parameters reached by autograd must be the same every step, even
     # for samples whose resolution falls outside the confidence-loss range.
+    # Datasets emit ``resolution`` unconditionally, using
+    # ``const.RESOLUTION_UNKNOWN`` for records without metadata, so an unknown
+    # resolution is gated OUT rather than waved through. The ``None`` branch is
+    # only for hand-built feature dicts (tests, ad-hoc inference).
     resolution = features.get("resolution")
     if resolution is None:
         conf_valid_mask = torch.ones((), device=gt_pos.device, dtype=gt_pos.dtype)
