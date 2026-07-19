@@ -460,3 +460,24 @@ class TestTrainingLoss:
         assert "diffusion_mse" in losses
         assert "smooth_lddt" in losses
         assert "distogram" in losses
+
+
+def test_independent_alphas_survive_alpha_diffusion_zero():
+    """FAPE / chirality must not be gated on ``alpha_diffusion``.
+
+    They carry their own weights; nesting them under the diffusion gate meant
+    ``alpha_diffusion=0`` silently produced zero FAPE gradient.
+    """
+    import inspect
+
+    from deepfold3.training import loss as loss_mod
+
+    src = inspect.getsource(loss_mod)
+    assert 'elif "denoised" in pred and cfg.alpha_diffusion > 0:' not in src, (
+        "training_loss re-nested the diffusion block under alpha_diffusion"
+    )
+    # The chunked path (diffusion_only_loss) must not re-introduce the gate either.
+    chunked = inspect.getsource(loss_mod.diffusion_only_loss)
+    assert "if cfg.alpha_diffusion > 0:" not in chunked, "diffusion_only_loss re-nested under alpha_diffusion"
+    # ...while the terms AF3 does scale by alpha_diffusion keep the factor.
+    assert "cfg.alpha_diffusion * cfg.alpha_bond" in chunked

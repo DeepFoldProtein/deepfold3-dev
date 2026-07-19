@@ -2057,155 +2057,157 @@ def diffusion_only_loss(
     components: dict[str, torch.Tensor] = {}
     total = gt_pos.new_zeros(())
 
-    if cfg.alpha_diffusion > 0:
-        # Atom/ligand symmetry (AF3 §4.2). Default: resolve the augmented GT once
-        # from the mini-rollout (same labelling as the shared GT above) and pass
-        # no swap tables to the MSE. Opt-in: resolve per noise sample inside the
-        # MSE (argmin vs each denoised sample). GT is already chain-permuted, so
-        # the MSE skips its own chain perm (no ``asym_id``).
-        if cfg.diffusion_mse_per_sample_symmetry and not features.get("__gt_prepermuted__"):
-            mse_kwargs = dict(
-                atom_swap_pairs=features.get("atom_swap_pairs"),
-                ligand_swap_pairs=features.get("ligand_swap_pairs"),
-                ligand_perms=features.get("ligand_perms"),
-            )
-        else:
-            # Skip when pre-permuted in forward_training (gt_aug already atom-resolved).
-            if mini_ref is not None and not features.get("__gt_prepermuted__"):
-                gt_aug = resolve_gt_atom_symmetry(
-                    mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, atom_mask
-                )
-            mse_kwargs = {}
-        l_mse = diffusion_mse_loss(
-            denoised,
-            gt_aug,
-            atom_mask,
-            noise_levels,
-            mol_type=features.get("mol_type"),
-            nucleotide_loss_weight=cfg.nucleotide_loss_weight,
-            ligand_loss_weight=cfg.ligand_loss_weight,
-            region_weights=region_weights,
-            apply_rigid_align=cfg.use_rigid_align,
-            **mse_kwargs,
+    # Deliberately NOT gated on ``alpha_diffusion`` — mirrors ``training_loss``.
+    # FAPE and the chirality terms below carry independent weights, so gating
+    # the whole block on alpha_diffusion silently zeroed them. The MSE /
+    # smooth-lDDT / bond terms keep their alpha_diffusion factor and contribute
+    # 0 when it is 0.
+    # Atom/ligand symmetry (AF3 §4.2). Default: resolve the augmented GT once
+    # from the mini-rollout (same labelling as the shared GT above) and pass
+    # no swap tables to the MSE. Opt-in: resolve per noise sample inside the
+    # MSE (argmin vs each denoised sample). GT is already chain-permuted, so
+    # the MSE skips its own chain perm (no ``asym_id``).
+    if cfg.diffusion_mse_per_sample_symmetry and not features.get("__gt_prepermuted__"):
+        mse_kwargs = dict(
+            atom_swap_pairs=features.get("atom_swap_pairs"),
+            ligand_swap_pairs=features.get("ligand_swap_pairs"),
+            ligand_perms=features.get("ligand_perms"),
         )
-        components["diffusion_mse"] = l_mse.detach()
+    else:
+        # Skip when pre-permuted in forward_training (gt_aug already atom-resolved).
+        if mini_ref is not None and not features.get("__gt_prepermuted__"):
+            gt_aug = resolve_gt_atom_symmetry(mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, atom_mask)
+        mse_kwargs = {}
+    l_mse = diffusion_mse_loss(
+        denoised,
+        gt_aug,
+        atom_mask,
+        noise_levels,
+        mol_type=features.get("mol_type"),
+        nucleotide_loss_weight=cfg.nucleotide_loss_weight,
+        ligand_loss_weight=cfg.ligand_loss_weight,
+        region_weights=region_weights,
+        apply_rigid_align=cfg.use_rigid_align,
+        **mse_kwargs,
+    )
+    components["diffusion_mse"] = l_mse.detach()
 
-        if cfg.alpha_smooth_lddt is not None:
-            l_lddt = smooth_lddt_loss(
-                denoised,
-                gt_pos,
-                atom_mask,
-                cutoffs=cfg.lddt_cutoffs,
-                inclusion_radius=cfg.lddt_inclusion_radius,
-                nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
-                min_distance=cfg.lddt_min_distance,
-                mol_type=features.get("mol_type"),
+    if cfg.alpha_smooth_lddt is not None:
+        l_lddt = smooth_lddt_loss(
+            denoised,
+            gt_pos,
+            atom_mask,
+            cutoffs=cfg.lddt_cutoffs,
+            inclusion_radius=cfg.lddt_inclusion_radius,
+            nucleotide_inclusion_radius=cfg.lddt_nucleotide_inclusion_radius,
+            min_distance=cfg.lddt_min_distance,
+            mol_type=features.get("mol_type"),
+        )
+        components["smooth_lddt"] = l_lddt.detach()
+        total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
+    else:
+        total = total + cfg.alpha_diffusion * l_mse
+
+    if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):
+        b_idx = features.get("bond_atom_indices")
+        b_gt = features.get("bond_gt_distances")
+        b_mask = features.get("bond_loss_mask")
+        if cfg.bond_include_symmetric:
+            b_idx, b_gt, b_mask = _augment_bond_indices_with_symmetric_pairs(
+                features, gt_pos, atom_mask, b_idx, b_gt, b_mask
             )
-            components["smooth_lddt"] = l_lddt.detach()
-            total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
+        l_bond = bond_loss(denoised, b_idx, b_gt, b_mask, noise_levels=noise_levels)
+        components["bond"] = l_bond.detach()
+        total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
+
+    if cfg.alpha_chirality > 0 and "chirality_target" in features:
+        l_chir = chirality_loss(
+            denoised,
+            features["frame_token_index"],
+            features["frame_atom_index"],
+            features["chirality_atom_idx"],
+            features["chirality_target"],
+        )
+        components["chirality"] = l_chir.detach()
+        total = total + cfg.alpha_chirality * l_chir
+        for k, v in chirality_violation_rates(
+            denoised,
+            features["frame_token_index"],
+            features["frame_atom_index"],
+            features["chirality_atom_idx"],
+            features["chirality_target"],
+            margin=cfg.chirality_margin,
+        ).items():
+            components[k] = v.detach()
+
+    if cfg.alpha_backbone_chirality > 0 and "mol_type" in features:
+        l_bbchir = backbone_chirality_loss(
+            denoised,
+            gt_pos,
+            atom_mask,
+            seq_mask,
+            features["asym_id"],
+            features["mol_type"],
+        )
+        components["backbone_chirality"] = l_bbchir.detach()
+        total = total + cfg.alpha_backbone_chirality * l_bbchir
+
+    if (
+        cfg.alpha_fape > 0
+        and "fape_atom_index" in features
+        and "fape_token_index" in features
+        and "fape_atom_mask" in features
+        and "frame_token_index" in features
+        and "frame_atom_index" in features
+    ):
+        seq_m = seq_mask
+        frm_m = features.get("frames_mask")
+        frm_m = frm_m.bool() if frm_m is not None else seq_m
+        pair_m = features.get("pair_mask")
+        if pair_m is None:
+            pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
         else:
-            total = total + cfg.alpha_diffusion * l_mse
-
-        if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):
-            b_idx = features.get("bond_atom_indices")
-            b_gt = features.get("bond_gt_distances")
-            b_mask = features.get("bond_loss_mask")
-            if cfg.bond_include_symmetric:
-                b_idx, b_gt, b_mask = _augment_bond_indices_with_symmetric_pairs(
-                    features, gt_pos, atom_mask, b_idx, b_gt, b_mask
-                )
-            l_bond = bond_loss(denoised, b_idx, b_gt, b_mask, noise_levels=noise_levels)
-            components["bond"] = l_bond.detach()
-            total = total + cfg.alpha_diffusion * cfg.alpha_bond * l_bond
-
-        if cfg.alpha_chirality > 0 and "chirality_target" in features:
-            l_chir = chirality_loss(
-                denoised,
-                features["frame_token_index"],
-                features["frame_atom_index"],
-                features["chirality_atom_idx"],
-                features["chirality_target"],
-            )
-            components["chirality"] = l_chir.detach()
-            total = total + cfg.alpha_chirality * l_chir
-            for k, v in chirality_violation_rates(
-                denoised,
-                features["frame_token_index"],
-                features["frame_atom_index"],
-                features["chirality_atom_idx"],
-                features["chirality_target"],
-                margin=cfg.chirality_margin,
-            ).items():
-                components[k] = v.detach()
-
-        if cfg.alpha_backbone_chirality > 0 and "mol_type" in features:
-            l_bbchir = backbone_chirality_loss(
+            pair_m = frm_m.unsqueeze(-1) & pair_m.bool()
+        if cfg.fape_atom_set.upper() == "ALL":
+            # AF2 §4.2.7 full: every atom slot is a point (the K-slot
+            # ``fape_*`` point indices are ignored); ``atom_mask`` gives
+            # presence. Frames still come from ``frame_*``.
+            l_fape = fape_loss(
                 denoised,
                 gt_pos,
-                atom_mask,
-                seq_mask,
-                features["asym_id"],
-                features["mol_type"],
+                None,
+                None,
+                None,
+                features["frame_atom_index"],
+                features["frame_token_index"],
+                frm_m,
+                seq_m,
+                pair_m,
+                clip_distance=cfg.fape_clip_distance,
+                normalize=cfg.fape_normalize,
+                atom_mask=atom_mask,
+                all_atom_points=True,
+                chunk_size=cfg.fape_chunk_size,
             )
-            components["backbone_chirality"] = l_bbchir.detach()
-            total = total + cfg.alpha_backbone_chirality * l_bbchir
-
-        if (
-            cfg.alpha_fape > 0
-            and "fape_atom_index" in features
-            and "fape_token_index" in features
-            and "fape_atom_mask" in features
-            and "frame_token_index" in features
-            and "frame_atom_index" in features
-        ):
-            seq_m = seq_mask
-            frm_m = features.get("frames_mask")
-            frm_m = frm_m.bool() if frm_m is not None else seq_m
-            pair_m = features.get("pair_mask")
-            if pair_m is None:
-                pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
-            else:
-                pair_m = frm_m.unsqueeze(-1) & pair_m.bool()
-            if cfg.fape_atom_set.upper() == "ALL":
-                # AF2 §4.2.7 full: every atom slot is a point (the K-slot
-                # ``fape_*`` point indices are ignored); ``atom_mask`` gives
-                # presence. Frames still come from ``frame_*``.
-                l_fape = fape_loss(
-                    denoised,
-                    gt_pos,
-                    None,
-                    None,
-                    None,
-                    features["frame_atom_index"],
-                    features["frame_token_index"],
-                    frm_m,
-                    seq_m,
-                    pair_m,
-                    clip_distance=cfg.fape_clip_distance,
-                    normalize=cfg.fape_normalize,
-                    atom_mask=atom_mask,
-                    all_atom_points=True,
-                    chunk_size=cfg.fape_chunk_size,
-                )
-            else:
-                fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
-                l_fape = fape_loss(
-                    denoised,
-                    gt_pos,
-                    features["fape_token_index"],
-                    features["fape_atom_index"],
-                    fape_mask_local,
-                    features["frame_atom_index"],
-                    features["frame_token_index"],
-                    frm_m,
-                    seq_m,
-                    pair_m,
-                    clip_distance=cfg.fape_clip_distance,
-                    normalize=cfg.fape_normalize,
-                    chunk_size=cfg.fape_chunk_size,
-                )
-            components["fape"] = l_fape.detach()
-            total = total + cfg.alpha_fape * l_fape
+        else:
+            fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
+            l_fape = fape_loss(
+                denoised,
+                gt_pos,
+                features["fape_token_index"],
+                features["fape_atom_index"],
+                fape_mask_local,
+                features["frame_atom_index"],
+                features["frame_token_index"],
+                frm_m,
+                seq_m,
+                pair_m,
+                clip_distance=cfg.fape_clip_distance,
+                normalize=cfg.fape_normalize,
+                chunk_size=cfg.fape_chunk_size,
+            )
+        components["fape"] = l_fape.detach()
+        total = total + cfg.alpha_fape * l_fape
 
     return total, components
 
@@ -2353,7 +2355,14 @@ def training_loss(
     if "__diffusion_logged__" in pred:
         losses.update(pred["__diffusion_logged__"])
         total = total + pred["__diffusion_total__"]
-    elif "denoised" in pred and cfg.alpha_diffusion > 0:
+    # NOT gated on ``alpha_diffusion`` — this block also carries FAPE and the
+    # chirality terms, which have their own independent weights. Nesting them
+    # under alpha_diffusion meant ``alpha_diffusion=0`` silently produced zero
+    # FAPE gradient despite ``alpha_fape > 0``, with no warning. The terms that
+    # AF3 *does* scale by alpha_diffusion (MSE, smooth-lDDT, bond) keep that
+    # factor below and simply contribute 0 when it is 0, which also keeps the
+    # grad-receiving parameter set identical for DDP static_graph.
+    elif "denoised" in pred:
         denoised = pred["denoised"]  # [S, N, M, 3]
         gt_aug = pred["gt_augmented"]  # [S, N, M, 3]
         noise_levels = pred["noise_levels"]  # [S]
