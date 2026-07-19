@@ -1269,6 +1269,21 @@ class PrecisionConfig:
 @dataclass
 class DataConfig:
     max_templates: int = 4
+    # Pad the template axis to ``max_templates`` instead of emitting the
+    # sampled count. AF3 draws ``k ~ min(Uniform[0, n], max_templates)`` per
+    # chain, so T varies 0..max_templates per sample and the O(N²) template
+    # stack costs a different amount on every rank — under DDP the step clock
+    # is then set by whichever rank drew the most templates (a rotating
+    # forward-straggler). Padding + a ``template_mask`` makes the per-step
+    # template cost constant with NO change in model output (pad slots are
+    # zeroed and excluded from the average denominator).
+    #
+    # This buys determinism, not throughput: at DDP world sizes the fleet
+    # already pays max-T on essentially every step, so padding raises each
+    # rank's own work to what it was already waiting for. Enable it to remove
+    # the last data-dependent source of per-rank compute variance (e.g. when
+    # attributing step-time spikes); leave it off to save the GPU-seconds.
+    pad_templates: bool = False
     max_neighborhood: int = 40
     # Cropping mixture weights (Protenix-style:
     # ContiguousCropping / SpatialCropping / SpatialInterfaceCropping).

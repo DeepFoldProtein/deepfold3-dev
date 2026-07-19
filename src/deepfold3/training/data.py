@@ -211,6 +211,9 @@ def build_dataloaders(
         # by forward_training (training + eval).
         msa_crop_size=model_cfg.msa_crop_size,
         n_msa_crops=(cfg.max_recycles + 1) if cfg.msa_precrop else 0,
+        # Fixed template axis — constant per-step template compute across
+        # ranks, at no change in model output. See ``DataConfig.pad_templates``.
+        pad_templates=model_cfg.data.pad_templates,
     )
 
     # Keys accepted by OF3Dataset (subset of ds_kwargs).
@@ -228,6 +231,10 @@ def build_dataloaders(
         "max_template_date",
         "msa_crop_size",
         "n_msa_crops",
+        # Must reach OF3Dataset too: a mixed df3/of3 batch with only one side
+        # padded loses the unpadded side's templates in collate (zero-filled
+        # ``template_mask``), and leaves T variable across ranks either way.
+        "pad_templates",
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 

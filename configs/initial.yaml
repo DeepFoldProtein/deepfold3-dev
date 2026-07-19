@@ -290,6 +290,10 @@ model:
     c_out: 32 # full DF3 MSA vocab (const.MSA_VOCAB_SIZE)
   data:
     max_templates: 4
+    # Fixed T == max_templates template axis (+ template_mask), so per-step
+    # template compute is constant across ranks instead of being set by
+    # whichever rank drew the most templates. Model output is unchanged.
+    pad_templates: true
     max_neighborhood: 40
     contiguous_crop_weight: 0.2
     spatial_crop_weight: 0.4

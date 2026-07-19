@@ -356,6 +356,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
         anchor_sampling: bool = False,
+        pad_templates: bool = False,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs.
@@ -386,8 +387,14 @@ class OF3Dataset(torch.utils.data.Dataset):
         )
         self.featurizer = Featurizer(
             max_msa_seqs=max_msa_seqs,
+            max_templates=max_templates,
             msa_crop_size=msa_crop_size,
             n_msa_crops=n_msa_crops,
+            # Must track ``TrainingDataset``: mixed df3/of3 batches would
+            # otherwise pair a padded sample (has ``template_mask``) with an
+            # unpadded one (no such key), and ``collate_fn`` zero-fills the
+            # missing key — masking the of3 sample's real templates away.
+            pad_templates=pad_templates,
         )
 
     def __len__(self) -> int:

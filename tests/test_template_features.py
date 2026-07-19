@@ -87,3 +87,99 @@ def test_per_chain_out_of_range_dropped():
     )
     assert out["template_aatype"][0].tolist()[:2] == [10, 11]
     assert out["template_pseudo_beta_mask"][0].tolist() == [True, True, False]
+
+
+def test_pad_templates_fixes_axis_and_marks_real_slots():
+    """``pad_templates`` yields a constant T with a real-vs-pad mask."""
+    kept = list(range(12))
+    for n_templates in (0, 1, 3):
+        per_chain = {0: [_make_template(12) for _ in range(n_templates)]}
+        out = Featurizer(max_templates=4, pad_templates=True)._build_template_features(
+            None, 12, _make_tokens(kept), per_chain, template_col_idx=np.array(kept)
+        )
+        for key, val in out.items():
+            if key != "template_mask":
+                assert val.shape[0] == 4, f"{key} not padded for n={n_templates}"
+        assert out["template_mask"].tolist() == [1.0] * n_templates + [0.0] * (4 - n_templates)
+        # Pad slots must read as empty, not as spurious structure.
+        assert not out["template_pseudo_beta_mask"][n_templates:].any()
+        assert not out["template_backbone_mask"][n_templates:].any()
+
+
+def test_pad_templates_matches_unpadded_output():
+    """Padding must not change the template embedding — bit-exact."""
+    import torch
+
+    from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
+    from deepfold3.model.template_embedding import TemplateEmbedding
+
+    torch.manual_seed(0)
+    cfg = TemplateEmbeddingConfig()
+    cfg.num_blocks = 1
+    mod = TemplateEmbedding(cfg, optim=OptimConfig()).eval().double()
+
+    n_tokens, n_real, t_max = 12, 2, 4
+    gen = torch.Generator().manual_seed(1)
+
+    def slots(t):
+        return {
+            "template_aatype": torch.randint(0, 21, (t, n_tokens), generator=gen),
+            "template_pseudo_beta": torch.randn(t, n_tokens, 3, generator=gen, dtype=torch.float64),
+            "template_pseudo_beta_mask": torch.ones(t, n_tokens, dtype=torch.float64),
+            "template_backbone_frame": torch.eye(3, dtype=torch.float64).expand(t, n_tokens, 3, 3).contiguous(),
+            "template_backbone_mask": torch.ones(t, n_tokens, dtype=torch.float64),
+            "template_ca": torch.randn(t, n_tokens, 3, generator=gen, dtype=torch.float64),
+        }
+
+    real = slots(n_real)
+    c_pair = mod.single_template_emb.query_norm.normalized_shape[0]
+    query_pair = torch.randn(n_tokens, n_tokens, c_pair, dtype=torch.float64)
+    pair_mask = torch.ones(n_tokens, n_tokens, dtype=torch.float64)
+
+    # Pad slots carry deliberate garbage: only ``template_mask`` may suppress them.
+    pad = t_max - n_real
+    junk = slots(pad)
+    junk["template_pseudo_beta_mask"] = torch.zeros(pad, n_tokens, dtype=torch.float64)
+    junk["template_backbone_mask"] = torch.zeros(pad, n_tokens, dtype=torch.float64)
+    padded = {k: torch.cat([real[k], junk[k]]) for k in real}
+
+    with torch.no_grad():
+        unpadded_out = mod(query_pair=query_pair, pair_mask=pair_mask, **real)
+        padded_out = mod(
+            query_pair=query_pair,
+            pair_mask=pair_mask,
+            template_mask=torch.tensor([1.0] * n_real + [0.0] * pad, dtype=torch.float64),
+            **padded,
+        )
+        # A fully padded sample must equal the legacy T=0 path.
+        empty_out = mod(query_pair=query_pair, pair_mask=pair_mask, **slots(0))
+        allpad_out = mod(
+            query_pair=query_pair,
+            pair_mask=pair_mask,
+            template_mask=torch.zeros(t_max, dtype=torch.float64),
+            **padded,
+        )
+
+    assert torch.equal(unpadded_out, padded_out)
+    assert torch.equal(empty_out, allpad_out)
+
+
+def test_pad_templates_reaches_every_dataset_class():
+    """A half-padded batch loses templates in collate — all classes must pad.
+
+    ``collate_fn`` zero-fills a key missing from some samples, so if one
+    dataset class emits ``template_mask`` and another does not, the unpadded
+    samples get an all-zero mask and their real templates are masked away.
+    """
+    import inspect
+
+    from deepfold3.data.module.dataset import TrainingDataset
+    from deepfold3.data.module.of3_dataset import OF3Dataset
+    from deepfold3.training.data import build_dataloaders  # noqa: F401 — import guard
+
+    for cls in (TrainingDataset, OF3Dataset):
+        assert "pad_templates" in inspect.signature(cls.__init__).parameters, cls.__name__
+
+    # OF3Dataset is fed through an explicit allow-list, not **kwargs.
+    src = inspect.getsource(inspect.getmodule(build_dataloaders))
+    assert '"pad_templates",' in src, "pad_templates missing from of3_kwarg_names"

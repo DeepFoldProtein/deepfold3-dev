@@ -43,10 +43,16 @@ class Featurizer:
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
         ccd_atom_order: dict[str, list[str]] | None = None,
+        pad_templates: bool = False,
     ):
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
         self.max_templates = max_templates
+        # Emit a fixed ``T == max_templates`` template axis plus a
+        # ``template_mask`` instead of the sampled count, so per-step template
+        # compute is constant across DDP ranks. Model output is unchanged.
+        # Rationale in ``DataConfig.pad_templates``; see ``_pad_template_axis``.
+        self.pad_templates = pad_templates
         # MSA pre-crop (training only). When ``n_msa_crops > 0`` the MSA output
         # is a FIXED [n_msa_crops * msa_crop_size, N] stack of pre-sampled crops
         # (CPU resample, mask-aware), one per recycle, so the GPU sees a
@@ -1307,9 +1313,12 @@ class Featurizer:
             template_pseudo_beta_mask  [T, N]         bool
             template_backbone_frame    [T, N, 3, 3]   float32
             template_backbone_mask     [T, N]         bool
+
+        With ``pad_templates`` the template axis is fixed at ``max_templates``
+        and an extra ``template_mask [T]`` marks real vs pad slots.
         """
         if not templates and not template_feats_per_chain:
-            return {
+            feats = {
                 "template_aatype": torch.zeros(0, N, dtype=torch.int64),
                 "template_ca": torch.zeros(0, N, 3),
                 "template_pseudo_beta": torch.zeros(0, N, 3),
@@ -1317,12 +1326,54 @@ class Featurizer:
                 "template_backbone_frame": torch.zeros(0, N, 3, 3),
                 "template_backbone_mask": torch.zeros(0, N, dtype=torch.bool),
             }
+        elif template_feats_per_chain and tokens is not None:
+            feats = self._build_per_chain_template_features(template_feats_per_chain, tokens, N, template_col_idx)
+        else:
+            # Single chain / flat list path (backward compatible)
+            feats = self._build_single_chain_template_features(templates, N)
 
-        if template_feats_per_chain and tokens is not None:
-            return self._build_per_chain_template_features(template_feats_per_chain, tokens, N, template_col_idx)
+        return self._pad_template_axis(feats) if self.pad_templates else feats
 
-        # Single chain / flat list path (backward compatible)
-        return self._build_single_chain_template_features(templates, N)
+    def _pad_template_axis(self, feats: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Pad the template axis to ``max_templates`` and emit ``template_mask``.
+
+        Pad slots are all-masked (``template_pseudo_beta_mask`` /
+        ``template_backbone_mask`` False, aatype = GAP) and carry
+        ``template_mask = 0``, which the template embedding uses to zero their
+        contribution and drop them from the average denominator. The model
+        output is therefore unchanged — only the tensor shape, and hence the
+        per-step compute, becomes constant.
+
+        Args:
+            feats: Template feature dict with a variable leading ``T`` axis.
+
+        Returns:
+            The same dict with ``T == max_templates`` plus ``template_mask``.
+        """
+        t_max = self.max_templates
+        t = feats["template_aatype"].shape[0]
+        # Guard the inference path, which may hand over more hits than
+        # ``max_templates``: the fixed axis is the contract, so truncate.
+        if t > t_max:
+            feats = {k: v[:t_max] for k, v in feats.items()}
+            t = t_max
+
+        mask = torch.zeros(t_max, dtype=torch.float32)
+        mask[:t] = 1.0
+        pad = t_max - t
+        if pad == 0:
+            return {**feats, "template_mask": mask}
+
+        # Trailing shape / dtype come from the tensor being extended, so a new
+        # template feature is padded correctly without touching this method.
+        # aatype pads with GAP (not ALA / zeros), matching the uncovered-position
+        # convention of the builders above; everything else is zero-filled.
+        padded = {}
+        for key, val in feats.items():
+            fill = const.MSA_GAP if key == "template_aatype" else 0
+            padded[key] = torch.cat([val, torch.full((pad, *val.shape[1:]), fill, dtype=val.dtype)])
+        padded["template_mask"] = mask
+        return padded
 
     def _build_single_chain_template_features(
         self,

@@ -205,6 +205,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
         monomer_template_struct_space: bool = False,
+        pad_templates: bool = False,
     ):
         self.records = records
         # Dataset label used to disambiguate record ids in NaN-skip logs
@@ -290,10 +291,14 @@ class TrainingDataset(torch.utils.data.Dataset):
                     logger.warning("Failed to load %s; ligand symmetry disabled", sidecar)
         self.featurizer = Featurizer(
             max_msa_seqs=max_msa_seqs,
+            # Forwarded so the padded template axis matches the dataset's own
+            # sampling cap (the Featurizer default would silently disagree).
+            max_templates=max_templates,
             ligand_perm_cache=ligand_perm_cache,
             msa_crop_size=msa_crop_size,
             n_msa_crops=n_msa_crops,
             ccd_atom_order=ccd_atom_order,
+            pad_templates=pad_templates,
         )
         # Mask/template availability is checked lazily per record at __getitem__
         # time. Pre-scanning would walk hundreds of thousands of files per worker

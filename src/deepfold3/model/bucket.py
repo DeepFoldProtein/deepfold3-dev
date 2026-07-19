@@ -110,6 +110,8 @@ PAD_PASSTHROUGH_KEYS = {
     "atom_swap_pairs",
     "ligand_swap_pairs",
     "ligand_perms",
+    # Real-vs-pad template slot mask (size = max_templates, no N axis)
+    "template_mask",
     # Per-sample scalars / metadata
     "resolution",
     "is_distillation",

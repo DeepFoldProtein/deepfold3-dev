@@ -318,6 +318,11 @@ class DeepFold3(nn.Module):
             # legacy cached features → embedding falls back to pseudo-beta.
             if "template_ca" in features:
                 template_kwargs["template_ca"] = features["template_ca"].float()
+            # Real-vs-pad slot mask, present only when the featurizer padded the
+            # template axis to a fixed ``max_templates``. Absent ⇒ every slot
+            # is real (legacy variable-T path).
+            if "template_mask" in features:
+                template_kwargs["template_mask"] = features["template_mask"].float()
 
         # Bond matrix: polymer-ligand and ligand-ligand covalent bonds [..., N, N, 1]
         bond_matrix = features.get("bond_matrix")
