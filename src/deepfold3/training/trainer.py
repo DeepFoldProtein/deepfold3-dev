@@ -1225,10 +1225,10 @@ class Trainer:
         # (the rank-0 write gate is inside the manager).
         if not shutdown.requested:
             self._save_checkpoint(output_dir / "checkpoint_final.pt")
-        # Staged checkpoints publish on a background thread; drain it before
-        # teardown so the last one reaches shared storage (and any failure is
+        # The final checkpoint's fsync / publish runs on a background thread;
+        # drain it before teardown so it reaches storage (and any failure is
         # raised here rather than lost on exit).
-        self.ckpt_manager.wait_for_publish()
+        self.ckpt_manager.wait_for_io()
         if self.dist.is_main:
             logger.info(
                 f"Training {'interrupted' if shutdown.requested else 'complete'} at step {self.state.effective_step}"

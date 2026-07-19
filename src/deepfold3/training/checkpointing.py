@@ -38,6 +38,24 @@ from deepfold3.training.state import TrainState
 logger = logging.getLogger(__name__)
 
 
+def _evict_after_read(path: str | Path) -> None:
+    """Drop a just-read checkpoint from the page cache.
+
+    A checkpoint is read once per process and never again, but every rank on a
+    node reads its own copy — 8× the blob size of cache per node, at the moment
+    the trainer is about to fork dataloader workers. The pages are already
+    clean after a read, so no ``fsync`` is needed here.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        drop_from_page_cache(fd)
+    finally:
+        os.close(fd)
+
+
 def load_pretrained_weights(
     model: nn.Module,
     path: str | Path,
@@ -56,10 +74,12 @@ def load_pretrained_weights(
         from safetensors.torch import load_file
 
         state = load_file(str(p), device=str(device))
+        _evict_after_read(p)
         model.load_state_dict(state, strict=strict)
         rank_zero_info(f"Loaded pretrained weights from {p}")
     elif p.suffix == ".pt":
         ckpt = torch.load(str(p), map_location=device, weights_only=False)
+        _evict_after_read(p)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         model.load_state_dict(state, strict=strict)
         rank_zero_info(f"Loaded pretrained weights from {p}")
@@ -149,22 +169,41 @@ class CheckpointManager:
         self.strict = strict
         self.device = device
         self.staging_dir = Path(staging_dir) if staging_dir else None
-        # ``max_workers=1`` is the no-overlap guarantee: a second save queues
-        # behind the first instead of racing it for staging disk.
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish") if self.staging_dir else None
-        self._publish_future: Future | None = None
+        # ``max_workers=1`` is the no-overlap guarantee: a second save's I/O
+        # queues behind the first instead of racing it for staging disk.
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-io")
+        self._io_future: Future | None = None
 
-    # ----- staged write helpers -----
+    # ----- post-write I/O, off the training thread -----
 
-    def wait_for_publish(self) -> None:
-        """Block until any in-flight background publish has finished.
+    def wait_for_io(self) -> None:
+        """Block until this save's background file I/O has finished.
 
         Called before the next save and at shutdown, so the process never
         exits mid-publish. Re-raises a background failure on the caller.
         """
-        if self._publish_future is not None:
-            pending, self._publish_future = self._publish_future, None
+        if self._io_future is not None:
+            pending, self._io_future = self._io_future, None
             pending.result()
+
+    @staticmethod
+    def _flush_and_evict(path: Path) -> None:
+        """Force the checkpoint to storage, then drop it from the page cache.
+
+        Nothing on this node reads a checkpoint again, so those pages are pure
+        cgroup pressure — several GB of it per save, on rank 0's node only,
+        which is the shape of a single-node stall.
+
+        Both halves have to happen here rather than inline after
+        ``torch.save``. ``DONTNEED`` only drops *clean* pages, so it needs the
+        ``fsync`` first; and an inline ``fsync`` would serialize the multi-GB
+        shared-storage write into the training step while every other rank
+        waits at the next collective. By the time this runs the blob is fully
+        written, so the thread needs only the path — no race with training.
+        """
+        with open(path, "rb") as f:
+            os.fsync(f.fileno())
+            drop_from_page_cache(f.fileno())
 
     def _publish(self, staged: Path, final: Path) -> None:
         """Copy ``staged`` → ``final``, then rotate. Runs off the training thread.
@@ -176,10 +215,7 @@ class CheckpointManager:
         """
         tmp = final.with_suffix(final.suffix + ".tmp")
         shutil.copyfile(staged, tmp)
-        with open(tmp, "rb") as f:
-            os.fsync(f.fileno())
-            # Nothing on this node reads the published copy again.
-            drop_from_page_cache(f.fileno())
+        self._flush_and_evict(tmp)
         os.replace(tmp, final)
         # Releases the staged pages too, so no DONTNEED is needed on the source.
         staged.unlink(missing_ok=True)
@@ -222,7 +258,7 @@ class CheckpointManager:
         if not dist_info.is_main:
             return
 
-        self.wait_for_publish()
+        self.wait_for_io()
 
         # With a staging dir the blocking write goes to node-local disk and the
         # much slower shared-storage write moves to a background thread. Every
@@ -272,9 +308,10 @@ class CheckpointManager:
         # go back to ``y`` before the (slow) publish starts.
         if write_path != path:
             logger.info(f"Staged checkpoint to {write_path}; publishing to {path} in background")
-            self._publish_future = self._pool.submit(self._publish, write_path, path)
+            self._io_future = self._pool.submit(self._publish, write_path, path)
         else:
             logger.info(f"Saved checkpoint to {path}")
+            self._io_future = self._pool.submit(self._flush_and_evict, path)
             if self.max_checkpoints > 0:
                 self._rotate(path.parent)
 
@@ -331,6 +368,7 @@ class CheckpointManager:
         Each missing-key fallback logs a rank-zero warning.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        _evict_after_read(path)
 
         state_dict = ckpt["model"]
         if any(k.startswith("module.") for k in state_dict):

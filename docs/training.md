@@ -533,7 +533,12 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 **Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
 
-**Staged writes** (`checkpoint_staging_dir`, default `""`): the blob is multiple GB and rank 0 writes it from the training thread, so every other rank sits in the next collective until it lands. Pointing `checkpoint_staging_dir` at node-local disk makes the blocking write local and moves the shared-storage copy to a single background thread (`CheckpointManager._publish`: `copyfile` → `fsync` → `fadvise(DONTNEED)` → atomic `os.replace`, then rotation). At most one publish is in flight; `wait_for_publish` drains it before the next save and at shutdown. Do **not** point this at a memory-backed mount (`/dev/shm`) — that charges the checkpoint to the memory cgroup, which is the pressure staging exists to relieve.
+**Post-write I/O** runs on a single background thread (`max_workers=1`), drained by `wait_for_io` before the next save and at shutdown:
+
+- **Always**: `_flush_and_evict` — `fsync` then `fadvise(DONTNEED)`. Nothing on the node reads a checkpoint again, so several GB per save is pure cgroup pressure, and it lands on rank 0's node only — the shape of a single-node stall. Both halves must be off the training thread: `DONTNEED` only drops *clean* pages so it needs the `fsync` first, and an inline `fsync` would serialize the multi-GB shared-storage write into the step while every other rank waits at the next collective. Once `torch.save` returns the blob is complete, so the thread needs only the path.
+- **With `checkpoint_staging_dir`** (default `""`): the blocking write goes to node-local disk instead, and `_publish` moves the shared-storage copy to the same thread (`copyfile` → flush/evict → atomic `os.replace` → rotation). Do **not** point this at a memory-backed mount (`/dev/shm`) — that charges the checkpoint to the memory cgroup, which is the pressure staging exists to relieve.
+
+The read side is symmetric: `_evict_after_read` drops the blob after `torch.load` / `load_file`. Every rank on a node reads its own copy on resume (8× the blob size per node), immediately before the trainer forks dataloader workers.
 
 **Fused kernel portability**: `DeepFold3.state_dict()` automatically filters out derived fused kernel parameters (identified by `OptimConfig.FUSED_STATE_DICT_MARKERS`). On load, `load_state_dict()` re-syncs fused params from base weights. This means checkpoints saved with fused kernels enabled can be loaded without them, and vice versa.
 
