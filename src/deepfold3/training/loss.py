@@ -2179,6 +2179,12 @@ def diffusion_only_loss(
         seq_m = seq_mask
         frm_m = features.get("frames_mask")
         frm_m = frm_m.bool() if frm_m is not None else seq_m
+        # ``frames_mask`` is CCD-derived (``ref_mask``), so it stays True when a
+        # backbone frame atom is unresolved in the GT — Gram-Schmidt would then
+        # build the frame from a zero-filled coordinate and inject a bogus
+        # gradient. Gate on the chain-permuted GT mask. Mirrors ``training_loss``.
+        frm_gt = atom_mask.bool()[features["frame_token_index"], features["frame_atom_index"]].all(dim=-1)
+        frm_m = frm_m & frm_gt
         pair_m = features.get("pair_mask")
         if pair_m is None:
             pair_m = frm_m.unsqueeze(-1) & seq_m.unsqueeze(-2)
@@ -2207,6 +2213,11 @@ def diffusion_only_loss(
             )
         else:
             fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
+            # K-slot point mask is ``ref_mask``-derived — gate on GT presence too
+            # (``all_atom_points`` above already uses the GT ``atom_mask``).
+            fape_mask_local = (
+                fape_mask_local & atom_mask.bool()[features["fape_token_index"], features["fape_atom_index"]]
+            )
             l_fape = fape_loss(
                 denoised,
                 gt_pos,
@@ -2315,6 +2326,29 @@ def training_loss(
     else:
         loss_atom_mask = atom_mask
         loss_seq_mask = gt_seq_mask
+
+    # --- GT-presence gate for the rigid-frame atoms (a, b, c) ---
+    # ``frames_mask`` / ``fape_atom_mask`` from the featurizer are CCD-derived
+    # (``ref_mask`` = the reference conformer's atom set), so they stay True for
+    # a token whose backbone N/CA/C — or whose FAPE point atom — is *unresolved
+    # in the GT*. ``atom_gt_positions`` is zero-filled there, so Gram-Schmidt
+    # would build the frame from a (0, 0, 0) coordinate and poison the PAE
+    # target, the tm_true diagnostic and (worse, since it carries gradient) the
+    # FAPE loss for every j scored against that frame. The 25° co-linearity
+    # filter does not catch it: an origin-substituted atom yields an arbitrary,
+    # usually well-conditioned angle.
+    #
+    # Same idea as ``rep_present`` below, which already gates the rep-atom
+    # coordinate losses. Uses the chain-permuted ``atom_mask`` so the lookup
+    # lines up with the permuted ``gt_pos``.
+    frame_tok_gate = features.get("frame_token_index")
+    frame_atom_gate = features.get("frame_atom_index")
+    frames_gt_present: torch.Tensor | None = None
+    if frame_atom_gate is not None:
+        if frame_tok_gate is None:
+            n_tok = seq_mask.shape[0]
+            frame_tok_gate = torch.arange(n_tok, device=gt_pos.device).unsqueeze(-1).expand(n_tok, 3)
+        frames_gt_present = atom_mask[frame_tok_gate, frame_atom_gate].all(dim=-1)  # [N]
 
     # --- Single/pair-representation magnitude regularization ---
     # ``alpha_{single,pair}_reg is None`` disables entirely; 0.0 is
@@ -2506,6 +2540,8 @@ def training_loss(
         ):
             frm_m_feat = features.get("frames_mask")
             frm_m = frm_m_feat.bool() if frm_m_feat is not None else loss_seq_mask
+            if frames_gt_present is not None:
+                frm_m = frm_m & frames_gt_present  # drop frames built on unresolved GT atoms
             pair_m_feat = features.get("pair_mask")
             if pair_m_feat is None:
                 pair_m = frm_m.unsqueeze(-1) & loss_seq_mask.unsqueeze(-2)
@@ -2534,6 +2570,13 @@ def training_loss(
                 )
             else:
                 fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
+                # Same CCD-vs-GT gap as ``frames_gt_present``: the K-slot point
+                # mask is ``ref_mask``-derived, so an unresolved CB / carbonyl O
+                # would be projected from (0, 0, 0). ``all_atom_points`` mode is
+                # already GT-gated (it uses ``loss_atom_mask`` as the point set).
+                fape_mask_local = (
+                    fape_mask_local & loss_atom_mask.bool()[features["fape_token_index"], features["fape_atom_index"]]
+                )
                 l_fape = fape_loss(
                     denoised,
                     gt_pos,
@@ -2674,7 +2717,10 @@ def training_loss(
             # PDE losses) so materialized unresolved residues (item 4b, whose rep
             # atom is (0,0,0)) don't leak into the tm_true / itm_true diagnostic.
             pair_mask_for_tm = pair_mask_for_tm.bool() & rep_present.unsqueeze(0) & rep_present.unsqueeze(1)
-            pae_mask_for_tm = (frames_mask_feat.bool().unsqueeze(-1) & pair_mask_for_tm.bool()).float()
+            frames_mask_tm = frames_mask_feat.bool()
+            if frames_gt_present is not None:
+                frames_mask_tm = frames_mask_tm & frames_gt_present
+            pae_mask_for_tm = (frames_mask_tm.unsqueeze(-1) & pair_mask_for_tm.bool()).float()
             mask_s_tm = (
                 pae_mask_for_tm.unsqueeze(0)
                 * pred_angle_ok_tm.float().unsqueeze(-1)
@@ -2760,6 +2806,13 @@ def training_loss(
                 if ref_mask is None:
                     ref_mask = loss_atom_mask  # fall back to GT mask if ref_mask absent
                 else:
+                    # Drop tokens the chain permutation left without a GT
+                    # counterpart. ``ref_mask`` is CCD-derived and carries no
+                    # chain-perm information, while the *target* (``loss_atom_mask``)
+                    # is zeroed there by ``& c_keep`` — leaving them in the
+                    # denominator would train the head to answer "unresolved" for
+                    # every atom of an unmatched pred chain.
+                    ref_mask = ref_mask & gt_seq_mask.unsqueeze(-1)
                     # Apply ligand-loss exclusion to the supervision domain
                     # (ref_mask) as well, otherwise excluded ligand atoms still
                     # enter the reduction denominator.
@@ -2803,7 +2856,12 @@ def training_loss(
                     # Drop pairs whose frame/target token has an unresolved GT rep
                     # atom — the aligned error uses gt_rep (see rep_seq_mask).
                     pair_mask_feat = pair_mask_feat.bool() & rep_present.unsqueeze(0) & rep_present.unsqueeze(1)
-                    pae_mask = (frames_mask.bool().unsqueeze(-1) & pair_mask_feat.bool()).float()
+                    # Drop frames whose (a, b, c) atoms are unresolved in the GT —
+                    # ``frames_mask`` alone is CCD-derived (see frames_gt_present).
+                    frames_mask_pae = frames_mask.bool()
+                    if frames_gt_present is not None:
+                        frames_mask_pae = frames_mask_pae & frames_gt_present
+                    pae_mask = (frames_mask_pae.unsqueeze(-1) & pair_mask_feat.bool()).float()
 
                     if "pae_features" in pred:
                         from deepfold3.training.fused_loss import pae_loss_fused

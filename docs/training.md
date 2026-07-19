@@ -134,10 +134,32 @@ not majority, is required**. The K samples live under `pred["chain_perm_gate_pos
 | Masked MSA      | `alpha_masked_msa` (0)             | BERT-style MSA reconstruction CE over corrupted entries. Requires `ModelConfig.masked_msa.enabled`. Single-query MSA cross-attention head at the end of the MSA module; trains the MSA stack + single track. All samples incl. distillation. |
 | pLDDT           | `alpha_confidence` (1e-4)          | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å. AF3 §4.3.1: j-axis restricted to representative atoms (CA / C1') of standard polymer tokens, with inclusion radius 15 Å for protein-rep j and 30 Å for nucleic-rep j; ligand j atoms drop. |
 | PDE             | `alpha_confidence` (1e-4)          | Predicted distance error cross-entropy                                                                                                                                         |
-| exp_resolved    | `alpha_confidence` (1e-4)          | Binary resolved/unresolved classification                                                                                                                                      |
+| exp_resolved    | `alpha_confidence` (1e-4)          | Binary resolved/unresolved classification. Supervision domain is `ref_mask` (canonical heavy-atom slots) AND-gated on `gt_seq_mask`, so tokens the chain permutation left unmatched leave the denominator instead of being taught "unresolved". |
 | PAE             | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1). Frames whose ∠(a, b, c) lies within 25° of co-linearity are dropped per-sample on both pred and GT. |
 | Single-repr reg | `alpha_single_reg` (0)             | Magnitude regularizer on trunk single output: mean per-token Σ_c &#124;s&#124;^p / C. Observation-only at α=0.                                                                 |
 | Pair-repr reg   | `alpha_pair_reg` (1e-4)            | Same form on pair output. Controls DistogramHead logit magnitude; prevents late-trajectory distogram destabilization (see [regularization-story.md](regularization-story.md)). |
+
+#### GT-presence gating of geometric masks
+
+The featurizer's `frames_mask`, `fape_atom_mask` and `rep_atom_present` all derive from
+`ref_mask` — the **CCD reference conformer's** atom set — not from `atom_gt_mask` (what the
+experimental structure actually resolved). `atom_gt_positions` is zero-filled at unresolved
+slots, so any loss that dereferences a CCD-present-but-GT-missing atom silently reads
+`(0, 0, 0)`. The 25° co-linearity filter does not catch this: an origin-substituted atom
+yields an arbitrary, usually well-conditioned angle.
+
+`training_loss` / `diffusion_only_loss` therefore re-derive presence from the
+**chain-permuted** `atom_gt_mask` before use:
+
+| Gate                 | Covers                                     | Consumers                          |
+| -------------------- | ------------------------------------------ | ---------------------------------- |
+| `rep_present`        | the rep atom (CB / C4 / C2 / CA)            | distogram, PDE, PAE, `tm_true`     |
+| `frames_gt_present`  | all three frame atoms (a, b, c)             | PAE, FAPE frames, `tm_true`        |
+| point-mask AND       | each FAPE K-slot point atom                 | FAPE point set                     |
+
+Because these gates read the permuted mask (`& c_keep`), they also drop tokens the chain
+permutation left without a GT counterpart — otherwise FAPE would score them against another
+chain's coordinates.
 
 #### Diagnostic metrics (logged, not in total)
 

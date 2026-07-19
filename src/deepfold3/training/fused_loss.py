@@ -193,6 +193,7 @@ def distogram_loss_fused(
     breaks = torch.linspace(first_break, last_break, num_bins - 1, device=dist.device)
     target = torch.bucketize(dist, breaks)
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # drop trivial i==i self-pairs (distance 0 -> bin 0)
 
     return chunked_linear_cross_entropy(
         features,
@@ -224,6 +225,7 @@ def distogram_entropy_fused(
     S, N, _, H = features.shape
 
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # mirror distogram_loss_fused so CE - H = KL stays exact
     pair_mask = pair_mask.unsqueeze(0).expand(S, -1, -1)  # [S, N, N]
     n_valid = pair_mask.sum().clamp(min=1)
 
@@ -329,6 +331,7 @@ def pde_loss_fused(
         token_mask: Valid token mask ``[N]``.
     """
     pair_mask = (token_mask.unsqueeze(1) & token_mask.unsqueeze(0)).float()
+    pair_mask.fill_diagonal_(0.0)  # drop trivial i==i self-pairs (error 0 -> bin 0)
     gt_dist = torch.cdist(gt_pos, gt_pos)
     pred_dist = torch.cdist(pred_pos, pred_pos)
     error = (pred_dist - gt_dist.unsqueeze(0)).abs()
