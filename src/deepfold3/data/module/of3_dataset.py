@@ -390,10 +390,11 @@ class OF3Dataset(torch.utils.data.Dataset):
             max_templates=max_templates,
             msa_crop_size=msa_crop_size,
             n_msa_crops=n_msa_crops,
-            # Must track ``TrainingDataset``: mixed df3/of3 batches would
-            # otherwise pair a padded sample (has ``template_mask``) with an
-            # unpadded one (no such key), and ``collate_fn`` zero-fills the
-            # missing key — masking the of3 sample's real templates away.
+            # Must track ``TrainingDataset``: of3 and df3 samples share one
+            # DataLoader, so padding only one of them leaves T varying across
+            # ranks and the straggler this is meant to remove survives.
+            # (Correctness does not depend on the two agreeing — the
+            # ``template_mask`` is emitted either way.)
             pad_templates=pad_templates,
         )
 

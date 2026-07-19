@@ -48,10 +48,12 @@ class Featurizer:
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
         self.max_templates = max_templates
-        # Emit a fixed ``T == max_templates`` template axis plus a
-        # ``template_mask`` instead of the sampled count, so per-step template
-        # compute is constant across DDP ranks. Model output is unchanged.
-        # Rationale in ``DataConfig.pad_templates``; see ``_pad_template_axis``.
+        # Emit a fixed ``T == max_templates`` template axis instead of the
+        # sampled count, so per-step template compute is constant across DDP
+        # ranks. Model output is unchanged. Note ``template_mask`` is emitted
+        # either way — see ``_finalize_template_axis``, which explains why the
+        # mask (not this flag) is what keeps the average correct.
+        # Rationale for the flag itself in ``DataConfig.pad_templates``.
         self.pad_templates = pad_templates
         # MSA pre-crop (training only). When ``n_msa_crops > 0`` the MSA output
         # is a FIXED [n_msa_crops * msa_crop_size, N] stack of pre-sampled crops
@@ -1332,48 +1334,64 @@ class Featurizer:
             # Single chain / flat list path (backward compatible)
             feats = self._build_single_chain_template_features(templates, N)
 
-        return self._pad_template_axis(feats) if self.pad_templates else feats
+        return self._finalize_template_axis(feats)
 
-    def _pad_template_axis(self, feats: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Pad the template axis to ``max_templates`` and emit ``template_mask``.
+    def _finalize_template_axis(self, feats: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Attach ``template_mask``, and with ``pad_templates`` fix ``T``.
 
+        ``template_mask`` is emitted **unconditionally** — 1.0 for a real
+        template slot, 0.0 for a pad slot — because it is what makes the
+        template average correct per sample rather than per batch:
+
+        * ``collate_fn`` pads every feature's ``T`` axis up to the batch
+          maximum with zeros, so a sample that drew 2 templates next to one
+          that drew 4 ends up with 2 empty slots. Without a mask the average
+          divides by the *padded* ``T`` and that sample's templates are
+          diluted 2/4. The mask is zero-padded by the very same collate step,
+          so its sum stays the real count.
+        * Emitting it always also keeps the feature contract identical across
+          dataset classes. A key present in only some samples is zero-filled
+          by ``collate_fn``, which for a mask means "all slots are pad" —
+          silently erasing that sample's templates.
+
+        With ``pad_templates`` the axis is additionally padded out to
+        ``max_templates`` so every rank's template compute is the same size.
         Pad slots are all-masked (``template_pseudo_beta_mask`` /
-        ``template_backbone_mask`` False, aatype = GAP) and carry
-        ``template_mask = 0``, which the template embedding uses to zero their
-        contribution and drop them from the average denominator. The model
-        output is therefore unchanged — only the tensor shape, and hence the
-        per-step compute, becomes constant.
+        ``template_backbone_mask`` False, aatype = GAP), so the only thing
+        that changes is the shape — never the model output.
 
         Args:
             feats: Template feature dict with a variable leading ``T`` axis.
 
         Returns:
-            The same dict with ``T == max_templates`` plus ``template_mask``.
+            The same dict plus ``template_mask``, with ``T == max_templates``
+            when ``pad_templates`` is set.
         """
-        t_max = self.max_templates
         t = feats["template_aatype"].shape[0]
+        t_max = self.max_templates
         # Guard the inference path, which may hand over more hits than
         # ``max_templates``: the fixed axis is the contract, so truncate.
-        if t > t_max:
+        if self.pad_templates and t > t_max:
             feats = {k: v[:t_max] for k, v in feats.items()}
             t = t_max
 
-        mask = torch.zeros(t_max, dtype=torch.float32)
+        out_t = t_max if self.pad_templates else t
+        mask = torch.zeros(out_t, dtype=torch.float32)
         mask[:t] = 1.0
-        pad = t_max - t
-        if pad == 0:
-            return {**feats, "template_mask": mask}
 
-        # Trailing shape / dtype come from the tensor being extended, so a new
-        # template feature is padded correctly without touching this method.
-        # aatype pads with GAP (not ALA / zeros), matching the uncovered-position
-        # convention of the builders above; everything else is zero-filled.
-        padded = {}
-        for key, val in feats.items():
-            fill = const.MSA_GAP if key == "template_aatype" else 0
-            padded[key] = torch.cat([val, torch.full((pad, *val.shape[1:]), fill, dtype=val.dtype)])
-        padded["template_mask"] = mask
-        return padded
+        pad = out_t - t
+        if pad > 0:
+            # Trailing shape / dtype come from the tensor being extended, so a
+            # new template feature is padded correctly without touching this
+            # method. aatype pads with GAP (not ALA / zeros), matching the
+            # uncovered-position convention of the builders above.
+            padded = {}
+            for key, val in feats.items():
+                fill = const.MSA_GAP if key == "template_aatype" else 0
+                padded[key] = torch.cat([val, torch.full((pad, *val.shape[1:]), fill, dtype=val.dtype)])
+            feats = padded
+
+        return {**feats, "template_mask": mask}
 
     def _build_single_chain_template_features(
         self,

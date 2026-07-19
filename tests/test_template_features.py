@@ -89,47 +89,77 @@ def test_per_chain_out_of_range_dropped():
     assert out["template_pseudo_beta_mask"][0].tolist() == [True, True, False]
 
 
-def test_pad_templates_fixes_axis_and_marks_real_slots():
+def _build_templates(n_templates: int, *, pad: bool, n_tokens: int = 12):
+    kept = list(range(n_tokens))
+    per_chain = {0: [_make_template(n_tokens) for _ in range(n_templates)]}
+    return Featurizer(max_templates=4, pad_templates=pad)._build_template_features(
+        None, n_tokens, _make_tokens(kept), per_chain, template_col_idx=np.array(kept)
+    )
+
+
+@pytest.mark.parametrize("n_templates", [0, 1, 3, 4])
+def test_template_mask_always_emitted(n_templates):
+    """The mask is part of the contract, padded or not.
+
+    A key present in only some samples is zero-filled by ``collate_fn`` —
+    for a mask that reads as "every slot is pad", silently erasing that
+    sample's templates. Emitting it unconditionally makes that impossible.
+    """
+    out = _build_templates(n_templates, pad=False)
+    assert out["template_mask"].tolist() == [1.0] * n_templates
+    assert out["template_aatype"].shape[0] == n_templates  # unpadded: T is the real count
+
+
+@pytest.mark.parametrize("n_templates", [0, 1, 3, 4])
+def test_pad_templates_fixes_axis_and_marks_real_slots(n_templates):
     """``pad_templates`` yields a constant T with a real-vs-pad mask."""
-    kept = list(range(12))
-    for n_templates in (0, 1, 3):
-        per_chain = {0: [_make_template(12) for _ in range(n_templates)]}
-        out = Featurizer(max_templates=4, pad_templates=True)._build_template_features(
-            None, 12, _make_tokens(kept), per_chain, template_col_idx=np.array(kept)
-        )
-        for key, val in out.items():
-            if key != "template_mask":
-                assert val.shape[0] == 4, f"{key} not padded for n={n_templates}"
-        assert out["template_mask"].tolist() == [1.0] * n_templates + [0.0] * (4 - n_templates)
-        # Pad slots must read as empty, not as spurious structure.
-        assert not out["template_pseudo_beta_mask"][n_templates:].any()
-        assert not out["template_backbone_mask"][n_templates:].any()
+    out = _build_templates(n_templates, pad=True)
+    for key, val in out.items():
+        if key != "template_mask":
+            assert val.shape[0] == 4, f"{key} not padded for n={n_templates}"
+    assert out["template_mask"].tolist() == [1.0] * n_templates + [0.0] * (4 - n_templates)
+    # Pad slots must read as empty, not as spurious structure.
+    assert not out["template_pseudo_beta_mask"][n_templates:].any()
+    assert not out["template_backbone_mask"][n_templates:].any()
+
+
+def _template_embedding(seed: int = 0):
+    """A minimal double-precision TemplateEmbedding for exactness checks."""
+    import torch
+
+    from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
+    from deepfold3.model.template_embedding import TemplateEmbedding
+
+    torch.manual_seed(seed)
+    cfg = TemplateEmbeddingConfig()
+    cfg.num_blocks = 1
+    return TemplateEmbedding(cfg, optim=OptimConfig()).eval().double()
+
+
+def _template_slots(n_slots: int, n_tokens: int, gen):
+    """``n_slots`` populated template slots in the embedding's input layout."""
+    import torch
+
+    return {
+        "template_aatype": torch.randint(0, 21, (n_slots, n_tokens), generator=gen),
+        "template_pseudo_beta": torch.randn(n_slots, n_tokens, 3, generator=gen, dtype=torch.float64),
+        "template_pseudo_beta_mask": torch.ones(n_slots, n_tokens, dtype=torch.float64),
+        "template_backbone_frame": torch.eye(3, dtype=torch.float64).expand(n_slots, n_tokens, 3, 3).contiguous(),
+        "template_backbone_mask": torch.ones(n_slots, n_tokens, dtype=torch.float64),
+        "template_ca": torch.randn(n_slots, n_tokens, 3, generator=gen, dtype=torch.float64),
+    }
 
 
 def test_pad_templates_matches_unpadded_output():
     """Padding must not change the template embedding — bit-exact."""
     import torch
 
-    from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
-    from deepfold3.model.template_embedding import TemplateEmbedding
-
-    torch.manual_seed(0)
-    cfg = TemplateEmbeddingConfig()
-    cfg.num_blocks = 1
-    mod = TemplateEmbedding(cfg, optim=OptimConfig()).eval().double()
-
+    mod = _template_embedding()
     n_tokens, n_real, t_max = 12, 2, 4
     gen = torch.Generator().manual_seed(1)
 
     def slots(t):
-        return {
-            "template_aatype": torch.randint(0, 21, (t, n_tokens), generator=gen),
-            "template_pseudo_beta": torch.randn(t, n_tokens, 3, generator=gen, dtype=torch.float64),
-            "template_pseudo_beta_mask": torch.ones(t, n_tokens, dtype=torch.float64),
-            "template_backbone_frame": torch.eye(3, dtype=torch.float64).expand(t, n_tokens, 3, 3).contiguous(),
-            "template_backbone_mask": torch.ones(t, n_tokens, dtype=torch.float64),
-            "template_ca": torch.randn(t, n_tokens, 3, generator=gen, dtype=torch.float64),
-        }
+        return _template_slots(t, n_tokens, gen)
 
     real = slots(n_real)
     c_pair = mod.single_template_emb.query_norm.normalized_shape[0]
@@ -165,11 +195,12 @@ def test_pad_templates_matches_unpadded_output():
 
 
 def test_pad_templates_reaches_every_dataset_class():
-    """A half-padded batch loses templates in collate — all classes must pad.
+    """Every dataset class must honour the flag, or T still varies by rank.
 
-    ``collate_fn`` zero-fills a key missing from some samples, so if one
-    dataset class emits ``template_mask`` and another does not, the unpadded
-    samples get an all-zero mask and their real templates are masked away.
+    of3 and df3 samples share one DataLoader, so padding only one of them
+    leaves the template axis variable across ranks and the forward-straggler
+    this flag exists to remove survives. Correctness does not depend on the
+    two agreeing — ``template_mask`` is emitted either way.
     """
     import inspect
 
@@ -183,3 +214,44 @@ def test_pad_templates_reaches_every_dataset_class():
     # OF3Dataset is fed through an explicit allow-list, not **kwargs.
     src = inspect.getsource(inspect.getmodule(build_dataloaders))
     assert '"pad_templates",' in src, "pad_templates missing from of3_kwarg_names"
+
+
+def test_collate_t_padding_does_not_dilute_templates():
+    """A sample's template average must not depend on its batch-mates.
+
+    ``collate_fn`` pads every feature's template axis up to the batch
+    maximum, so a sample that drew 2 templates alongside one that drew 4
+    gains 2 empty slots. Dividing by that padded ``T`` diluted the smaller
+    sample's templates by real/padded; the per-sample ``template_mask.sum()``
+    denominator is what removes the dependence.
+    """
+    import torch
+
+    mod = _template_embedding()
+    n_tokens, n_real = 8, 2
+    gen = torch.Generator().manual_seed(3)
+    # One fixed set of real slots, reused verbatim in both containers.
+    content = _template_slots(n_real, n_tokens, gen)
+    # What collate_fn produces when a batch-mate drew 4 templates: zero-pad to T=4.
+    collated = {
+        key: torch.cat([val, torch.zeros((2, *val.shape[1:]), dtype=val.dtype)]) for key, val in content.items()
+    }
+
+    c_pair = mod.single_template_emb.query_norm.normalized_shape[0]
+    query_pair = torch.randn(n_tokens, n_tokens, c_pair, dtype=torch.float64)
+    pair_mask = torch.ones(n_tokens, n_tokens, dtype=torch.float64)
+
+    with torch.no_grad():
+        alone = mod(query_pair=query_pair, pair_mask=pair_mask, template_mask=torch.ones(n_real), **content)
+        # collate zero-pads the mask alongside every other feature.
+        with_mate = mod(
+            query_pair=query_pair,
+            pair_mask=pair_mask,
+            template_mask=torch.tensor([1.0, 1.0, 0.0, 0.0], dtype=torch.float64),
+            **collated,
+        )
+        diluted = mod(query_pair=query_pair, pair_mask=pair_mask, **collated)  # no mask: old behaviour
+
+    assert torch.equal(alone, with_mate), "template output depends on batch-mates' template count"
+    # Guard that the test is actually exercising the failure it claims to.
+    assert not torch.equal(alone, diluted), "maskless path no longer dilutes — test is vacuous"

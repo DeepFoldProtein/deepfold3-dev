@@ -456,12 +456,14 @@ class TemplateEmbedding(nn.Module):
             multichain_mask: [B?, N, N] intra-chain mask (1 for same-chain
                 pairs). Restricts template geometry to intra-chain pairs so the
                 (frame-inconsistent) cross-chain off-diagonal is masked out.
-            template_mask: [B?, T] 1.0 for real template slots, 0.0 for
-                pad slots (emitted by the featurizer when templates are
-                padded to a fixed ``max_templates``). Pad slots are zeroed
-                out of the sum and excluded from the average denominator, so
-                the result is identical to running with the unpadded tensors.
-                ``None`` (the default) ⇒ every slot is real, the legacy path.
+            template_mask: [B?, T] 1.0 for real template slots, 0.0 for pad
+                slots. Always emitted by the featurizer; pad slots arise both
+                from ``pad_templates`` and from ``collate_fn`` padding the
+                template axis to the batch maximum. Pad slots are zeroed out
+                of the sum and excluded from the (per-sample) average
+                denominator, so a sample's result does not depend on how many
+                templates its batch-mates happened to draw. ``None`` ⇒ treat
+                every slot as real (legacy / direct callers).
 
         Returns:
             Template pair embedding [B?, N, N, pair_channel].
@@ -522,15 +524,17 @@ class TemplateEmbedding(nn.Module):
             # ``query_pair`` (embed_query) regardless of the per-residue masks,
             # so an all-masked slot still returns a non-zero tensor. Zero it
             # explicitly, or padding would shift the average.
-            summed = summed + (emb if mask_t is None else emb * mask_t)
+            summed = (summed + emb) if mask_t is None else torch.addcmul(summed, emb, mask_t)
 
-        # Average over the REAL templates. Keeping the ``+ 1e-7`` epsilon makes
-        # the padded path bit-exact against the unpadded one (denominator is
-        # the real count either way), and keeps 0-template samples at 0/1e-7.
+        # Average over the REAL templates, counted PER SAMPLE — see the
+        # ``template_mask`` arg doc above for why ``T`` is the wrong divisor.
+        # The ``+ 1e-7`` epsilon keeps a 0-template sample at 0/1e-7, not 0/0.
         if template_mask is None:
+            # Legacy callers that pass no mask: every slot is real, and an
+            # unbatched call cannot be diluted by collate.
             embedding = summed / (T + 1e-7)
         else:
-            n_real = template_mask.sum(dim=-1)  # [B?] real slot count
+            n_real = template_mask.sum(dim=-1)  # [B?] real slots for THIS sample
             if has_batch:
                 n_real = n_real.view(-1, 1, 1, 1)
             embedding = summed / (n_real + 1e-7)
