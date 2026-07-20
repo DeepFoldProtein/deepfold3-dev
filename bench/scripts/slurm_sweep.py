@@ -210,6 +210,7 @@ def write_sbatch(
     seeds: list[int],
     max_concurrent: int | None,
     save_distogram: bool,
+    snapshot: str,
     tag: str = "",
 ) -> Path:
     gres = f"gpu:{gpu_type}:1" if gpu_type and gpu_type != "any" else "gpu:1"
@@ -254,6 +255,7 @@ for attempt in 1 2 3 4 5; do
     if {DF3} inference-batch \\
         --inputs-file "$SHARD" \\
         --params {ckpt} \\
+        --snapshot {snapshot} \\
         --optim inference \\
         --num-samples {num_samples} \\
         --num-recycles {num_recycles} \\
@@ -319,6 +321,7 @@ def submit_step(args, step: int, categories: list[str], tag: str = "") -> str | 
         [int(s) for s in args.seed.split(",") if s != ""],
         args.max_concurrent,
         not args.no_distogram,
+        args.snapshot,
         tag,
     )
     order = " > ".join(c for c, _ in by_cat)
@@ -379,6 +382,16 @@ def main() -> None:
         help="Cap simultaneously-running array tasks (Slurm '%%N'). Default: unlimited (GPU-bound).",
     )
     ap.add_argument("--no-distogram", action="store_true", help="Disable --save-distogram.")
+    ap.add_argument(
+        "--snapshot",
+        default="average",
+        choices=["auto", "average", "shadow", "fast"],
+        help="Weight snapshot to evaluate from a .pt checkpoint: 'average' (SF's x / live AdamW "
+        "params), 'shadow' (external EMA), 'fast' (SF z, ablation), 'auto' (shadow if present "
+        "else average). No-op for exported .safetensors, where the snapshot is baked in at "
+        "export time. Default 'average' matches `deepfold3 export`, so a series mixing .pt and "
+        ".safetensors stays consistent.",
+    )
     ap.add_argument(
         "--per-category",
         dest="per_category",

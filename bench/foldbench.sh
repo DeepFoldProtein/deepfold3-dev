@@ -29,6 +29,8 @@
 #   GPU_TYPE=auto           Slurm GRES gpu type (auto|RTX4090|RTX6000|any)
 #   SHARDS=<auto>           array tasks = max concurrent GPUs (default: all)
 #   NO_EVAL=0               set 1 to submit only the sweep (no eval job)
+#   SNAPSHOT=average        .pt weight snapshot (average|shadow|fast|auto);
+#                           no-op for exported .safetensors
 # ============================================================================
 set -euo pipefail
 
@@ -43,6 +45,12 @@ SEEDS="${SEEDS:-42,43,44,45}"
 NUM_SAMPLES="${NUM_SAMPLES:-5}"
 GPU_TYPE="${GPU_TYPE:-auto}"
 NO_EVAL="${NO_EVAL:-0}"
+# Weight snapshot for .pt checkpoints: average (SF's x / live AdamW params),
+# shadow (external EMA), fast (SF z, ablation), auto (shadow if present else
+# average). No-op for exported .safetensors — those bake the snapshot in at
+# export time. Default 'average' matches `deepfold3 export`, so a series that
+# mixes .pt symlinks and .safetensors is scored consistently.
+SNAPSHOT="${SNAPSHOT:-average}"
 
 ALL_CATS="monomer_protein monomer_rna monomer_dna interface_protein_protein interface_antibody_antigen interface_protein_dna interface_protein_rna interface_protein_peptide"
 if [ "$CATEGORIES" = all ]; then CATS="$ALL_CATS"; else CATS="$(echo "$CATEGORIES" | tr ',' ' ')"; fi
@@ -63,7 +71,7 @@ done
 SHARDS_ARG=""; [ -n "${SHARDS:-}" ] && SHARDS_ARG="--shards $SHARDS"
 $PY bench/scripts/slurm_sweep.py --series "$SERIES" --steps "$STEPS" \
     --categories "$CATEGORIES" --gpu-type "$GPU_TYPE" \
-    --seed "$SEEDS" --num-samples "$NUM_SAMPLES" $SHARDS_ARG
+    --seed "$SEEDS" --num-samples "$NUM_SAMPLES" --snapshot "$SNAPSHOT" $SHARDS_ARG
 
 if [ "$NO_EVAL" = 1 ]; then
   echo "== NO_EVAL=1: sweep submitted; run eval later with:"

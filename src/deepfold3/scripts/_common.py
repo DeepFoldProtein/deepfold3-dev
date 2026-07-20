@@ -48,6 +48,40 @@ def require_manifest(data_dir: Path) -> Path:
     return manifest_path
 
 
+def _optimizer_param_order(ckpt: dict) -> list[str]:
+    """Flat optimizer-index → parameter-name map for a ``.pt`` checkpoint.
+
+    ``optimizer.state_dict()`` keys per-parameter state by an index that runs in
+    param-group order, so recovering a parameter's ``z`` needs this mapping.
+    Prefers ``optimizer_param_names`` (recorded by :class:`CheckpointManager`).
+    Older checkpoints fall back to rebuilding the model on the ``meta`` device
+    from the embedded configs and replaying ``build_optimizer``'s grouping — no
+    weights are materialized, so the cost is the module tree only.
+    """
+    saved = ckpt.get("optimizer_param_names") if isinstance(ckpt, dict) else None
+    if saved:
+        return list(saved)
+
+    model_cfg = ckpt.get("model_cfg") if isinstance(ckpt, dict) else None
+    train_cfg = ckpt.get("train_cfg") if isinstance(ckpt, dict) else None
+    if model_cfg is None or train_cfg is None:
+        raise click.ClickException(
+            "--snapshot fast: checkpoint has no 'optimizer_param_names' and no embedded "
+            "model_cfg/train_cfg to rebuild the optimizer ordering from."
+        )
+
+    import torch
+
+    from deepfold3.model.model import DeepFold3
+    from deepfold3.training.optim import build_optimizer
+
+    with torch.device("meta"):
+        model = DeepFold3(model_cfg)
+    optimizer = build_optimizer(model, train_cfg)
+    name_of = {id(p): n for n, p in model.named_parameters()}
+    return [name_of[id(p)] for group in optimizer.param_groups for p in group["params"] if id(p) in name_of]
+
+
 def select_snapshot(ckpt: dict, choice: str) -> dict:
     """Return the chosen weight snapshot from a ``.pt`` checkpoint as a state_dict.
 
@@ -98,22 +132,34 @@ def select_snapshot(ckpt: dict, choice: str) -> dict:
     if choice == "fast":
         if not has_optim_z:
             raise click.ClickException("--snapshot fast: no SF 'z' state in checkpoint")
-        # Map (param_id_in_optim_state) → param_name by ordering. SF's z
-        # always equals model.parameters() in shape and (insertion) order
-        # because :class:`AdamWScheduleFree` adds entries one param at a
-        # time during step(). Brittle if the model architecture differs
-        # from save time, so this path errors loudly on length mismatch
-        # and is documented as ablation-only.
-        z_by_id = {pid: s["z"] for pid, s in optim_state.items() if "z" in s}
-        model_items = list(model.items())
-        if len(z_by_id) != len(model_items):
+        # ``optimizer.state_dict()`` keys per-parameter state by a flat index
+        # running in *param-group* order (``build_optimizer`` emits decay then
+        # no-decay). That is NOT ``state_dict()`` order, which follows module
+        # registration and additionally carries buffers — so zipping the two
+        # silently assigns ``z`` to the wrong tensors. Resolve the index →
+        # name map explicitly instead.
+        z_by_id = {int(pid): s["z"] for pid, s in optim_state.items() if "z" in s}
+        order = _optimizer_param_order(ckpt)
+        if len(order) != len(z_by_id):
             raise click.ClickException(
-                f"--snapshot fast: z count ({len(z_by_id)}) != model param count "
-                f"({len(model_items)}); ablation path requires matched ordering."
+                f"--snapshot fast: z count ({len(z_by_id)}) != optimizer param count "
+                f"({len(order)}); checkpoint and model config disagree."
             )
-        z_state = {name: z for (name, _), z in zip(model_items, z_by_id.values(), strict=True)}
-        click.echo(f"  snapshot=fast (= SF z; {len(z_state)} params)")
-        return z_state
+        z_state = {order[idx]: z for idx, z in sorted(z_by_id.items()) if idx < len(order)}
+        mismatched = [
+            n for n, z in z_state.items() if n in model and tuple(z.shape) != tuple(model[n].shape)
+        ]
+        if mismatched:
+            raise click.ClickException(
+                f"--snapshot fast: {len(mismatched)} z tensors disagree in shape with "
+                f"ckpt['model'] (e.g. {mismatched[:3]}); the index→name map is wrong."
+            )
+        # Buffers hold no ``z`` (they are not optimized) — carry them over from
+        # the saved snapshot so the returned state_dict stays complete.
+        out = {**model, **z_state}
+        n_buf = len(out) - len(z_state)
+        click.echo(f"  snapshot=fast (= SF z; {len(z_state)} params + {n_buf} buffers)")
+        return out
 
     raise click.ClickException(f"--snapshot: unknown choice {choice!r}")
 

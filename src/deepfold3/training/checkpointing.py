@@ -278,9 +278,22 @@ class CheckpointManager:
             # when present, is always EMA of this snapshot — inference
             # composes by overlay (see scripts/_common.py:select_snapshot).
             snapshot_kind = "x" if isinstance(optimizer, AdamWScheduleFree) else "live"
+            # Flat optimizer-index → parameter-name map. ``optimizer.state_dict()``
+            # keys its per-parameter state (including Schedule-Free's ``z``) by a
+            # flat index that runs in *param-group* order — ``build_optimizer``
+            # emits a decay group followed by a no-decay group, so the index
+            # order is NOT ``state_dict()`` order (which additionally interleaves
+            # buffers). Recording the mapping here lets ``select_snapshot`` fetch
+            # ``z`` without replaying the grouping heuristics. See
+            # ``scripts/_common.py:select_snapshot``.
+            _param_name = {id(p): n for n, p in model.named_parameters()}
+            optimizer_param_names = [
+                _param_name[id(p)] for group in optimizer.param_groups for p in group["params"] if id(p) in _param_name
+            ]
             blob: dict = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "optimizer_param_names": optimizer_param_names,
                 "scheduler": scheduler.state_dict(),
                 "global_step": state.global_step,
                 "effective_step": state.effective_step,
