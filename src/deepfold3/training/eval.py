@@ -110,9 +110,25 @@ def run_eval(
     If ``optimizer`` is a Schedule-Free optimizer, ``optimizer_eval_mode``
     flips its live params from ``y`` (gradient point) to ``x`` (inference
     target) for the duration of the pass and restores ``y`` on exit.
-    For plain AdamW this is a no-op.
+    For plain AdamW this is a no-op — and because AdamW has no averaged
+    iterate, ``eval_snapshot='average'`` on an AdamW run with EMA active is
+    upgraded to the EMA shadow (the deployment weights); otherwise it would
+    silently evaluate the raw live params, which are never deployed.
     """
     use_shadow = cfg.eval_snapshot == "shadow"
+    # A plain (non-Schedule-Free) optimizer has NO averaged iterate: eval_snapshot
+    # 'average' would fall through to the raw *live* params, which are not the
+    # deployment target when EMA is enabled. AdamW's only meaningful smoothed /
+    # inference snapshot is the EMA shadow, so upgrade 'average' -> shadow whenever
+    # EMA is present on a non-SF optimizer (matches what `inference --snapshot auto`
+    # picks for these checkpoints). SF is untouched: its 'average' is the genuine x.
+    is_schedule_free = getattr(optimizer, "eval_mode", None) is not None
+    if cfg.eval_snapshot == "average" and not is_schedule_free and ema is not None:
+        use_shadow = True
+        logger.info(
+            "eval_snapshot='average' on a non-Schedule-Free optimizer with EMA active — "
+            "AdamW has no averaged iterate; evaluating on the EMA shadow (the deployment weights)."
+        )
     if use_shadow and ema is None:
         logger.warning(
             "eval_snapshot='shadow' requested but EMA is disabled "

@@ -750,6 +750,9 @@ class TrainingConfig:
     # Eval snapshot — applies to run_eval forward pass. "average" reads
     # SF's x directly (responsive, current state). "shadow" reads EMA-over-x
     # (slow, 1/(1-ema_decay) lag). Training-time shadow update is unaffected.
+    # NOTE: on a non-SF optimizer (AdamW) there is no averaged iterate, so
+    # "average" would read the raw live params (never deployed). run_eval
+    # upgrades "average" -> shadow automatically when EMA is active on AdamW.
     eval_snapshot: Literal["average", "shadow"] = "average"
     # Refined SF decoupling parameter C (Through the River, arxiv 2507.09846,
     # Algorithm 2 line 11). ``None`` keeps vanilla SF (`c_t = γ_t²/Σγ_i²`); a
