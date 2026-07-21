@@ -333,13 +333,9 @@ def summarize(series: str, category: str, plot: bool) -> None:
         # Steps where the model hasn't folded get their success-rate column
         # hatched over: early DockQ "successes" there are collapsed-blob artefacts
         # (inflated fnat, no fnonnat penalty), so the bar height is not
-        # trustworthy. See memory/early_interface_dockq_blob_artifact. The "folded"
-        # bar is half of AF3's own whole-complex lDDT for this category (harder
-        # interfaces like RNA get a lower bar than easier ones like Ab-Ag), so it
-        # scales with achievable difficulty rather than a flat 0.5.
-        af3ld_ref = AF3_INTERFACE_LDDT.get(category)
-        LDDT_FOLD_THRESH = 0.5 * af3ld_ref if af3ld_ref is not None else 0.5
-        ld_by_step = {d["step"]: d["med"] for d in ld}
+        # trustworthy.
+        LDDT_FOLD_THRESH = 0.5
+        ld_by_step = {d["step"]: d["mean"] for d in ld}
 
         # Bar width in step units = 72% of the smallest gap between benchmarked
         # steps, so bars never overlap even when the grid is irregular (1k/2k/5k).
@@ -377,7 +373,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
                     hatch="////",
                     linewidth=0.0,
                     zorder=9,
-                    label=f"lDDT < ½·AF3 ({LDDT_FOLD_THRESH:.2f}) — unreliable" if j == 0 else None,
+                    label="TM < 0.5 (unreliable)" if j == 0 else None,
                 )
             af3 = AF3_SUCCESS_RATE.get(category)
             if af3 is not None:
@@ -489,7 +485,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
             axl,
             ld,
             "lDDT",
-            "whole-model lDDT (black) + inter-chain ilddt (red, collapse-sensitive, ≥10k) — median + IQR",
+            "whole-model lDDT (black) + inter-chain ilddt (red) — median + IQR",
             AF3_INTERFACE_LDDT.get(category),
             overlay=(il, "inter-chain ilddt", "tab:red"),
             conf=ld_conf,
