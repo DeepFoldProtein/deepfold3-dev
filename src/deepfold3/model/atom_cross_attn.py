@@ -355,13 +355,15 @@ class AtomPerAtomConditioning(nn.Module):
         self.num_element_classes = num_element_classes
         self.num_atom_name_chars = num_atom_name_chars
         # ``ref_element`` is stored as the raw atomic number Z (one-indexed:
-        # H=1, C=6, ...). DeepFold3 one-hots it at index Z by default, which is
-        # self-consistent for from-scratch training (index 0 is an unused/dead
-        # channel, element 128 is dropped). AF3/Protenix instead one-hot the
-        # zero-indexed periodic-table position (Z-1: H=0, C=5). Set
-        # ``ref_element_zero_index=True`` to match the AF3 convention — required
-        # if loading AF3-converted ``embed_ref_element`` weights, since the
-        # converter copies rows verbatim with no shift.
+        # H=1, C=6, ...). DeepFold3 one-hots it at index Z by default (index 0
+        # is an unused/dead channel, element 128 dropped). This is ALSO the AF3
+        # convention: AF3 one-hots at Z over 128 classes ("Element is encoded
+        # as atomic number of the periodic table"), so AF3-converted
+        # ``embed_ref_element`` weights — copied row-verbatim — load correctly
+        # with the default False. Set ``ref_element_zero_index=True`` ONLY for
+        # the *Protenix* convention, which one-hots the zero-indexed position
+        # (Z-1: H=0, C=5) over 118 classes. Do NOT use True for AF3 — it shifts
+        # every element down by one and corrupts the trunk.
         self.ref_element_zero_index = ref_element_zero_index
         self.embed_ref_pos = LinearNoBias(3, c)
         self.embed_ref_mask = LinearNoBias(1, c)
