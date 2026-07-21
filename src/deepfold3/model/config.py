@@ -274,6 +274,28 @@ class DiffusionConfig:
     # Training noise sampling (log-normal): t = sigma_data * exp(p_mean + p_std * z), z ~ N(0,1)
     p_mean: float = -1.2
     p_std: float = 1.5
+    # Optional high-σ mixture on the training noise sampler. With probability
+    # ``sigma_mix_alpha`` draw σ from a high-σ component instead of the base
+    # log-normal σ = σ_data·exp(p_mean + p_std·z), to train the docking / global-
+    # arrangement σ regime the base under-covers. The base (median σ≈4.8)
+    # concentrates on local-refinement σ, so the high-σ decades — where inference
+    # spends ~55% of its steps and the collapse-vs-separate outcome is decided
+    # (steps 50–120, σ 18.6–490) — are under-trained.
+    #   ``sigma_mix_kind="uniform"`` (simplest ablation): log-uniform over the
+    #     full inference range [σ_data·smin, σ_data·smax]. α controls the mix,
+    #     so α=1.0 makes the sampler a pure log-uniform (flat in log σ, no base
+    #     — the most extreme ablation). Enable ``clamp_train_sigma`` so the
+    #     extreme-low-σ draws don't spike the EDM weight 1/σ².
+    #   ``sigma_mix_kind="lognormal"``: a targeted smooth high-σ log-normal bump
+    #     centred at σ = σ_data·exp(sigma_mix_p_mean) (≈90 at 1.73, mid docking
+    #     window) with its own tighter ``sigma_mix_p_std`` — no discontinuity,
+    #     and (unlike the full-range uniform) no mass wasted at the easy tails.
+    # 0.0 = pure base log-normal (default, unchanged). α=0.2 docking σ coverage
+    # 18%→~20% (uniform, full range) / ~33% (lognormal, targeted).
+    sigma_mix_alpha: float = 0.0
+    sigma_mix_kind: str = "uniform"
+    sigma_mix_p_mean: float = 1.73
+    sigma_mix_p_std: float = 1.0
     # EDM diffusion-MSE weight w = (σ² + σ_d²)/(σ·σ_d)² → 1/σ² as σ→0, so a
     # rare small-σ draw in the log-normal's left tail can concentrate the
     # gradient in one sample and spike grad_norm by orders of magnitude.

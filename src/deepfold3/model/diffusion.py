@@ -1098,10 +1098,26 @@ class DiffusionHead(nn.Module):
         gt_aug = gt_positions.unsqueeze(-4).expand(*batch_shape, num_samples, *gt_positions.shape[-3:]).clone()
         _augment_in_place(gt_aug, gt_mask.bool(), generator=None)
 
-        # Sample noise levels from log-normal: t = sigma_data * exp(p_mean + p_std * z)
-        noise_levels = cfg.sigma_data * torch.exp(
-            cfg.p_mean + cfg.p_std * torch.randn(*batch_shape, num_samples, device=device)
-        )  # [B?, S]
+        # Sample noise levels. Base: log-normal ln σ = ln σ_data + p_mean + p_std·z.
+        # Optional (sigma_mix_alpha > 0): with prob α draw from a high-σ component
+        # instead — either a log-uniform over [σ_data, σ_data·smax] (simplest
+        # ablation) or a high-σ log-normal bump — to train the docking / global-
+        # arrangement regime the base under-covers.
+        shape = (*batch_shape, num_samples)
+        ln_sd = math.log(cfg.sigma_data)
+        log_base = ln_sd + cfg.p_mean + cfg.p_std * torch.randn(shape, device=device)
+        if cfg.sigma_mix_alpha > 0.0:
+            if cfg.sigma_mix_kind == "uniform":
+                # log-uniform over the full inference range; α=1.0 → pure sampler
+                ln_lo = math.log(cfg.sigma_data * cfg.smin)
+                ln_hi = math.log(cfg.sigma_data * cfg.smax)
+                log_mix = ln_lo + torch.rand(shape, device=device) * (ln_hi - ln_lo)
+            else:  # "lognormal": targeted smooth high-σ bump
+                log_mix = ln_sd + cfg.sigma_mix_p_mean + cfg.sigma_mix_p_std * torch.randn(shape, device=device)
+            pick_mix = torch.rand(shape, device=device) < cfg.sigma_mix_alpha
+            noise_levels = torch.where(pick_mix, log_mix, log_base).exp()  # [B?, S]
+        else:
+            noise_levels = log_base.exp()  # [B?, S]
         # Floor σ so the EDM weight 1/σ² + 1/σ_d² stays bounded — without this
         # the rare left-tail draw spikes grad_norm by orders of magnitude.
         if cfg.clamp_train_sigma:
