@@ -64,16 +64,20 @@ def convert(params: Path, af3_ref: Path, output: Path) -> None:
         state_dict[k] = v
 
     # Step 4: Save as safetensors with embedded ModelConfig metadata.
-    # Converted AF3 weights map onto the default ``ModelConfig`` (which is
-    # tuned to match AF3 architecture exactly), so embedding those defaults
-    # is what callers should reconstruct at inference time.
+    # Converted AF3 weights map onto the default ``ModelConfig`` except for
+    # ``ref_element_zero_index``: the converter copies ``embed_ref_element``
+    # rows verbatim, so the model must one-hot the zero-indexed periodic-table
+    # position (Z-1) to match AF3 — the dataclass default (False) is the
+    # from-scratch convention and would silently mis-index elements here.
     click.echo(f"[convert] saving {output} …")
     output.parent.mkdir(parents=True, exist_ok=True)
     from safetensors.torch import save_file
 
     from deepfold3.model.config import ModelConfig, model_cfg_to_metadata
 
-    metadata = model_cfg_to_metadata(ModelConfig())
+    af3_cfg = ModelConfig()
+    af3_cfg.diffusion.atom_cross_att.ref_element_zero_index = True
+    metadata = model_cfg_to_metadata(af3_cfg)
     save_file(state_dict, str(output), metadata=metadata)
     click.echo(f"  saved {len(state_dict)} tensors + ModelConfig metadata to {output.resolve()}")
 
