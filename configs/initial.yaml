@@ -1,15 +1,15 @@
 training:
-  optimizer_type: schedule_free
+  optimizer_type: adamw
   lr: 1.8e-3
-  weight_decay: 1.0e-4
+  weight_decay: 0.0
   betas: [0.9, 0.95]
   eps: 1.0e-8
-  decoupling_parameter: 200.0
+  # decoupling_parameter: 200.0
 
   warmup_steps: 1000
-  # start_decay_after: 50000
-  # decay_every: 50000
-  # decay_factor: 0.95
+  start_decay_after: 50000
+  decay_every: 50000
+  decay_factor: 0.95
   # finetune_scheduler: af3
   # cosine_min_lr_ratio: 0.1
   # cosine_max_steps: 20000
@@ -56,14 +56,10 @@ training:
   diffusion_chunk_size: 8
   mini_rollout_steps: 20
   mini_rollout_samples: 1
-  # Chain-permutation stability gate: resolve the shared chain permutation from
-  # K independent mini-rollout draws and apply it only on unanimous agreement,
-  # else fall back to identity (un-permuted GT). Breaks the symmetric-multimer
-  # oscillating-target latch.
+  permute_gt_before_noise: true # Permute-then-noise ordering fix
+  diffusion_mse_per_sample_symmetry: false
   chain_perm_stability_gate: true
   chain_perm_gate_k: 3
-  diffusion_mse_per_sample_symmetry: false
-  permute_gt_before_noise: true # Permute-then-noise ordering fix
 
   alpha_diffusion: 4.0
   alpha_smooth_lddt: 1.0
@@ -199,7 +195,7 @@ datasets:
 
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
-    weight: 0.40
+    weight: 0.30
     strategy: uniform
     is_distillation: true
     format: of3
@@ -223,7 +219,7 @@ datasets:
 
   - name: afdb_nvda
     data_dir: /data/distillation/afdb_nvda
-    weight: 0.05
+    weight: 0.15
     strategy: weighted
     is_distillation: true
     format: df3
@@ -258,14 +254,23 @@ model:
     sigma_data: 16.0
     p_mean: -1.2
     p_std: 1.5
+    # High-σ mixture on the noise sampler: with prob α draw σ from a log-uniform
+    # over the full inference range instead of the base log-normal, lifting the
+    # whole σ range (esp. the under-trained docking regime, steps 50–120). α=1.0
+    # → pure log-uniform. 0.0 = current behaviour. clamp_train_sigma floors the
+    # low-σ tail (the uniform reaches σ<0.1) so the EDM weight 1/σ² stays bounded.
+    sigma_mix_alpha: 0.2
+    sigma_mix_kind: uniform   # uniform (full-range, simplest ablation) | lognormal (targeted bump)
+    clamp_train_sigma: true
+    train_sigma_min: 0.1      # σ floor (w=1/σ²+1/σ_d²≲100). Inference reaches σ≈0.006, but σ<0.1 is c_skip≈1 (identity) → no need to train
     skip_amp_sample: true
     skip_amp_sample_training: true
     atom_cross_att:
       # Element one-hot indexing. false (default): one-hot the raw atomic number
-      # Z (H=1, C=6, ...) — index 0 is a dead channel, self-consistent for
-      # from-scratch training. true: zero-indexed periodic-table position
-      # (Z-1: H=0, C=5), the AF3/Protenix convention — set true only when
-      # warm-starting from AF3-converted embed_ref_element weights.
+      # Z (H=1, C=6, ...). This matches AF3 (128 classes, one-hot at Z), so it
+      # is correct BOTH for from-scratch training and for AF3-converted
+      # embed_ref_element weights. true: zero-indexed position (Z-1: H=0, C=5),
+      # the Protenix convention (118 classes) — NOT AF3; never use it for AF3.
       ref_element_zero_index: false
   confidence:
     num_layer: 4
