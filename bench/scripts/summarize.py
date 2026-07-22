@@ -325,7 +325,7 @@ def summarize(series: str, category: str, plot: bool) -> None:
         tiers = dockq_tier_fractions(series, category, mode="oracle")
         ld = interface_metric_dist(series, category, "lddt")
         tm = interface_metric_dist(series, category, "tm_score")
-        il = interface_metric_dist(series, category, "iLDDT")
+        il = interface_metric_dist(series, category, "ilddt")
         ld_conf = interface_metric_dist(series, category, "lddt", select="conf")
         tm_conf = interface_metric_dist(series, category, "tm_score", select="conf")
         fig, (axd, axl, axt) = plt.subplots(3, 1, figsize=(10, 13), sharex=True)
