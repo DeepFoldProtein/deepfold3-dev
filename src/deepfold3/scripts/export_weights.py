@@ -5,10 +5,12 @@ Usage
 deepfold3 export \\
     --checkpoint runs/exp1/checkpoint_final.pt \\
     --output     weights.safetensors \\
-    --snapshot   average
+    --snapshot   auto
 
-Selects one weight *snapshot* from the checkpoint (default ``average`` =
-Schedule-Free's averaged iterate ``x`` / live params for plain AdamW; see
+Selects one weight *snapshot* from the checkpoint (default ``auto`` = the EMA
+shadow when present, else ``ckpt['model']`` = Schedule-Free's averaged iterate
+``x`` / live params for plain AdamW — the deployment target, matching
+``deepfold3 inference`` and eval; see
 :func:`deepfold3.scripts._common.select_snapshot` for the full vocabulary),
 strips any DDP ``module.`` prefix, and writes a single ``.safetensors`` file
 with the architectural :class:`ModelConfig` embedded as JSON in the header
@@ -37,14 +39,16 @@ from deepfold3.scripts._common import load_pt_snapshot
 @click.option("--output", required=True, type=click.Path(path_type=Path), help="Output .safetensors file path.")
 @click.option(
     "--snapshot",
-    type=click.Choice(["average", "auto", "shadow", "fast"]),
-    default="average",
+    type=click.Choice(["auto", "average", "shadow", "fast"]),
+    default="auto",
     show_default=True,
     help=(
-        "Which weight snapshot to extract. 'average' = ckpt['model'] "
-        "(SF averaged iterate x / live AdamW params). 'shadow' = external EMA "
-        "shadow (errors if absent). 'auto' = shadow when present else average. "
-        "'fast' = SF z buffer (ablation only)."
+        "Which weight snapshot to extract. 'auto' = shadow when present (overlaid "
+        "on ckpt['model']), else ckpt['model'] — the deployment target for both "
+        "SF (no shadow → averaged iterate x) and AdamW+EMA (shadow), matching "
+        "`deepfold3 inference` and eval. 'average' forces ckpt['model'] "
+        "(SF x / live AdamW params). 'shadow' forces the external EMA shadow "
+        "(errors if absent). 'fast' = SF z buffer (ablation only)."
     ),
 )
 def export(checkpoint: Path, output: Path, snapshot: str) -> None:
