@@ -8,7 +8,7 @@
 # beta trajectories, into runs/$SERIES/ss_analysis/).
 #
 # FoldBench-small = num_tokens <= MAX_TOKENS (default 1024). Each target is
-# folded with 4 seeds (SEEDS) x --num-samples samples. GPU-gated: never launches
+# folded with 2 seeds (SEEDS) x --num-samples samples. GPU-gated: never launches
 # while another sweep (orchestrate.sh / run_sweep.py) is active, so it coexists
 # with a separate orchestrator. Resumable (per checkpoint x category).
 #
@@ -18,9 +18,10 @@
 # Env overrides:
 #   SERIES        series name              (default df3v1)
 #   CATEGORIES    space list of categories (default: the 8 below)
-#   SEEDS         comma list of seeds      (default 42,43,44,45 — FoldBench uses 4)
+#   SEEDS         comma list of seeds      (default 42,43 — lighter than FoldBench's 4)
 #   NUM_SAMPLES   diffusion samples / seed (default 5)
 #   MAX_TOKENS    FoldBench-small cap      (default 1024)
+#   SNAPSHOT      .pt weight snapshot      (default auto: shadow if present else average)
 #   STEP_OFFSET   series-global step shift (default 0)
 set -u
 cd "$(dirname "$0")/../.."
@@ -33,7 +34,7 @@ POLL="${2:-3600}"            # ~1 h
 # of colliding with the earlier phase's points. e.g. STEP_OFFSET=110000:
 # stage1 checkpoint_5000 -> df3v1 step_115000 (continues after stage0's 110k).
 OFFSET="${STEP_OFFSET:-0}"
-SEEDS="${SEEDS:-42,43,44,45}"
+SEEDS="${SEEDS:-42,43}"
 NUM_SAMPLES="${NUM_SAMPLES:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
@@ -73,6 +74,15 @@ SH
   chmod +x "$_FASTBIN/lscpu"
 fi
 export PATH="$_FASTBIN:$PATH"
+# --- OST binary ------------------------------------------------------------
+# eval_ost.py defaults to `apptainer run <sif> compare-structures` (the cluster
+# image). This dev host has no apptainer but ships OpenStructure in the
+# foldbench conda env, so point OST_CMD there when that binary exists; leave it
+# unset otherwise so the apptainer default still works on the cluster. Override
+# with OST_CMD=... .
+if [ -z "${OST_CMD:-}" ] && [ -x "$HOME/.conda/envs/foldbench/bin/ost" ]; then
+  export OST_CMD="$HOME/.conda/envs/foldbench/bin/ost compare-structures"
+fi
 # ---------------------------------------------------------------------------
 
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
@@ -138,9 +148,13 @@ while true; do
   mkdir -p "bench/ckpts/$SERIES"                        # self-heal for new series
   ln -sfn "$(realpath "$sel_ckpt")" "bench/ckpts/$SERIES/step_$G.pt"
 
+  # --snapshot auto: shadow when the checkpoint carries an EMA shadow (AdamW+EMA
+  # runs, e.g. df3v4/r12 — the deployment target), else ckpt['model'] (SF's x /
+  # live AdamW). Matches `deepfold3 export`/`inference`/eval; average would score
+  # the raw live params (NOT deployed) for an AdamW+EMA run. Env-overridable.
   $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
       --gpus "$GPUS" --num-samples "$NUM_SAMPLES" --num-recycles 10 \
-      --seed "$SEEDS" --snapshot average
+      --seed "$SEEDS" --snapshot "${SNAPSHOT:-auto}"
   $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
   if [ "$CAT" = "monomer_protein" ]; then
     run_ss_analysis "$CAT" "$G"
