@@ -254,23 +254,15 @@ model:
     sigma_data: 16.0
     p_mean: -1.2
     p_std: 1.5
-    # High-σ mixture on the noise sampler: with prob α draw σ from a log-uniform
-    # over the full inference range instead of the base log-normal, lifting the
-    # whole σ range (esp. the under-trained docking regime, steps 50–120). α=1.0
-    # → pure log-uniform. 0.0 = current behaviour. clamp_train_sigma floors the
-    # low-σ tail (the uniform reaches σ<0.1) so the EDM weight 1/σ² stays bounded.
-    sigma_mix_alpha: 0.2
-    sigma_mix_kind: uniform   # uniform (full-range, simplest ablation) | lognormal (targeted bump)
+    sigma_mix_alpha: 0.02 # 1/48=0.021
+    sigma_mix_kind: uniform # uniform (log-uniform over [smin,smax]) | lognormal (targeted bump)
+    sigma_mix_smin: 4.0e-4 # uniform-mix lower bound, s = σ/σ_data (raise to skip easy low-σ tail)
+    sigma_mix_smax: 160.0 # uniform-mix upper bound, s = σ/σ_data
     clamp_train_sigma: true
-    train_sigma_min: 0.1      # σ floor (w=1/σ²+1/σ_d²≲100). Inference reaches σ≈0.006, but σ<0.1 is c_skip≈1 (identity) → no need to train
+    train_sigma_min: 0.01
     skip_amp_sample: true
     skip_amp_sample_training: true
     atom_cross_att:
-      # Element one-hot indexing. false (default): one-hot the raw atomic number
-      # Z (H=1, C=6, ...). This matches AF3 (128 classes, one-hot at Z), so it
-      # is correct BOTH for from-scratch training and for AF3-converted
-      # embed_ref_element weights. true: zero-indexed position (Z-1: H=0, C=5),
-      # the Protenix convention (118 classes) — NOT AF3; never use it for AF3.
       ref_element_zero_index: false
   confidence:
     num_layer: 4

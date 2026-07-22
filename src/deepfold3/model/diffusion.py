@@ -1108,9 +1108,11 @@ class DiffusionHead(nn.Module):
         log_base = ln_sd + cfg.p_mean + cfg.p_std * torch.randn(shape, device=device)
         if cfg.sigma_mix_alpha > 0.0:
             if cfg.sigma_mix_kind == "uniform":
-                # log-uniform over the full inference range; α=1.0 → pure sampler
-                ln_lo = math.log(cfg.sigma_data * cfg.smin)
-                ln_hi = math.log(cfg.sigma_data * cfg.smax)
+                # log-uniform over [σ_data·sigma_mix_smin, σ_data·sigma_mix_smax],
+                # i.e. bounded in s = σ/σ_data by the mixture's own smin/smax
+                # (decoupled from the inference schedule); α=1.0 → pure sampler.
+                ln_lo = math.log(cfg.sigma_data * cfg.sigma_mix_smin)
+                ln_hi = math.log(cfg.sigma_data * cfg.sigma_mix_smax)
                 log_mix = ln_lo + torch.rand(shape, device=device) * (ln_hi - ln_lo)
             else:  # "lognormal": targeted smooth high-σ bump
                 log_mix = ln_sd + cfg.sigma_mix_p_mean + cfg.sigma_mix_p_std * torch.randn(shape, device=device)
