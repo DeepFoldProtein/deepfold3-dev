@@ -210,9 +210,13 @@ def plot(records, ref_fit, ref_pairs, series, category, out_png):
     for r in (records[-1],):
         col = cmap(norm(r["step"]))
         axA.plot(nx, r["a"] * nx ** r["b"], "-", color=col, lw=1.6, alpha=0.9, zorder=3)
+    last_step = records[-1]["step"]
     for r in records:  # (records[0], records[-1]):
         p = np.array(r["pairs"])
-        axA.scatter(p[:, 0], p[:, 1], s=10, color=cmap(norm(r["step"])), alpha=0.5, edgecolor="none", zorder=2)
+        # Latest step drawn on top of everything (GT z=6, lines z≤6) so the
+        # current model's cloud is never occluded; older steps stay beneath.
+        z = 12 if r["step"] == last_step else 2
+        axA.scatter(p[:, 0], p[:, 1], s=10, color=cmap(norm(r["step"])), alpha=0.5, edgecolor="none", zorder=z)
     axA.set_xscale("log")
     axA.set_yscale("log")
     axA.set_xlim(*XLIM_N)  # shared across categories so monomer/multimer compare directly
