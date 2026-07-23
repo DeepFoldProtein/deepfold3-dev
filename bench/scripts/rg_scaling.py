@@ -176,12 +176,24 @@ def plot(records, ref_fit, ref_pairs, series, category, out_png):
     fig, (axA, axB) = plt.subplots(1, 2, figsize=(15, 6))
     steps = [r["step"] for r in records]
     norm = Normalize(min(steps), max(steps))
-    cmap = cm.viridis
+    # Reversed so the LATEST step is purple (the most salient viridis end) and
+    # earliest is yellow — the current model's curve reads at a glance.
+    cmap = cm.viridis_r
 
     # --- Panel A: log-log Rg vs N ---
+    # GT reference in a colour+marker the step colormap can never emit (black ✕),
+    # so experimental points are never mistaken for an early-step scatter.
     rn = np.array(ref_pairs)
     axA.scatter(
-        rn[:, 0], rn[:, 1], s=14, c="tab:blue", alpha=0.35, edgecolor="none", label="FoldBench reference", zorder=2
+        rn[:, 0],
+        rn[:, 1],
+        s=30,  # plain stroke x (no fill, no outline) — arms are thin lines, so it never blankets
+        marker="x",  # non-viridis red + distinct shape; step points show through the gaps
+        c="#d62728",
+        linewidths=1.0,
+        alpha=0.45,
+        label="FoldBench reference (GT)",
+        zorder=6,
     )
     nx = np.array(XLIM_N, dtype=float)
     axA.plot(nx, LIT_A * nx**LIT_B, "--", color="tab:green", lw=2.5, zorder=6, label=r"literature $R_g=3.2\,N^{1/3}$")
