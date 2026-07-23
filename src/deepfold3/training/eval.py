@@ -124,11 +124,11 @@ def run_eval(
     # picks for these checkpoints). SF is untouched: its 'average' is the genuine x.
     is_schedule_free = getattr(optimizer, "eval_mode", None) is not None
     if cfg.eval_snapshot == "average" and not is_schedule_free and ema is not None:
+        # AdamW has no averaged iterate, so 'average' would fall through to the raw
+        # live params (never deployed); the EMA shadow is the deployment snapshot.
+        # Upgrade silently here — the one-time note is emitted at trainer startup
+        # (Trainer's config summary), not per-eval.
         use_shadow = True
-        logger.info(
-            "eval_snapshot='average' on a non-Schedule-Free optimizer with EMA active — "
-            "AdamW has no averaged iterate; evaluating on the EMA shadow (the deployment weights)."
-        )
     if use_shadow and ema is None:
         logger.warning(
             "eval_snapshot='shadow' requested but EMA is disabled "

@@ -709,6 +709,15 @@ class Trainer:
             f"mini_rollout_steps={cfg.mini_rollout_steps}, mini_rollout_samples={cfg.mini_rollout_samples}"
         )
         rank_zero_info(f"  dtype={cfg.dtype}, grad_clip={cfg.grad_clip_norm}, ema_decay={cfg.ema_decay}")
+        if (
+            cfg.eval_snapshot == "average"
+            and getattr(self.optimizer, "eval_mode", None) is None
+            and self.ema is not None
+        ):
+            rank_zero_info(
+                "  eval_snapshot='average' on a non-Schedule-Free optimizer with EMA active — "
+                "AdamW has no averaged iterate; evaluating on the EMA shadow (the deployment weights)."
+            )
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)

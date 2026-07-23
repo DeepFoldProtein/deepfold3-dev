@@ -29,6 +29,11 @@ from deepfold3.training.state import TrainState
 
 logger = logging.getLogger(__name__)
 
+# torch 2.13 deprecated ``all_gather_into_tensor`` in favour of the identically
+# signed ``all_gather_single`` (emits a FutureWarning on every call otherwise).
+# Prefer the new name when present, fall back for older torch — same semantics.
+_all_gather_into_tensor = getattr(dist, "all_gather_single", None) or dist.all_gather_into_tensor
+
 
 def _clip_grad_norm_fp64(parameters, max_norm: float) -> torch.Tensor:
     """Deterministic-precision analogue of ``torch.nn.utils.clip_grad_norm_``.
@@ -609,7 +614,7 @@ class WrappedOptimizer:
             if self.dist.is_distributed:
                 if self._nan_gather_buf is None:
                     self._nan_gather_buf = torch.zeros(self.dist.world_size, device=self._nan_accum.device)
-                dist.all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
+                _all_gather_into_tensor(self._nan_gather_buf, self._nan_accum)
                 nan_flags = self._nan_gather_buf
             else:
                 nan_flags = self._nan_accum
@@ -657,7 +662,7 @@ class WrappedOptimizer:
             if self.dist.is_distributed:
                 if self._grad_norm_gather_buf is None:
                     self._grad_norm_gather_buf = torch.zeros(self.dist.world_size, device=grad_norm.device)
-                dist.all_gather_into_tensor(self._grad_norm_gather_buf, grad_norm.view(1))
+                _all_gather_into_tensor(self._grad_norm_gather_buf, grad_norm.view(1))
                 grad_norms_per_rank = self._grad_norm_gather_buf
             else:
                 grad_norms_per_rank = grad_norm.view(1)
