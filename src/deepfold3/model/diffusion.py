@@ -35,6 +35,15 @@ from deepfold3.model.primitives import (
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
+# Fixed seed for the non-trainable Fourier noise-embedding basis (w ~ N(0,1),
+# b ~ U[0,1)). NOT needed for DDP rank agreement — DDP broadcasts buffers from
+# rank 0 at construction and the basis never changes — but it keeps the basis
+# reproducible across separate runs (so A/B arms share one fixed basis instead of
+# a per-launch random confound) and deterministic on single-GPU / non-DDP. The
+# buffers are persisted in checkpoints and overwritten by AF3-converted weights on
+# load. See DiffusionConditioningBlock.__init__.
+_FOURIER_INIT_SEED = 314159
+
 
 @dataclasses.dataclass
 class DiffusionStatic:
@@ -519,9 +528,23 @@ class DiffusionConditioningBlock(nn.Module):
         self.single_cond_norm_w = nn.Parameter(torch.ones(single_in))
         self.single_cond_proj = LinearNoBias(single_in, c_single_out)
 
-        # Noise embedding conditioning (Fourier weights loaded from safetensors)
-        self.register_buffer("fourier_weight", torch.zeros(fourier_dim))
-        self.register_buffer("fourier_bias", torch.zeros(fourier_dim))
+        # Noise embedding conditioning — fixed (non-trainable) random Fourier
+        # features. These were previously zero-initialised and only ever filled by
+        # loading AF3-converted weights, so *from-scratch* training left them at 0
+        # → cos(2π·(x·0+0)) = 1 for every σ → LN(const)=0 → the whole noise
+        # embedding contributed nothing and the diffusion conditioning carried NO
+        # explicit σ signal (the net could only see σ via the EDM input scaling,
+        # which saturates to unit noise at high σ). Sample them here instead.
+        # AF3's pseudocode says w,b ~ N(0,I) but its reference weights are
+        # w ~ N(0,1) and b ~ Uniform[0,1) — b is a phase inside cos(2π·) (standard
+        # Rahimi–Recht random Fourier features). A private fixed-seed generator
+        # keeps the basis reproducible across runs (DDP already syncs buffers from
+        # rank 0 at construction, so this is not for rank agreement);
+        # load_state_dict overwrites these when initialising from AF3-converted
+        # weights or resuming.
+        _fourier_gen = torch.Generator().manual_seed(_FOURIER_INIT_SEED)
+        self.register_buffer("fourier_weight", torch.randn(fourier_dim, generator=_fourier_gen))
+        self.register_buffer("fourier_bias", torch.rand(fourier_dim, generator=_fourier_gen))
         self.noise_emb_norm_w = nn.Parameter(torch.ones(fourier_dim))
         self.noise_emb_proj = LinearNoBias(fourier_dim, c_single_out)
 
