@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -646,46 +647,133 @@ def load_logit_maps(
     return out
 
 
+@dataclass
+class LogitSources:
+    """The set of files one prediction sample's pairwise maps can come from.
+
+    Attributes:
+        conf_json: ``confidences.json`` (scalar summary + per-token metadata).
+        logits_npz: per-sample codec ``.npz`` holding the PAE / PDE logits.
+        distogram_npz: per-seed codec ``.npz`` holding the distogram logits.
+    """
+
+    conf_json: Path | None = None
+    logits_npz: Path | None = None
+    distogram_npz: Path | None = None
+
+    def merge(self, other: LogitSources) -> LogitSources:
+        """Combine two resolutions; ``self`` wins on any slot it already fills."""
+        return LogitSources(
+            conf_json=self.conf_json or other.conf_json,
+            logits_npz=self.logits_npz or other.logits_npz,
+            distogram_npz=self.distogram_npz or other.distogram_npz,
+        )
+
+    def __bool__(self) -> bool:
+        return any((self.conf_json, self.logits_npz, self.distogram_npz))
+
+
+def _glob(directory: Path, pattern: str, sole: bool = False) -> Path | None:
+    """First (or sole) file matching ``pattern`` in ``directory``, else None."""
+    if not directory.is_dir():
+        return None
+    hits = sorted(p for p in directory.glob(pattern) if p.is_file())
+    if not hits or (sole and len(hits) > 1):
+        return None
+    return hits[0]
+
+
+def _find_distogram_npz(anchor: Path, stem: str) -> Path | None:
+    """Locate the per-seed distogram npz belonging to ``anchor``.
+
+    ``anchor`` is a per-sample file (``confidences.json`` / ``logits.npz``) and
+    ``stem`` its sample-agnostic name prefix. Both inference output layouts are
+    covered: a ``seed-{seed}_sample-{s}/`` directory (distogram one level up,
+    matched by seed tag) or a flat ``{stem}_distogram.npz`` sibling.
+    """
+    dir_name = anchor.parent.name  # e.g. seed-42_sample-0
+    if dir_name.startswith("seed-") and "_sample-" in dir_name:
+        seed_tag = dir_name.split("_sample-")[0]  # seed-42
+        cand = anchor.parent.parent / f"{seed_tag}_distogram.npz"
+        if cand.exists():
+            return cand
+    cand = anchor.with_name(f"{stem}_distogram.npz")
+    if cand.exists():
+        return cand
+    # Last resort: an unambiguous distogram sitting next to the sample files.
+    return _glob(anchor.parent, "*_distogram.npz", sole=True)
+
+
+def resolve_logit_sources(path: str | Path) -> LogitSources:
+    """Resolve any prediction artifact into the files needed to plot it.
+
+    ``path`` may be a ``confidences.json``, a per-sample logits ``.npz``, a
+    per-seed distogram ``.npz``, or a directory holding them. The companions of
+    whatever was passed are discovered around it, following either inference
+    output layout::
+
+        <out>/seed-{seed}_sample-{s}/{confidences.json,logits.npz}
+        <out>/seed-{seed}_distogram.npz                  # per seed, one level up
+
+        <out>/{stem}[_sample{s}]_{confidences.json,logits.npz}
+        <out>/{stem}_distogram.npz                       # per seed, beside it
+
+    Returns:
+        A :class:`LogitSources` with any slot left ``None`` when the
+        corresponding file is absent.
+    """
+    path = Path(path)
+
+    if path.is_dir():
+        conf = _glob(path, "confidences.json") or _glob(path, "*_confidences.json")
+        if conf is not None:
+            return resolve_logit_sources(conf)
+        logits = _glob(path, "logits.npz") or _glob(path, "*_logits.npz")
+        if logits is not None:
+            return resolve_logit_sources(logits)
+        dgram = _glob(path, "*_distogram.npz")
+        return LogitSources(distogram_npz=dgram)
+
+    if path.suffix == ".npz":
+        if path.name.endswith("_distogram.npz"):
+            return LogitSources(distogram_npz=path)
+        # Per-sample logits npz: find the confidences.json and distogram beside it.
+        stem = path.name.split("_logits.npz")[0].split("_sample")[0]
+        conf = path.with_name("confidences.json")
+        if not conf.exists():
+            cand = path.with_name(path.name.replace("_logits.npz", "_confidences.json"))
+            conf = cand if cand.exists() else conf
+        return LogitSources(
+            conf_json=conf if conf.exists() else None,
+            logits_npz=path,
+            distogram_npz=_find_distogram_npz(path, stem),
+        )
+
+    # Confidences JSON.
+    logits = path.with_name("logits.npz")
+    if not logits.exists():
+        cand_name = path.name.replace("_confidences.json", "_logits.npz")
+        if cand_name != path.name:
+            logits = path.with_name(cand_name)
+    stem = path.name.split("_confidences.json")[0].split("_sample")[0]
+    return LogitSources(
+        conf_json=path,
+        logits_npz=logits if logits.exists() else None,
+        distogram_npz=_find_distogram_npz(path, stem),
+    )
+
+
 def discover_logit_npz(conf_path: str | Path) -> tuple[Path | None, Path | None]:
     """Locate the per-sample ``logits.npz`` (PAE/PDE) and per-seed
     ``*_distogram.npz`` for a ``confidences.json`` written by ``deepfold3
-    inference``, following either output layout.
+    inference``.
 
-    JSON-input layout::
-
-        <out>/seed-{seed}_sample-{s}/confidences.json   # + logits.npz beside it
-        <out>/seed-{seed}_distogram.npz                 # one level up, per seed
-
-    MSA/sequence layout::
-
-        <out>/{stem}[_sample{s}]_confidences.json
-        <out>/{stem}[_sample{s}]_logits.npz
-        <out>/{stem}_distogram.npz                       # per seed, beside it
-
-    Returns ``(logits_npz, distogram_npz)`` with either element ``None`` if the
+    Thin wrapper over :func:`resolve_logit_sources`; returns
+    ``(logits_npz, distogram_npz)`` with either element ``None`` if the
     corresponding file is absent.
     """
-    conf_path = Path(conf_path)
-
-    logits_npz = conf_path.with_name("logits.npz")
-    if not logits_npz.exists():
-        cand_name = conf_path.name.replace("_confidences.json", "_logits.npz")
-        if cand_name != conf_path.name:
-            logits_npz = conf_path.with_name(cand_name)
-    logits_npz = logits_npz if logits_npz.exists() else None
-
-    distogram_npz = None
-    dir_name = conf_path.parent.name  # e.g. seed-42_sample-0
-    if dir_name.startswith("seed-") and "_sample-" in dir_name:
-        seed_tag = dir_name.split("_sample-")[0]  # seed-42
-        cand = conf_path.parent.parent / f"{seed_tag}_distogram.npz"
-        distogram_npz = cand if cand.exists() else None
-    if distogram_npz is None:
-        stem = conf_path.name.split("_confidences.json")[0].split("_sample")[0]
-        cand = conf_path.with_name(f"{stem}_distogram.npz")
-        distogram_npz = cand if cand.exists() else None
-
-    return logits_npz, distogram_npz
+    src = resolve_logit_sources(conf_path)
+    return src.logits_npz, src.distogram_npz
 
 
 def load_logit_maps_from_json(

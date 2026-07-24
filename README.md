@@ -92,9 +92,17 @@ This produces:
 ### 4. Plot confidence maps
 
 ```bash
-deepfold3 plot \
-    --input output/prediction_confidences.json \
-    --output output/confidences.png
+deepfold3 plot --input output/prediction_confidences.json --output output/confidences.png
+```
+
+`--input` also takes the raw logit `.npz` files directly, or the directory holding them —
+the companions (confidences JSON, per-seed distogram) are discovered around whatever is passed:
+
+```bash
+deepfold3 plot --input output/seed-42_sample-0/            # whole sample directory
+deepfold3 plot --input output/seed-42_sample-0/logits.npz  # PAE + PDE (+ distogram beside it)
+deepfold3 plot --input output/seed-42_distogram.npz        # trunk distogram only
+deepfold3 plot --input output/prediction_logits.npz --panels pae,contact --contact-threshold 12
 ```
 
 ## CLI Reference
@@ -116,7 +124,7 @@ deepfold3 train --help
 | `deepfold3 msa`            | Search MSAs via MMseqs2 (server or local), with template hits                     |
 | `deepfold3 inference`      | Run structure prediction from A3M or JSON input                                   |
 | `deepfold3 convert`        | Convert AF3 Haiku parameters to safetensors                                       |
-| `deepfold3 plot`           | Plot PAE/PDE/contact maps from confidences JSON                                   |
+| `deepfold3 plot`           | Plot PAE/PDE/distogram/contact maps from a confidences JSON, logit `.npz`, or dir |
 | `deepfold3 prepare`        | Preprocess PDB mmCIF files into training data                                     |
 | `deepfold3 cluster`        | Cluster sequences with MMseqs2 (builds cluster file from training data)           |
 | `deepfold3 apply-clusters` | Apply a cluster file to a manifest for cluster-balanced sampling                  |

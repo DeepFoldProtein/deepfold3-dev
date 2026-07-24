@@ -245,6 +245,24 @@ def save_logits(
     np.savez_compressed(path, **payloads)
 
 
+def load_attrs(path: str | Path) -> dict:
+    """Read only the self-describing ``attrs`` dict from a codec ``.npz``.
+
+    Cheap counterpart to :func:`load_logits` for callers that just need the
+    provenance / bin-edge metadata (seed, sample index, bin edges) without
+    paying to dequantize the payload arrays.
+    """
+    with np.load(path) as f:
+        return json.loads(bytes(f["_meta"]).decode("utf-8")).get("attrs", {})
+
+
+def head_names(path: str | Path) -> list[str]:
+    """List the head names stored in a codec ``.npz`` without decoding them."""
+    with np.load(path) as f:
+        meta = json.loads(bytes(f["_meta"]).decode("utf-8"))
+    return [name for name in HEADS if name in meta["heads"]]
+
+
 def load_logits(path: str | Path) -> DecodedLogits:
     """Load and dequantize logits.
 

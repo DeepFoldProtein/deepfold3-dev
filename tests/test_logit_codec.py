@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from deepfold3.io import confidences as conf
@@ -154,6 +155,73 @@ def test_discover_logit_npz_msa_layout(tmp_path):
     logits_npz, dg_npz = conf.discover_logit_npz(tmp_path / "pred_sample0_confidences.json")
     assert logits_npz == tmp_path / "pred_sample0_logits.npz"
     assert dg_npz == tmp_path / "pred_distogram.npz"
+
+
+def test_resolve_sources_from_logits_npz(tmp_path):
+    """A per-sample logits npz resolves its own confidences.json + distogram."""
+    sample_dir = tmp_path / "seed-42_sample-0"
+    sample_dir.mkdir()
+    (sample_dir / "confidences.json").write_text("{}")
+    (sample_dir / "logits.npz").write_bytes(b"x")
+    (tmp_path / "seed-42_distogram.npz").write_bytes(b"x")
+
+    src = conf.resolve_logit_sources(sample_dir / "logits.npz")
+    assert src.conf_json == sample_dir / "confidences.json"
+    assert src.logits_npz == sample_dir / "logits.npz"
+    assert src.distogram_npz == tmp_path / "seed-42_distogram.npz"
+
+    # The MSA layout resolves the same way from its npz.
+    (tmp_path / "pred_sample0_logits.npz").write_bytes(b"x")
+    (tmp_path / "pred_sample0_confidences.json").write_text("{}")
+    (tmp_path / "pred_distogram.npz").write_bytes(b"x")
+    src = conf.resolve_logit_sources(tmp_path / "pred_sample0_logits.npz")
+    assert src.conf_json == tmp_path / "pred_sample0_confidences.json"
+    assert src.distogram_npz == tmp_path / "pred_distogram.npz"
+
+
+def test_resolve_sources_from_distogram_npz_and_dir(tmp_path):
+    """A distogram npz stands alone; a sample directory resolves everything."""
+    sample_dir = tmp_path / "seed-7_sample-1"
+    sample_dir.mkdir()
+    (sample_dir / "confidences.json").write_text("{}")
+    (sample_dir / "logits.npz").write_bytes(b"x")
+    (tmp_path / "seed-7_distogram.npz").write_bytes(b"x")
+
+    src = conf.resolve_logit_sources(tmp_path / "seed-7_distogram.npz")
+    assert (src.conf_json, src.logits_npz) == (None, None)
+    assert src.distogram_npz == tmp_path / "seed-7_distogram.npz"
+
+    src = conf.resolve_logit_sources(sample_dir)
+    assert src.conf_json == sample_dir / "confidences.json"
+    assert src.logits_npz == sample_dir / "logits.npz"
+    assert src.distogram_npz == tmp_path / "seed-7_distogram.npz"
+
+
+def test_plot_from_logits_npz_only(tmp_path):
+    """`deepfold3 plot` renders straight from the npz, without any JSON."""
+    pytest.importorskip("matplotlib")
+    from deepfold3.scripts.plot_confidences import plot_confidences_file
+
+    out = _fake_output(n=8, s=1, seed=31)
+    conf.save_sample_logits(tmp_path / "pred_logits.npz", out, sample_idx=0, seed=31)
+    conf.save_distogram_logits(tmp_path / "pred_distogram.npz", out, seed=31)
+
+    png = tmp_path / "maps.png"
+    drawn = plot_confidences_file(tmp_path / "pred_logits.npz", png)
+    assert drawn == ["pae", "pde", "distogram"]
+    assert png.exists()
+
+    # Explicit panel selection, in the requested order.
+    drawn = plot_confidences_file(tmp_path / "pred_logits.npz", png, panels="contact,pae")
+    assert drawn == ["contact", "pae"]
+
+    # Distogram alone → only the distogram-derived panel.
+    assert plot_confidences_file(tmp_path / "pred_distogram.npz", png) == ["distogram"]
+
+    # Nothing plottable → falsy return.
+    empty = tmp_path / "empty_dir"
+    empty.mkdir()
+    assert plot_confidences_file(empty, png) == []
 
 
 def test_load_logit_maps_from_json_roundtrip(tmp_path):
