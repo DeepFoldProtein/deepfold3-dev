@@ -27,7 +27,8 @@ Decisions (see project memory ``project_stochastic_atomization_design``):
   * atomized tokens are detected downstream by ``atom_num == 1 & polymer`` — the
     featurizer routes them through its single-atom path.
   * ``residue_index`` is shared across a residue's atom tokens (drives the
-    within-residue ``rel_token`` encoding).
+    within-residue ``rel_token`` encoding); ``atom_in_res`` carries the
+    CCD-canonical atom index, matching the tokenizer's ligand-atom convention.
 """
 
 from __future__ import annotations
@@ -66,6 +67,25 @@ def _ccd_bond_names(res_name: str) -> tuple[tuple[str, str], ...]:
         if 0 <= a < len(names) and 0 <= b < len(names):
             out.append((names[a], names[b]))
     return tuple(out)
+
+
+@lru_cache(maxsize=512)
+def _ccd_atom_indices(res_name: str) -> dict[str, int]:
+    """``{atom_name: CCD-canonical index}`` for a residue.
+
+    ``atom_in_res`` is the CCD-local atom index by convention (the tokenizer
+    writes it that way for ligand atoms, and the symmetry code falls back to it
+    when its name→index route is unavailable). The structure's stored atom order
+    is NOT guaranteed to match the CCD, so resolve by name. Empty when the CCD
+    entry is unavailable — callers fall back to the stored order.
+    """
+    try:
+        from deepfold3.data.ccd import load_ccd_molecule
+
+        mol = load_ccd_molecule(res_name)
+    except Exception:
+        return {}
+    return {name: i for i, name in enumerate(mol.atom_names)}
 
 
 def _eligible_residue_tokens(tokenized: Tokenized, source: str, interface_distance: float) -> np.ndarray:
@@ -177,14 +197,21 @@ def atomize_tokens(
         # name-based) would corrupt. token_idx is renumbered globally below.
         a_start = int(tok["atom_idx"])
         a_num = int(tok["atom_num"])
+        # ``atom_in_res`` is CCD-canonical by convention (see _ccd_atom_indices);
+        # resolve by atom name because the stored order need not match the CCD.
+        src_res_name = const.RES_TYPE_INDEX_TO_NAME.get(int(tok["res_type"]))
+        ccd_index = _ccd_atom_indices(src_res_name) if src_res_name else {}
         for j in range(a_num):
             gi = a_start + j
             atom = atoms[gi]
+            atom_name = atom["name"].decode("ascii", errors="replace").strip()
             row = {name: tok[name] for name in TOKEN_DTYPE.names}
             row["res_type"] = _UNK_RES_TYPE  # match modified-residue atom tokens
             row["atom_idx"] = gi
             row["atom_num"] = 1
-            row["atom_in_res"] = j  # local atom index (residue_index stays res_id)
+            # CCD-local index, falling back to the stored order when the atom is
+            # absent from the CCD entry (residue_index stays res_id).
+            row["atom_in_res"] = int(ccd_index.get(atom_name, j))
             row["center_x"] = float(atom["x"])
             row["center_y"] = float(atom["y"])
             row["center_z"] = float(atom["z"])

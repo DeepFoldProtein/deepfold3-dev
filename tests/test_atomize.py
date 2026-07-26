@@ -112,6 +112,28 @@ def test_atomize_synthesizes_ccd_intra_residue_bonds():
         assert int(b["atom_1"]) == 0 and int(b["atom_2"]) == 0
 
 
+def test_atom_in_res_is_ccd_canonical():
+    """``atom_in_res`` must be the CCD-local index, not the stored atom order.
+
+    The symmetry code treats it as a CCD index (that is the tokenizer's ligand
+    convention), so a structure whose atom order differs from the CCD would
+    otherwise mislabel the atoms.
+    """
+    from deepfold3.data.ccd import load_ccd_molecule
+
+    tok = _tokenize(_build_ala_asp_structure())
+    out = atomize_tokens(tok, np.array([1]))  # ASP
+    ccd_names = load_ccd_molecule("ASP").atom_names
+
+    for t in out.tokens:
+        if int(t["atom_num"]) != 1:
+            continue
+        name = out.structure.atoms[int(t["atom_idx"])]["name"].decode().strip()
+        if name not in ccd_names:
+            continue
+        assert int(t["atom_in_res"]) == ccd_names.index(name), name
+
+
 def test_atomize_expands_mask_channels():
     tok = _tokenize(_build_ala_asp_structure())
     region = np.array([0, 5], dtype=np.int16)  # ASP labelled region 5
