@@ -710,6 +710,7 @@ class DiffusionHead(nn.Module):
         ref_atom_name_chars: torch.Tensor,
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> DiffusionStatic:
         """Pre-compute everything that does NOT depend on noisy positions /
         noise level: conditioning ``pair_cond``, single-cond pre-noise, and the
@@ -727,6 +728,7 @@ class DiffusionHead(nn.Module):
             ref_element=ref_element,
             ref_charge=ref_charge,
             ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
             trunk_single=embeddings["single"],
             trunk_pair=pair_cond,
         )
@@ -749,6 +751,7 @@ class DiffusionHead(nn.Module):
         ref_element: torch.Tensor | None = None,  # [B?, N, M] int64
         ref_charge: torch.Tensor | None = None,  # [B?, N, M]
         ref_atom_name_chars: torch.Tensor | None = None,  # [B?, N, M, 4] int64
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
         seq_mask: torch.Tensor | None = None,  # [B?, N]
         rel_feat: torch.Tensor | None = None,  # [B?, N, N, rel_feat_dim]
         static: DiffusionStatic | None = None,
@@ -769,6 +772,7 @@ class DiffusionHead(nn.Module):
                 ref_element=ref_element,
                 ref_charge=ref_charge,
                 ref_atom_name_chars=ref_atom_name_chars,
+                ref_space_uid=ref_space_uid,
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,
             )
@@ -819,6 +823,7 @@ class DiffusionHead(nn.Module):
         ref_element: torch.Tensor | None = None,
         ref_charge: torch.Tensor | None = None,
         ref_atom_name_chars: torch.Tensor | None = None,
+        ref_space_uid: torch.Tensor | None = None,
         seq_mask: torch.Tensor | None = None,
         rel_feat: torch.Tensor | None = None,
         static: DiffusionStatic | None = None,
@@ -878,7 +883,9 @@ class DiffusionHead(nn.Module):
             if static is None:
                 # Promote unbatched ref_* to [1, ...] so the encoder/conditioning
                 # always see a batched layout.
-                def _b(t: torch.Tensor) -> torch.Tensor:
+                def _b(t: torch.Tensor | None) -> torch.Tensor | None:
+                    if t is None:
+                        return None
                     return t if has_batch else t.unsqueeze(0)
 
                 static = self.compute_static(
@@ -888,6 +895,7 @@ class DiffusionHead(nn.Module):
                     ref_element=_b(ref_element),
                     ref_charge=_b(ref_charge),
                     ref_atom_name_chars=_b(ref_atom_name_chars),
+                    ref_space_uid=_b(ref_space_uid),
                     seq_mask=_b(seq_mask),
                     rel_feat=_b(rel_feat),
                 )
@@ -905,6 +913,7 @@ class DiffusionHead(nn.Module):
                 None,  # ref_element
                 None,  # ref_charge
                 None,  # ref_atom_name_chars
+                None,  # ref_space_uid
                 None,  # seq_mask
                 None,  # rel_feat
                 static_bs,
@@ -934,6 +943,7 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor,  # [B?, N]
         rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
         generator: torch.Generator | None = None,
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> dict[str, torch.Tensor]:
         """Draw samples from the diffusion model (Euler-Maruyama sampler).
 
@@ -964,6 +974,7 @@ class DiffusionHead(nn.Module):
                 seq_mask,
                 rel_feat,
                 generator,
+                ref_space_uid=ref_space_uid,
             )
 
     def _sample_impl(
@@ -977,6 +988,7 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
         generator: torch.Generator | None,
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         N, M = ref_mask.shape[-2:]
@@ -1004,7 +1016,9 @@ class DiffusionHead(nn.Module):
         # to a leading B=1 so the encoder/conditioning always see batched.
         has_batch = ref_pos.dim() == 4
 
-        def _ensure_b(t: torch.Tensor) -> torch.Tensor:
+        def _ensure_b(t: torch.Tensor | None) -> torch.Tensor | None:
+            if t is None:
+                return None
             return t if has_batch else t.unsqueeze(0)
 
         static = self.compute_static(
@@ -1014,6 +1028,7 @@ class DiffusionHead(nn.Module):
             ref_element=_ensure_b(ref_element),
             ref_charge=_ensure_b(ref_charge),
             ref_atom_name_chars=_ensure_b(ref_atom_name_chars),
+            ref_space_uid=_ensure_b(ref_space_uid),
             seq_mask=_ensure_b(seq_mask),
             rel_feat=_ensure_b(rel_feat),
         )
@@ -1061,6 +1076,7 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
         num_samples: int = 1,
         static: DiffusionStatic | None = None,
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward: augment GT, add noise, denoise once (AF3 §3.7.1).
 
@@ -1096,6 +1112,7 @@ class DiffusionHead(nn.Module):
                 rel_feat,
                 num_samples,
                 static,
+                ref_space_uid=ref_space_uid,
             )
 
     def _sample_training_impl(
@@ -1112,6 +1129,7 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,
         num_samples: int,
         static: DiffusionStatic | None,
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         batch_shape = gt_positions.shape[:-3]  # () or (B,)
@@ -1169,6 +1187,7 @@ class DiffusionHead(nn.Module):
                 ref_element,
                 ref_charge,
                 ref_atom_name_chars,
+                ref_space_uid,
                 seq_mask,
                 rel_feat,
             )

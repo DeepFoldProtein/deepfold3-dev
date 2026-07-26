@@ -249,6 +249,31 @@ def _gather_q_to_k(arr: torch.Tensor, q_to_k_idx: torch.Tensor, q_to_k_mask: tor
     return _flat_take(arr.reshape(-1, *arr.shape[2:]), q_to_k_idx, q_to_k_mask)
 
 
+def _offsets_valid(subsets: AtomSubsets, ref_space_uid: torch.Tensor | None = None) -> torch.Tensor:
+    """AF3 Algorithm 5 line 3: ``v_lm = (ref_space_uid_l == ref_space_uid_m)``.
+
+    ``ref_space_uid`` numbers each (chain id, residue index) reference conformer,
+    so the gate admits every atom pair sharing one conformer. Falls back to token
+    identity when the feature is absent (older callers / feature dicts). The two
+    agree for multi-atom polymer residue tokens, but NOT for one-atom tokens
+    (ligand, modified residue, atomized residue): there token identity collapses
+    to the self-pair, dropping the reference-conformer offsets and distances
+    entirely — exactly the geometry AF3 feeds the atom encoder.
+
+    Args:
+        subsets: atom subset indices from :func:`build_atom_subsets`.
+        ref_space_uid: ``[B?, N, M]`` int reference-space ids, or None.
+
+    Returns:
+        ``[B?, S, Q, K]`` bool validity mask.
+    """
+    if ref_space_uid is None:
+        return subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)
+    uid_q = _gather_to_subsets(ref_space_uid.unsqueeze(-1), subsets.ta_to_q_idx, subsets.ta_to_q_mask)
+    uid_k = _gather_q_to_k(uid_q, subsets.q_to_k_idx, subsets.q_to_k_mask)
+    return uid_q.squeeze(-1).unsqueeze(-1) == uid_k.squeeze(-1).unsqueeze(-2)
+
+
 @dataclasses.dataclass
 class AtomCrossAttEncoderOutput:
     token_act: torch.Tensor  # [N_tok, per_token_channels]
@@ -732,6 +757,7 @@ class EvoformerConditioningEncoder(nn.Module):
         ref_element: torch.Tensor,  # [B?, N, M] int64
         ref_charge: torch.Tensor,  # [B?, N, M] float
         ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> torch.Tensor:
         """Returns token_act ``[B?, N, per_token_channels]``."""
         N, M = ref_pos.shape[-3], ref_pos.shape[-2]
@@ -752,8 +778,8 @@ class EvoformerConditioningEncoder(nn.Module):
         queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)  # [B?, S, Q, 3]
         keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)  # [B?, S, K, 3]
 
-        # offsets_valid: same-token atom pairs (same reference frame)
-        offsets_valid = subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)  # [B?, S, Q, K]
+        # offsets_valid: atom pairs sharing one reference conformer (AF3 Alg. 5 v_lm)
+        offsets_valid = _offsets_valid(subsets, ref_space_uid)  # [B?, S, Q, K]
 
         # Build cross-subset pair_cond [B?, S, Q, K, cp]
         row = self.single_to_pair_row_enc(F.relu(queries_single))  # [B?, S, Q, cp]
@@ -875,6 +901,7 @@ class AtomEncoder(nn.Module):
         ref_atom_name_chars: torch.Tensor,  # [B?, N, M, 4] int64
         trunk_single: torch.Tensor,  # [B?, N, c_single=384]
         trunk_pair: torch.Tensor,  # [B?, N, N, c_pair=128]
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
     ) -> AtomEncoderStatic:
         """Compute the noise-independent encoder state.
 
@@ -903,7 +930,7 @@ class AtomEncoder(nn.Module):
 
         queries_ref_pos = _gather_to_subsets(ref_pos, subsets.ta_to_q_idx, subsets.ta_to_q_mask)
         keys_ref_pos = _gather_q_to_k(queries_ref_pos, subsets.q_to_k_idx, subsets.q_to_k_mask)
-        offsets_valid = subsets.token_for_query.unsqueeze(-1) == subsets.token_for_key.unsqueeze(-2)
+        offsets_valid = _offsets_valid(subsets, ref_space_uid)
 
         # --- Trunk pair contribution ---
         tp_norm = layer_norm(trunk_pair, [trunk_pair.shape[-1]]) * self.lnorm_trunk_pair_w
@@ -947,6 +974,7 @@ class AtomEncoder(nn.Module):
         ref_element: torch.Tensor | None = None,  # [B?, N, M] int64
         ref_charge: torch.Tensor | None = None,  # [B?, N, M] float
         ref_atom_name_chars: torch.Tensor | None = None,  # [B?, N, M, 4] int64
+        ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
         noisy_atom_pos: torch.Tensor | None = None,  # [B?, N, M, 3] or None
         trunk_single: torch.Tensor | None = None,  # [B?, N, c_single=384]
         trunk_pair: torch.Tensor | None = None,  # [B?, N, N, c_pair=128]
@@ -960,7 +988,7 @@ class AtomEncoder(nn.Module):
         """
         if static is None:
             static = self.compute_static(
-                ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars, trunk_single, trunk_pair
+                ref_pos, ref_mask, ref_element, ref_charge, ref_atom_name_chars, trunk_single, trunk_pair, ref_space_uid
             )
 
         subsets = static.subsets

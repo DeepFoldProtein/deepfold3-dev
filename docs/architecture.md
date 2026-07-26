@@ -195,6 +195,12 @@ Processes structural templates (known PDB structures similar to the query) into 
 - Encoder: maps noisy atom positions to flat subset space, conditions with trunk single/pair
 - Decoder: maps denoised subset features back to `[N, M, 3]` atom positions
 - Trunk pair broadcast: `pair[token_for_query, token_for_key]` -> `[S, Q, K, pair_channels]`
+- Reference-conformer geometry (`ref_pos` offsets + inverse distances) is gated by
+  `v_lm = (ref_space_uid_l == ref_space_uid_m)` (AF3 Algorithm 5 line 3, `_offsets_valid`).
+  `ref_space_uid` numbers each `(chain, residue_index)` conformer, so all atoms of one
+  residue see each other — including one-atom tokens (ligand, modified residue, atomized
+  residue), where a token-identity gate would collapse to the self-pair and drop the
+  geometry entirely. Absent the feature the gate falls back to token identity.
 
 ### `diffusion.py` -- Denoising
 

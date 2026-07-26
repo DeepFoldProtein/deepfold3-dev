@@ -246,6 +246,7 @@ class DeepFold3(nn.Module):
         ref_element = features["ref_element"]
         ref_charge = features["ref_charge"].float()
         ref_atom_name_chars = features["ref_atom_name_chars"]
+        ref_space_uid = features.get("ref_space_uid")
 
         use_ckpt = torch.is_grad_enabled()
         # Match OF3 ``input_embedders.py:127`` — wrap the atom conditioning
@@ -267,6 +268,7 @@ class DeepFold3(nn.Module):
                     ref_element,
                     ref_charge,
                     ref_atom_name_chars,
+                    ref_space_uid,
                 )
             else:
                 evo_cond_act = self.evo_cond_encoder(
@@ -275,6 +277,7 @@ class DeepFold3(nn.Module):
                     ref_element=ref_element,
                     ref_charge=ref_charge,
                     ref_atom_name_chars=ref_atom_name_chars,
+                    ref_space_uid=ref_space_uid,
                 )
         if fp32_ace:
             evo_cond_act = evo_cond_act.to(raw_feat.dtype)
@@ -475,6 +478,7 @@ class DeepFold3(nn.Module):
             "ref_element": features["ref_element"],
             "ref_charge": features["ref_charge"].float(),
             "ref_atom_name_chars": features["ref_atom_name_chars"],
+            "ref_space_uid": features.get("ref_space_uid"),
         }
 
     def forward_training(
