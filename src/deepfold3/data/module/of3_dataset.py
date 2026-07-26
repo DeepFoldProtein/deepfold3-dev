@@ -27,6 +27,7 @@ from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.io_cache import read_npz
 from deepfold3.data.module.dataset import _build_record_anchors, _draw_crop_anchor, _retry_getitem
 from deepfold3.data.prepare.openfold3 import convert_of3_structure
+from deepfold3.data.tokenize.atomize import maybe_atomize
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
     MSA,
@@ -354,6 +355,9 @@ class OF3Dataset(torch.utils.data.Dataset):
         max_template_date: str | None = None,
         name: str = "",
         exclude_loss_mol_types: tuple[int, ...] | list[int] = (),
+        atomize_prob: float = 0.0,
+        atomize_source: str = "random",
+        atomize_max_residues: int = 0,
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
         anchor_sampling: bool = False,
@@ -373,6 +377,12 @@ class OF3Dataset(torch.utils.data.Dataset):
         self.max_template_date = max_template_date
         # See ``TrainingDataset.exclude_loss_mol_types`` for semantics.
         self.exclude_loss_mol_types = tuple(int(m) for m in (exclude_loss_mol_types or ()))
+        # Stochastic atomization — same knobs as ``TrainingDataset``; applied
+        # through the shared ``maybe_atomize`` entry point so the regularizer
+        # is dataset-format-agnostic. No-op at the 0.0 default.
+        self.atomize_prob = float(atomize_prob)
+        self.atomize_source = atomize_source
+        self.atomize_max_residues = int(atomize_max_residues)
         # Two-stage AF3 §2.5.1 anchor sampling (weighted datasets only). OF3
         # sets are monomeric so the anchor is the single chain, but the branch
         # is kept for parity with ``TrainingDataset``. See ``_draw_crop_anchor``.
@@ -448,6 +458,15 @@ class OF3Dataset(torch.utils.data.Dataset):
             arr = TokenMask.loss_weight_excluding_mol_types(tokenized.tokens, self.exclude_loss_mol_types)
             tokenized = tokenized.with_mask(TokenMask({MASK_LOSS_WEIGHT: arr}))
         crop_anchor = _draw_crop_anchor(self._record_anchors, idx)
+        # Atomize BEFORE cropping so the crop budget accounts for the expansion.
+        tokenized = maybe_atomize(
+            tokenized,
+            idx,
+            prob=self.atomize_prob,
+            source=self.atomize_source,
+            max_residues=self.atomize_max_residues,
+            interface_distance=self.cropper.interface_distance,
+        )
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         feats = self.featurizer.process(
             tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain

@@ -153,6 +153,55 @@ def select_residues_to_atomize(
     return picked
 
 
+def maybe_atomize(
+    tokenized: Tokenized,
+    idx: int,
+    *,
+    prob: float,
+    source: str = "random",
+    max_residues: int = 0,
+    interface_distance: float = 15.0,
+) -> Tokenized:
+    """Dataset-agnostic entry point: select + apply, or pass through.
+
+    Runs AFTER tokenization and BEFORE cropping so the crop's token / atom
+    budget accounts for the expansion. A no-op at ``prob <= 0`` (the default),
+    so every dataset can call it unconditionally.
+
+    The RNG is seeded from the worker's torch seed (reseeded per-epoch by the
+    DataLoader) mixed with the sample index: it still varies per sample and per
+    epoch, but is reproducible under a fixed global seed. A bare
+    ``default_rng()`` would draw OS entropy and bypass torch/global seeding
+    entirely. Cropping stays independently stochastic and unseeded.
+
+    Args:
+        tokenized: freshly tokenized, un-cropped sample.
+        idx: dataset sample index (mixed into the seed).
+        prob: per-eligible-residue Bernoulli probability.
+        source: ``random`` | ``interface`` | ``region``.
+        max_residues: cap on atomized residues per sample (0 = uncapped).
+        interface_distance: neighbour radius for ``source="interface"``.
+
+    Returns:
+        The atomized :class:`Tokenized`, or ``tokenized`` unchanged.
+    """
+    if prob <= 0.0:
+        return tokenized
+
+    import torch
+
+    rng = np.random.default_rng([torch.initial_seed(), idx])
+    to_atomize = select_residues_to_atomize(
+        tokenized,
+        rng,
+        prob=prob,
+        source=source,
+        max_residues=max_residues,
+        interface_distance=interface_distance,
+    )
+    return atomize_tokens(tokenized, to_atomize)
+
+
 def atomize_tokens(
     tokenized: Tokenized,
     to_atomize: np.ndarray,

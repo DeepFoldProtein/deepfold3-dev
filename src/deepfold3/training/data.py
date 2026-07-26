@@ -234,6 +234,10 @@ def build_dataloaders(
         # Must reach OF3Dataset too — of3 and df3 share one DataLoader, so
         # padding only one side leaves T varying across ranks.
         "pad_templates",
+        # Stochastic atomization applies to every dataset format (no-op at 0.0).
+        "atomize_prob",
+        "atomize_source",
+        "atomize_max_residues",
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 

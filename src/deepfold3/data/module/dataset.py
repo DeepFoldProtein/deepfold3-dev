@@ -28,6 +28,7 @@ from deepfold3.data.masking import TokenMask
 from deepfold3.data.msa.paths import paired_msa_path, unpaired_msa_path
 from deepfold3.data.parse.pdb_chain_cache import PdbChainCache, template_features_from_chain
 from deepfold3.data.paths import mask_path, monomer_template_path, structure_path, template_path
+from deepfold3.data.tokenize.atomize import maybe_atomize
 from deepfold3.data.tokenize.tokenizer import Tokenizer
 from deepfold3.data.types import (
     ATOM_DTYPE,
@@ -499,25 +500,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         # subset of standard residues into per-atom tokens BEFORE cropping, so
         # the crop's token budget accounts for the expansion. No-op at
         # atomize_prob=0 (default). Inference paths never call this.
-        if self.atomize_prob > 0.0:
-            from deepfold3.data.tokenize.atomize import atomize_tokens, select_residues_to_atomize
-
-            # Seed from the worker's torch seed (reseeded per-epoch by the
-            # DataLoader) mixed with the sample idx: still varies per sample and
-            # per epoch, but is reproducible under a fixed global seed
-            # (determinism mode). A bare ``default_rng()`` draws OS entropy and
-            # bypasses torch/global seeding entirely, so it can never be
-            # reproduced. (Crop is independently stochastic and unseeded here.)
-            atomize_rng = np.random.default_rng([torch.initial_seed(), idx])
-            to_atomize = select_residues_to_atomize(
-                tokenized,
-                atomize_rng,
-                prob=self.atomize_prob,
-                source=self.atomize_source,
-                max_residues=self.atomize_max_residues,
-                interface_distance=self.cropper.interface_distance,
-            )
-            tokenized = atomize_tokens(tokenized, to_atomize)
+        tokenized = maybe_atomize(
+            tokenized,
+            idx,
+            prob=self.atomize_prob,
+            source=self.atomize_source,
+            max_residues=self.atomize_max_residues,
+            interface_distance=self.cropper.interface_distance,
+        )
 
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
         timing["tokenize_crop"], _t = time.perf_counter() - _t, time.perf_counter()
