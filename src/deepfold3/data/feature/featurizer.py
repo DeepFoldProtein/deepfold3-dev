@@ -383,35 +383,71 @@ class Featurizer:
         frame_atom_index = np.zeros((N, 3), dtype=np.int64)
         frame_token_index = np.tile(np.arange(N, dtype=np.int64)[:, None], (1, 3))
 
-        # Pre-collect ligand atom positions and per-chain token membership
-        # for the §4.3.2 nearest-neighbour lookup (O(n_chain) per ligand).
-        ligand_xyz = np.zeros((N, 3), dtype=np.float32)
-        ligand_present = np.zeros(N, dtype=bool)
-        ligand_by_chain: dict[int, list[int]] = {}
+        # Pre-collect one-atom-token positions and per-chain membership for the
+        # §4.3.2 nearest-neighbour frame lookup (O(n_chain) per token). Covers
+        # ligand / ion / glycan atoms AND atomized polymer atoms (modified
+        # residues, stochastic atomization) — both store their single atom at
+        # slot 0 and need their frame built from neighbouring atoms.
+        single_xyz = np.zeros((N, 3), dtype=np.float32)
+        single_present = np.zeros(N, dtype=bool)
+        single_by_chain: dict[int, list[int]] = {}
         for i, tok in enumerate(tokens):
-            if int(tok["mol_type"]) != const.MOL_NONPOLYMER:
+            if int(tok["atom_num"]) != 1 and int(tok["mol_type"]) != const.MOL_NONPOLYMER:
                 continue
-            ligand_by_chain.setdefault(int(tok["asym_id"]), []).append(i)
+            single_by_chain.setdefault(int(tok["asym_id"]), []).append(i)
             atom_idx = int(tok["atom_idx"])
             if atom_idx < len(data.structure.atoms):
                 atom = data.structure.atoms[atom_idx]
                 if bool(atom["is_present"]):
-                    ligand_xyz[i] = (float(atom["x"]), float(atom["y"]), float(atom["z"]))
-                    ligand_present[i] = True
+                    single_xyz[i] = (float(atom["x"]), float(atom["y"]), float(atom["z"]))
+                    single_present[i] = True
 
         _COS_25_DEG = 0.9063  # cos(25°) — colinearity cutoff (AF3 §4.3.2)
+
+        def _set_single_atom_frame(i: int, asym_id: int) -> None:
+            """AF3 §4.3.2 frame for a one-atom token: ``(nearest, self, 2nd nearest)``
+            among the one-atom tokens of the same chain.
+
+            No-op when the chain holds fewer than three such atoms or the three
+            fall within 25° of colinear, leaving ``frames_mask`` False.
+            """
+            neighbours = [j for j in single_by_chain.get(asym_id, []) if j != i and single_present[j]]
+            if len(neighbours) < 2:
+                return  # covers single-atom chains (e.g. Na+, Cl-)
+            b_xyz = single_xyz[i]
+            dists = np.linalg.norm(single_xyz[neighbours] - b_xyz, axis=-1)
+            order = np.argsort(dists)
+            a_tok = neighbours[int(order[0])]
+            c_tok = neighbours[int(order[1])]
+            v_a = single_xyz[a_tok] - b_xyz
+            v_c = single_xyz[c_tok] - b_xyz
+            denom = float(np.linalg.norm(v_a) * np.linalg.norm(v_c))
+            if denom < 1e-6:
+                return  # coincident atoms → undefined angle
+            if abs(float(np.dot(v_a, v_c)) / denom) > _COS_25_DEG:
+                return  # within 25° of colinear
+            frame_token_index[i] = (a_tok, i, c_tok)
+            # frame_atom_index[i] stays (0, 0, 0) — one-atom tokens store their
+            # single atom at slot 0.
+            frames_mask_np[i] = True
 
         for i, tok in enumerate(tokens):
             mt = int(tok["mol_type"])
             rt = int(tok["res_type"])
             if is_atomized[i]:
-                # Atomized polymer atom: its single atom (slot 0) is the
-                # representative, so the token stays in the distogram /
-                # confidence masks. No local rigid frame (single atom) →
-                # frames_mask stays False (drops it from PAE frames, like a
-                # lone ion). Nearest-neighbour frames could be added later.
+                # Atomized polymer atom (modified residue, bonded glycan, or a
+                # stochastically atomized standard residue): its single atom
+                # (slot 0) is both the representative and the token center, so
+                # the token stays in the distogram / confidence masks. Its local
+                # frame comes from the same nearest-neighbour rule as ligand
+                # atoms (AF3 §4.3.2); the nearest one-atom tokens are normally
+                # the sibling atoms of its own residue, so the frame recovers
+                # the residue-local frame the whole-residue token would have had
+                # — keeping the token in the PAE frame set and under FAPE.
                 token_to_rep_atom[i] = 0
                 rep_atom_present[i] = bool(ref_mask[i, 0])
+                if single_present[i]:
+                    _set_single_atom_frame(i, int(tok["asym_id"]))
                 continue
             if mt == const.MOL_PROTEIN:
                 token_to_center_atom[i] = 1  # CA is the pLDDT-neighbour center atom
@@ -461,30 +497,10 @@ class Featurizer:
                     frame_atom_index[i] = (c1_idx, c3_idx, c4_idx)
                     frames_mask_np[i] = True
             elif mt == const.MOL_NONPOLYMER:
-                if not ligand_present[i]:
+                if not single_present[i]:
                     continue
                 rep_atom_present[i] = True  # ligand atom at slot 0 (verified present above)
-                neighbours = [j for j in ligand_by_chain.get(int(tok["asym_id"]), []) if j != i and ligand_present[j]]
-                if len(neighbours) < 2:
-                    continue  # covers single-atom chains (e.g. Na+, Cl-)
-                b_xyz = ligand_xyz[i]
-                neighbour_xyz = ligand_xyz[neighbours]  # [K, 3]
-                dists = np.linalg.norm(neighbour_xyz - b_xyz, axis=-1)
-                order = np.argsort(dists)
-                a_tok = neighbours[int(order[0])]
-                c_tok = neighbours[int(order[1])]
-                v_a = ligand_xyz[a_tok] - b_xyz
-                v_c = ligand_xyz[c_tok] - b_xyz
-                denom = float(np.linalg.norm(v_a) * np.linalg.norm(v_c))
-                if denom < 1e-6:
-                    continue  # coincident atoms → undefined angle
-                cos_ang = float(np.dot(v_a, v_c)) / denom
-                if abs(cos_ang) > _COS_25_DEG:
-                    continue  # within 25° of colinear
-                frame_token_index[i] = (a_tok, i, c_tok)
-                # frame_atom_index[i] stays (0, 0, 0) — ligand tokens store
-                # their single atom at slot 0.
-                frames_mask_np[i] = True
+                _set_single_atom_frame(i, int(tok["asym_id"]))
 
         # Mask tokens without a valid rep atom so distogram / confidence
         # targets don't read garbage coordinates at ``gt_pos[i, rep_idx]``.

@@ -166,8 +166,20 @@ def test_featurize_atomized_keeps_tokens_in_masks():
     gt_mask = feats["atom_gt_mask"].numpy()
     assert gt_mask[1:, 0].all()
     assert not gt_mask[1:, 1:].any()
-    # Frames off for single-atom tokens (no local rigid frame).
-    assert not bool(feats["frames_mask"][1:].any())
+    # Atomized tokens get the AF3 §4.3.2 nearest-neighbour frame (same rule as
+    # ligand atoms), so they stay in the PAE frame set instead of dropping out.
+    atom_tok_frames = feats["frames_mask"][1:]
+    assert bool(atom_tok_frames.any()), "atomized tokens must get nearest-neighbour frames"
+    # Each frame references other one-atom tokens of the same residue, and the
+    # middle slot is the token itself.
+    fti = feats["frame_token_index"].numpy()
+    for i in range(1, N):
+        if not bool(feats["frames_mask"][i]):
+            continue
+        a_tok, b_tok, c_tok = fti[i]
+        assert b_tok == i
+        assert a_tok != i and c_tok != i
+        assert 1 <= a_tok < N and 1 <= c_tok < N
     # Symmetric ASP oxygens surfaced into the (ligand) swap-pair channel.
     assert len(feats["ligand_swap_pairs"]) == 1
 
