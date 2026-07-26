@@ -13,8 +13,8 @@ ligands and glycans) and mildly regularizing token boundaries.
 The transform runs on a :class:`~deepfold3.data.types.Tokenized` object AFTER
 tokenization but BEFORE cropping, so the crop's token/atom budget accounts for
 the expansion. It leaves ``structure`` untouched — only the token→atom grouping
-changes — and re-derives ``bonds`` (existing token bonds remapped to the split
-atom tokens + intra-residue connectivity synthesised from the CCD).
+changes — and re-derives ``bonds`` by remapping the existing token bonds onto
+the split atom tokens.
 
 Decisions (see project memory ``project_stochastic_atomization_design``):
   * ``res_type`` is set to UNK (20), exactly matching the tokenizer's
@@ -45,28 +45,6 @@ _POLYMER = (const.MOL_PROTEIN, const.MOL_RNA, const.MOL_DNA)
 # Atom tokens carry res_type=UNK, matching the tokenizer's modified-residue
 # per-atom tokens (tokenizer.py: ``res_type = 20`` for non-standard residues).
 _UNK_RES_TYPE = const.RES_TYPE_ORDER["UNK"]
-
-
-@lru_cache(maxsize=512)
-def _ccd_bond_names(res_name: str) -> tuple[tuple[str, str], ...]:
-    """CCD heavy-atom connectivity for a residue as ``(name_a, name_b)`` pairs.
-
-    Cached per residue name (standard residues are few, so this warms fast).
-    Returns an empty tuple when the CCD entry is unavailable — intra-residue
-    bond synthesis is an enhancement, not required for the token split.
-    """
-    try:
-        from deepfold3.data.ccd import load_ccd_molecule
-
-        mol = load_ccd_molecule(res_name)
-    except Exception:
-        return ()
-    names = mol.atom_names
-    out: list[tuple[str, str]] = []
-    for a, b, _order in mol.bonds:
-        if 0 <= a < len(names) and 0 <= b < len(names):
-            out.append((names[a], names[b]))
-    return tuple(out)
 
 
 @lru_cache(maxsize=512)
@@ -305,29 +283,16 @@ def atomize_tokens(
             continue
         _add_bond(r1[0], r1[1], r2[0], r2[1])
 
-    # Intra-residue backbone / side-chain bonds from the CCD (these are implicit
-    # for un-atomized residues; once split they must be re-expressed as token
-    # bonds so the pair track sees the residue's connectivity).
-    for i in atomize_set:
-        tok = tokens[i]
-        res_name = tok["res_type"]
-        res_name = const.RES_TYPE_INDEX_TO_NAME.get(int(res_name))
-        if res_name is None:
-            continue
-        pairs = _ccd_bond_names(res_name)
-        if not pairs:
-            continue
-        a_start = int(tok["atom_idx"])
-        a_num = int(tok["atom_num"])
-        name_to_new: dict[str, int] = {}
-        for j in range(a_num):
-            nm = atoms[a_start + j]["name"].decode("ascii", errors="replace").strip()
-            name_to_new[nm] = old_atom_to_new[(i, j)]
-        for na, nb in pairs:
-            ta = name_to_new.get(na)
-            tb = name_to_new.get(nb)
-            if ta is not None and tb is not None:
-                _add_bond(ta, 0, tb, 0)
+    # NOTE: intra-residue connectivity is deliberately NOT synthesised here.
+    # The tokenizer builds ``token_bonds`` from ``structure.bonds`` only
+    # (cross-entity ``_struct_conn`` + ligand bonds), so a modified residue —
+    # atomized at INFERENCE — carries no intra-residue token bonds either.
+    # Emitting them for atomized standard residues would make the training
+    # distribution differ from the inference one in ``bond_matrix``, defeating
+    # the point of the regularizer. The residue's internal geometry still
+    # reaches the model: all atom tokens of one residue share a
+    # ``ref_space_uid``, which gates the atom encoder's reference-conformer
+    # offsets and distances (AF3 Algorithm 5 line 3, ``_offsets_valid``).
 
     new_bonds = np.array(bond_rows, dtype=TOKEN_BOND_DTYPE) if bond_rows else np.empty(0, dtype=TOKEN_BOND_DTYPE)
 

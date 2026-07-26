@@ -100,16 +100,27 @@ def test_atomize_expands_selected_residue():
     assert out.structure is tok.structure
 
 
-def test_atomize_synthesizes_ccd_intra_residue_bonds():
+def test_atomize_emits_no_intra_residue_bonds():
+    """Atomized residues must look like modified residues in ``bond_matrix``.
+
+    The tokenizer derives token bonds from ``structure.bonds`` alone, so a
+    modified residue — atomized at inference — carries no intra-residue token
+    bonds. Synthesising them here would make the training distribution differ
+    from the inference one. The residue's internal geometry instead reaches the
+    model through the shared ``ref_space_uid`` (AF3 Algorithm 5 line 3).
+    """
     tok = _tokenize(_build_ala_asp_structure())
     out = atomize_tokens(tok, np.array([1]))
-    # ASP intra bonds present (N-CA, CA-C, C-O, CA-CB, CB-CG, CG-OD1, CG-OD2);
-    # OXT bond is skipped because the residue has no OXT atom.
-    assert len(out.bonds) == 7
-    # Every bond is between two ASP atom tokens (indices 1..8), slot 0.
-    for b in out.bonds:
-        assert 1 <= int(b["token_1"]) <= 8 and 1 <= int(b["token_2"]) <= 8
-        assert int(b["atom_1"]) == 0 and int(b["atom_2"]) == 0
+    assert len(out.bonds) == len(tok.bonds) == 0
+
+    # All atom tokens of the split residue share one reference space, which is
+    # what carries the connectivity into the atom encoder.
+    from deepfold3.data.feature.featurizer import Featurizer
+
+    feats = Featurizer(max_msa_seqs=8).process(out, training=True, random_rot=False)
+    uid = feats["ref_space_uid"].numpy()
+    atom_uids = {int(uid[i, 0]) for i in range(1, len(out.tokens))}
+    assert len(atom_uids) == 1, "atomized residue atoms must share one ref_space_uid"
 
 
 def test_atom_in_res_is_ccd_canonical():
