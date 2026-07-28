@@ -1,0 +1,9 @@
+category,step,mean,conf_top1,oracle,r_within_target,r_within_ci_lo,r_within_ci_hi,n_targets,r_pooled
+monomer_protein,23000,0.931,0.931,0.944,0.02,-0.045,0.085,319,0.706
+monomer_rna,23000,0.312,0.311,0.362,-0.091,-0.294,0.12,15,-0.063
+monomer_dna,23000,0.213,0.209,0.244,0.017,-0.159,0.192,14,0.492
+interface_protein_protein,23000,0.662,0.667,0.733,0.038,-0.071,0.146,237,0.055
+interface_antibody_antigen,23000,0.297,0.355,0.565,0.128,0.044,0.211,138,0.056
+interface_protein_peptide,23000,0.743,0.829,0.914,-0.068,-0.336,0.21,35,0.679
+interface_protein_dna,23000,0.474,0.474,0.474,0.046,-0.292,0.374,19,-0.067
+interface_protein_rna,23000,1.0,1.0,1.0,-0.051,-0.414,0.326,5,0.886

@@ -1,0 +1,17 @@
+category,r14_step,model,n,rank1_A%,rank1_M%,rank1_H%,rank1_succ%,mean_succ%,oracle_succ%,oracle_gain_over_rank1%
+protein–protein,23000,PXv2,166,9.0,22.9,41.0,72.9,72.9,78.9,6.0
+protein–protein,23000,PXv1,166,7.8,21.1,42.2,71.1,69.3,78.9,7.8
+protein–protein,23000,BT2,166,10.8,23.5,34.9,69.3,68.7,73.5,4.2
+protein–protein,23000,BT1,166,8.4,26.5,34.3,69.3,69.3,73.5,4.2
+protein–protein,23000,AF3,166,7.8,20.5,40.4,68.7,67.5,73.5,4.8
+protein–protein,23000,OF3p2,166,10.8,21.1,35.5,67.5,63.9,75.3,7.8
+protein–protein,23000,DF3r14,166,6.0,20.5,38.0,64.5,65.7,72.3,7.8
+protein–protein,23000,EF2,166,,,,,63.3,68.1,
+antibody–antigen,23000,PXv2,70,15.7,21.4,31.4,68.6,60.0,78.6,10.0
+antibody–antigen,23000,PXv1,70,10.0,14.3,24.3,48.6,41.4,67.1,18.6
+antibody–antigen,23000,AF3,70,10.0,14.3,21.4,45.7,44.3,64.3,18.6
+antibody–antigen,23000,DF3r14,70,12.9,17.1,10.0,40.0,31.4,58.6,18.6
+antibody–antigen,23000,OF3p2,70,11.4,12.9,12.9,37.1,28.6,55.7,18.6
+antibody–antigen,23000,BT1,70,10.0,17.1,10.0,37.1,37.1,42.9,5.7
+antibody–antigen,23000,BT2,70,10.0,11.4,8.6,30.0,27.1,41.4,11.4
+antibody–antigen,23000,EF2,70,,,,,42.9,60.0,
