@@ -46,6 +46,37 @@ _Every section auto-refreshes to the latest benched r14 step per category: `plot
 > 9.9 agab points, and there is no reason to think it costs r14 nothing. Restoring templates to
 > the bench inputs is the cleanest way to settle it.
 
+> ### Two conditions change at step 24500 — read the trajectory in three pieces
+>
+> | steps | training templates | bench templates |
+> |---|---|---|
+> | ≤ 24000 | **misaligned** (median 7% identity) | none |
+> | 24500 → | **fixed** (median 98%) | **4 per protein chain** |
+>
+> **Training side.** Template hit files store the template-side alignment in
+> structure space (0-based resolved-residue), but the multimer loader read them
+> as SEQRES and re-ran the seqres→structure realignment. The two frames differ
+> by the template's unresolved N-terminal count, which varies per template, so
+> every hit was shifted by a different amount. `patchr` (weight 0.50) and
+> `teddymer` (0.10) — **60% of the mix** — were affected; measured median
+> identity of what the model actually received was 7%, i.e. random. `afdb_nvda`
+> was correct, and the of3 sets (`long_monomers`, `short_monomers`) use a
+> genuinely SEQRES-space format and were never affected. Fixed in `75d89f2`,
+> applied from the 24500 restart.
+>
+> **Bench side.** The harness folded template-free until now (in-distribution —
+> training draws `k = min(Uniform[0, n_avail], 4)`, so `k = 0` occurs — but the
+> model's weakest supported mode). Templates are now attached from the
+> pre-computed m8 hits, date-filtered to `query_release − 60d`; without that
+> filter 11.4% of bench chains would receive their own PDB entry as a template.
+>
+> **Consequence for reading this report.** Steps ≤ 24000 and ≥ 24500 are not
+> comparable, and because both conditions changed together, a step at 24500
+> **cannot be attributed** to either one alone. Splitting them needs one
+> checkpoint folded both ways (`MAX_TEMPLATES=0` into a separate series). Every
+> number in the sections below is from step 23k and therefore from the old
+> regime on both counts.
+
 ## The 18k–19k protein–protein dip was transient
 
 Recorded because it nearly triggered a data rollback. A dataset change landed at step 17.5k

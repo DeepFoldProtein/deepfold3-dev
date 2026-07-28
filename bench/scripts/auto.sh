@@ -23,6 +23,7 @@
 #                 (e.g. SEEDS_INTERFACE_ANTIBODY_ANTIGEN=42,43,44,45). Defaults
 #                 below give antibody-antigen FoldBench's full 4 seeds.
 #   NUM_SAMPLES   diffusion samples / seed (default 5)
+#   MAX_TEMPLATES structural templates per protein chain (default 4; 0 = off)
 #   MAX_TOKENS    FoldBench-small cap      (default 1024)
 #   SNAPSHOT      .pt weight snapshot      (default auto: shadow if present else average)
 #   STEP_OFFSET   series-global step shift (default 0)
@@ -65,6 +66,22 @@ cat_seeds() {
 }
 NUM_SAMPLES="${NUM_SAMPLES:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
+# Structural templates per protein chain, attached to the bench inputs from the
+# pre-computed m8 hits in bench/data/msa/m8 and filtered to release dates at
+# least `template_cutoff_days` before the query (11.4% of bench chains list
+# their own PDB entry as a hit, so the filter is not optional).
+#
+# The bench folded template-free until now, which is in-distribution for the
+# model (training draws k = min(Uniform[0, n_avail], 4), so k = 0 happens) but
+# is its weakest supported mode, and it made `af3_ref` a handicapped AlphaFold3:
+# on identical targets our template-free fold trails the published AF3 by 3.8
+# points on protein-protein and 9.9 on antibody-antigen.
+#
+# CAUTION: turning this on changes the bench inputs, so numbers before and after
+# are not comparable. Do not flip it in the same window as a training-side
+# change unless you are willing to lose the attribution — run one checkpoint
+# both ways (MAX_TEMPLATES=0 into a separate SERIES) if you need the split.
+MAX_TEMPLATES="${MAX_TEMPLATES:-4}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
 # node: 8-GPU box -> 0..7, 4-GPU box -> 0..3). Override with GPUS=0,1 to reserve.
 GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
@@ -120,7 +137,8 @@ fi
 
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
 echo "[auto] categories: $CATEGORIES"
-echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS"
+echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS templates=$MAX_TEMPLATES"
+[ "$MAX_TEMPLATES" -gt 0 ] && echo "[auto]   NOTE templates are ON — numbers are not comparable to template-free steps"
 for _c in $CATEGORIES; do
   _s="$(cat_seeds "$_c")"
   [ "$_s" != "$SEEDS" ] && echo "[auto]   seed override: $_c = $_s"
@@ -135,8 +153,9 @@ sweep_active() {
 # current cap). New categories / a raised cap slot in without re-benchmarking
 # existing predictions (sweep is skip-existing).
 for CAT in $CATEGORIES; do
-  echo "[auto] $(date '+%m-%d %H:%M') building inputs for $CAT (<=$MAX_TOKENS tokens) ..."
-  $PY bench/scripts/build_inputs.py --category "$CAT" --max-tokens "$MAX_TOKENS" || \
+  echo "[auto] $(date '+%m-%d %H:%M') building inputs for $CAT (<=$MAX_TOKENS tokens, templates=$MAX_TEMPLATES) ..."
+  $PY bench/scripts/build_inputs.py --category "$CAT" --max-tokens "$MAX_TOKENS" \
+      --max-templates "$MAX_TEMPLATES" || \
     echo "[auto] WARN build_inputs failed for $CAT"
 done
 
