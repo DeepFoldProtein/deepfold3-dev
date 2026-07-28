@@ -162,7 +162,7 @@ Processes structural templates (known PDB structures similar to the query) into 
   - Unit vectors (x, y, z) from backbone frames `[N, N, 1]`
   - Backbone mask `[N, N, 1]`, query pair `[N, N, 128]`
 - 2-layer `TemplatePairFormerBlock` stack + output LayerNorm
-- Uses per-template pair mask (`pb_mask[i] × pb_mask[j]`) derived from template coverage, not the query `multichain_mask`. This allows multimer templates to provide cross-chain features (interface distances, relative orientations)
+- Template pair features are masked to **intra-chain pairs only**: `pb_mask[i] × pb_mask[j] × multichain_mask` (`34326d5`). Template features come from per-chain extraction, each chain in its own frame, so cross-chain template distances/orientations are not real interface geometry and are masked out. The query passthrough and per-token aatype stay unmasked
 
 **`TemplatePairFormerBlock`** -- Simplified PairFormer (no single track):
 

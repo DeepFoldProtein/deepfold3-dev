@@ -498,14 +498,14 @@ def fetch_pdb_mmcif(pdb_id, cache_dir=None, pdb_mmcif_dir=None) -> str:
 
 - `find_multimer_templates()` discovers multimer templates from pre-computed per-chain m8 files
 - Groups m8 hits across chains by template PDB ID; PDB IDs hitting ≥2 query chains are multimer template candidates
-- Uses `scipy.optimize.linear_sum_assignment` (Hungarian algorithm) for optimal query-to-template chain pairing
+- Uses `scipy.optimize.linear_sum_assignment` (Hungarian algorithm) for optimal query-to-template chain pairing. This decides which template chain aligns to which query chain; it does **not** give the model inter-chain geometry, which the intra-chain template mask removes
 - Self-hit exclusion: skips template PDB ID == training PDB ID
 - Offline preprocessing: `deepfold3 prepare-templates --data-dir ... --m8-dir ...` writes `{data_dir}/templates/{pdb_id}.json`. Auto-consumes `data/mmcif_meta.json` from `scan-mmcif` to populate `release_date` per hit (required for the training-time date cutoff to admit templates; without it every hit is dropped). Override with `--mmcif-cache <path>` or disable by pointing to a non-existent file.
 - Training-time: `TrainingDataset` loads template JSON index, reads mmCIF from PDB mirror, extracts `TemplateFeatures` via existing `_extract_from_index_pairs()`
 - **Structure-space monomer hits (Foldseek):** MMseqs2/HHsearch align against SEQRES, so a monomer hit's `tstart`/`cigar` are SEQRES-space and `template_features_from_chain` realigns SEQRES→structure. Foldseek aligns against the 3D structure, so its indices are already **resolved-residue (structure) space**; applying the realignment double-shifts them. Set the per-dataset flag `monomer_template_struct_space: true` (config `datasets:` entry, or the 7th `--dataset name:path:weight:strategy:distill:format:tpl_struct_space` field) to pass `indices_are_struct=True`, which skips the realignment. Works with a normal (seqres-populated) `pdb_chain_cache`; no cache rebuild needed. Key the JSON `template_pdb_id` by the assembly-qualified id (e.g. `2bsk-assembly1`) and point `--mmcif-dir` at the assembly mirror so `find_pdb_mmcif_path` resolves the assembly file and its auth chain directly.
 - Template augmentation: each sample randomly uses 0..max_templates (uniform), sampling from available hits
 - Per-chain dropout: for multimer templates, each chain alignment is independently kept with 50% probability (at least 1 chain always kept), creating partial multimer context during training
-- Per-template pair mask: template embedding uses `template_pseudo_beta_mask[i] × template_pseudo_beta_mask[j]` instead of query `multichain_mask`, allowing multimer templates to provide cross-chain features (interface distances, relative orientations)
+- Template pair mask is intra-chain only: `template_pseudo_beta_mask[i] × template_pseudo_beta_mask[j] × multichain_mask` (`34326d5`). Per-chain extraction puts each chain's template in its own frame, so the cross-chain off-diagonal carries no valid interface geometry and is masked. A multimer template index therefore behaves as a bundle of per-chain templates
 - CLI: `deepfold3 train --mmcif-dir /path/to/pdb/mmcif`
 
 **JSON template hits format** (produced by tools like Protenix/Boltz):
