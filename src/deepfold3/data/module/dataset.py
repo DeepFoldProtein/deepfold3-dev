@@ -276,7 +276,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         slow_sample_log_threshold_s: float = 0.0,
         msa_crop_size: int = 1024,
         n_msa_crops: int = 0,
-        monomer_template_struct_space: bool = False,
+        template_struct_space: bool = False,
         pad_templates: bool = False,
     ):
         self.records = records
@@ -383,10 +383,12 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_template_date = max_template_date
         self.default_template_cutoff_date = default_template_cutoff_date
         self.prefer_monomer_templates = prefer_monomer_templates
-        # Monomer template hits store structure-space (resolved-residue) template
-        # indices instead of SEQRES-space ones (e.g. Foldseek search). When set,
-        # the seqres→structure realignment is skipped at feature-extraction time.
-        self.monomer_template_struct_space = monomer_template_struct_space
+        # Template hit files store structure-space (0-based resolved-residue)
+        # template indices instead of SEQRES-space ones. When set, the
+        # seqres→structure realignment is skipped at feature-extraction time.
+        # Applies to BOTH the monomer and multimer index files: the frame is a
+        # property of how the search was run, not of which loader reads it.
+        self.template_struct_space = template_struct_space
         self._has_templates = (self.data_dir / "templates").is_dir()
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
         # Per-chain template cache (memory LRU + hierarchical sharded disk).
@@ -825,7 +827,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                         ct,
                         query_to_seqres,
                         chain_info.num_residues,
-                        indices_are_struct=self.monomer_template_struct_space,
+                        indices_are_struct=self.template_struct_space,
                     )
                 except Exception as e:
                     _count_drop(
@@ -913,7 +915,18 @@ class TrainingDataset(torch.utils.data.Dataset):
                     continue
                 try:
                     query_to_seqres = dict(zip(query_indices, seqres_indices, strict=True))
-                    feats = template_features_from_chain(ct, query_to_seqres, chain_info.num_residues)
+                    # ``template_struct_space`` applies here too: the multimer index
+                    # is produced by the same search as the monomer one, so its
+                    # template indices live in the same frame. Omitting this ran the
+                    # seqres->structure realignment on already-structure-space
+                    # indices, shifting every hit by the template's unresolved
+                    # N-terminal count.
+                    feats = template_features_from_chain(
+                        ct,
+                        query_to_seqres,
+                        chain_info.num_residues,
+                        indices_are_struct=self.template_struct_space,
+                    )
                 except Exception as e:
                     _count_drop(
                         "multimer template extraction failed",

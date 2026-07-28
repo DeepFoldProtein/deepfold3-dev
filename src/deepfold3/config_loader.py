@@ -139,7 +139,12 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 "cutoff_date": str(entry.get("cutoff_date", "")),
                 "exclude_loss_mol_types": excl,
                 "crop_weights": crop_weights,
-                "monomer_template_struct_space": bool(entry.get("monomer_template_struct_space", False)),
+                # ``monomer_template_struct_space`` is the deprecated spelling; it applied
+                # only to the monomer path, but the flag is a property of the index files
+                # and both paths need it.
+                "template_struct_space": bool(
+                    entry.get("template_struct_space", entry.get("monomer_template_struct_space", False))
+                ),
                 "max_template_date": str(entry.get("max_template_date", "")),
             }
         )

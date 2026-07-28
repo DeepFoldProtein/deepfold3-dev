@@ -429,7 +429,7 @@ def train(
             strategy=parts[3] if len(parts) > 3 else "uniform",
             is_distillation=parts[4].lower() in ("true", "1", "yes") if len(parts) > 4 else False,
             format=parts[5] if len(parts) > 5 else "df3",
-            monomer_template_struct_space=parts[6].lower() in ("true", "1", "yes") if len(parts) > 6 else False,
+            template_struct_space=parts[6].lower() in ("true", "1", "yes") if len(parts) > 6 else False,
         )
         # CLI dataset with same name replaces config-defined one
         if entry.name in existing_ds:

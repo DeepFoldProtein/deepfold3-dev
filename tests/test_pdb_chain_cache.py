@@ -134,7 +134,7 @@ def test_indices_are_struct_skips_realign():
     """Foldseek-style hits carry structure-space template indices: with
     ``indices_are_struct=True`` they index the resolved-residue lookup directly
     (no seqres realignment). With the default (SEQRES-space), a leading unresolved
-    gap shifts the mapping. This guards the ``monomer_template_struct_space`` path.
+    gap shifts the mapping. This guards the ``template_struct_space`` path.
     """
     L = 5
     lookup = {}

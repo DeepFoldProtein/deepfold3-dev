@@ -174,7 +174,7 @@ class TestNormalizeDatasets:
                 "cutoff_date": "",
                 "exclude_loss_mol_types": [3],
                 "crop_weights": None,
-                "monomer_template_struct_space": False,
+                "template_struct_space": False,
                 "max_template_date": "",
             }
         ]
@@ -246,7 +246,7 @@ class TestLoadConfig:
                 "cutoff_date": "",
                 "exclude_loss_mol_types": [],
                 "crop_weights": None,
-                "monomer_template_struct_space": False,
+                "template_struct_space": False,
                 "max_template_date": "",
             }
         ]
@@ -372,3 +372,40 @@ datasets:
         assert ds[0]["name"] == "afdb"
         assert ds[0]["weight"] == 0.5
         assert ds[0]["is_distillation"] is True
+
+
+class TestTemplateStructSpace:
+    """``template_struct_space`` gates the seqres->structure realignment.
+
+    It was previously named ``monomer_template_struct_space`` and read only by
+    the monomer template loader, while the multimer loader always assumed
+    SEQRES-space indices. Both index files come from the same search and are
+    structure-space, so the multimer path realigned already-realigned indices —
+    shifting every hit by the template's unresolved N-terminal count.
+    """
+
+    def test_defaults_false(self):
+        from deepfold3.config_loader import normalize_datasets
+
+        (spec,) = normalize_datasets([{"name": "a", "data_dir": "/a"}])
+        assert spec["template_struct_space"] is False
+
+    def test_canonical_key(self):
+        from deepfold3.config_loader import normalize_datasets
+
+        (spec,) = normalize_datasets([{"name": "a", "data_dir": "/a", "template_struct_space": True}])
+        assert spec["template_struct_space"] is True
+
+    def test_deprecated_alias_still_accepted(self):
+        from deepfold3.config_loader import normalize_datasets
+
+        (spec,) = normalize_datasets([{"name": "a", "data_dir": "/a", "monomer_template_struct_space": True}])
+        assert spec["template_struct_space"] is True
+
+    def test_canonical_key_wins_over_alias(self):
+        from deepfold3.config_loader import normalize_datasets
+
+        (spec,) = normalize_datasets(
+            [{"name": "a", "data_dir": "/a", "template_struct_space": True, "monomer_template_struct_space": False}]
+        )
+        assert spec["template_struct_space"] is True

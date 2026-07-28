@@ -616,12 +616,22 @@ class DatasetConfig:
             monomer distillation set skip (wasted) interface crops while a
             multi-chain PDB set keeps them (AF3 §2.7 samples the strategy
             per example). ``None`` = use the global weights.
-        monomer_template_struct_space: If True, this dataset's monomer template
-            hits (``monomer_templates/{msa_id}.json``) carry structure-space
-            (resolved-residue) template indices rather than SEQRES-space ones —
-            e.g. Foldseek structure-search hits. The seqres→structure realignment
-            is then skipped at feature extraction. Default False (MMseqs2/HHsearch
-            SEQRES-space behaviour).
+        template_struct_space: If True, this dataset's template indices —
+            ``monomer_templates/{msa_id}.json`` **and** ``templates/{id}.json``
+            — are structure-space (0-based resolved-residue) rather than
+            SEQRES-space, so the seqres→structure realignment is skipped at
+            feature extraction. Default False (SEQRES-space).
+
+            Get this wrong and templates silently become noise: the two frames
+            differ by the number of unresolved N-terminal residues, which varies
+            per template. Measured on the shipped indices by re-deriving each
+            hit's sequence identity and comparing it to the identity the search
+            recorded — under the SEQRES reading the medians missed by 74 / 26 /
+            16 points (patchr / afdb_nvda / teddymer), under the structure
+            reading by 0.5 / 1.9 / 1.4, with ~98% of hits within 10 points. All
+            three shipped sets are structure-space.
+
+            ``monomer_template_struct_space`` is accepted as a deprecated alias.
         max_template_date: Per-dataset override of the global
             ``data.max_template_date`` hard cap on template release dates
             (ISO ``YYYY-MM-DD``). ``""`` (default) inherits the global value.
@@ -641,7 +651,7 @@ class DatasetConfig:
     cutoff_date: str = ""
     exclude_loss_mol_types: list[int] = field(default_factory=list)
     crop_weights: dict[str, float] | None = None
-    monomer_template_struct_space: bool = False
+    template_struct_space: bool = False
     max_template_date: str = ""
 
 

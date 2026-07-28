@@ -321,7 +321,7 @@ def build_dataloaders(
                 is_distillation=spec.is_distillation,
                 name=spec.name,
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
-                monomer_template_struct_space=spec.monomer_template_struct_space,
+                template_struct_space=spec.template_struct_space,
                 anchor_sampling=(spec.strategy == "weighted"),
                 **_spec_kwargs(ds_kwargs, spec),
             )
