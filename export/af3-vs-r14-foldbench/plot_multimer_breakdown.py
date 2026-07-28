@@ -1,4 +1,8 @@
-"""protein-protein interfaces split by composition (homo/hetero) x size (dimer / N-mer≥3).
+"""RETIRED — not run by update_foldbench.sh; its report section is frozen at step 23k.
+Same reason as plot_overview.py: the AF3 side is the template-free `af3_ref` sweep, a
+handicapped AlphaFold3. Kept runnable; see that script's header to revive.
+
+protein-protein interfaces split by composition (homo/hetero) x size (dimer / N-mer≥3).
 Left: 4 cross buckets. Right: marginals. Each row af3 vs r14, stacked CAPRI tiers
 (rank-1) + oracle caret. Homo/hetero from entity grouping in the bench input JSONs.
 

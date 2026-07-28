@@ -1,4 +1,13 @@
-"""FoldBench-style overview: af3_ref vs df3v4r14 at its latest benched step.
+"""RETIRED — not run by update_foldbench.sh; its report section is frozen at step 23k.
+
+The baseline here is the `af3_ref` sweep, folded before the bench attached templates:
+a handicapped AlphaFold3, 3.8 points under the published AF3 on protein-protein and
+9.9 on antibody-antigen on identical targets. Kept runnable so it can be revived once
+af3_ref is re-folded WITH templates, or once precompute_external.py covers all eight
+categories and this can be re-based on FoldBench's own AF3 predictions (the cache holds
+only ppi + agab). Re-add the line to update_foldbench.sh when either lands.
+
+FoldBench-style overview: af3_ref vs df3v4r14 at its latest benched step.
 Left  — monomers: TM-score, conf-top1 (solid) → oracle (faint cap).
 Right — interfaces: DockQ stacked in CAPRI tiers (Acceptable/Medium/High) at
         conf-top1 selection; oracle success rate marked as a caret (ceiling).
