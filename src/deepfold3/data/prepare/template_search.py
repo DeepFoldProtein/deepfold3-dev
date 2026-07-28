@@ -64,6 +64,22 @@ class ChainAlignment:
     cigar: str
 
 
+#: Coordinate frame of the template-side alignment positions written into the
+#: index files. ``"struct"`` = 0-based **resolved-residue** positions (what an
+#: m8 search against structure sequences yields); ``"seqres"`` = 0-based SEQRES
+#: positions. The two differ by the template's unresolved N-terminal count,
+#: which varies per template, so reading one as the other shifts every hit by a
+#: different amount and turns templates into noise without raising anything.
+#: Recorded per hit so the loader never has to be told out-of-band; index files
+#: written before this field existed are structure-space (verified against the
+#: identity each search recorded: 0.5-1.9 pt agreement structure-space vs
+#: 16-74 pt seqres-space across patchr / afdb_nvda / teddymer).
+INDEX_SPACE_STRUCT = "struct"
+INDEX_SPACE_SEQRES = "seqres"
+#: What this module emits, and what pre-existing files are assumed to be.
+DEFAULT_INDEX_SPACE = INDEX_SPACE_STRUCT
+
+
 @dataclass
 class MultimerTemplateHit:
     """A multimer template: one PDB entry covering one or more query chains.
@@ -80,6 +96,10 @@ class MultimerTemplateHit:
     score: float = 0.0
     min_evalue: float = float("inf")
     release_date: str | None = None
+    #: Frame of ``ChainAlignment.tstart`` / ``cigar`` template positions.
+    #: ``None`` = not recorded (file predates the field); the reader leaves it
+    #: unset so the caller can apply its own default.
+    index_space: str | None = DEFAULT_INDEX_SPACE
 
     @property
     def num_chains_covered(self) -> int:
@@ -105,6 +125,9 @@ class MonomerTemplateHit:
     tend: int  # 1-based
     cigar: str
     release_date: str | None = None
+    #: Frame of ``tstart`` / ``cigar`` template positions. See INDEX_SPACE_*.
+    #: ``None`` = not recorded; caller falls back to its config flag.
+    index_space: str | None = DEFAULT_INDEX_SPACE
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +484,9 @@ def load_template_hits(path: Path) -> list[MultimerTemplateHit]:
             score=d.get("score", 0.0),
             min_evalue=d.get("min_evalue", float("inf")),
             release_date=d.get("release_date"),
+            # ``None`` when the file predates this field, which lets the caller
+            # fall back to its per-dataset config flag instead of guessing.
+            index_space=d.get("index_space"),
         )
         for d in data
     ]
@@ -478,4 +504,4 @@ def load_monomer_template_hits(path: Path) -> list[MonomerTemplateHit]:
     """Load per-sequence monomer template hits from a JSON file."""
     with open(path) as f:
         data = json.load(f)
-    return [MonomerTemplateHit(**d) for d in data]
+    return [MonomerTemplateHit(**{"index_space": None, **d}) for d in data]

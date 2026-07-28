@@ -255,3 +255,54 @@ def test_collate_t_padding_does_not_dilute_templates():
     assert torch.equal(alone, with_mate), "template output depends on batch-mates' template count"
     # Guard that the test is actually exercising the failure it claims to.
     assert not torch.equal(alone, diluted), "maskless path no longer dilutes — test is vacuous"
+
+
+class TestTemplateIndexSpaceResolution:
+    """Which coordinate frame the loader reads template positions in.
+
+    Structure-space and SEQRES-space differ by the template's unresolved
+    N-terminal count, which varies per template. Reading one as the other
+    misaligns every hit and raises nothing — the templates simply become noise
+    — so the frame is recorded in the index file and the per-dataset config
+    flag is only a fallback for files written before that field existed.
+    """
+
+    @staticmethod
+    def _resolver(config_flag: bool):
+        from deepfold3.data.module.dataset import TrainingDataset
+
+        ds = TrainingDataset.__new__(TrainingDataset)
+        ds.template_struct_space = config_flag
+        ds._warned_index_space = False
+        ds.name = "unit"
+        ds.data_dir = "/unit"
+        return ds
+
+    def test_recorded_value_wins_over_config(self):
+        # Config says SEQRES, file says structure -> file wins.
+        assert self._resolver(config_flag=False)._indices_are_struct("struct") is True
+        # And the other way round.
+        assert self._resolver(config_flag=True)._indices_are_struct("seqres") is False
+
+    def test_legacy_index_falls_back_to_config(self):
+        assert self._resolver(config_flag=True)._indices_are_struct(None) is True
+        assert self._resolver(config_flag=False)._indices_are_struct(None) is False
+
+    def test_fallback_warns_once_per_dataset(self, caplog):
+        import logging
+
+        ds = self._resolver(config_flag=True)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                ds._indices_are_struct(None)
+        warnings = [r for r in caplog.records if "index_space" in r.getMessage()]
+        assert len(warnings) == 1, "legacy fallback must warn, but only once per dataset"
+
+    def test_recorded_value_never_warns(self, caplog):
+        import logging
+
+        ds = self._resolver(config_flag=True)
+        with caplog.at_level(logging.WARNING):
+            ds._indices_are_struct("struct")
+            ds._indices_are_struct("seqres")
+        assert not [r for r in caplog.records if "index_space" in r.getMessage()]

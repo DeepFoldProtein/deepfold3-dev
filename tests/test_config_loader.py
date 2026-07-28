@@ -409,3 +409,94 @@ class TestTemplateStructSpace:
             [{"name": "a", "data_dir": "/a", "template_struct_space": True, "monomer_template_struct_space": False}]
         )
         assert spec["template_struct_space"] is True
+
+
+class TestTemplateIndexSpace:
+    """The index file records its own coordinate frame; config is the fallback.
+
+    Reading structure-space indices as SEQRES (or vice versa) shifts every hit
+    by the template's unresolved N-terminal count and produces silently random
+    templates, so the frame must not depend on someone setting a config key
+    correctly for each dataset.
+    """
+
+    def test_writer_records_struct_and_roundtrips(self, tmp_path):
+        from deepfold3.data.prepare.template_search import (
+            INDEX_SPACE_STRUCT,
+            ChainAlignment,
+            MultimerTemplateHit,
+            load_template_hits,
+            save_template_hits,
+        )
+
+        aln = ChainAlignment(
+            query_chain_idx=0,
+            template_chain_id="A",
+            identity=0.9,
+            evalue=1e-9,
+            qstart=1,
+            qend=10,
+            tstart=1,
+            tend=10,
+            cigar="10M",
+        )
+        p = tmp_path / "t.json"
+        save_template_hits([MultimerTemplateHit(template_pdb_id="1ABC", chain_alignments=[aln])], p)
+        assert '"index_space":"struct"' in p.read_text()
+        assert load_template_hits(p)[0].index_space == INDEX_SPACE_STRUCT
+
+    def test_legacy_file_reports_unknown(self, tmp_path):
+        """No field -> None, so the loader falls back instead of guessing."""
+        import json
+
+        from deepfold3.data.prepare.template_search import load_template_hits
+
+        p = tmp_path / "legacy.json"
+        p.write_text(
+            json.dumps(
+                [
+                    {
+                        "template_pdb_id": "1ABC",
+                        "chain_alignments": [
+                            {
+                                "query_chain_idx": 0,
+                                "template_chain_id": "A",
+                                "identity": 0.9,
+                                "evalue": 1e-9,
+                                "qstart": 1,
+                                "qend": 10,
+                                "tstart": 1,
+                                "tend": 10,
+                                "cigar": "10M",
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        assert load_template_hits(p)[0].index_space is None
+
+    def test_monomer_legacy_file_reports_unknown(self, tmp_path):
+        import json
+
+        from deepfold3.data.prepare.template_search import load_monomer_template_hits
+
+        p = tmp_path / "m.json"
+        p.write_text(
+            json.dumps(
+                [
+                    {
+                        "template_pdb_id": "1ABC",
+                        "template_chain_id": "A",
+                        "identity": 0.9,
+                        "evalue": 1e-9,
+                        "qstart": 1,
+                        "qend": 10,
+                        "tstart": 1,
+                        "tend": 10,
+                        "cigar": "10M",
+                    }
+                ]
+            )
+        )
+        assert load_monomer_template_hits(p)[0].index_space is None

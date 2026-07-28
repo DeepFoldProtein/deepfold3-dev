@@ -389,6 +389,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         # Applies to BOTH the monomer and multimer index files: the frame is a
         # property of how the search was run, not of which loader reads it.
         self.template_struct_space = template_struct_space
+        # One-shot guard for the legacy-index warning in ``_indices_are_struct``.
+        self._warned_index_space = False
         self._has_templates = (self.data_dir / "templates").is_dir()
         self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
         # Per-chain template cache (memory LRU + hierarchical sharded disk).
@@ -710,6 +712,34 @@ class TrainingDataset(torch.utils.data.Dataset):
             logger.warning("Corrupt MSA %s: %s — skipping", path, e)
             return None
 
+    def _indices_are_struct(self, recorded: str | None) -> bool:
+        """Resolve the template index frame for one hit.
+
+        The value recorded in the index file wins: it is written by whatever
+        produced the alignment and cannot drift out of sync with the data. The
+        per-dataset ``template_struct_space`` flag is the fallback for files
+        written before the field existed — warned about once per dataset,
+        because a wrong fallback is invisible at runtime (templates just become
+        noise) and the only cure is regenerating the index.
+        """
+        from deepfold3.data.prepare.template_search import INDEX_SPACE_STRUCT
+
+        if recorded is not None:
+            return recorded == INDEX_SPACE_STRUCT
+        if not self._warned_index_space:
+            self._warned_index_space = True
+            logger.warning(
+                "%s: template index files do not record `index_space`; falling back to "
+                "template_struct_space=%s from the dataset config. If that is wrong, every "
+                "template is silently misaligned by the template's unresolved N-terminal "
+                "count. Re-run `deepfold3 prepare-templates` to stamp the frame into the "
+                "index, or verify by re-deriving each hit's identity and comparing it to the "
+                "identity the search recorded.",
+                self.name or self.data_dir,
+                self.template_struct_space,
+            )
+        return self.template_struct_space
+
     def _effective_template_cutoff(self, record: Record) -> str | None:
         """Effective template release-date cutoff for a record (fail-closed).
 
@@ -827,7 +857,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                         ct,
                         query_to_seqres,
                         chain_info.num_residues,
-                        indices_are_struct=self.template_struct_space,
+                        indices_are_struct=self._indices_are_struct(hit.index_space),
                     )
                 except Exception as e:
                     _count_drop(
@@ -925,7 +955,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                         ct,
                         query_to_seqres,
                         chain_info.num_residues,
-                        indices_are_struct=self.template_struct_space,
+                        indices_are_struct=self._indices_are_struct(hit.index_space),
                     )
                 except Exception as e:
                     _count_drop(
