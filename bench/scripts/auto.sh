@@ -19,14 +19,17 @@
 #   SERIES        series name              (default df3v1)
 #   CATEGORIES    space list of categories (default: the 8 below)
 #   SEEDS         comma list of seeds      (default 42,43 — lighter than FoldBench's 4)
+#   SEEDS_<CAT>   per-category seed override, CAT upper-cased with '-'/' ' -> '_'
+#                 (e.g. SEEDS_INTERFACE_ANTIBODY_ANTIGEN=42,43,44,45). Defaults
+#                 below give antibody-antigen FoldBench's full 4 seeds.
 #   NUM_SAMPLES   diffusion samples / seed (default 5)
 #   MAX_TOKENS    FoldBench-small cap      (default 1024)
 #   SNAPSHOT      .pt weight snapshot      (default auto: shadow if present else average)
 #   STEP_OFFSET   series-global step shift (default 0)
 set -u
 cd "$(dirname "$0")/../.."
-SERIES="${SERIES:-df3v3}"
-TRAIN_DIR="${1:-runs/df3-stage0-r10}"
+SERIES="${SERIES:-df3v4r14}"
+TRAIN_DIR="${1:-runs/df3-stage0-r14}"
 POLL="${2:-3600}"            # ~1 h
 # STEP_OFFSET shifts the benchmarked step number (raw checkpoint step N is
 # logged as N+OFFSET) so a fork that restarts the step counter (e.g. stage1
@@ -35,6 +38,31 @@ POLL="${2:-3600}"            # ~1 h
 # stage1 checkpoint_5000 -> df3v1 step_115000 (continues after stage0's 110k).
 OFFSET="${STEP_OFFSET:-0}"
 SEEDS="${SEEDS:-42,43}"
+# Per-category seed count. Sample count is a real axis of the comparison, not a
+# free knob: `oracle` is monotone in N, so an N mismatch biases the model with
+# fewer draws downward. BOTH reference sets use 4 seeds x 5 = 20 samples —
+# FoldBench's external models, and our own `af3_ref` fold of AlphaFold3 (verified:
+# seeds 42,43,44,45 in every category's raw CSV). Running r14 at 2 seeds was
+# therefore not "lighter", it was self-handicapping.
+#
+# Measured, not extrapolated (r14 @ step 20k, 10 -> 20 samples):
+#   protein-protein   rank-1 65.0 -> 66.7   oracle 70.8 -> 73.8
+#   antibody-antigen  rank-1 27.5 -> 26.8   oracle 40.6 -> 47.8   (@19k)
+# Extrapolating oracle from the 10-sample data badly understates it (predicted
+# +1.3 for agab, actual +7.2): targets with 0/10 successes get p_hat = 0 under an
+# iid model and are frozen as unsolvable, which is exactly the population extra
+# seeds crack. Measure, do not extrapolate.
+#
+# run_sweep --skip-existing is keyed on (target, seed), so raising these tops up
+# the new seeds without re-folding 42/43. Cost is ~2x the category's sweep time;
+# drop a category back to "$SEEDS" here if bench throughput becomes the blocker.
+SEEDS_INTERFACE_ANTIBODY_ANTIGEN="${SEEDS_INTERFACE_ANTIBODY_ANTIGEN:-42,43,44,45}"
+SEEDS_INTERFACE_PROTEIN_PROTEIN="${SEEDS_INTERFACE_PROTEIN_PROTEIN:-42,43,44,45}"
+# Resolve the seed list for a category: SEEDS_<CAT_UPPER> if set, else SEEDS.
+cat_seeds() {
+  local var="SEEDS_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+  printf '%s' "${!var:-$SEEDS}"
+}
 NUM_SAMPLES="${NUM_SAMPLES:-5}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
@@ -45,9 +73,14 @@ GPUS="${GPUS:-0}"
 # ligand-aware scorer, so it would be mis-scored as a monomer. Add it to
 # CATEGORIES only alongside a proper ligand metric.
 # Category priority (highest first): the three we watch most closely lead, so a
-# fresh checkpoint scores monomer_protein / protein-protein / antibody-antigen
+# fresh checkpoint scores monomer_protein / antibody-antigen / protein-protein
 # before the rest. Order here is the per-checkpoint eval order.
-CATEGORIES="${CATEGORIES:-monomer_protein interface_protein_protein interface_antibody_antigen \
+# antibody-antigen runs BEFORE protein-protein: it is the smaller sweep (95
+# in-cap targets vs 212) and it is the category whose frontier we are tracking,
+# so the metric we most want lands first. protein-protein is the long pole —
+# especially at 4 seeds — and putting it last means a slow ppi sweep no longer
+# delays agab.
+CATEGORIES="${CATEGORIES:-monomer_protein interface_antibody_antigen interface_protein_protein \
 monomer_rna monomer_dna \
 interface_protein_dna interface_protein_rna interface_protein_peptide}"
 PY=.venv/bin/python
@@ -88,6 +121,10 @@ fi
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
 echo "[auto] categories: $CATEGORIES"
 echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS"
+for _c in $CATEGORIES; do
+  _s="$(cat_seeds "$_c")"
+  [ "$_s" != "$SEEDS" ] && echo "[auto]   seed override: $_c = $_s"
+done
 
 sweep_active() {
   pgrep -f "orchestrate.sh" >/dev/null || pgrep -f "run_sweep.py" >/dev/null \
@@ -116,8 +153,8 @@ run_ss_analysis() {  # monomer_protein only — DSSP secondary-structure suite
 
 # Process ONE (checkpoint, category) unit per iteration, re-scanning every time,
 # so priority is re-evaluated at each unit boundary: newest checkpoint first,
-# and within it the CATEGORIES order (monomer_protein / protein-protein /
-# antibody-antigen lead). A fresh checkpoint landing mid-run preempts the older
+# and within it the CATEGORIES order (monomer_protein / antibody-antigen /
+# protein-protein lead). A fresh checkpoint landing mid-run preempts the older
 # backlog at the next boundary instead of waiting a whole pass.
 while true; do
   # Highest-priority pending unit = newest 1k-grid checkpoint x its first
@@ -152,16 +189,32 @@ while true; do
   # runs, e.g. df3v4/r12 — the deployment target), else ckpt['model'] (SF's x /
   # live AdamW). Matches `deepfold3 export`/`inference`/eval; average would score
   # the raw live params (NOT deployed) for an AdamW+EMA run. Env-overridable.
+  CAT_SEEDS="$(cat_seeds "$CAT")"
+  [ "$CAT_SEEDS" != "$SEEDS" ] && echo "[auto] $CAT uses seeds=$CAT_SEEDS (global $SEEDS)"
   $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
       --gpus "$GPUS" --num-samples "$NUM_SAMPLES" --num-recycles 10 \
-      --seed "$SEEDS" --snapshot "${SNAPSHOT:-auto}"
+      --seed "$CAT_SEEDS" --snapshot "${SNAPSHOT:-auto}"
   $PY bench/scripts/eval_ost.py  --series "$SERIES" --step "$G" --category "$CAT" --workers 48
   if [ "$CAT" = "monomer_protein" ]; then
     run_ss_analysis "$CAT" "$G"
   fi
-  $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT"
+  $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT" --ref-series "${REF_SERIES:-af3_ref}"
   # cross-category lDDT overview (mean + median per step, all categories)
   $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" || \
     echo "[auto] WARN plot_lddt_grid failed"
+  # Refresh the whole af3-vs-r14 FoldBench report after an interface eval:
+  # overview, confidence calibration, multimer decomposition, the 8-model
+  # mean->oracle comparison and its post-cutoff control, and the rank-1||oracle
+  # twin-bar figure. External model rows are cached; only r14 is recomputed, and
+  # every script auto-detects the latest benched step per category, so running
+  # this after either interface category is safe and cheap.
+  case "$CAT" in
+    interface_protein_protein|interface_antibody_antigen)
+      if [ -f export/af3-vs-r14-foldbench/foldbench_ext_cache.json ]; then
+        export/af3-vs-r14-foldbench/update_foldbench.sh \
+          && echo "[auto] foldbench report refreshed" \
+          || echo "[auto] WARN foldbench report update failed"
+      fi ;;
+  esac
   echo "[auto] $(date '+%m-%d %H:%M') done $CAT step $G"
 done
