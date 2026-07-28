@@ -11,9 +11,19 @@ Both monomer (``pdb_id,seed,sample,lddt,...``) and interface
 dump repeats the whole-model lDDT across interface rows, so lDDT is collapsed to
 one value per (pdb_id, seed, sample) before averaging.
 
+A measured reference series can be overlaid as a dotted horizontal baseline per
+category (``--ref``, off by default) — computed the SAME way as the trajectory
+(``per_target_lddt`` over the ref series' latest benched step), so it is a
+like-for-like comparison on the same num-token-capped manifest. A baseline is
+drawn only for categories that have BOTH a trajectory in ``--series`` and an eval
+in the ref series (categories the ref never benched simply get no baseline).
+Series in ``summarize.RETIRED_REF_SERIES`` — currently the template-free
+``af3_ref`` fold — are refused; see the note there.
+
 Usage:
     python bench/scripts/plot_lddt_grid.py --series df3v2
     python bench/scripts/plot_lddt_grid.py --series df3v2 --category monomer_protein monomer_rna
+    python bench/scripts/plot_lddt_grid.py --series df3v4r14 --ref some_measured_series
 """
 
 from __future__ import annotations
@@ -27,6 +37,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# Single source of truth for the retirement list and the published AF3 numbers.
+from summarize import AF3_INTERFACE_LDDT, AF3_MONOMER, RETIRED_REF_SERIES  # noqa: E402
 
 BENCH = Path(__file__).resolve().parents[1]
 
@@ -156,30 +169,104 @@ def write_csv(panels: list[tuple[str, dict[str, list[dict]]]], out_csv: Path) ->
                     w.writerow([cat, metric, p["step"], p["n"], round(p["mean"], 4), round(p["median"], 4)])
 
 
-def _panel(ax, data: dict[str, list[dict]], title: str, ylabel: str) -> None:
-    """Draw one row: mean (solid) + median (dashed) per category."""
+def _panel(
+    ax,
+    data: dict[str, list[dict]],
+    title: str,
+    ylabel: str,
+    ref: dict[str, dict] | None = None,
+    ref_label: str = "",
+    paper: dict[str, float] | None = None,
+) -> None:
+    """Draw one row: mean (solid) + median (dashed) per category.
+
+    ``ref`` overlays a measured baseline series as faint horizontal lines — mean
+    (solid) and median (dotted), category-coloured — only for categories the
+    trajectory itself shows, so the comparison is line-to-line.
+
+    ``paper`` is the published AF3 mean per category (FoldBench Supp. Table 3),
+    drawn dash-dot ONLY where no measured baseline exists. It is a mean over the
+    paper's FULL set, not our num-token-capped subset — a target marker, not a
+    like-for-like value.
+    """
     for cat, pts in data.items():
         steps = [p["step"] for p in pts]
         color = CATEGORY_COLORS.get(cat, "tab:gray")
         ax.plot(steps, [p["mean"] for p in pts], "-o", color=color, lw=2, ms=4, label=cat)
         ax.plot(steps, [p["median"] for p in pts], "--x", color=color, lw=1.3, ms=5, alpha=0.8)
+    if ref:
+        drawn = False
+        for cat, r in ref.items():
+            if cat not in data:  # only baseline the categories that have a trajectory here
+                continue
+            color = CATEGORY_COLORS.get(cat, "tab:gray")
+            ax.axhline(r["mean"], color=color, ls="-", lw=1.1, alpha=0.35, zorder=1)
+            ax.axhline(r["median"], color=color, ls=":", lw=1.1, alpha=0.35, zorder=1)
+            drawn = True
+        if drawn:  # grey proxies so the legend explains the faint baseline styling
+            ax.plot([], [], color="0.5", ls="-", lw=1.1, alpha=0.6, label=f"{ref_label} mean")
+            ax.plot([], [], color="0.5", ls=":", lw=1.1, alpha=0.6, label=f"{ref_label} median")
+    if paper and not ref:
+        drawn = False
+        for cat, v in paper.items():
+            if cat not in data:
+                continue
+            ax.axhline(v, color=CATEGORY_COLORS.get(cat, "tab:gray"), ls="-.", lw=1.1, alpha=0.4, zorder=1)
+            drawn = True
+        if drawn:
+            ax.plot([], [], color="0.5", ls="-.", lw=1.1, alpha=0.6, label="AF3 paper mean (full set)")
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=11, loc="left")
     ax.set_ylim(-0.02, 1.0)  # shared [0,1] across rows so the three metrics compare directly
     ax.grid(True, alpha=0.3)
-    if data:
+    if data or ref:
         ax.legend(fontsize=8, ncol=2, loc="upper left")
 
 
-def plot(mono_lddt, iface_lddt, iface_ilddt, series: str, out_png: Path) -> None:
+def ref_values(ref_series: str, categories: list[str], col: str) -> dict[str, dict]:
+    """Baseline ``{cat: {mean, median, step, n}}`` from a fixed reference series.
+
+    Computed via the same ``collect`` path as the trajectory (like-for-like), then
+    reduced to the ref series' latest benched step per category (``af3_ref`` writes
+    a single ``step_0``; latest-step is robust to a ref benched elsewhere).
+    """
+    return {cat: pts[-1] for cat, pts in collect(ref_series, categories, col).items() if pts}
+
+
+def plot(mono_lddt, iface_lddt, iface_ilddt, series: str, out_png: Path, refs=None, ref_label: str = "") -> None:
     """3-row figure: monomer whole-model / interface complex whole-model /
-    interface inter-chain ilddt. Shared training-step x-axis."""
+    interface inter-chain ilddt. Shared training-step x-axis. ``refs`` is a
+    ``(mono, iface_lddt, iface_ilddt)`` triple of baseline dicts (or None)."""
+    rm, ri, rii = refs or ({}, {}, {})
+    # Paper AF3 means, used only where no measured baseline is available. There is no
+    # published inter-chain iLDDT, so row 3 keeps no marker.
+    paper_mono = {c: v["lddt"] for c, v in AF3_MONOMER.items()}
     fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(10, 13), sharex=True)
-    _panel(ax0, mono_lddt, "Monomer — whole-model lDDT", "lDDT")
-    _panel(ax1, iface_lddt, "Interface — complex (whole-model) lDDT", "lDDT")
-    _panel(ax2, iface_ilddt, "Interface — inter-chain lDDT (iLDDT, collapse-sensitive)", "iLDDT")
+    _panel(ax0, mono_lddt, "Monomer — whole-model lDDT", "lDDT", ref=rm, ref_label=ref_label, paper=paper_mono)
+    _panel(
+        ax1,
+        iface_lddt,
+        "Interface — complex (whole-model) lDDT",
+        "lDDT",
+        ref=ri,
+        ref_label=ref_label,
+        paper=AF3_INTERFACE_LDDT,
+    )
+    _panel(
+        ax2,
+        iface_ilddt,
+        "Interface — inter-chain lDDT (iLDDT, collapse-sensitive)",
+        "iLDDT",
+        ref=rii,
+        ref_label=ref_label,
+    )
     ax2.set_xlabel("training step")
-    fig.suptitle(f"{series}: per-category lDDT vs step   (solid = mean, dashed = median)", fontsize=13)
+    base = f"{series}: per-category lDDT vs step   (solid = mean, dashed = median)"
+    if ref_label:
+        base += f"   —   faint = {ref_label} baseline (solid mean, dotted median)"
+    else:
+        base += "   —   dash-dot = AF3 paper mean (FoldBench full set, not this subset)"
+    fig.suptitle(base, fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
     fig.savefig(out_png, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -189,6 +276,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--series", default="df3v2")
     ap.add_argument("--category", nargs="*", default=list(CATEGORY_COLORS), help="subset of categories")
+    ap.add_argument(
+        "--ref",
+        default="",
+        help="fixed reference series overlaid as a faint per-category baseline "
+        "(mean solid, median dotted). Off by default; series in RETIRED_REF_SERIES "
+        f"({', '.join(sorted(RETIRED_REF_SERIES))}) are refused.",
+    )
     args = ap.parse_args()
 
     mono = [c for c in args.category if c not in INTERFACE_CATEGORIES]
@@ -201,11 +295,28 @@ def main() -> None:
         print(f"[lddt-grid] no eval raw dumps found for series {args.series}")
         return
 
+    # Reference baseline overlay (skip when empty, retired, or the series itself).
+    ref_label = args.ref.strip()
+    if ref_label in RETIRED_REF_SERIES:
+        print(f"[lddt-grid] ref series '{ref_label}' is retired — baseline skipped")
+        ref_label = ""
+    refs = None
+    if ref_label and ref_label != args.series:
+        ref_mono = ref_values(ref_label, mono, "lddt")
+        ref_iface = ref_values(ref_label, iface, "lddt")
+        ref_iface_i = ref_values(ref_label, iface, "ilddt")
+        refs = (ref_mono, ref_iface, ref_iface_i)
+        if not (ref_mono or ref_iface or ref_iface_i):
+            print(f"[lddt-grid] ref series '{ref_label}' has no eval dumps — baseline skipped")
+            ref_label, refs = "", None
+    else:
+        ref_label = ""
+
     out_root = BENCH / "runs" / args.series
     out_png = out_root / "lddt_by_category.png"
     out_csv = out_root / "lddt_by_category.csv"
     write_csv([("lddt", mono_lddt), ("lddt", iface_lddt), ("ilddt", iface_ilddt)], out_csv)
-    plot(mono_lddt, iface_lddt, iface_ilddt, args.series, out_png)
+    plot(mono_lddt, iface_lddt, iface_ilddt, args.series, out_png, refs=refs, ref_label=ref_label)
 
     print(f"[lddt-grid] -> {out_csv}")
     for label, data in (("monomer lddt", mono_lddt), ("interface lddt", iface_lddt), ("interface ilddt", iface_ilddt)):

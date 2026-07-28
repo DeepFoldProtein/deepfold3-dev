@@ -24,6 +24,7 @@
 #                 below give antibody-antigen FoldBench's full 4 seeds.
 #   NUM_SAMPLES   diffusion samples / seed (default 5)
 #   MAX_TEMPLATES structural templates per protein chain (default 4; 0 = off)
+#   REF_SERIES    measured baseline overlay (default: none — see note below)
 #   MAX_TOKENS    FoldBench-small cap      (default 1024)
 #   SNAPSHOT      .pt weight snapshot      (default auto: shadow if present else average)
 #   STEP_OFFSET   series-global step shift (default 0)
@@ -42,7 +43,7 @@ SEEDS="${SEEDS:-42,43}"
 # Per-category seed count. Sample count is a real axis of the comparison, not a
 # free knob: `oracle` is monotone in N, so an N mismatch biases the model with
 # fewer draws downward. BOTH reference sets use 4 seeds x 5 = 20 samples —
-# FoldBench's external models, and our own `af3_ref` fold of AlphaFold3 (verified:
+# FoldBench's external models, and the `af3_ref` fold of AlphaFold3 (verified:
 # seeds 42,43,44,45 in every category's raw CSV). Running r14 at 2 seeds was
 # therefore not "lighter", it was self-handicapping.
 #
@@ -75,13 +76,25 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 # model (training draws k = min(Uniform[0, n_avail], 4), so k = 0 happens) but
 # is its weakest supported mode, and it made `af3_ref` a handicapped AlphaFold3:
 # on identical targets our template-free fold trails the published AF3 by 3.8
-# points on protein-protein and 9.9 on antibody-antigen.
+# points on protein-protein and 9.9 on antibody-antigen — which is why af3_ref is
+# no longer drawn as a baseline (see REF_SERIES).
 #
 # CAUTION: turning this on changes the bench inputs, so numbers before and after
 # are not comparable. Do not flip it in the same window as a training-side
 # change unless you are willing to lose the attribution — run one checkpoint
 # both ways (MAX_TEMPLATES=0 into a separate SERIES) if you need the split.
 MAX_TEMPLATES="${MAX_TEMPLATES:-4}"
+# Measured baseline overlaid on the per-category figures. Empty = none, and the
+# figures fall back to the published AF3 numbers (FoldBench Supp. Table 3, drawn
+# dotted and labelled "paper, full set" — a target marker, not like-for-like).
+#
+# `af3_ref` used to be the default and is now RETIRED: it was folded before the
+# bench attached templates, so it is a handicapped AlphaFold3 (3.8 points below
+# the published AF3 on protein-protein, 9.9 on antibody-antigen, same targets).
+# summarize.py / plot_lddt_grid.py refuse it by name, so setting it here has no
+# effect until af3_ref is re-folded WITH templates and dropped from their
+# RETIRED_REF_SERIES.
+REF_SERIES="${REF_SERIES:-}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
 # node: 8-GPU box -> 0..7, 4-GPU box -> 0..3). Override with GPUS=0,1 to reserve.
 GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
@@ -137,7 +150,7 @@ fi
 
 echo "[auto] start $(date '+%m-%d %H:%M')  series=$SERIES train_dir=$TRAIN_DIR offset=$OFFSET poll=${POLL}s"
 echo "[auto] categories: $CATEGORIES"
-echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS templates=$MAX_TEMPLATES"
+echo "[auto] seeds=$SEEDS samples=$NUM_SAMPLES max_tokens=$MAX_TOKENS templates=$MAX_TEMPLATES ref=${REF_SERIES:-none (paper AF3)}"
 [ "$MAX_TEMPLATES" -gt 0 ] && echo "[auto]   NOTE templates are ON — numbers are not comparable to template-free steps"
 for _c in $CATEGORIES; do
   _s="$(cat_seeds "$_c")"
@@ -217,9 +230,9 @@ while true; do
   if [ "$CAT" = "monomer_protein" ]; then
     run_ss_analysis "$CAT" "$G"
   fi
-  $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT" --ref-series "${REF_SERIES:-af3_ref}"
+  $PY bench/scripts/summarize.py --series "$SERIES" --category "$CAT" --ref-series "$REF_SERIES"
   # cross-category lDDT overview (mean + median per step, all categories)
-  $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" || \
+  $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" --ref "$REF_SERIES" || \
     echo "[auto] WARN plot_lddt_grid failed"
   # Refresh the whole af3-vs-r14 FoldBench report after an interface eval:
   # overview, confidence calibration, multimer decomposition, the 8-model

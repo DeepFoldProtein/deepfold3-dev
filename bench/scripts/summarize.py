@@ -152,9 +152,15 @@ DOCKQ_TIERS = [
 # (AF3 column, full set — targets released after 2023-01). Interfaces use
 # DockQ >= 0.23; protein_ligand uses LRMSD < 2 A and LDDT-PLI > 0.8 (and isn't
 # swept here by default). Drawn as a reference line on the success-rate panel.
-# Note: the paper uses the *full* FoldBench set, not our num_tokens-capped small
-# subset, so it's a target marker, not a like-for-like comparison. (n = paper
-# target count per category.)
+#
+# TWO caveats, both in the line's label so the panel can't be misread:
+#  - the paper uses the *full* FoldBench set, not our num_tokens-capped subset, so
+#    it's a target marker, not a like-for-like comparison (n = paper target count);
+#  - it is a MEAN-over-samples rate, while the panel's bar stack is the ORACLE
+#    (best-of-N). Cross-checked against FoldBench's own per-target rows on our
+#    capped subset: antibody-antigen AF3 mean 46.7 / oracle 64.4 (n=90) against the
+#    47.9 below — the paper number tracks the mean, and sits ~18 points under the
+#    oracle it shares an axis with. Never read "we crossed the line" as parity.
 AF3_SUCCESS_RATE = {
     "interface_protein_protein": 0.7293,  # n=279
     "interface_antibody_antigen": 0.4790,  # n=172
@@ -182,6 +188,85 @@ AF3_INTERFACE_LDDT = {
     "interface_protein_rna": 0.78,
     "interface_protein_peptide": 0.84,
 }
+
+# --- measured reference series -------------------------------------------------
+# A measured reference series is a full sweep of another model through OUR bench
+# pipeline (same num-token-capped manifest), so its overlay is like-for-like in a
+# way the paper dicts above are not. When one is given and has an eval we prefer
+# its measured value; otherwise we fall back to the paper dict (labelled "paper"
+# so the two are never confused). ``--ref-series ""`` disables the overlay.
+#
+# RETIRED: `af3_ref`. It was folded template-free (the bench attached no
+# `templates` field until MAX_TEMPLATES landed), which is AlphaFold3's weakest
+# supported mode — on identical targets it trails the published AF3 by 3.8 points
+# on protein-protein and 9.9 on antibody-antigen. Overlaying it understates AF3
+# and invites the reading "we are close to AF3" when the gap is to a handicapped
+# fold. Retiring it here (not just flipping the default) means an already-running
+# auto.sh, or any stale command line that still passes `--ref-series af3_ref`,
+# stops drawing it too; the raw sweep stays on disk under runs/af3_ref. Drop the
+# entry once af3_ref has been re-folded WITH templates.
+RETIRED_REF_SERIES = {"af3_ref"}
+_REF_ROW_CACHE: dict[tuple[str, str], dict | None] = {}
+
+
+def resolve_ref_series(ref_series: str, series: str) -> str:
+    """``ref_series`` with self-reference and retired series stripped (loudly)."""
+    if ref_series == series:  # don't draw a series' reference line against itself
+        return ""
+    if ref_series in RETIRED_REF_SERIES:
+        print(f"[summary] reference series '{ref_series}' is retired — overlay dropped, using paper AF3 numbers")
+        return ""
+    return ref_series
+
+
+def _ref_row(ref_series: str, category: str) -> dict | None:
+    """Latest-step summary row of a reference series for ``category`` (cached).
+
+    ``af3_ref`` writes a single ``step_0`` summary, but pick the latest step to
+    be robust to a series benched at some other step number.
+    """
+    if not ref_series:
+        return None
+    key = (ref_series, category)
+    if key not in _REF_ROW_CACHE:
+        eval_root = BENCH / "runs" / ref_series / "eval" / category
+        row = None
+        step_dirs = sorted(eval_root.glob("step_*"), key=lambda p: int(_STEP.search(p.name).group(1)))
+        for sd in reversed(step_dirs):
+            f = sd / "summary.csv"
+            if f.exists():
+                row = next(csv.DictReader(open(f)), None)
+                if row:
+                    break
+        _REF_ROW_CACHE[key] = row
+    return _REF_ROW_CACHE[key]
+
+
+def ref_value(
+    ref_series: str, category: str, column: str, fallback: float | None
+) -> tuple[float | None, bool]:
+    """``(value, measured)`` for a reference line.
+
+    Measured mean ``column`` from the reference series when present, else
+    ``fallback`` (the paper dict). ``measured`` tells the caller which source
+    won so a paper fallback can be labelled distinctly.
+    """
+    row = _ref_row(ref_series, category)
+    if row is not None and row.get(column) not in (None, ""):
+        try:
+            return float(row[column]), True
+        except ValueError:
+            pass
+    return fallback, False
+
+
+def _spine_marker(ax, y, color, marker="<", ms=8, alpha=0.95, label=None):
+    """A marker sitting on the right spine at data-value ``y`` — lets the AF3 ref be
+    read straight off the right axis edge. ``label`` adds it to the legend."""
+    ax.plot(
+        1.0, y, marker=marker, color=color, ms=ms, alpha=alpha, label=label,
+        transform=ax.get_yaxis_transform(), clip_on=False, zorder=6,
+    )
 
 
 def dockq_tier_fractions(series: str, category: str, mode: str = "oracle") -> list[dict]:
@@ -266,7 +351,8 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt", select:
     return out
 
 
-def summarize(series: str, category: str, plot: bool) -> None:
+def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> None:
+    ref_series = resolve_ref_series(ref_series, series)
     summaries = load_step_summaries_for(series, category)
     if not summaries:
         print(f"[summary] no per-step summaries yet for {series}/{category}")
@@ -375,11 +461,24 @@ def summarize(series: str, category: str, plot: bool) -> None:
                     zorder=9,
                     label="TM < 0.5 (unreliable)" if j == 0 else None,
                 )
-            af3 = AF3_SUCCESS_RATE.get(category)
+            # Success panel uses ORACLE (matches the oracle DockQ-tier stack top);
+            # every other panel uses the mean aggregate. Measured af3_ref value is a
+            # percentage (÷100 to the fraction axis); the paper fallback is a fraction.
+            af3_pct, af3_measured = ref_value(ref_series, category, "success_rate_oracle", None)
+            af3 = (af3_pct / 100.0) if af3_measured else AF3_SUCCESS_RATE.get(category)
             if af3 is not None:
                 # bar height (acceptable+medium+high) == success rate @0.23, so
                 # this line is directly comparable to the top of each stack.
-                axd.axhline(af3, color="#d7301f", ls="--", lw=1.8, zorder=8, label=f"AF3 success @0.23 ({af3:.0%})")
+                # The measured ref is an oracle like the stack; the paper fallback is a
+                # mean-over-samples rate on the full set — say which, on the line.
+                _sfx = "oracle" if af3_measured else "paper mean, full set"
+                # Faint thin line in the SAME colour as the success score it references
+                # (the confidence top-1 success line, "#2166ac") — not a bold red dash.
+                axd.axhline(
+                    af3, color="#2166ac", alpha=0.5, lw=1.1, zorder=3,
+                    label=f"AF3 success @0.23 ({af3:.0%}, {_sfx})",
+                )
+                _spine_marker(axd, af3, "#2166ac")
             # Confidence top-1 success @0.23 (ranking_score-selected sample) — the
             # deployed number; its gap below the oracle stack top measures how good
             # the confidence head's ranking is. Present only once a run trains the
@@ -429,16 +528,41 @@ def summarize(series: str, category: str, plot: bool) -> None:
             if qs_handle is not None:
                 handles.append(qs_handle)
                 labels.append("oracle QS-score")
-            axd.legend(handles, labels, loc="center left", bbox_to_anchor=(1.14, 0.5), fontsize=8, title="tier / QS")
+            # opaque + above the hatched bars (zorder 9) so the hatch doesn't show through
+            _leg = axd.legend(handles, labels, loc="upper left", fontsize=8, title="tier / QS", framealpha=1.0)
+            _leg.set_zorder(20)
             axd.grid(axis="y", alpha=0.3)
 
-        def _dist_panel(ax, dist, ylabel, title, af3ref=None, overlay=None, conf=None):
+        def _dist_panel(
+            ax,
+            dist,
+            ylabel,
+            title,
+            af3ref_median=None,
+            overlay=None,
+            conf=None,
+            af3ref_mean=None,
+            overlay_af3ref=None,
+            paper_ref=None,
+        ):
             """median + mean + IQR band of a whole-model metric vs real step.
 
             ``overlay=(dist, label, color)`` draws a second metric (e.g. inter-chain
             iLDDT) in colour on the same axes — median line + IQR band.
             ``conf`` is the confidence-top-1 distribution (same shape as ``dist``);
             its across-target median is drawn as a distinct line (deployed number).
+
+            A measured reference series is folded like-for-like and reduced from its raw
+            per-target values (its summary stores no median): the whole-model **median**
+            ref (``af3ref_median``, black — matches the black median line) as a faint line
+            + spine marker, the **mean** ref (``af3ref_mean``, gray — matches the gray mean
+            line) as a spine marker, and the overlay's **median** (``overlay_af3ref``, the
+            overlay's own colour). Such a series is left-skewed so median ≫ mean here.
+
+            ``paper_ref`` is the published AF3 number (FoldBench Supp. Table 3) and is
+            drawn dotted ONLY when no measured ref is available. It is a mean over the
+            paper's FULL set, not our num-token-capped subset — a target marker, never a
+            like-for-like value.
             """
             if dist:
                 sx = [d["step"] for d in dist]
@@ -453,8 +577,16 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 )
                 ax.plot(sx, [d["med"] for d in dist], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
                 ax.plot(sx, [d["mean"] for d in dist], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
-                if af3ref is not None:
-                    ax.axhline(af3ref, color="#d7301f", ls="--", lw=1.8, zorder=7, label=f"AF3 ({af3ref:.2f})")
+                if af3ref_median is not None:
+                    ax.axhline(af3ref_median, color="k", alpha=0.5, lw=1.1, zorder=3,
+                               label=f"AF3 median ({af3ref_median:.2f})")
+                    _spine_marker(ax, af3ref_median, "k")
+                if af3ref_mean is not None:
+                    _spine_marker(ax, af3ref_mean, "0.45", label=f"AF3 mean ({af3ref_mean:.2f})")
+                if af3ref_median is None and paper_ref is not None:
+                    ax.axhline(paper_ref, color="k", alpha=0.35, lw=1.1, ls=":", zorder=3,
+                               label=f"AF3 paper mean, full set ({paper_ref:.2f})")
+                    _spine_marker(ax, paper_ref, "k", alpha=0.55)
             if conf:
                 cx = [d["step"] for d in conf]
                 ax.plot(
@@ -474,28 +606,49 @@ def summarize(series: str, category: str, plot: bool) -> None:
                 ax.plot(
                     ox, [d["med"] for d in odist], "-D", color=ocol, lw=2, ms=4, label=f"{olabel} (median)", zorder=6
                 )
+                if overlay_af3ref is not None:
+                    ax.axhline(
+                        overlay_af3ref, color=ocol, alpha=0.5, lw=1.1, zorder=3,
+                        label=f"AF3 {olabel} median ({overlay_af3ref:.2f})",
+                    )
+                    _spine_marker(ax, overlay_af3ref, ocol)
             if dist or (overlay is not None and overlay[0]):
-                ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
+                ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
             ax.set_ylim(-0.02, 1.02)
             ax.set_ylabel(ylabel)
             ax.grid(alpha=0.3)
             ax.set_title(title)
 
+        # AF3 refs computed like-for-like from the measured ref series' raw per-target
+        # values (its summary has no median column); left-skewed → median ≫ mean. With
+        # no ref series these stay None and the lDDT panel falls back to the paper mean.
+        def _af3(col):
+            d = interface_metric_dist(ref_series, category, col) if ref_series else []
+            return (d[0]["med"], d[0]["mean"]) if d else (None, None)
+
+        _ld_med, _ld_mean = _af3("lddt")
+        _il_med, _ = _af3("ilddt")
+        _tm_med, _tm_mean = _af3("tm_score")
         _dist_panel(
             axl,
             ld,
             "lDDT",
             "whole-model lDDT (black) + inter-chain iLDDT (red) — median + IQR",
-            AF3_INTERFACE_LDDT.get(category),
+            af3ref_median=_ld_med,
             overlay=(il, "inter-chain iLDDT", "tab:red"),
             conf=ld_conf,
+            af3ref_mean=_ld_mean,
+            overlay_af3ref=_il_med,
+            paper_ref=AF3_INTERFACE_LDDT.get(category),
         )
         _dist_panel(
             axt,
             tm,
             "TM-score (whole model)",
             "whole-model TM-score (median + IQR across targets)",
+            af3ref_median=_tm_med,
             conf=tm_conf,
+            af3ref_mean=_tm_mean,
         )
         if all_steps:
             # pad by a bar so edge bars aren't clipped. sharex applies to all panels.
@@ -557,21 +710,32 @@ def summarize(series: str, category: str, plot: bool) -> None:
                         ms=3,
                         label=f"{c} (n={nlast})",
                     )
-            af3v = AF3_MONOMER.get(category, {}).get(mk)
-            if af3v is not None:
-                # AF3 reference (FoldBench full set), labelled at the right edge
-                # since each panel's value differs and only axes[0] shows a legend.
-                ax.axhline(af3v, color="#d7301f", ls="--", lw=1.8, zorder=7)
+            # AF3 refs like-for-like from the measured ref series' raw per-target values:
+            # median (black, matches the median line) + mean (gray); its summary has no
+            # median column. With no ref series, fall back to the paper mean (dotted).
+            _raw_col = {"lddt": "lddt", "tm": "tm_score", "gdt": "oligo_gdtts"}[mk]
+            _af3d = interface_metric_dist(ref_series, category, _raw_col) if ref_series else []
+            _paper = AF3_MONOMER.get(category, {}).get(mk)
+            if not _af3d and _paper is not None:
+                ax.axhline(_paper, color="k", alpha=0.35, lw=1.1, ls=":", zorder=3)
+                _spine_marker(ax, _paper, "k", alpha=0.55)
                 ax.text(
-                    0.995,
-                    af3v,
-                    f"AF3 {af3v:.2f}",
+                    0.005, _paper, f"AF3 paper mean (full set) {_paper:.2f}",
                     transform=ax.get_yaxis_transform(),
-                    ha="right",
-                    va="bottom",
-                    fontsize=8,
-                    color="#d7301f",
-                    clip_on=False,
+                    ha="left", va="bottom", fontsize=8, color="k", alpha=0.7, clip_on=False,
+                )
+            if _af3d:
+                _med, _mean = _af3d[0]["med"], _af3d[0]["mean"]
+                ax.axhline(_med, color="k", alpha=0.5, lw=1.1, zorder=3)
+                _spine_marker(ax, _med, "k")
+                _spine_marker(ax, _mean, "0.45")
+                ax.text(
+                    0.005, _med, f"AF3 median {_med:.2f}", transform=ax.get_yaxis_transform(),
+                    ha="left", va="bottom", fontsize=8, color="k", alpha=0.7, clip_on=False,
+                )
+                ax.text(
+                    0.005, _mean, f"AF3 mean {_mean:.2f}", transform=ax.get_yaxis_transform(),
+                    ha="left", va="top", fontsize=8, color="0.45", alpha=0.9, clip_on=False,
                 )
             ax.set_ylabel(label)
             ax.set_title(label)
@@ -616,8 +780,16 @@ def main() -> None:
     ap.add_argument("--series", default="df3v1")
     ap.add_argument("--category", default="monomer_protein")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument(
+        "--ref-series",
+        default="",
+        help="Series whose measured mean (oracle for the success panel) is drawn as a "
+        "reference line; falls back to the built-in paper AF3 dicts when its eval is "
+        "absent or no series is given (the default). Series listed in "
+        f"RETIRED_REF_SERIES ({', '.join(sorted(RETIRED_REF_SERIES))}) are refused.",
+    )
     args = ap.parse_args()
-    summarize(args.series, args.category, plot=not args.no_plot)
+    summarize(args.series, args.category, plot=not args.no_plot, ref_series=args.ref_series)
 
 
 if __name__ == "__main__":
