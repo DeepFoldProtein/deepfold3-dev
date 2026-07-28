@@ -2,9 +2,9 @@
 
 **Date:** 2026-07-27
 **Model:** `df3-stage0-r14` (bench series `df3v4r14`), checkpoint step **23,000** — all eight categories.
-**Baseline:** `af3_ref` — AlphaFold3 run through the **same** bench harness.
-**Figures:** `af3_vs_r14_overview.png`, `confidence_calibration.png`, `foldbench_models_ppi_agab.png` (+`_post2023-06-01`) · **Data:** `overview_data.csv`, `confidence_data.csv`, `foldbench_models_data.csv`, `foldbench_target_dates.csv`
-_Every section auto-refreshes to the latest benched r14 step per category: `plot_overview.py`, `plot_confidence.py`, `plot_multimer_breakdown.py`, `plot_foldbench_models.py`, `plot_foldbench_conf.py`, `plot_foldbench_ranked.py` — all take `--step N` to pin. `bench/scripts/auto.sh` runs `update_foldbench.sh` after each interface eval, so the whole report follows the live run. External-model rows are fixed; only r14 moves._
+**Baseline:** **FoldBench official** AF3 rows. The `af3_ref` sweep — AlphaFold3 through our own bench harness — is **retired as a displayed baseline** (see the box below); its step-23k tables are kept as a frozen record.
+**Figures:** `confidence_calibration.png`, `foldbench_models_ppi_agab.png` (+`_post2023-06-01`), `foldbench_ranked_ppi_agab.png` (+`_post2023-06-01`), `foldbench_conf_models.png` · **Data:** `confidence_data.csv`, `foldbench_models_data.csv`, `foldbench_ranked_data.csv`, `foldbench_target_dates.csv`, `overview_data.csv` + `multimer_breakdown_data.csv` (frozen)
+_Live sections auto-refresh to the latest benched r14 step per category: `plot_confidence.py`, `plot_foldbench_models.py`, `plot_foldbench_conf.py`, `plot_foldbench_ranked.py` — all take `--step N` to pin. `bench/scripts/auto.sh` runs `update_foldbench.sh` after each interface eval, so those sections follow the live run. External-model rows are fixed; only r14 moves. **Two sections no longer refresh** — Overview and Multimer decomposition; they are marked FROZEN and their step numbers do not advance._
 
 > **Sample budget — corrected.** `af3_ref` and every external model are folded at **4 seeds × 5 =
 > 20 samples**. r14 ran at **2 × 5 = 10** until the seed top-up (antibody from 19k, protein–protein
@@ -32,8 +32,19 @@ _Every section auto-refreshes to the latest benched r14 step per category: `plot
 > **DF3r14 folds the same template-free inputs**, so `af3_ref` vs r14 remains a valid
 > *same-inputs* control and is the right test of "which model is better given identical
 > features". It is **not** a test of "how does r14 compare to AF3 as deployed" — for that,
-> use the FoldBench-official rows. **Headline claims in this report follow the FoldBench
-> official numbers.** Against them, at step 23k:
+> use the FoldBench-official rows.
+>
+> **`af3_ref` is therefore retired as a displayed baseline** (2026-07-28). Presenting a
+> handicapped AF3 as the headline comparison invites reading the gap as parity. It is
+> dropped from `bench/scripts/summarize.py` / `plot_lddt_grid.py` (refused by name via
+> `RETIRED_REF_SERIES`, so a running `auto.sh` cannot resurrect it) and from
+> `update_foldbench.sh`; the per-category bench figures now fall back to the published AF3
+> numbers, and the two report sections built on it are frozen at step 23k rather than
+> deleted — the measurement is sound, it is the framing that was wrong. Revive it by
+> re-folding `af3_ref` **with** templates.
+>
+> **Headline claims in this report follow the FoldBench official numbers.** Against them,
+> at step 23k:
 >
 > | | FoldBench AF3 | DF3r14 @23k | gap |
 > |---|---|---|---|
@@ -119,11 +130,17 @@ Because the harness is shared, protocol differences cancel and af3_ref vs r14 is
 
 ---
 
-## Overview — step 23k *(same-inputs control vs `af3_ref`)*
+## Overview — step 23k *(same-inputs control vs `af3_ref`)* — **FROZEN**
 
-![overview](af3_vs_r14_overview.png)
+> **This section no longer refreshes.** `plot_overview.py` is out of `update_foldbench.sh`
+> because its figure is an `af3_ref` head-to-head; the figure is deleted (regenerate with
+> `plot_overview.py` if ever needed) and the table below is a frozen **step-23k** record —
+> `overview_data.csv` was rolled back to match, so table and CSV agree. The AF3 column is
+> the **template-free** `af3_ref` fold, not deployed AF3 — read it only as "which model is
+> better at identical features". Rebasing this section on FoldBench-official AF3 needs
+> `precompute_external.py` extended past ppi + agab.
 
-| category | n | metric | AF3 (rank-1→oracle) | r14 @23k (rank-1→oracle) | r14 @20k |
+| category | n | metric | AF3 `af3_ref` (rank-1→oracle) | r14 @23k (rank-1→oracle) | r14 @20k |
 |---|---|---|---|---|---|
 | monomer protein | 333 | TM | 0.940 → 0.949 | 0.931 → 0.944 | 0.932 → 0.944 |
 | monomer RNA | 15 | TM | 0.337 → 0.406 | 0.311 → 0.362 | 0.278 → 0.335 |
@@ -217,15 +234,19 @@ bouncing across zero).
 
 ---
 
-## Multimer decomposition (protein–protein, 240 interfaces)
+## Multimer decomposition (protein–protein, 240 interfaces) — **FROZEN**
 
 Each scored interface classified by **composition** (homo = both chains share sequence / hetero = different entities, from the bench input JSON entity grouping) × **assembly size** (dimer = 2 chains / N-mer = ≥3 chains).
 
-![multimer](multimer_breakdown.png)
+> **This section no longer refreshes.** `plot_multimer_breakdown.py` is out of
+> `update_foldbench.sh` for the same reason as Overview — the figure is an `af3_ref`
+> head-to-head. Figure deleted, table frozen at **step 23k**, and
+> `multimer_breakdown_data.csv` rolled back to match. The AF3 column is the template-free
+> `af3_ref` fold.
 
 Both models at **20 samples** (4 seeds × 5).
 
-| bucket | n | AF3 rank-1→oracle | r14 @23k rank-1→oracle | r14 @20k | r14 @12k *(N=10)* |
+| bucket | n | AF3 `af3_ref` rank-1→oracle | r14 @23k rank-1→oracle | r14 @20k | r14 @12k *(N=10)* |
 |---|---|---|---|---|---|
 | homo-dimer | 99 | 49 → 55 | **53 → 60** | 53 → 58 | 52 → 59 |
 | hetero-dimer | 28 | 82 → 86 | 82 → 86 | 79 → 86 | 75 → 82 |
@@ -393,7 +414,7 @@ For the same-inputs control (`af3_ref`, template-free, identical MSAs) r14 is at
 - Running `eval_ost.py` outside `auto.sh` needs the same environment auto.sh exports: `OST_CMD="$HOME/.conda/envs/foldbench/bin/ost compare-structures"` (this host has no `apptainer`, which is the script's default) and `PATH="$HOME/.local/fastbin:$PATH"` (the `lscpu` shim). Without the first, every OST subprocess raises `FileNotFoundError` and no raw CSV is written.
 - protein–DNA is the one non-common row: r14 scored 20 interfaces at 19k vs af3_ref's 19.
 - r14 eval uses the `shadow` (EMA) snapshot (bench `--snapshot auto`); af3_ref is the fixed release weights.
-- Scripts: `plot_overview.py`, `plot_confidence.py`, `plot_multimer_breakdown.py`, `plot_foldbench_models.py` (rerun from repo root; `--after YYYY-MM-DD` for the cutoff control, `--step N` to pin). Data: `overview_data.csv`, `confidence_data.csv`, `multimer_breakdown_data.csv`, `foldbench_models_data.csv`, `foldbench_models_data_post2023-06-01.csv`, `foldbench_target_dates.csv` (per-target RCSB release dates).
+- Scripts run by `update_foldbench.sh`: `plot_confidence.py`, `plot_foldbench_models.py`, `plot_foldbench_conf.py`, `plot_foldbench_ranked.py` (rerun from repo root; `--after YYYY-MM-DD` for the cutoff control, `--step N` to pin). `plot_overview.py` and `plot_multimer_breakdown.py` are kept but **not** run — they draw `af3_ref`; re-add them to `update_foldbench.sh` after re-folding `af3_ref` with templates. Data: `confidence_data.csv`, `foldbench_models_data.csv`, `foldbench_models_data_post2023-06-01.csv`, `foldbench_ranked_data.csv`, `foldbench_target_dates.csv` (per-target RCSB release dates), plus the frozen `overview_data.csv` / `multimer_breakdown_data.csv`.
 - External-model comparison shows **mean and oracle** DockQ (rank-1 only where `ranking_score` exists — OF3p2/EF2 lack it) on the **207 ppi / 90 agab** common set (∩ all 8 models; FoldBench-small — r14 folds ≤1024-tok, so >1024-residue full-FoldBench targets + OST-failed 8i82 are excluded, not a target mismatch). The external comparison tracks the **latest benched r14 step (20k)**, matching the header.
 - Training-cutoff control uses per-target **release dates from RCSB** (`initial_release_date`); 1 ppi target undated and dropped from the post-cutoff set. Pre-cutoff n is small (42 ppi / 21 agab) — directional, but the BT2 effect size is large. Cutoff = Boltz-2's; other models' cutoffs differ (AF3 2021-09-30 earlier, so post-2023-06-01 removes nothing memorizable for AF3).
 - Multimer classification is protein–protein only; antibody/peptide/NA are separate top-level categories. homo/hetero from input-JSON entity grouping (shared sequence), so chain-letter labels (e.g. 8kbm A/A-2/B/B-2 = one entity) are handled correctly.
