@@ -238,6 +238,15 @@ def build_dataloaders(
         "atomize_prob",
         "atomize_source",
         "atomize_max_residues",
+        # NOT here on purpose: ``template_struct_space``. OF3 records carry their
+        # alignment as ``template.npz``'s ``idx_map``, which is 1-based SEQRES —
+        # measured: reading it as SEQRES reconstructs 27% median identity on
+        # long_monomers / short_monomers, reading it as structure-space gives
+        # 7.5% (random). OF3Dataset therefore always wants the SEQRES path and
+        # takes no such argument. **Setting template_struct_space on a
+        # ``format: of3`` dataset entry is silently ignored** — if an of3-format
+        # source ever ships structure-space indices, plumb it through here rather
+        # than assuming the config entry did anything.
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 

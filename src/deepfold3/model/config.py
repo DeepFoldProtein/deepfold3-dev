@@ -631,6 +631,12 @@ class DatasetConfig:
             reading by 0.5 / 1.9 / 1.4, with ~98% of hits within 10 points. All
             three shipped sets are structure-space.
 
+            **Only applies to ``format: df3`` datasets.** OF3 records store the
+            alignment as ``template.npz``'s ``idx_map``, which is 1-based SEQRES
+            by construction; ``OF3Dataset`` takes no such argument, so setting
+            this on a ``format: of3`` entry does nothing (see
+            ``training/data.py:of3_kwarg_names``).
+
             ``monomer_template_struct_space`` is accepted as a deprecated alias.
         max_template_date: Per-dataset override of the global
             ``data.max_template_date`` hard cap on template release dates

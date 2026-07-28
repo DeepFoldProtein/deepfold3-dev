@@ -197,6 +197,9 @@ datasets:
     # Multi-chain PDB assemblies: keep all three AF3 §2.7 crop strategies.
     crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
 
+  # of3-format sets below: their template.npz idx_map is 1-based SEQRES, which
+  # is what OF3Dataset assumes. `template_struct_space` is a df3-only knob and
+  # would be silently ignored here.
   - name: long_monomers
     data_dir: /data/distillation/long_monomers/preprocessed
     weight: 0.20
