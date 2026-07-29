@@ -468,8 +468,17 @@ class OF3Dataset(torch.utils.data.Dataset):
             interface_distance=self.cropper.interface_distance,
         )
         tokenized = self.cropper.crop(tokenized, self.max_tokens, self.max_atoms, anchor=crop_anchor)
+        # Template arrays stay in full query space, so they must be gathered by
+        # the pre-rebase query column — ``msa_col_idx`` is rebased to the sliced
+        # MSA here (the MSA is attached before the crop, unlike the df3
+        # crop-then-load path). Without this the chain's first ``k`` template
+        # rows land on the crop regardless of which residues survived.
         feats = self.featurizer.process(
-            tokenized, training=True, random_rot=True, template_feats_per_chain=template_feats_per_chain
+            tokenized,
+            training=True,
+            random_rot=True,
+            template_feats_per_chain=template_feats_per_chain,
+            template_col_idx=tokenized.query_col_idx,
         )
 
         # 6. Distillation flag

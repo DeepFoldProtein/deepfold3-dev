@@ -377,6 +377,33 @@ def test_tokenizer_atomizes_modified_residue():
     assert len(ala_tokens) == 1
 
 
+def test_modified_residue_keeps_template_alignment():
+    """A modified residue expands to per-atom tokens, so token position stops
+    tracking query residue. Templates must still be gathered by query index:
+    the ASN's atom tokens repeat its row, the ligand takes none, and nothing
+    downstream shifts (the failure mode a positional gather produces)."""
+    from deepfold3.data.feature.featurizer import Featurizer
+    from deepfold3.data.module.dataset import _whole_query_col_idx
+    from deepfold3.data.parse.templates import TemplateFeatures
+
+    st = _asn_glycosylation_structure()
+    st = Structure(atoms=st.atoms, bonds=_bonds([(6, 7)]), residues=st.residues, chains=st.chains)
+    tok = Tokenizer().tokenize(Input(structure=st, paired_msa={}, unpaired_msa={}))
+
+    # 2 query residues (ALA, ASN) -> 6 tokens (1 + 4 atoms + 1 ligand).
+    cols = _whole_query_col_idx(tok)
+    assert cols.tolist() == [0, 1, 1, 1, 1, -1]
+
+    n_res = 2
+    tmpl = TemplateFeatures(
+        aatype=np.arange(n_res, dtype=np.int64),
+        atom_positions=np.zeros((n_res, const.MAX_ATOMS_PER_TOKEN, 3), np.float32),
+        atom_mask=np.ones((n_res, const.MAX_ATOMS_PER_TOKEN), bool),
+    )
+    out = Featurizer()._build_single_chain_template_features([tmpl], len(cols), cols)
+    assert out["template_aatype"][0].tolist() == [0, 1, 1, 1, 1, const.MSA_GAP]
+
+
 def test_tokenizer_keeps_unmodified_residue_single_token():
     st = _asn_glycosylation_structure()
     # No bonds → ASN not modified → single token.

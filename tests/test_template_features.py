@@ -54,6 +54,23 @@ def test_single_chain_truncates_to_n():
     assert out["template_aatype"][0].tolist() == list(range(146))
 
 
+def test_single_chain_expanded_residue_gathers_by_query_index():
+    """A modified residue tokenizes per atom; its 4 atom tokens must all read
+    the residue's own template row, and the residues after it must not shift."""
+    cols = np.array([0, 1, 2, 2, 2, 2, 3, 4])  # residue 2 expanded to 4 atom tokens
+    out = Featurizer()._build_single_chain_template_features([_make_template(5)], len(cols), cols)
+    assert out["template_aatype"][0].tolist() == [0, 1, 2, 2, 2, 2, 3, 4]
+
+
+def test_single_chain_ligand_tokens_take_no_template():
+    """Ligand tokens (-1) are outside the query space: masked, never gathered."""
+    cols = np.array([0, 1, 2, -1, -1])
+    out = Featurizer()._build_single_chain_template_features([_make_template(3)], len(cols), cols)
+    assert out["template_aatype"][0].tolist()[:3] == [0, 1, 2]
+    assert out["template_aatype"][0].tolist()[3:] == [const.MSA_GAP] * 2
+    assert out["template_pseudo_beta_mask"][0].tolist() == [True, True, True, False, False]
+
+
 # --- per-chain (crop-aware) path — the training path ---
 
 
@@ -78,6 +95,40 @@ def test_per_chain_no_crop_positional_fallback():
         {0: [_make_template(12)]}, _make_tokens(list(range(12))), 12, template_col_idx=None
     )
     assert out["template_aatype"][0].tolist() == list(range(12))
+
+
+def test_inference_templates_stay_on_their_own_chain():
+    """A chain's templates must land on that chain, through the inference entry
+    point (tokenize -> query index -> featurize).
+
+    ``from_job`` used to collapse a lone templated chain to the flat builder,
+    which is whole-query indexed and put chain B's rows on chain A; it now
+    routes every per-chain case here.
+    """
+    from deepfold3.data.module.dataset import _build_complex_structure, _tokenize_and_featurize
+    from deepfold3.data.types import Input
+
+    seq_a, seq_b = "AAAAAAAA", "CCCCCC"
+    structure = _build_complex_structure([(seq_a, const.MOL_PROTEIN, "A"), (seq_b, const.MOL_PROTEIN, "B")])
+    inp = Input(structure=structure, paired_msa={}, unpaired_msa={})
+    feats = _tokenize_and_featurize(inp, template_feats_per_chain={1: [_make_template(len(seq_b))]})
+
+    aatype = feats["template_aatype"][0].tolist()
+    assert aatype[: len(seq_a)] == [const.MSA_GAP] * len(seq_a)  # untemplated chain
+    assert aatype[len(seq_a) :] == list(range(len(seq_b)))  # chain B's own rows
+
+
+def test_per_chain_expanded_residue_repeats_row():
+    """Atomized / modified residues share one query column, so their atom tokens
+    repeat that residue's template row — AF3's ``standard_token_idxs`` gather."""
+    cols = [4, 5, 5, 5, 6]  # residue 5 atomized into 3 atom tokens
+    tmpl = _make_template(12)
+    tmpl.atom_positions[:, :, 0] = np.arange(12)[:, None]  # CB.x == query index
+    out = Featurizer()._build_per_chain_template_features(
+        {0: [tmpl]}, _make_tokens(cols), len(cols), template_col_idx=np.array(cols)
+    )
+    assert out["template_aatype"][0].tolist() == cols
+    assert out["template_pseudo_beta"][0, :, 0].tolist() == [float(c) for c in cols]
 
 
 def test_per_chain_out_of_range_dropped():

@@ -501,6 +501,35 @@ def test_remap_msa_col_idx_gather_invariant():
         assert got == want, f"token {tok}: sliced gather {got} != full gather {want}"
 
 
+def test_crop_keeps_raw_query_columns_for_templates():
+    """When the crop slices an MSA it rebases ``msa_col_idx`` — templates still
+    live in full query space, so the raw columns must survive on
+    ``template_col_idx`` (the of3 path gathers template rows with them)."""
+    import random
+    from dataclasses import replace
+
+    n = 100
+    data = replace(make_tokenized(n, n_chains=1, with_msa=True), msa_col_idx=np.arange(n, dtype=np.int32))
+    cropper = Cropper(contiguous_weight=1.0, spatial_weight=0.0, interface_weight=0.0)
+    cropped = cropper.crop(data, max_tokens=30, max_atoms=10_000_000, seed=random.Random(0).randint(0, 1000))
+
+    kept = cropped.tokens["residue_index"]  # == the token's original index
+    assert cropped.template_col_idx.tolist() == kept.tolist()
+    assert cropped.query_col_idx.tolist() == kept.tolist()
+    # msa_col_idx is rebased onto the sliced MSA and is NOT the query index.
+    assert cropped.msa_col_idx.tolist() == list(range(len(kept)))
+
+
+def test_query_col_idx_falls_back_when_uncropped():
+    """No crop, no slice: ``msa_col_idx`` is already the query index."""
+    from dataclasses import replace
+
+    data = replace(make_tokenized(10, n_chains=1, with_msa=True), msa_col_idx=np.arange(10, dtype=np.int32))
+    out = Cropper().crop(data, max_tokens=64, max_atoms=10_000_000)
+    assert out.template_col_idx is None
+    assert out.query_col_idx.tolist() == list(range(10))
+
+
 def test_remap_msa_col_idx_preserves_ligand_gaps():
     """Ligand / column-less tokens (-1) stay -1 through the remap."""
     asym = np.array([0, 0, 0])

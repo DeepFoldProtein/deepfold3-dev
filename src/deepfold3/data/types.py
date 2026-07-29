@@ -345,6 +345,24 @@ class Tokenized:
     # the canonical sequence).  Ligand tokens get -1 (no MSA column).
     # Shape: int32 [N_tokens].  AF3 calls this ``standard_token_idxs``.
     msa_col_idx: np.ndarray | None = None
+    # Per-token *query residue* index within the chain — i.e. ``msa_col_idx``
+    # before any rebase onto a column-sliced MSA.  Set by the cropper; it is
+    # what template arrays (which stay in full query space) must be gathered
+    # by, since ``msa_col_idx`` is rebased to 0..k-1 whenever an MSA is sliced
+    # alongside the crop.  Same broadcast convention: every atom token of an
+    # expanded residue shares the residue's index; ligand tokens get -1.
+    template_col_idx: np.ndarray | None = None
+
+    @property
+    def query_col_idx(self) -> np.ndarray | None:
+        """Per-token query residue index to gather template rows by.
+
+        ``template_col_idx`` when the cropper recorded one, else ``msa_col_idx``
+        — which is the same thing on any path that did not slice an MSA (no
+        crop, or crop-then-load). Read this instead of ``msa_col_idx`` when
+        placing template features.
+        """
+        return self.template_col_idx if self.template_col_idx is not None else self.msa_col_idx
 
     def with_mask(self, token_mask: TokenMask) -> Tokenized:
         """Return a copy with the given token mask attached."""

@@ -297,8 +297,12 @@ def atomize_tokens(
     new_bonds = np.array(bond_rows, dtype=TOKEN_BOND_DTYPE) if bond_rows else np.empty(0, dtype=TOKEN_BOND_DTYPE)
 
     # msa_col_idx and token_mask expand by gathering along the source map
-    # (atomized atoms inherit the residue's MSA column / mask value).
+    # (atomized atoms inherit the residue's MSA column / mask value). The same
+    # inheritance is what feeds the residue's template row to each of its atom
+    # tokens — AF3 does exactly this via ``standard_token_idxs``
+    # (features.py: "for expanded residues, we get repeated template information").
     new_msa_col = tokenized.msa_col_idx[source_map_arr] if tokenized.msa_col_idx is not None else None
+    new_tpl_col = tokenized.template_col_idx[source_map_arr] if tokenized.template_col_idx is not None else None
     new_mask: TokenMask | None = (
         tokenized.token_mask.select(source_map_arr) if tokenized.token_mask is not None else None
     )
@@ -310,5 +314,6 @@ def atomize_tokens(
         tokens=new_tokens,
         bonds=new_bonds,
         msa_col_idx=new_msa_col,
+        template_col_idx=new_tpl_col,
         token_mask=new_mask,
     )

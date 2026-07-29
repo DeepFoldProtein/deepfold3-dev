@@ -1329,6 +1329,13 @@ class Featurizer:
         templates populate only that chain's region of the [T, N] tensors.
         Single-chain (or single chain with templates): uses flat list as before.
 
+        ``template_col_idx`` is the query index each token gathers its template
+        row by. Its space follows the path taken: chain-local residue index for
+        the per-chain path, whole-query index for the flat path. Without it both
+        paths fall back to token position, which is only correct when every
+        token is one residue (no atomized / modified residues, no ligand) and
+        nothing was cropped away.
+
         Returns dict with keys:
             template_aatype            [T, N]         int64
             template_pseudo_beta       [T, N, 3]      float32
@@ -1352,7 +1359,7 @@ class Featurizer:
             feats = self._build_per_chain_template_features(template_feats_per_chain, tokens, N, template_col_idx)
         else:
             # Single chain / flat list path (backward compatible)
-            feats = self._build_single_chain_template_features(templates, N)
+            feats = self._build_single_chain_template_features(templates, N, template_col_idx)
 
         return self._finalize_template_axis(feats)
 
@@ -1417,8 +1424,15 @@ class Featurizer:
         self,
         templates: list[TemplateFeatures] | None,
         N: int,
+        col_idx: np.ndarray | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Build template features from a flat list (single-chain case)."""
+        """Build template features from a flat list (single-chain case).
+
+        ``col_idx`` is the per-token query index into the (whole-query) template
+        arrays, with -1 for tokens outside that space (ligands). When omitted,
+        template row *k* goes to token *k* — correct only while token position
+        and query residue coincide.
+        """
         if not templates:
             return {
                 "template_aatype": torch.zeros(0, N, dtype=torch.int64),
@@ -1441,12 +1455,29 @@ class Featurizer:
         t_frame_mask = np.zeros((T, N), dtype=bool)
         t_ca = np.zeros((T, N, 3), dtype=np.float32)  # CA = unit-vector frame origin
 
+        cols = None if col_idx is None else np.asarray(col_idx)
         for t, tmpl in enumerate(templates):
-            L = min(len(tmpl.aatype), N)
-            # Single-chain (no crop): template row k → query position k, contiguous.
-            idx = np.arange(L)
+            if cols is None:
+                # Single-chain, one token per residue: row k → query position k.
+                idx = np.arange(min(len(tmpl.aatype), N))
+                dst_pos, src_idx = idx, idx
+            else:
+                # Gather by query index: expanded residues (modified / atomized)
+                # repeat their row across their atom tokens, ligands (-1) get none.
+                valid = (cols >= 0) & (cols < len(tmpl.aatype))
+                dst_pos, src_idx = np.where(valid)[0], cols[valid]
+            if len(dst_pos) == 0:
+                continue
             self._fill_template_slot(
-                t_aatype[t], t_pb[t], t_pb_mask[t], t_frame[t], t_frame_mask[t], tmpl, idx, idx, ca_row=t_ca[t]
+                t_aatype[t],
+                t_pb[t],
+                t_pb_mask[t],
+                t_frame[t],
+                t_frame_mask[t],
+                tmpl,
+                dst_pos,
+                src_idx,
+                ca_row=t_ca[t],
             )
 
         return {

@@ -529,7 +529,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         # Original (pre-rebase) chain-local column per token == the per-chain
         # template array's query index; keep it for correct template placement
         # before rebasing msa_col_idx for the sliced MSA gather.
-        template_col_idx = tokenized.msa_col_idx
+        template_col_idx = tokenized.query_col_idx
         remapped_col_idx = remap_msa_col_idx_to_slice(
             tokenized.tokens["asym_id"], tokenized.msa_col_idx, chain_msa_cols
         )
@@ -975,17 +975,57 @@ def _tokenize_and_featurize(
     templates: list[TemplateFeatures] | None = None,
     template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Shared tokenize -> featurize pipeline for inference inputs."""
+    """Shared tokenize -> featurize pipeline for inference inputs.
+
+    ``templates`` is a whole-query flat list (JSON dialect); its rows are
+    gathered by each token's index into the concatenated polymer sequences.
+    ``template_feats_per_chain`` is per chain, gathered by the chain-local
+    residue index. Either way the index comes from ``msa_col_idx``, so a chain
+    holding a modified residue — which tokenizes to one token per atom — keeps
+    its templates on the right residues instead of shifting everything after it.
+    """
     tokenizer = Tokenizer()
     featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
     tokenized = tokenizer.tokenize(inp)
+    if template_feats_per_chain:
+        col_idx = tokenized.query_col_idx
+    else:
+        col_idx = _whole_query_col_idx(tokenized)
     return featurizer.process(
         tokenized,
         training=False,
         random_rot=False,
         templates=templates,
         template_feats_per_chain=template_feats_per_chain,
+        template_col_idx=col_idx,
     )
+
+
+def _whole_query_col_idx(tokenized: Tokenized) -> np.ndarray | None:
+    """Per-token index into the concatenated per-chain query sequences.
+
+    The flat (JSON) template list is aligned to all polymer chains concatenated
+    in chain order, so a token's row is its chain's residue offset plus its
+    chain-local column. Non-polymer tokens stay at -1 and take no template row,
+    matching how the offsets are counted (ligands contribute no columns).
+
+    Inference only: chain lengths are read off the tokens present, which assumes
+    nothing was cropped away.
+    """
+    col_idx = tokenized.query_col_idx
+    if col_idx is None:
+        return None
+    asym = tokenized.tokens["asym_id"]
+    out = np.full(len(col_idx), -1, dtype=np.int64)
+    offset = 0
+    for aid in sorted({int(a) for a in asym}):
+        sel = np.where((asym == aid) & (col_idx >= 0))[0]
+        if len(sel) == 0:
+            continue
+        cols = col_idx[sel].astype(np.int64)
+        out[sel] = cols + offset
+        offset += int(cols.max()) + 1
+    return out
 
 
 class InferenceInput:
@@ -1202,17 +1242,15 @@ class InferenceInput:
                     if chain_templates:
                         template_feats_per_chain[asym_id] = chain_templates
 
-            if len(template_feats_per_chain) == 1:
-                template_feats = next(iter(template_feats_per_chain.values()))
-            elif len(template_feats_per_chain) > 1:
-                template_feats = next(iter(template_feats_per_chain.values()))
-
         inp = Input(structure=structure, paired_msa=paired_msa_dict, unpaired_msa=unpaired_msa_dict)
+        # A single templated chain goes through the per-chain path too: the flat
+        # path is aligned to the *whole* query, so handing it one chain's array
+        # only works when that chain is first and every other chain follows it.
         return _tokenize_and_featurize(
             inp,
             max_msa_seqs=max_msa_seqs,
             templates=template_feats,
-            template_feats_per_chain=template_feats_per_chain if len(template_feats_per_chain) > 1 else None,
+            template_feats_per_chain=template_feats_per_chain or None,
         )
 
 

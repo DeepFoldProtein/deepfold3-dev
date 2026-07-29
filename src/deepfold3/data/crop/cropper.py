@@ -750,6 +750,12 @@ class Cropper:
         # by the dataset, which rebases then — rebasing here would destroy the
         # original columns the dataset needs to slice from disk (double rebase).
         new_msa_col_idx = data.msa_col_idx[selected] if data.msa_col_idx is not None else None
+        # Templates are indexed by the *query* residue, so they need the columns
+        # as they were before any rebase — keep a copy on the cropped object
+        # (``Tokenized.template_col_idx``). Without it the caller cannot tell
+        # whether ``msa_col_idx`` is raw or rebased, and gathering template rows
+        # with a rebased index silently misplaces every hit.
+        new_template_col_idx = None if new_msa_col_idx is None else new_msa_col_idx.copy()
         sliced_msa_here = bool(data.paired_msa) or bool(data.unpaired_msa)
         if new_msa_col_idx is not None and sliced_msa_here:
             new_msa_col_idx = remap_msa_col_idx_to_slice(new_tokens["asym_id"], new_msa_col_idx, chain_msa_cols)
@@ -762,4 +768,5 @@ class Cropper:
             unpaired_msa=_crop_msa_dict(data.unpaired_msa),
             token_mask=data.token_mask.select(selected) if data.token_mask is not None else None,
             msa_col_idx=new_msa_col_idx,
+            template_col_idx=new_template_col_idx,
         )
