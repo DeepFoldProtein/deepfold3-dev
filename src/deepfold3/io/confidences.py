@@ -307,6 +307,72 @@ def compute_iptm(
     return float(per_alignment.max().item())
 
 
+def compute_chain_pair_iptm(
+    pae_logits: torch.Tensor,
+    seq_mask: torch.Tensor,
+    pair_mask: torch.Tensor,
+    asym_id: torch.Tensor,
+    max_error_bin: float = _DEFAULT_CFG.max_error_bin,
+    num_bins: int = _DEFAULT_CFG.num_distogram_bins,
+    d0_pair_mask: torch.Tensor | None = None,
+) -> dict[tuple[int, int], float]:
+    """ipTM restricted to each unordered pair of distinct chains.
+
+    :func:`compute_iptm` pools every cross-chain pair into one number, so a
+    prediction whose interfaces differ in quality — an Fab where the heavy chain
+    is docked and the light chain is not — gets a single score that describes
+    neither. This computes the same quantity per chain pair: the j-normalization
+    and the row max run over that pair alone.
+
+    The TM-adjusted PAE itself is **not** re-derived per pair. AF3's interface
+    ``d0`` is already a function of the two chains at ``(i, j)``
+    (``|chain_i| + |chain_j|``, see :func:`compute_iptm`), so the entries a pair
+    reads are identical to the ones the global ipTM reads — only the pooling
+    changes. That also makes the two exactly consistent: on a two-chain
+    prediction the single pair's value equals the global ipTM.
+
+    Args:
+        pae_logits: [N, N, num_bins] logits.
+        seq_mask: [N] float mask gating the per-row alignment + max.
+        pair_mask: [N, N] float mask for the row-wise j-sum.
+        asym_id: [N] int chain identifiers.
+        d0_pair_mask: [N, N] pair mask for counting per-chain tokens in the
+            per-pair d0. Falls back to ``pair_mask``.
+
+    Returns:
+        ``{(asym_a, asym_b): iptm}`` for every ordered-by-value distinct pair
+        that has at least one unmasked cross-chain token pair. Empty for a
+        single-chain prediction.
+    """
+    same_chain = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)  # [N, N] bool
+    count_mask = pair_mask if d0_pair_mask is None else d0_pair_mask
+    x = same_chain.float()
+    num_chain_tokens = (x * count_mask).sum(dim=-1)  # [N]
+    num_interface_tokens = num_chain_tokens.unsqueeze(0) + num_chain_tokens.unsqueeze(-1)  # [N, N]
+    num_interface_tokens = num_interface_tokens - x * (num_interface_tokens.long() // 2).float()
+    num_interface_tokens = num_interface_tokens * count_mask
+
+    tm_adj = _compute_tm_adjusted_pae(pae_logits, num_interface_tokens, max_error_bin, num_bins)
+
+    chains = [int(c) for c in torch.unique(asym_id).tolist()]
+    out: dict[tuple[int, int], float] = {}
+    for ai, a in enumerate(chains):
+        in_a = asym_id == a
+        for b in chains[ai + 1 :]:
+            in_b = asym_id == b
+            # Both directions: rows of a scored against b, and rows of b against a.
+            pair_ab = (in_a.unsqueeze(-1) & in_b.unsqueeze(-2)) | (in_b.unsqueeze(-1) & in_a.unsqueeze(-2))
+            mask = pair_mask * pair_ab.float()
+            if mask.sum() == 0:
+                continue
+            denom = mask.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            per_alignment = (tm_adj * (mask / denom)).sum(dim=-1) * seq_mask
+            # Rows outside {a, b} have an all-zero mask row and score 0, so the
+            # max is over the pair's own rows without masking them explicitly.
+            out[(a, b)] = float(per_alignment.max().item())
+    return out
+
+
 def has_clash(
     atom_positions: torch.Tensor,
     atom_mask: torch.Tensor,
@@ -890,9 +956,16 @@ def save_confidences_json(
         iptm = compute_iptm(
             pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_pair_mask=pair_mask
         )
+        # Per-chain-pair ipTM: the global one pools every interface of a
+        # multi-interface prediction into a single score, which cannot rank a
+        # sample whose interfaces disagree (an Fab's H-Ag vs L-Ag).
+        pair_iptm = compute_chain_pair_iptm(
+            pae_logits_s, tm_mask, tm_pair_mask, asym_id, max_error_bin, num_bins, d0_pair_mask=pair_mask
+        )
     else:
         ptm = 0.0
         iptm = float("nan")
+        pair_iptm = {}
 
     # PDE — scalar average_pde only; the dense [N, N] PDE matrix moves to the
     # codec npz (``save_sample_logits``).
@@ -940,9 +1013,16 @@ def save_confidences_json(
     # Number of unique chains
     num_chains = int(asym_cpu.unique().numel())
 
+    # Keyed by chain name (``"A-B"``) so consumers can look an interface up by the
+    # names they already carry, e.g. the bench's per-interface (ic1, ic2).
+    chain_pair_iptm = {
+        f"{asym_id_to_chain_name(a)}-{asym_id_to_chain_name(b)}": round(v, 4) for (a, b), v in pair_iptm.items()
+    }
+
     summary = {
         "ptm": round(ptm, 4),
         "iptm": round(iptm, 4) if not math.isnan(iptm) else None,
+        "chain_pair_iptm": chain_pair_iptm or None,
         "ranking_score": round(ranking_score, 4),
         "mean_plddt": round(mean_plddt, 2),
         "average_pde": round(average_pde, 2),
