@@ -1233,3 +1233,49 @@ def test_meters_scalar_n_still_supported():
     m.update({"loss": torch.tensor(3.0)})
     averaged, _ = m.sync()
     assert averaged["loss"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Eval dataloader — training-only regularizers must not run at eval
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("atomize_eval,expected", [(False, 0.0), (True, 0.5)])
+def test_eval_atomization_follows_its_flag(atomize_eval, expected):
+    """Eval atomizes only when ``data.atomize_eval`` asks for it.
+
+    Default off: inference never atomizes standard residues, so an eval set
+    that did would be scored on a distribution the model is never served — and
+    the per-sample Bernoulli draw would add noise to the metric on top of that.
+    On: eval inherits the training atomize_* settings verbatim.
+    """
+    import inspect
+
+    from deepfold3.model.config import ModelConfig
+    from deepfold3.training.data import build_dataloaders
+    from deepfold3.training.distributed import DistInfo
+
+    cfg = TrainingConfig()
+    cfg.data_dir = "/nonexistent"  # no sample is ever read, only the dataset built
+    cfg.num_workers = 0
+    cfg.eval_num_workers = 0
+    model_cfg = ModelConfig()
+    model_cfg.data.atomize_prob = 0.5
+    model_cfg.data.atomize_eval = atomize_eval
+
+    train_dl, eval_dl = build_dataloaders(
+        cfg=cfg,
+        model_cfg=model_cfg,
+        dist=DistInfo(rank=0, world_size=1, local_rank=0, device=torch.device("cpu")),
+        records=_make_records(8),
+        eval_records=_make_records(2),
+        distillation_records=[],
+    )
+    assert train_dl.dataset.atomize_prob == 0.5  # train is never touched by the flag
+    assert eval_dl.dataset.atomize_prob == expected
+
+    # ``cfg.eval_datasets`` specs are built by the same helper as the training
+    # extras and need on-disk discovery to instantiate, so pin the routing flag
+    # that selects the eval kwargs for them.
+    src = inspect.getsource(inspect.getmodule(build_dataloaders))
+    assert "keep_after=True, for_eval=True" in src, "eval specs no longer request the eval kwargs"

@@ -1399,7 +1399,8 @@ class DataConfig:
     # at inference for modified residues / bonded ligands / glycans) and acts as
     # a mild token-boundary regularizer. Applied BEFORE cropping so the token
     # budget accounts for the expansion. 0.0 = disabled (default; enable from a
-    # fine-tune stage). See ``data/tokenize/atomize.py``.
+    # fine-tune stage). Train split only unless ``atomize_eval`` says otherwise.
+    # See ``data/tokenize/atomize.py``.
     atomize_prob: float = 0.0
     # Which residues are eligible for atomization:
     #   "random"    — every standard polymer residue.
@@ -1410,6 +1411,15 @@ class DataConfig:
     # Hard cap on the number of residues atomized per sample (0 = no cap).
     # Bounds the token-budget blow-up on large interfaces / many-CDR inputs.
     atomize_max_residues: int = 0
+    # Whether the eval split atomizes too. Default False: eval mirrors what is
+    # served (inference never atomizes), the same way dropout runs in train mode
+    # only, and the per-sample Bernoulli draw would otherwise re-roll every
+    # epoch and add noise to the metric. Set True to score eval on the *training*
+    # distribution instead — e.g. to read the eval loss as a like-for-like
+    # continuation of the training curve while atomization is on. Inherits
+    # ``atomize_prob`` / ``atomize_source`` / ``atomize_max_residues``; a no-op
+    # at ``atomize_prob = 0``.
+    atomize_eval: bool = False
 
 
 @dataclass

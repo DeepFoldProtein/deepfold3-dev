@@ -67,8 +67,9 @@ training:
 model:
   data:
     max_chains: 20
-
-# data:
-#   atomize_max_residues: 24
-#   atomize_source: "interface"
-#   atomize_prob: 0.03
+    # Stochastic atomization (training-only regularizer), disabled by default.
+    # Must live under model.data — a top-level `data:` block is not read.
+    # atomize_prob: 0.03
+    # atomize_source: "interface"
+    # atomize_max_residues: 24
+    # atomize_eval: false  # true = eval atomizes too (default: train split only)

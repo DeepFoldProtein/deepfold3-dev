@@ -250,6 +250,19 @@ def build_dataloaders(
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 
+    # By default eval mirrors deployment, so the stochastic-atomization
+    # regularizer is off there — inference never atomizes standard residues, and
+    # a per-sample random expansion would add noise to the eval metric on top of
+    # that. Same reason dropout runs in train mode only. ``data.atomize_eval``
+    # opts eval back in (then it inherits every atomize_* setting verbatim).
+    # Everything else (crop, random rotation, training-time features) stays on
+    # either way: eval scores training losses.
+    if model_cfg.data.atomize_eval:
+        eval_ds_kwargs, eval_of3_kwargs = ds_kwargs, of3_kwargs
+    else:
+        eval_ds_kwargs = {**ds_kwargs, "atomize_prob": 0.0}
+        eval_of3_kwargs = {**of3_kwargs, "atomize_prob": 0.0}
+
     # Cache discovered records by (data_dir, format) to avoid re-scanning.
     record_cache: dict[tuple[str, str], list] = {}
 
@@ -303,7 +316,7 @@ def build_dataloaders(
             out = {**out, "max_template_date": spec.max_template_date}
         return out
 
-    def load_from_spec(spec, *, keep_after: bool, preloaded_records=None):
+    def load_from_spec(spec, *, keep_after: bool, preloaded_records=None, for_eval: bool = False):
         recs = preloaded_records if preloaded_records is not None else discover(spec.data_dir, spec.format)
         if spec.cutoff_date:
             recs = _apply_cutoff(recs, spec.cutoff_date, keep_after=keep_after)
@@ -321,7 +334,7 @@ def build_dataloaders(
                 # Weighted datasets draw the crop anchor at load time (AF3 §2.5.1
                 # conditional); uniform ones let the cropper self-seed.
                 anchor_sampling=(spec.strategy == "weighted"),
-                **_spec_kwargs(of3_kwargs, spec),
+                **_spec_kwargs(eval_of3_kwargs if for_eval else of3_kwargs, spec),
             )
         else:
             ds = TrainingDataset(
@@ -332,7 +345,7 @@ def build_dataloaders(
                 exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
                 template_struct_space=spec.template_struct_space,
                 anchor_sampling=(spec.strategy == "weighted"),
-                **_spec_kwargs(ds_kwargs, spec),
+                **_spec_kwargs(eval_ds_kwargs if for_eval else ds_kwargs, spec),
             )
         return ds, recs
 
@@ -449,12 +462,12 @@ def build_dataloaders(
             TrainingDataset(
                 records=eval_records,
                 data_dir=Path(cfg.data_dir),
-                **ds_kwargs,
+                **eval_ds_kwargs,
             )
         )
 
     for spec in cfg.eval_datasets:
-        ds, recs = load_from_spec(spec, keep_after=True)
+        ds, recs = load_from_spec(spec, keep_after=True, for_eval=True)
         if ds is None:
             logger.warning("Eval dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
             continue

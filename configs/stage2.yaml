@@ -7,6 +7,11 @@ base: stage1.yaml
 # atom — the layout modified residues, glycans and bonded ligands already use at
 # inference. Training-time only; inference never atomizes standard residues.
 #
+# The eval split is left un-atomized (`atomize_eval: false`, the default): it is
+# scored on what gets served, and its loss stays directly comparable to stage 1's
+# — the train curve alone moves when atomization turns on. Set it true only to
+# read eval as a like-for-like continuation of the stage-2 training curve.
+#
 # --- Sizing atomize_prob -------------------------------------------------
 # Measured on 400 random multi-chain patchr assemblies (15 A cross-chain cutoff,
 # matching model.data.interface_distance):
@@ -56,3 +61,4 @@ model:
     atomize_prob: 0.01
     atomize_source: interface
     atomize_max_residues: 8
+    atomize_eval: false
