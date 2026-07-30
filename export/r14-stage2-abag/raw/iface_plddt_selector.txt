@@ -1,0 +1,9 @@
+interface_antibody_antigen step 30000: 116 interfaces, 116 with variance
+
+  within-target Spearman vs DockQ:  interface pLDDT +0.131   ranking_score +0.106
+  (median +0.128 / +0.069;  frac rho>0: 0.66 / 0.58)
+
+  random (mean)            success  27.59%   mean DockQ 0.1994
+  rank-1 ranking_score     success  31.03%   mean DockQ 0.2333
+  rank-1 interface pLDDT   success  31.90%   mean DockQ 0.2359
+  oracle                   success  49.14%   mean DockQ 0.3414

@@ -1,0 +1,30 @@
+
+########## interface_protein_protein (n=240)
+  mean   25k 0.4890  26k 0.4905  27k 0.4976  28k 0.4905  29k 0.4869  30k 0.4878
+  oracle 25k 0.5798  26k 0.5725  27k 0.5966  28k 0.5768  29k 0.5644  30k 0.5718
+  conf   25k 0.5032  26k 0.5012  27k 0.5177  28k 0.5057  29k 0.4931  30k 0.5103
+
+  window 25+26k  vs  29+30k
+    mean   delta -0.0024 median +0.0004 CI [-0.0169, +0.0120]
+           success@0.23 65.00 -> 65.42 pt (+1 targets)
+    oracle delta -0.0080 median -0.0005 CI [-0.0259, +0.0098]
+           success@0.23 71.67 -> 72.08 pt (+1 targets)
+    conf   delta -0.0005 median +0.0000 CI [-0.0187, +0.0172]
+           success@0.23 65.00 -> 66.67 pt (+4 targets)
+  per-target slope /1k steps: -0.00068 median +0.00012 CI [-0.00394, +0.00260]
+  churn |delta| adjacent: 25->26k 0.0347 26->27k 0.0385 27->28k 0.0356 28->29k 0.0470 29->30k 0.0333
+
+########## interface_antibody_antigen (n=138)
+  mean   25k 0.2091  26k 0.2082  27k 0.1960  28k 0.1997  29k 0.2103  30k 0.1984
+  oracle 25k 0.3467  26k 0.3378  27k 0.3192  28k 0.3236  29k 0.3420  30k 0.3418
+  conf   25k 0.2276  26k 0.2276  27k 0.2110  28k 0.2334  29k 0.2303  30k 0.2310
+
+  window 25+26k  vs  29+30k
+    mean   delta -0.0043 median -0.0007 CI [-0.0266, +0.0168]
+           success@0.23 30.43 -> 29.71 pt (-1 targets)
+    oracle delta -0.0004 median -0.0013 CI [-0.0212, +0.0208]
+           success@0.23 57.25 -> 54.35 pt (-4 targets)
+    conf   delta +0.0030 median +0.0012 CI [-0.0242, +0.0286]
+           success@0.23 33.33 -> 32.61 pt (-1 targets)
+  per-target slope /1k steps: -0.00124 median +0.00008 CI [-0.00629, +0.00361]
+  churn |delta| adjacent: 25->26k 0.0406 26->27k 0.0492 27->28k 0.0388 28->29k 0.0512 29->30k 0.0385

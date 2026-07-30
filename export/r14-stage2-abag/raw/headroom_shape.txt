@@ -1,0 +1,38 @@
+
+########## interface_antibody_antigen step 30000 (n=138), rank-1 = 31.88%
+  passing samples per target (of 20):
+     0- 0:   67  ( 48.6%)
+     1- 2:   16  ( 11.6%)
+     3- 5:    9  (  6.5%)
+     6-10:   12  (  8.7%)
+    11-15:    9  (  6.5%)
+    16-19:   13  (  9.4%)
+    20-20:   12  (  8.7%)
+  ceiling if a selector could always find a passing sample when >= m of 20 pass:
+    m>= 1:  51.45%   <- oracle
+    m>= 2:  44.20%
+    m>= 3:  39.86%
+    m>= 5:  34.78%
+    m>= 8:  31.88%
+    m>=10:  27.54%
+  -> current rank-1 (31.9%) sits between m>=8 (31.9%) and m>=9 (29.7%)
+  oracle passes: 71 targets, of which 16 (23%) pass on only 1-2 of 20 samples
+
+########## interface_protein_protein step 30000 (n=240), rank-1 = 65.83%
+  passing samples per target (of 20):
+     0- 0:   67  ( 27.9%)
+     1- 2:   10  (  4.2%)
+     3- 5:    6  (  2.5%)
+     6-10:    7  (  2.9%)
+    11-15:    5  (  2.1%)
+    16-19:   16  (  6.7%)
+    20-20:  129  ( 53.8%)
+  ceiling if a selector could always find a passing sample when >= m of 20 pass:
+    m>= 1:  72.08%   <- oracle
+    m>= 2:  69.17%
+    m>= 3:  67.92%
+    m>= 5:  66.25%
+    m>= 8:  64.17%
+    m>=10:  62.50%
+  -> current rank-1 (65.8%) sits between m>=5 (66.2%) and m>=6 (65.4%)
+  oracle passes: 173 targets, of which 10 (6%) pass on only 1-2 of 20 samples

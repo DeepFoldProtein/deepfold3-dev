@@ -1,0 +1,24 @@
+
+### never (0/20): 67 interfaces
+  fnat (native contacts recovered)  0.029  median 0.006   fnat<0.05 on 79% of them
+  fnonnat (model contacts not native) 0.961
+  iRMSD  14.15 A   LRMSD  47.23 A
+  whole-model lDDT 0.823   iLDDT 0.472
+  cross-sample contact agreement (Jaccard) 0.447  median 0.390
+  sd(DockQ) over 20 samples 0.0162
+
+### partial (1-15/20): 46 interfaces
+  fnat (native contacts recovered)  0.212  median 0.143   fnat<0.05 on 15% of them
+  fnonnat (model contacts not native) 0.779
+  iRMSD   7.76 A   LRMSD  21.89 A
+  whole-model lDDT 0.859   iLDDT 0.615
+  cross-sample contact agreement (Jaccard) 0.506  median 0.483
+  sd(DockQ) over 20 samples 0.1483
+
+### solved (>=16/20): 25 interfaces
+  fnat (native contacts recovered)  0.680  median 0.696   fnat<0.05 on 0% of them
+  fnonnat (model contacts not native) 0.415
+  iRMSD   2.31 A   LRMSD   7.20 A
+  whole-model lDDT 0.887   iLDDT 0.752
+  cross-sample contact agreement (Jaccard) 0.754  median 0.747
+  sd(DockQ) over 20 samples 0.1221

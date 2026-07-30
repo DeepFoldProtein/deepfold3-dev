@@ -1,0 +1,15 @@
+pair                                GT-vs-GT  pred-vs-pred  self recall  cross recall
+8h3x B-A | 8weo B-A                    0.000         0.000        0.571         0.000   DockQ 0.24/0.29
+7ua2 C-A | 7uvs A-C                    0.000         0.111        0.100         0.000   DockQ 0.05/0.04
+7ua2 C-A | 7uvs B-C                    0.000         0.000        0.137         0.000   DockQ 0.05/0.03
+7yv1 B-A | 8be3 A-B                    0.483         0.519        0.671         0.593   DockQ 0.14/0.09
+7yv1 C-A | 8be3 A-B                    0.333         0.348        0.463         0.296   DockQ 0.15/0.09
+7yds C-A | 8aom B-A                    0.485         0.000        0.512         0.036   DockQ 0.11/0.57
+8aok B-A | 8aom B-A                    0.537         0.231        0.521         0.250   DockQ 0.15/0.57
+7yds C-A | 8aok B-A                    0.436         0.000        0.105         0.000   DockQ 0.11/0.15
+7yxu B-A | 8gye E-A                    0.233         0.000        0.058         0.370   DockQ 0.02/0.01
+7yxu B-A | 8gye F-A                    0.069         0.000        0.058         0.600   DockQ 0.02/0.01
+7yxu C-A | 8gye E-A                    0.091         0.000        0.000         0.000   DockQ 0.02/0.01
+7yxu C-A | 8gye F-A                    0.077         0.000        0.000         0.000   DockQ 0.02/0.01
+
+mean over 12 interface pairs:  GT-vs-GT 0.229   pred-vs-pred 0.101
