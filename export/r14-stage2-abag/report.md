@@ -215,6 +215,47 @@ is not copying the wrong answer from a similar complex either — it is a third 
 antigen surface) to epitope reacts strongly to its inputs but is not the right function: deterministic
 within a target, arbitrary across targets.
 
+### What the failing targets have in common: the antigen is big
+
+All 144 scored interfaces are `{ic1, ic2} == {antibody_chain, antigen_chain}` — the bench never scores an
+H–L interface, so every number here is antibody-vs-antigen (50 entries contribute one interface, 43 two,
+2 four). Comparing never / partial / solved on everything available (`raw/failure_features.txt`):
+
+| median | never (67) | partial (46) | solved (25) |
+|---|---|---|---|
+| **antigen length** | **202** | 150 | **125** |
+| native contacts (nnat) | 36 | 33 | 38 |
+| antibody length | 217 | 216 | 214 |
+| antibody MSA depth | 12504 | 12638 | 12159 |
+| antigen MSA depth | 2388 | 1671 | 2422 |
+| templates | 4 | 4 | 4 |
+
+Only antigen size separates them. Interface size does not (nnat quartiles overlap completely: never
+20/36/50, solved 20/38/51) — **a large, well-defined native interface is not easier**. MSA depth, template
+count and antibody length are flat. Heavy / light / single-chain antibodies fail at 58 / 51 / 48%, despite
+light-chain interfaces being less than half the size (median nnat 17 vs 39 and 50), which is the same point
+again. And 36 of 43 two-interface entries have both interfaces on the same side of "never": **failure is
+per-complex** — when the Fab docks to the wrong place, both its interfaces are wrong together.
+
+The size dependence is monotone (`raw/antigen_size.txt`; Spearman(antigen length, mean DockQ) = −0.423):
+
+| antigen length | n | never % | median mean-DockQ |
+|---|---|---|---|
+| < 100 | 30 | **20.0** | 0.245 |
+| 100–150 | 24 | 37.5 | 0.105 |
+| 150–250 | 38 | 57.9 | 0.080 |
+| ≥ 250 | 46 | **65.2** | 0.028 |
+
+Complex size correlates almost as well (−0.409) but the two are 0.677 correlated with each other, and
+stratifying separates them: within `total < 700` tokens, small vs large antigens fail 23.4% vs 53.2%,
+while within `antigen < 150` residues, small vs large complexes fail 20.0% vs 37.5%. Antigen size carries
+the larger share (antibody length is constant at ~217, so most of the complex-size variation *is* antigen).
+
+This is the signature of a **search/discrimination problem**: the wider the antigen surface, the less often
+the right patch is chosen, while the size and quality of the true interface do not matter. Correlational, not
+causal — large antigens may also be intrinsically harder kinds (multi-domain, viral glycoprotein ectodomains).
+But "small interface", "shallow MSA", "no template" and "light chain" are all ruled out.
+
 ---
 
 ## Standing implications
@@ -222,6 +263,9 @@ within a target, arbitrary across targets.
 - Antibody-antigen is the one interface class with no co-evolutionary signal available in principle —
   antibodies and antigens do not co-evolve — so the MSA route that carries other interfaces is empty here.
   Nothing in this investigation suggests a short experiment flips it.
+- Failure scales with the **antigen's surface**, not with the interface's size or the depth of either MSA,
+  and it is per-complex. Any attempt at this axis should be evaluated on large antigens (≥250 residues,
+  where 65% of interfaces never produce a single passing sample), not on the small ones that already work.
 - Do not spend effort on sample selection for either category: +8 pt is the realistic ceiling for AbAg and
   ~+2 pt for ppi, both requiring a ranker far better than anything the head currently emits.
 - If confidence-head work is revisited anyway, the lever is `mini_rollout_samples: 1` — one rollout per
@@ -245,6 +289,8 @@ within a target, arbitrary across targets.
 | `raw/abag_failure_groups.txt` | never/partial/solved profile with fnat, fnonnat, spread |
 | `raw/paratope_vs_epitope.txt` | paratope and epitope recall by group |
 | `raw/same_antigen.txt` | shared-antigen epitope agreement |
+| `raw/failure_features.txt` | never/partial/solved vs interface size, chain lengths, MSA depth, templates, H/L |
+| `raw/antigen_size.txt` | failure rate by antigen and complex size, with stratification |
 | `scripts/` | the script behind each `raw/` file (run from the repo root) |
 
 Related: `bench/scripts/step_compare.py` (`9c3589c`) for per-target checkpoint diffs;

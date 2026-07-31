@@ -1,0 +1,26 @@
+n=138 interfaces
+Spearman(antigen length, mean DockQ)  = -0.423
+Spearman(total tokens,   mean DockQ)  = -0.409
+Spearman(antigen length, total tokens)= +0.677
+
+  by ANTIGEN length
+               bin    n  never%  mean DockQ  oracle DockQ
+             0-100   30    20.0       0.245         0.460
+           100-150   24    37.5       0.105         0.440
+           150-250   38    57.9       0.080         0.178
+              250+   46    65.2       0.028         0.096
+
+  by TOTAL complex length (tokens)
+               bin    n  never%  mean DockQ  oracle DockQ
+             0-500   42    26.2       0.210         0.460
+           500-700   52    48.1       0.081         0.263
+           700-900   38    68.4       0.024         0.080
+              900+    6    83.3       0.051         0.140
+
+  stratified: does antigen length still separate within a complex-size band?
+    total < 700    n= 94  ag_len<=138: never  23.4% (n=47)   ag_len>138: never  53.2% (n=47)
+    total >= 700   n= 44  ag_len<=291: never  63.6% (n=22)   ag_len>291: never  77.3% (n=22)
+
+  stratified: does complex size still separate within an antigen-size band?
+    antigen < 150  n= 54  total<=487: never  20.0% (n=30)   total>487: never  37.5% (n=24)
+    antigen >= 150 n= 84  total<=689: never  52.4% (n=42)   total>689: never  71.4% (n=42)

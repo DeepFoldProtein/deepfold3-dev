@@ -1,0 +1,21 @@
+144 interfaces: never=73, partial=46, solved=25
+  nnat            never n= 67 med 36  partial n= 46 med 33  solved n= 25 med 38
+  ab_len          never n= 73 med 217  partial n= 46 med 216  solved n= 25 med 214
+  ag_len          never n= 73 med 202  partial n= 46 med 150  solved n= 25 med 125
+  ab_msa          never n= 73 med 12504  partial n= 46 med 12638  solved n= 25 med 12159
+  ag_msa          never n= 73 med 2388  partial n= 46 med 1671  solved n= 25 med 2422
+  ab_tpl          never n= 47 med 4  partial n= 26 med 4  solved n= 19 med 4
+  ag_tpl          never n= 45 med 4  partial n= 23 med 4  solved n= 16 med 4
+
+  by antibody chain type (share of that class that is 'never'):
+    H      n= 43  never  58.1%   median nnat 39
+    L      n= 43  never  51.2%   median nnat 17
+    single n= 50  never  48.0%   median nnat 50
+
+  is failure per-complex? (2-interface entries)
+    36/43 entries have both interfaces on the same side of 'never'
+
+  nnat quartiles by group:
+    never    n= 67  Q1  20  med  36  Q3  50  min 1
+    partial  n= 46  Q1  18  med  33  Q3  42  min 1
+    solved   n= 25  Q1  20  med  38  Q3  51  min 2
