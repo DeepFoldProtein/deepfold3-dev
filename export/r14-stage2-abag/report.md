@@ -286,23 +286,50 @@ the one that separated there is gone.
 | 40–80 | 81 | 21.0 | 0.676 |
 | ≥ 80 | 99 | 22.2 | 0.704 |
 
-**Paired-MSA presence is a threshold, not a gradient** (heteromers only, n=71 — see the caveat below):
+**Paired-MSA presence is a threshold, and it is a separate axis from interface size.** The pairing
+pipeline skips pure homo-oligomers (their pairing is trivial), so all 153 interfaces without a paired file
+are homomeric and the paired-depth question is a heteromer question. Split that way (n=71 heteromers, all
+with a paired file):
 
-| paired MSA depth | n | never % | median mean-DockQ |
+| | n | never % | median DockQ | median nnat | median unpaired MSA |
+|---|---|---|---|---|---|
+| heteromer, paired < 10 | 18 | **50.0** | 0.201 | **92** | **2** |
+| heteromer, paired 10–1000 | 22 | **0.0** | 0.771 | 65 | 316 |
+| heteromer, paired ≥ 1000 | 31 | 12.9 | 0.729 | 49 | 2047 |
+| heteromer, paired ≥ 10 (all) | 53 | **7.5** | 0.762 | 59 | 697 |
+| homomer (pairing trivial) | 164 | 29.9 | 0.605 | 75 | 896 |
+
+Ten paired rows separates 50% from 7.5% — and the failing group has the *largest* interfaces of the five
+(median 92 native contacts), so this is not interface size in disguise. Crossing the two axes on heteromers:
+
+| never % | nnat < 40 | nnat ≥ 40 |
+|---|---|---|
+| **paired < 10** | 50.0% (n=2) | **50.0%** (n=16) |
+| **paired ≥ 10** | 18.8% (n=16) | **2.7%** (n=37) |
+
+Among large interfaces, paired-MSA presence moves failure 2.7% → 50% (18×); among paired-rich interfaces,
+interface size moves it 2.7% → 18.8% (7×). Both axes are real and paired MSA is the stronger one. (The
+paired<10 / nnat<40 cell is n=2 — ignore that cell alone.) Note also that the paired<10 group has a median
+*unpaired* depth of 2: the search found nothing for that chain at all, so this is an MSA-search failure
+upstream of pairing, not a pairing-algorithm failure.
+
+Homomers have perfect pairing by construction and still fail 4× more often than paired-rich heteromers
+(29.9% vs 7.5%). Their driver is interface size:
+
+| homomer nnat | n | never % | median DockQ |
 |---|---|---|---|
-| < 10 | 18 | **50.0** | 0.201 |
-| 10–100 | 6 | 0.0 | 0.842 |
-| 100–1000 | 16 | 0.0 | 0.751 |
-| ≥ 1000 | 31 | 12.9 | 0.729 |
+| < 20 | 12 | 50.0 | 0.070 |
+| 20–40 | 25 | **52.0** | 0.037 |
+| 40–80 | 53 | 28.3 | 0.599 |
+| ≥ 80 | 74 | 20.3 | 0.721 |
 
-Half the interfaces whose shallower chain has essentially no paired MSA never produce a passing sample;
-ten paired rows is already enough to move to ~0%, and more depth buys nothing. The never group's median
-paired depth is **1** — the query itself.
+37 homomeric interfaces (23%) have under 40 contacts and half of them never pass, against 8.3% for
+heteromers in the same size band — shallow homomeric contacts (crystallographic or genuinely weak) are the
+bulk of the homomer failures.
 
-*Caveat on that table:* 153 of 235 interfaces have no paired MSA file at all, and **all 153 are homomeric** —
-pure homo-oligomers are excluded from the pairing pipeline by construction (their pairing is trivial), so
-the paired-depth analysis is a heteromer analysis. Homomers as a group fail at 29.9% against heteromers'
-18.3%, and within homomers the driver is interface size again (nnat < 40 → ~50% never, ≥ 80 → 20%).
+**So ppi failure is three populations**: heteromers whose chain has no MSA at all (n=18, 50% never),
+shallow homomeric interfaces (nnat < 40, n=37, 51% never), and everything else, which largely works
+(paired-rich heteromers 7.5%, large homomers 20%).
 
 ### The contrast
 
@@ -313,8 +340,8 @@ the paired-depth analysis is a heteromer analysis. Homomers as a group fail at 2
 | failure vs paired MSA | not available in principle | **<10 rows → 50% never** |
 | unit of failure | the complex (84% of Fabs fail on both interfaces) | the interface |
 
-Same "0 of 20 samples pass", two different causes. **ppi fails where the evidence is missing** — no
-co-evolutionary pairing, or an interface too small to determine — which is the kind of thing a better
+Same "0 of 20 samples pass", two different causes. **ppi fails where the evidence is missing** — no MSA for
+one chain (so no pairing), or an interface too small to determine — which is the kind of thing a better
 pairing pipeline or a wider genomic database can still fix. **Antibody-antigen fails with the evidence in
 hand**: it fails on wide antigens regardless of how large and well-defined the true interface is, and
 regardless of MSA depth. One is a data problem, the other is a learning problem.
@@ -324,8 +351,9 @@ regardless of MSA depth. One is a data problem, the other is a learning problem.
 - Antibody-antigen is the one interface class with no co-evolutionary signal available in principle —
   antibodies and antigens do not co-evolve — so the MSA route that carries other interfaces is empty here.
   Nothing in this investigation suggests a short experiment flips it.
-- The two interface categories need separate work. ppi's failures track missing evidence (paired MSA
-  under ~10 rows, interfaces under ~20 contacts) and are a pipeline/data target; antibody-antigen's track
+- The two interface categories need separate work. ppi's failures track missing evidence — a chain whose
+  MSA search returned nothing (median unpaired depth 2, 50% never) or an interface under ~40 contacts —
+  and are a pipeline/data target; antibody-antigen's track
   antigen size with the evidence present, and are not.
 - AbAg failure scales with the **antigen's surface**, not with the interface's size or the depth of either MSA,
   and it is per-complex. Any attempt at this axis should be evaluated on large antigens (≥250 residues,

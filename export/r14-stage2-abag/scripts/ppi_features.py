@@ -126,3 +126,45 @@ def table(field, bins, title):
 table("total", [(0,400),(400,700),(700,1000),(1000,10**9)], "by TOTAL complex length")
 table("min_paired", [(0,10),(10,100),(100,1000),(1000,10**9)], "by PAIRED MSA depth (shallower chain)")
 table("nnat", [(0,20),(20,40),(40,80),(80,10**9)], "by native contact count")
+
+# --- paired MSA vs interface size, kept apart --------------------------------
+# The pairing pipeline skips pure homo-oligomers (their pairing is trivial), so
+# every interface without a paired file is homomeric. Mixing the two hides which
+# axis is doing the work; split them and cross-tabulate.
+het = [r for r in rows if not r["homo"]]
+homo = [r for r in rows if r["homo"]]
+
+def rate(sub):
+    return 100 * sum(r["never"] for r in sub) / len(sub) if sub else float("nan")
+
+def med(sub, k):
+    v = [r[k] for r in sub if r[k] is not None]
+    return st.median(v) if v else float("nan")
+
+print(f"\n  heteromers n={len(het)} (all have a paired MSA); homomers n={len(homo)} "
+      f"({sum(1 for r in homo if r['min_paired'] is not None)} have one)")
+print(f"\n  {'group':32s} {'n':>4s} {'never%':>7s} {'medDockQ':>9s} {'medNnat':>8s} {'medUnpaired':>12s}")
+for nm, sub in (("heteromer, paired < 10", [r for r in het if r["min_paired"] < 10]),
+                ("heteromer, paired 10-1000", [r for r in het if 10 <= r["min_paired"] < 1000]),
+                ("heteromer, paired >= 1000", [r for r in het if r["min_paired"] >= 1000]),
+                ("heteromer, paired >= 10 (all)", [r for r in het if r["min_paired"] >= 10]),
+                ("homomer (pairing trivial)", homo)):
+    print(f"  {nm:32s} {len(sub):4d} {rate(sub):7.1f} {med(sub,'mean_dq'):9.3f} "
+          f"{med(sub,'nnat'):8.0f} {med(sub,'min_msa'):12.0f}")
+
+print("\n  heteromers, paired depth x interface size (never %)")
+print(f"  {'':22s} {'nnat < 40':>18s} {'nnat >= 40':>18s}")
+for nm, sel in (("paired < 10", lambda r: r["min_paired"] < 10), ("paired >= 10", lambda r: r["min_paired"] >= 10)):
+    line = f"  {nm:22s}"
+    for lo, hi in ((0, 40), (40, 10**9)):
+        sub = [r for r in het if sel(r) and r["nnat"] is not None and lo <= r["nnat"] < hi]
+        line += f"  {rate(sub):6.1f}% (n={len(sub):2d})".rjust(18)
+    print(line)
+
+for nm, group in (("homomers", homo), ("heteromers", het)):
+    print(f"\n  {nm} by interface size")
+    for lo, hi in ((0, 20), (20, 40), (40, 80), (80, 10**9)):
+        sub = [r for r in group if r["nnat"] is not None and lo <= r["nnat"] < hi]
+        if sub:
+            nm2 = f"{lo}-{hi}" if hi < 10**9 else f"{lo}+"
+            print(f"    nnat {nm2:>8s}  n={len(sub):3d}  never {rate(sub):5.1f}%  med DockQ {med(sub,'mean_dq'):.3f}")

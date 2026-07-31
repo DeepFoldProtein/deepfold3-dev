@@ -38,3 +38,29 @@ n=235  never=62, partial=28, solved=145
            20-40 n= 37  never  37.8%  median mean-DockQ 0.503
            40-80 n= 81  never  21.0%  median mean-DockQ 0.676
              80+ n= 99  never  22.2%  median mean-DockQ 0.704
+
+  heteromers n=71 (all have a paired MSA); homomers n=164 (11 have one)
+
+  group                               n  never%  medDockQ  medNnat  medUnpaired
+  heteromer, paired < 10             18    50.0     0.201       92            2
+  heteromer, paired 10-1000          22     0.0     0.771       65          316
+  heteromer, paired >= 1000          31    12.9     0.729       49         2047
+  heteromer, paired >= 10 (all)      53     7.5     0.762       59          697
+  homomer (pairing trivial)         164    29.9     0.605       75          896
+
+  heteromers, paired depth x interface size (never %)
+                                  nnat < 40         nnat >= 40
+  paired < 10                 50.0% (n= 2)      50.0% (n=16)
+  paired >= 10                18.8% (n=16)       2.7% (n=37)
+
+  homomers by interface size
+    nnat     0-20  n= 12  never  50.0%  med DockQ 0.070
+    nnat    20-40  n= 25  never  52.0%  med DockQ 0.037
+    nnat    40-80  n= 53  never  28.3%  med DockQ 0.599
+    nnat      80+  n= 74  never  20.3%  med DockQ 0.721
+
+  heteromers by interface size
+    nnat     0-20  n=  6  never  50.0%  med DockQ 0.216
+    nnat    20-40  n= 12  never   8.3%  med DockQ 0.806
+    nnat    40-80  n= 28  never   7.1%  med DockQ 0.725
+    nnat      80+  n= 25  never  28.0%  med DockQ 0.459
