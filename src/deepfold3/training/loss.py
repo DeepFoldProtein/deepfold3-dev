@@ -1114,6 +1114,12 @@ _FAPE_ATOM_SET_SLOTS: dict[str, tuple[int, ...]] = {
     "NCACO+CB": (0, 1, 2, 3, 4),  # K=5 — AF2 backbone + CB (current default)
 }
 
+# Which (frame, point) pairs FAPE scores. ``pooled`` is plain AF2 — one term
+# over every pair — and stays the default so existing ``alpha_fape`` runs keep
+# computing exactly what they did. The rest split on ``asym_id``; see
+# ``fape_loss``.
+_FAPE_MODES = frozenset({"pooled", "both", "intra", "inter"})
+
 
 def _apply_fape_atom_set_mask(
     mask: torch.Tensor,  # [N, K] bool
@@ -1157,7 +1163,10 @@ def fape_loss(
     atom_mask: torch.Tensor | None = None,  # [N, M] bool — required for all_atom_points
     all_atom_points: bool = False,  # AF2 §4.2.7 full: project every atom slot per token
     chunk_size: int = 0,  # chunk the frame (i) axis; 0 = all N frames at once
-) -> torch.Tensor:
+    asym_id: torch.Tensor | None = None,  # [N] int — chain id; required unless mode="pooled"
+    clip_distance_inter: float = 30.0,  # AF-Multimer: looser clamp on cross-chain pairs
+    mode: str = "pooled",  # pooled | both | intra | inter
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Frame-Aligned Point Error (AF2 §4.2.7), K-atoms-per-token form.
 
     For every (frame_i, token_j, fape_atom_k) triple projects atom
@@ -1232,13 +1241,43 @@ def fape_loss(
         chunk_size: split the frame (i) axis into chunks of this size to
             bound peak memory (0 = all N frames at once). Exact: the
             (i, j, atom) reduction is a plain sum, so chunks accumulate.
+        asym_id: ``[N]`` chain id per token. Required for every mode except
+            ``pooled``. A pair is classified by whether the frame token and
+            the *point's* token share a chain; the point's token is
+            ``fape_token_index[j, k]``, which is not always ``j`` — the K-slot
+            layout lets a row borrow a neighbouring token's atom.
+        clip_distance_inter: outlier clamp in Å for cross-chain pairs. The
+            10 Å intra clamp gives a chain docked 50 Å away exactly zero
+            gradient, which is why intra-only FAPE cannot fix a pose.
+        mode: which pairs are scored, and how.
+
+            * ``pooled`` (default) — no chain split: every pair in one term
+              under ``clip_distance``. This is plain AF2 FAPE and what this
+              function did before the split existed, so it is the default and
+              existing ``alpha_fape`` runs are unchanged.
+            * ``both`` — AF-Multimer: same-chain pairs at ``clip_distance``,
+              cross-chain at ``clip_distance_inter``, each averaged and
+              normalised over its own pairs.
+            * ``intra`` — same-chain pairs only; cross-chain pairs are dropped
+              rather than folded in (so a pose error contributes nothing).
+            * ``inter`` — cross-chain pairs only.
 
     Returns:
-        Scalar FAPE in pred dtype. Dimensionless when ``normalize=True``.
+        ``(intra, inter)`` scalars in pred dtype, each averaged over its own
+        pairs — so their relative weight does not drift with how many chains a
+        crop happens to contain. In ``pooled`` mode the whole loss is in
+        ``intra`` and ``inter`` is 0; ``inter`` is also 0 for a single-chain
+        crop. Dimensionless when ``normalize=True`` — each class is divided by
+        *its own* clamp.
     """
+    if mode not in _FAPE_MODES:
+        raise ValueError(f"Unknown fape mode={mode!r}; expected one of {sorted(_FAPE_MODES)}")
+    if mode != "pooled" and asym_id is None:
+        raise ValueError(f"fape_loss(mode={mode!r}) requires asym_id")
     out_dtype = pred_pos.dtype
+    zero = pred_pos.new_zeros(())
     if pair_mask.sum().item() == 0:
-        return pred_pos.new_zeros(())
+        return zero, zero
 
     with torch.amp.autocast(device_type=pred_pos.device.type, enabled=False):
         pred32 = pred_pos.float()
@@ -1288,12 +1327,24 @@ def fape_loss(
         gt_angle_ok = _frame_angle_mask(gt_frames, angle_threshold).float()  # [N]
         pmf = pair_mask.float()  # [N_i, N_j]
 
+        # Chain of each POINT, not of column j: in K-slot mode the point at
+        # (j, k) belongs to token ``fape_token_index[j, k]``, which can be a
+        # neighbouring token. Classifying by j would mislabel those pairs.
+        point_asym = None
+        if mode != "pooled":
+            if all_atom_points:
+                point_asym = asym_id.view(-1, 1).expand(N, pred_atoms.shape[2])  # [N_j, P]
+            else:
+                point_asym = asym_id[fape_token_index]  # [N_j, P]
+
         # Chunk over the frame axis i to bound the [S, C, N_j, P, 3] peak
         # (all-atom P=M=24 is ~5× the K=5 path). The (i, j, atom) reduction is
         # a plain sum, so chunk sums accumulate to the exact unchunked result.
         cs = chunk_size if chunk_size and chunk_size > 0 else N
-        err_per_sample = pred32.new_zeros(S)
-        n_per_sample = pred32.new_zeros(S)
+        err_intra = pred32.new_zeros(S)
+        n_intra = pred32.new_zeros(S)
+        err_inter = pred32.new_zeros(S)
+        n_inter = pred32.new_zeros(S)
         for i0 in range(0, N, cs):
             i1 = min(i0 + cs, N)
             # rel[s, i, j, p, :] = atoms[s, j, p, :] - b[s, i, :]
@@ -1310,9 +1361,6 @@ def fape_loss(
 
             # Smooth norm: sqrt(d²+ε) keeps the backward bounded at d→0.
             error = (((pred_local - gt_local.unsqueeze(0)) ** 2).sum(-1) + eps).sqrt()  # [S, C, N_j, P]
-            clamped = error.clamp(max=clip_distance)
-            if normalize:
-                clamped = clamped / clip_distance
 
             # Mask: pair_mask × frame-angle (i-axis) × per-point presence.
             mask_pair = (
@@ -1322,14 +1370,47 @@ def fape_loss(
             )  # [S, C, N_j]
             mask = mask_pair.unsqueeze(-1) * point_mask.unsqueeze(0).unsqueeze(0)  # [S, C, N_j, P]
 
-            err_per_sample = err_per_sample + (clamped * mask).sum(dim=(-1, -2, -3))  # [S]
-            n_per_sample = n_per_sample + mask.sum(dim=(-1, -2, -3))  # [S]
+            if point_asym is None:
+                clamped = error.clamp(max=clip_distance)
+                if normalize:
+                    clamped = clamped / clip_distance
+                err_intra = err_intra + (clamped * mask).sum(dim=(-1, -2, -3))
+                n_intra = n_intra + mask.sum(dim=(-1, -2, -3))
+                continue
 
-        # Per-sample mean → mean across samples (matches ``pae_loss`` / OF3
-        # convention; samples with sparse valid frames are not over-weighted).
-        loss = (err_per_sample / n_per_sample.clamp(min=1)).mean()
+            # Per-pair clamp: each class is clamped and normalised by its own
+            # distance, so the two terms are both in [0, 1] and the looser
+            # inter clamp does not enter three times as large.
+            same = asym_id[i0:i1].view(1, -1, 1, 1) == point_asym.view(1, 1, *point_asym.shape)  # [1, C, N_j, P]
+            clip = torch.where(same, error.new_tensor(clip_distance), error.new_tensor(clip_distance_inter))
+            clamped = torch.minimum(error, clip)
+            if normalize:
+                clamped = clamped / clip
 
-    return loss.to(out_dtype)
+            m_intra = mask * same if mode != "inter" else torch.zeros_like(mask)
+            m_inter = mask * (~same) if mode != "intra" else torch.zeros_like(mask)
+            err_intra = err_intra + (clamped * m_intra).sum(dim=(-1, -2, -3))  # [S]
+            n_intra = n_intra + m_intra.sum(dim=(-1, -2, -3))  # [S]
+            err_inter = err_inter + (clamped * m_inter).sum(dim=(-1, -2, -3))
+            n_inter = n_inter + m_inter.sum(dim=(-1, -2, -3))
+
+        def _reduce(err_sum: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+            """Per-sample mean, then mean over the samples that had any pair.
+
+            Averaging over all S would let a sample with no pairs of this class
+            (a single-chain crop has no inter pairs) pull the term toward 0 as
+            if it had scored perfectly.
+            """
+            valid = n > 0
+            n_valid = valid.float().sum()
+            if float(n_valid) == 0.0:
+                return zero.float()
+            return ((err_sum / n.clamp(min=1)) * valid.float()).sum() / n_valid
+
+        intra = _reduce(err_intra, n_intra)
+        inter = _reduce(err_inter, n_inter)
+
+    return intra.to(out_dtype), inter.to(out_dtype)
 
 
 def frame_aligned_error(
@@ -2169,13 +2250,16 @@ def diffusion_only_loss(
         total = total + cfg.alpha_backbone_chirality * l_bbchir
 
     if (
-        cfg.alpha_fape > 0
+        (cfg.alpha_fape > 0 or cfg.alpha_fape_inter > 0)
         and "fape_atom_index" in features
         and "fape_token_index" in features
         and "fape_atom_mask" in features
         and "frame_token_index" in features
         and "frame_atom_index" in features
     ):
+        # ``fape_mode`` decides whether the chain split happens at all; the id
+        # is just handed over (unused when the mode is "pooled").
+        fape_asym = features.get("asym_id")
         seq_m = seq_mask
         frm_m = features.get("frames_mask")
         frm_m = frm_m.bool() if frm_m is not None else seq_m
@@ -2194,7 +2278,7 @@ def diffusion_only_loss(
             # AF2 §4.2.7 full: every atom slot is a point (the K-slot
             # ``fape_*`` point indices are ignored); ``atom_mask`` gives
             # presence. Frames still come from ``frame_*``.
-            l_fape = fape_loss(
+            l_fape, l_fape_inter = fape_loss(
                 denoised,
                 gt_pos,
                 None,
@@ -2210,6 +2294,9 @@ def diffusion_only_loss(
                 atom_mask=atom_mask,
                 all_atom_points=True,
                 chunk_size=cfg.fape_chunk_size,
+                asym_id=fape_asym,
+                clip_distance_inter=cfg.fape_clip_distance_inter,
+                mode=cfg.fape_mode,
             )
         else:
             fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
@@ -2218,7 +2305,7 @@ def diffusion_only_loss(
             fape_mask_local = (
                 fape_mask_local & atom_mask.bool()[features["fape_token_index"], features["fape_atom_index"]]
             )
-            l_fape = fape_loss(
+            l_fape, l_fape_inter = fape_loss(
                 denoised,
                 gt_pos,
                 features["fape_token_index"],
@@ -2232,9 +2319,13 @@ def diffusion_only_loss(
                 clip_distance=cfg.fape_clip_distance,
                 normalize=cfg.fape_normalize,
                 chunk_size=cfg.fape_chunk_size,
+                asym_id=fape_asym,
+                clip_distance_inter=cfg.fape_clip_distance_inter,
+                mode=cfg.fape_mode,
             )
         components["fape"] = l_fape.detach()
-        total = total + cfg.alpha_fape * l_fape
+        components["fape_inter"] = l_fape_inter.detach()
+        total = total + cfg.alpha_fape * l_fape + cfg.alpha_fape_inter * l_fape_inter
 
     return total, components
 
@@ -2531,13 +2622,14 @@ def training_loss(
         # projection as ``pae_loss`` but with gradient flowing to atoms
         # (PAE detaches via ``bucketize``).
         if (
-            cfg.alpha_fape > 0
+            (cfg.alpha_fape > 0 or cfg.alpha_fape_inter > 0)
             and "fape_atom_index" in features
             and "fape_token_index" in features
             and "fape_atom_mask" in features
             and "frame_token_index" in features
             and "frame_atom_index" in features
         ):
+            fape_asym = features.get("asym_id")  # unused when fape_mode == "pooled"
             frm_m_feat = features.get("frames_mask")
             frm_m = frm_m_feat.bool() if frm_m_feat is not None else loss_seq_mask
             if frames_gt_present is not None:
@@ -2551,7 +2643,7 @@ def training_loss(
                 # AF2 §4.2.7 full: every atom slot is a point (the K-slot
                 # ``fape_*`` point indices are ignored); ``loss_atom_mask``
                 # gives presence. Frames still come from ``frame_*``.
-                l_fape = fape_loss(
+                l_fape, l_fape_inter = fape_loss(
                     denoised,
                     gt_pos,
                     None,
@@ -2567,6 +2659,9 @@ def training_loss(
                     atom_mask=loss_atom_mask,
                     all_atom_points=True,
                     chunk_size=cfg.fape_chunk_size,
+                    asym_id=fape_asym,
+                    clip_distance_inter=cfg.fape_clip_distance_inter,
+                    mode=cfg.fape_mode,
                 )
             else:
                 fape_mask_local = _apply_fape_atom_set_mask(features["fape_atom_mask"].bool(), cfg.fape_atom_set)
@@ -2577,7 +2672,7 @@ def training_loss(
                 fape_mask_local = (
                     fape_mask_local & loss_atom_mask.bool()[features["fape_token_index"], features["fape_atom_index"]]
                 )
-                l_fape = fape_loss(
+                l_fape, l_fape_inter = fape_loss(
                     denoised,
                     gt_pos,
                     features["fape_token_index"],
@@ -2591,9 +2686,13 @@ def training_loss(
                     clip_distance=cfg.fape_clip_distance,
                     normalize=cfg.fape_normalize,
                     chunk_size=cfg.fape_chunk_size,
+                    asym_id=fape_asym,
+                    clip_distance_inter=cfg.fape_clip_distance_inter,
+                    mode=cfg.fape_mode,
                 )
             losses["fape"] = l_fape
-            total = total + cfg.alpha_fape * l_fape
+            losses["fape_inter"] = l_fape_inter
+            total = total + cfg.alpha_fape * l_fape + cfg.alpha_fape_inter * l_fape_inter
 
     # Representative atom positions (shared by distogram + confidence)
     N = seq_mask.shape[0]

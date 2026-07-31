@@ -918,6 +918,31 @@ class TrainingConfig:
     alpha_fape: float = 0.0
     fape_clip_distance: float = 10.0
     fape_normalize: bool = True
+    # Which (frame, point) pairs FAPE scores:
+    #   "pooled" — every pair in one term under ``fape_clip_distance``. Plain
+    #              AF2, and the default, so existing ``alpha_fape`` runs are
+    #              unchanged. ``alpha_fape_inter`` is ignored.
+    #   "both"   — AF-Multimer §2.1: same-chain pairs at ``fape_clip_distance``
+    #              (weight ``alpha_fape``), cross-chain at
+    #              ``fape_clip_distance_inter`` (weight ``alpha_fape_inter``).
+    #   "intra"  — same-chain pairs only; cross-chain pairs are dropped.
+    #   "inter"  — cross-chain pairs only (weight ``alpha_fape_inter``).
+    #
+    # Two reasons the cross-chain half is its own term rather than pooled under
+    # one clamp: (1) at 10 Å a chain docked 50 Å from its site is fully
+    # saturated, i.e. gets *zero* gradient, so pooled/intra FAPE cannot correct
+    # a pose at all; (2) the cross-chain share of all pairs swings with how many
+    # chains a crop happens to hold (~50% for a dimer, <10% for a large
+    # assembly), so pooling makes the docking signal's strength a function of
+    # crop composition. Separate denominators remove that, and ``fape_inter`` is
+    # logged on its own — the term exists to be watched.
+    #
+    # Turning the cross-chain term on raises the cost of a wrong chain
+    # permutation: the intra term is permutation-invariant, the inter one is
+    # not. Check ``chain_perm_gate_k`` before enabling.
+    fape_mode: str = "pooled"
+    alpha_fape_inter: float = 0.0
+    fape_clip_distance_inter: float = 30.0
     # Per-token atom set projected into every frame. The featurizer
     # always emits K=5 slots — [0..2] frame atoms (N/CA/C for protein,
     # C1'/C3'/C4' for nucleic), [3] rep (CB protein, C1' nucleic —
