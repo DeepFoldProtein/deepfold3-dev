@@ -7,6 +7,7 @@ Three questions, answered in order, each one forced by the previous answer:
 1. Did stochastic atomization (stage 2) change anything? → No, and the noise floor says why it could not have been seen.
 2. Antibody-antigen rank-1 trails oracle by 20+ points — can a better sample selector close it? → No. The remaining gap is mostly a lottery no selector can win.
 3. Then what is actually wrong with antibody-antigen? → The paratope is right, the epitope is wrong, and the wrong epitope is not reproducible across entries.
+4. Does protein-protein fail the same way? → No — opposite features drive it, and its failures look fixable by data where antibody-antigen's do not.
 
 Raw tool output for every number below is in `raw/`; the scripts that produced it are in `scripts/`. Per-step bench aggregates are in `steps_summary.csv`.
 
@@ -258,12 +259,75 @@ But "small interface", "shallow MSA", "no template" and "light chain" are all ru
 
 ---
 
+## 4. Protein-protein fails for the opposite reasons
+
+The same treatment on ppi at step 30000 (235 interfaces with inputs resolvable: never 62, partial 28,
+solved 145; `raw/ppi_features.txt`). Every feature that was flat for antibody-antigen separates here, and
+the one that separated there is gone.
+
+| median | never (62) | partial (28) | solved (145) |
+|---|---|---|---|
+| native contacts (nnat) | 58 | 61 | **76** |
+| shorter chain | 146 | 120 | 103 |
+| total complex length | 336 | 333 | 360 |
+| unpaired MSA (shallower chain) | 314 | 447 | **654** |
+| **paired MSA (shallower chain)** | **1** | 434 | **1052** |
+
+**Size does not matter here.** Spearman(total length, mean DockQ) = −0.021, longest chain −0.066 — against
+−0.423 for antigen length on the antibody side. The 700–1000-token bucket fails *less* than the 0–400 one
+(22.6% vs 26.9%).
+
+**Interface size does matter**, exactly the reverse of antibody-antigen:
+
+| native contacts | n | never % | median mean-DockQ |
+|---|---|---|---|
+| < 20 | 18 | **50.0** | 0.070 |
+| 20–40 | 37 | 37.8 | 0.503 |
+| 40–80 | 81 | 21.0 | 0.676 |
+| ≥ 80 | 99 | 22.2 | 0.704 |
+
+**Paired-MSA presence is a threshold, not a gradient** (heteromers only, n=71 — see the caveat below):
+
+| paired MSA depth | n | never % | median mean-DockQ |
+|---|---|---|---|
+| < 10 | 18 | **50.0** | 0.201 |
+| 10–100 | 6 | 0.0 | 0.842 |
+| 100–1000 | 16 | 0.0 | 0.751 |
+| ≥ 1000 | 31 | 12.9 | 0.729 |
+
+Half the interfaces whose shallower chain has essentially no paired MSA never produce a passing sample;
+ten paired rows is already enough to move to ~0%, and more depth buys nothing. The never group's median
+paired depth is **1** — the query itself.
+
+*Caveat on that table:* 153 of 235 interfaces have no paired MSA file at all, and **all 153 are homomeric** —
+pure homo-oligomers are excluded from the pairing pipeline by construction (their pairing is trivial), so
+the paired-depth analysis is a heteromer analysis. Homomers as a group fail at 29.9% against heteromers'
+18.3%, and within homomers the driver is interface size again (nnat < 40 → ~50% never, ≥ 80 → 20%).
+
+### The contrast
+
+| | antibody-antigen | protein-protein |
+|---|---|---|
+| failure vs partner size | **−0.42** (bigger antigen, worse) | −0.02 (no relation) |
+| failure vs interface size | none (nnat 36 / 33 / 38) | **strong** (<20 contacts → 50% never) |
+| failure vs paired MSA | not available in principle | **<10 rows → 50% never** |
+| unit of failure | the complex (84% of Fabs fail on both interfaces) | the interface |
+
+Same "0 of 20 samples pass", two different causes. **ppi fails where the evidence is missing** — no
+co-evolutionary pairing, or an interface too small to determine — which is the kind of thing a better
+pairing pipeline or a wider genomic database can still fix. **Antibody-antigen fails with the evidence in
+hand**: it fails on wide antigens regardless of how large and well-defined the true interface is, and
+regardless of MSA depth. One is a data problem, the other is a learning problem.
+
 ## Standing implications
 
 - Antibody-antigen is the one interface class with no co-evolutionary signal available in principle —
   antibodies and antigens do not co-evolve — so the MSA route that carries other interfaces is empty here.
   Nothing in this investigation suggests a short experiment flips it.
-- Failure scales with the **antigen's surface**, not with the interface's size or the depth of either MSA,
+- The two interface categories need separate work. ppi's failures track missing evidence (paired MSA
+  under ~10 rows, interfaces under ~20 contacts) and are a pipeline/data target; antibody-antigen's track
+  antigen size with the evidence present, and are not.
+- AbAg failure scales with the **antigen's surface**, not with the interface's size or the depth of either MSA,
   and it is per-complex. Any attempt at this axis should be evaluated on large antigens (≥250 residues,
   where 65% of interfaces never produce a single passing sample), not on the small ones that already work.
 - Do not spend effort on sample selection for either category: +8 pt is the realistic ceiling for AbAg and
@@ -291,6 +355,7 @@ But "small interface", "shallow MSA", "no template" and "light chain" are all ru
 | `raw/same_antigen.txt` | shared-antigen epitope agreement |
 | `raw/failure_features.txt` | never/partial/solved vs interface size, chain lengths, MSA depth, templates, H/L |
 | `raw/antigen_size.txt` | failure rate by antigen and complex size, with stratification |
+| `raw/ppi_features.txt` | the same feature comparison for protein-protein, incl. paired-MSA depth |
 | `scripts/` | the script behind each `raw/` file (run from the repo root) |
 
 Related: `bench/scripts/step_compare.py` (`9c3589c`) for per-target checkpoint diffs;
