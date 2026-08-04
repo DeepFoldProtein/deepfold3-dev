@@ -1,0 +1,59 @@
+base: initial.yaml
+
+# Protenix v2 (references/Protenix/configs/configs_model_type.py:52) mapped onto
+# DF3: a pure width scale-up of the pair track — c_z 128 -> 256, c_m 64 -> 128,
+# with hidden_scale_up, i.e. per-head dim held fixed and the head count following
+# the channel width. Depth, loss weights, optimizer and the dataset mix are
+# inherited unchanged. Not warm-startable from a c_z=128 checkpoint.
+
+training:
+  wandb_project: deepfold3-protenix-v2
+
+  diffusion_batch_size: 64
+  diffusion_chunk_size: 8
+
+  batch_size_per_rank: 1
+  accumulate_grad_batches: 2
+
+model:
+  num_recycles: 10
+
+  evoformer:
+    msa_channel: 128
+    pair_channel: 256
+    pair_attention:
+      num_head: 8 # 256 // 8 = 32 per head (AF3 c=32, Nhead follows c_z)
+    msa_attention:
+      # AF3 Alg. 8 line 7 pins MSAPairWeightedAveraging to c = 8 per head. DF3
+      # ties total width to c_msa, so the head count has to absorb the
+      # c_m 64 -> 128 widening for c to stay at 8.
+      num_head: 16
+
+  pairformer:
+    pair_channel: 256
+    pair_attention:
+      num_head: 8
+
+  confidence:
+    pair_channel: 256
+    pair_attention_num_head: 8
+
+  template:
+    # DF3-only deviation: Protenix v2 leaves the template stack at c=64, where
+    # hidden_scale_up yields 2 heads x 32. Widening to 128 instead recovers the
+    # AF3 spec attention shape (c=32, Nhead=4), which DF3 cannot express at c=64
+    # because head_dim = num_channels // num_heads.
+    #
+    # BOTH num_channels must be set: template_embedding.py:281 builds the blocks
+    # from pairformer.num_channels, while the outer one sizes the feature
+    # projections and output LN. Setting only one crashes at the first forward.
+    num_channels: 128
+    pair_channel: 256
+    pairformer:
+      num_layer: 2
+      num_channels: 128
+      num_heads: 4
+
+  diffusion:
+    conditioning_pair_channel: 256
+    steps: 200
