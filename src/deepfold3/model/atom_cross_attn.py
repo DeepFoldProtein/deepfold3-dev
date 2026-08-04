@@ -854,6 +854,8 @@ class AtomEncoder(nn.Module):
         num_atom_name_chars: int = 64,
         atom_name_length: int = 4,
         ref_element_zero_index: bool = False,
+        c_trunk_single: int = 384,
+        c_trunk_pair: int = 128,
     ):
         super().__init__()
         c = per_atom_channels
@@ -866,15 +868,19 @@ class AtomEncoder(nn.Module):
             c, cp, num_element_classes, num_atom_name_chars, atom_name_length, ref_element_zero_index
         )
 
-        # Trunk single conditioning
+        # Trunk single conditioning. ``c_trunk_single`` is the width of
+        # ``embeddings["single"]`` (evoformer.seq_channel); the AF3 default is 384.
         # AF3: embed_trunk_single_cond uses final_init (zeros)
-        self.lnorm_trunk_single_w = nn.Parameter(torch.ones(384))
-        self.embed_trunk_single = LinearNoBias(384, c, initializer="zeros")
+        self.lnorm_trunk_single_w = nn.Parameter(torch.ones(c_trunk_single))
+        self.embed_trunk_single = LinearNoBias(c_trunk_single, c, initializer="zeros")
 
-        # Trunk pair conditioning
+        # Trunk pair conditioning. NOTE the input here is the DiffusionConditioning
+        # output (``pair_cond``), so this is ``diffusion.conditioning_pair_channel``
+        # — NOT evoformer.pair_channel. Both were hardcoded to the AF3 widths until
+        # a 256-wide pair track tripped the mismatch inside sample()/compute_static.
         # AF3: embed_trunk_pair_cond uses final_init (zeros)
-        self.lnorm_trunk_pair_w = nn.Parameter(torch.ones(128))
-        self.embed_trunk_pair = LinearNoBias(128, cp, initializer="zeros")
+        self.lnorm_trunk_pair_w = nn.Parameter(torch.ones(c_trunk_pair))
+        self.embed_trunk_pair = LinearNoBias(c_trunk_pair, cp, initializer="zeros")
 
         # Encoder-specific additional pair conditioning (_1 variants)
         self.single_to_pair_row_enc = LinearNoBias(c, cp)

@@ -670,6 +670,11 @@ class DiffusionHead(nn.Module):
             num_atom_name_chars=cfg.atom_cross_att.num_atom_name_chars,
             atom_name_length=cfg.atom_cross_att.atom_name_length,
             ref_element_zero_index=cfg.atom_cross_att.ref_element_zero_index,
+            # compute_static() feeds trunk_single=embeddings["single"] and
+            # trunk_pair=pair_cond (the DiffusionConditioning output), so these
+            # must track the conditioning widths, not the AF3 defaults.
+            c_trunk_single=c_single,
+            c_trunk_pair=cfg.conditioning_pair_channel,
         )
 
         # Project trunk single to diffusion act (scale-only LN + no-bias projection)
