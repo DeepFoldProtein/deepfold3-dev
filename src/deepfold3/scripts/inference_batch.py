@@ -46,7 +46,7 @@ import torch
 from deepfold3.scripts import cli
 
 
-def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str):
+def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str, msa_crop_size: int | None = None):
     """Load weights + build model. Returns ``(model, model_cfg)``.
 
     Same as the top half of ``inference``. Extracted so batch loops can
@@ -94,6 +94,16 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str)
         model_cfg.optim = OptimConfig.inference()
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
+
+    # See ``inference``: default follows the MSA pool cap, not the training crop.
+    from deepfold3.data.const import MAX_MSA_ROWS
+
+    want = msa_crop_size if msa_crop_size is not None else MAX_MSA_ROWS
+    if want != model_cfg.msa_crop_size:
+        prev = model_cfg.msa_crop_size
+        model_cfg.msa_crop_size = want
+        src = "flag" if msa_crop_size is not None else "default (MSA pool cap)"
+        click.echo(f"[batch] msa_crop_size {prev} -> {want} per recycle [{src}]")
 
     if optim and optim != "none":
         torch.set_float32_matmul_precision("high")
@@ -306,6 +316,14 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     type=click.Path(exists=True, path_type=Path),
     help="Model parameters (.safetensors / .pt / .bin / .bin.zst)",
 )
+@click.option(
+    "--msa-crop-size",
+    type=int,
+    default=None,
+    help=(
+        "Per-recycle MSA rows for the Evoformer. Default: follow the MSA pool cap (``const.MAX_MSA_ROWS`` = 16384) rather than the checkpoint's value — training deliberately uses a small crop for throughput and randomises the effective row count (AF3 s2.3 k ~ Uniform[1, crop]) so the model is row-count invariant, and serving is meant to use the whole pool. Pass a smaller number to reproduce a training-crop run or to bound memory."
+    ),
+)
 @click.option("--num-recycles", default=10, show_default=True)
 @click.option("--num-samples", default=5, show_default=True)
 @click.option("--snapshot", type=click.Choice(["auto", "shadow", "average", "fast"]), default="auto", show_default=True)
@@ -365,6 +383,7 @@ def inference_batch(
     json_paths: tuple[Path, ...],
     output_template: str,
     params: Path,
+    msa_crop_size: int | None,
     num_recycles: int,
     num_samples: int,
     snapshot: str,
@@ -402,7 +421,7 @@ def inference_batch(
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     click.echo(f"[batch] device: {dev}")
 
-    model, model_cfg = _load_model_once(params, snapshot, dev, optim)
+    model, model_cfg = _load_model_once(params, snapshot, dev, optim, msa_crop_size)
 
     seed_list = list(dict.fromkeys(seeds))
 

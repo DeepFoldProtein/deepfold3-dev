@@ -82,6 +82,14 @@ from deepfold3.scripts._common import load_pt_snapshot, pin_cuda_device
     show_default=True,
     help="Molecule type",
 )
+@click.option(
+    "--msa-crop-size",
+    type=int,
+    default=None,
+    help=(
+        "Per-recycle MSA rows for the Evoformer. Default: follow the MSA pool cap (``const.MAX_MSA_ROWS`` = 16384) rather than the checkpoint's value — training deliberately uses a small crop for throughput and randomises the effective row count (AF3 s2.3 k ~ Uniform[1, crop]) so the model is row-count invariant, and serving is meant to use the whole pool. Pass a smaller number to reproduce a training-crop run or to bound memory."
+    ),
+)
 @click.option("--num-recycles", default=10, show_default=True, help="Evoformer recycling iterations")
 @click.option("--num-samples", default=5, show_default=True, help="Number of diffusion samples per seed")
 @click.option(
@@ -159,6 +167,7 @@ def inference(
     output: Path,
     params: Path,
     mol_type: str,
+    msa_crop_size: int | None,
     num_recycles: int,
     num_samples: int,
     snapshot: str,
@@ -259,6 +268,19 @@ def inference(
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
     # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
+
+    # Default to the MSA pool cap, NOT the checkpoint's training crop: the crop
+    # is a training-throughput choice and the random-k mask makes the model
+    # row-count invariant, so serving the trained crop would throw away MSA the
+    # model can use. Explicit --msa-crop-size still wins.
+    from deepfold3.data.const import MAX_MSA_ROWS
+
+    want = msa_crop_size if msa_crop_size is not None else MAX_MSA_ROWS
+    if want != model_cfg.msa_crop_size:
+        prev = model_cfg.msa_crop_size
+        model_cfg.msa_crop_size = want
+        src = "flag" if msa_crop_size is not None else "default (MSA pool cap)"
+        click.echo(f"[inference] msa_crop_size {prev} -> {want} per recycle [{src}]")
 
     if optim and optim != "none":
         torch.set_float32_matmul_precision("high")  # TF32 for better perf
