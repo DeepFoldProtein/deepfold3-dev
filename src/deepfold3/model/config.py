@@ -320,6 +320,68 @@ class DiffusionConfig:
     # assume bf16 inputs — disable those when enabling skip-amp.
     skip_amp_sample: bool = False  # inference Euler-Maruyama (sample())
     skip_amp_sample_training: bool = False  # training rollout (sample_training())
+    # --- Trunk-conditioning dropout (OpenFold-3 ``use_conditioning_prob``) -----
+    # Probability of KEEPING the trunk conditioning on a diffusion training
+    # forward; ``1.0`` = always keep = current behaviour. OF3 ships 1.0 as the
+    # code default and overrides to 0.8 (20% drop) in every training YAML
+    # (`examples/training_yamls/initial_training.yml:45`).
+    #
+    # Dropped exactly as OF3 does it: ``single``/``pair`` are multiplied by zero
+    # *only* on the way into ``DiffusionConditioningBlock.compute_static``
+    # (`diffusion_conditioning.py:241-249`). ``target_feat`` and ``rel_feat``
+    # survive, the Fourier noise embedding survives, and — matching OF3 /
+    # AF3 Algorithm 20 — the **un-zeroed** trunk single still reaches the atom
+    # encoder (`diffusion_module.py:198-204`), so this is a *partial* drop, not
+    # a true unconditional pass. Do not "fix" that without deciding to diverge.
+    #
+    # One draw per forward, shared by all ``diffusion_batch_size`` samples
+    # (OF3 uses one ``random.random()`` per step). Zeroing an input still
+    # reaches every parameter, so DDP ``static_graph=True`` is unaffected.
+    #
+    # OF3 has no inference-time guidance that consumes this; training with it
+    # is what would make classifier-free guidance possible later.
+    use_conditioning_prob: float = 1.0
+    # --- Masked / partial diffusion (motif scaffolding) -----------------------
+    # NOT an OF3 feature — OF3 noises every atom unconditionally
+    # (`projects/of3_all_atom/model.py:466-485`). Written from scratch here.
+    #
+    # With probability ``diffusion_mask_prob`` a diffusion sample keeps part of
+    # the (augmented) ground truth CLEAN and noises only the rest, so the model
+    # learns to place the noised part *relative to* a given anchor. Motivation
+    # (`export/pose-decomposition/`): the inter-chain pose is committed by the
+    # first denoise call and no amount of resampling escapes it, and uniform
+    # noising cannot break that — any σ low enough to preserve good local
+    # structure also preserves the wrong pose, while any σ high enough to erase
+    # the pose erases everything and re-commits identically. Selective noising
+    # is the only way to erase a pose while keeping a structure.
+    #
+    # Representation is RePaint-style **replacement at the single global σ**:
+    # the clean tokens' coordinates are substituted into the noisy input and
+    # the network is left to notice they are clean (they are, trivially: at high
+    # σ they are the only atoms with sane bond lengths). Known limitation — the
+    # EDM input scaling ``c_in = 1/√(σ²+σ_d²)`` is global, so at σ ≫ σ_data the
+    # anchor arrives numerically ~300× smaller than the noised cloud. The
+    # principled fix is a per-token σ, which needs the noise embedding and the
+    # c_in/c_skip/c_out broadcasts to go per-token (OF3 cannot do it either:
+    # its ``t`` is ``[B, S]``).
+    #
+    # The loss is NOT masked to the noised region. At high σ ``c_skip → 0``, so
+    # reproducing the clean region is a real reconstruction task rather than a
+    # free copy, and leaving the loss alone keeps this option from touching the
+    # loss code at all.
+    #
+    # ``diffusion_mask_mode``:
+    #   "chain" — keep a random non-empty PROPER subset of chains clean (always
+    #             ≥1 clean and ≥1 noised). Targets docking directly. Falls back
+    #             to "span" on a single-chain crop.
+    #   "span"  — keep one contiguous token span clean (classic motif
+    #             scaffolding).
+    # The clean fraction is drawn uniformly from
+    # ``[diffusion_mask_min_frac, diffusion_mask_max_frac]``.
+    diffusion_mask_prob: float = 0.0
+    diffusion_mask_mode: str = "chain"
+    diffusion_mask_min_frac: float = 0.25
+    diffusion_mask_max_frac: float = 0.75
     transformer: DiffusionTransformerConfig = field(default_factory=DiffusionTransformerConfig)
     atom_cross_att: AtomCrossAttConfig = field(default_factory=AtomCrossAttConfig)
 
@@ -340,6 +402,14 @@ class ConfidenceConfig:
     uniform_residual_scale: bool = False
     # See PairFormerConfig.pair_bias_gate.
     pair_bias_gate: bool = False
+    # Probability of KEEPING the trunk PAIR embedding in the confidence head
+    # (OpenFold-3 ``use_confidence_emb_prob``, `head_modules.py:195-196`).
+    # ``1.0`` = always keep = current behaviour; OF3's training YAMLs use 0.8.
+    # Training-only, pair-only — the single repr, ``target_feat`` and the
+    # predicted positions are never dropped. The distogram head reads the
+    # un-zeroed pair (it is computed from ``embeddings["pair"]`` separately),
+    # so the distogram loss is unaffected, matching OF3's ordering.
+    use_pair_emb_prob: float = 1.0
     pair_bias_gate_init_tau: float = 0.25
     # See PairFormerConfig.single_transition_linear_out_init_gain.
     single_transition_linear_out_init_gain: float | None = None
@@ -1026,9 +1096,6 @@ class TrainingConfig:
     # a slightly tighter MSE, but it disagrees with the other losses' mini-rollout
     # labelling and can inflate grad-norm; see the shared-permutation notes).
     diffusion_mse_per_sample_symmetry: bool = False
-
-    # Region-based loss weighting (region_id → weight multiplier, e.g. {3: 5.0} for CDR-H3)
-    region_loss_weights: dict[int, float] = field(default_factory=dict)
 
     # Smooth LDDT thresholds. AlphaFold 3 supplement eq. 6 / Protenix
     # ``loss.py``: nucleotide-nucleotide pairs use 30 Å, everything else

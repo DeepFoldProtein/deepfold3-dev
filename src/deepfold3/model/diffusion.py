@@ -137,6 +137,63 @@ def _random_augmentation(
     return _random_augmentation_from_vectors(positions, mask, v0, v1, translation)
 
 
+def build_diffusion_clean_mask(
+    asym_id: torch.Tensor,  # [B, N] int
+    seq_mask: torch.Tensor,  # [B, N] bool
+    num_samples: int,
+    *,
+    prob: float,
+    mode: str = "chain",
+    min_frac: float = 0.25,
+    max_frac: float = 0.75,
+) -> torch.Tensor | None:
+    """``[B, S, N]`` bool — tokens handed to the denoiser as clean ground truth.
+
+    Masked / partial diffusion (motif scaffolding). Each of the ``S`` diffusion
+    samples independently fires with probability ``prob``; a sample that does
+    not fire gets an all-False row and is noised normally, so ``prob`` is the
+    fraction of the diffusion batch that becomes a conditional-placement task.
+
+    ``mode="chain"`` keeps a random non-empty PROPER subset of chains clean —
+    always ≥1 clean and ≥1 noised, so there is both something to place and
+    something to place it against. A single-chain crop has no such subset and
+    falls back to ``"span"``.
+
+    Returns ``None`` when nothing fired, so callers can skip the work entirely.
+    """
+    if prob <= 0.0 or num_samples <= 0:
+        return None
+    B, N = asym_id.shape
+    dev = asym_id.device
+    fire = torch.rand(B, num_samples, device=dev) < prob
+    if not bool(fire.any()):
+        return None
+
+    mask = torch.zeros(B, num_samples, N, dtype=torch.bool, device=dev)
+    lo, hi = float(min_frac), float(max_frac)
+    for b in range(B):
+        valid_b = seq_mask[b].bool()
+        n_valid = int(valid_b.sum())
+        if n_valid < 4:
+            continue
+        chains = asym_id[b][valid_b].unique()
+        valid_idx = valid_b.nonzero(as_tuple=True)[0]
+        for s in range(num_samples):
+            if not bool(fire[b, s]):
+                continue
+            frac = lo + float(torch.rand((), device=dev)) * (hi - lo)
+            if mode == "chain" and chains.numel() >= 2:
+                perm = chains[torch.randperm(chains.numel(), device=dev)]
+                k = max(1, min(int(chains.numel()) - 1, int(round(frac * float(chains.numel())))))
+                keep = perm[:k]
+                mask[b, s] = (asym_id[b].unsqueeze(-1) == keep).any(-1) & valid_b
+            else:  # "span", and the single-chain fallback for "chain"
+                ln = max(1, min(n_valid - 1, int(round(frac * n_valid))))
+                start = int(torch.randint(0, n_valid - ln + 1, (), device=dev))
+                mask[b, s, valid_idx[start : start + ln]] = True
+    return mask
+
+
 def _augment_in_place(
     positions: torch.Tensor,  # [B?, S, N, M, 3]
     mask: torch.Tensor,  # [B?, N, M] bool
@@ -716,14 +773,26 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor,
         rel_feat: torch.Tensor,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
+        use_conditioning: bool = True,
     ) -> DiffusionStatic:
         """Pre-compute everything that does NOT depend on noisy positions /
         noise level: conditioning ``pair_cond``, single-cond pre-noise, and the
         atom encoder static state. Reuse via :meth:`denoise` ``static=`` kwarg.
+
+        ``use_conditioning=False`` is the OpenFold-3 trunk-conditioning drop
+        (``use_conditioning_prob``, `diffusion_conditioning.py:241-249`): the
+        trunk single/pair are zeroed on the way into the conditioning block
+        while ``target_feat`` / ``rel_feat`` survive. Matching OF3 and AF3
+        Algorithm 20, the **un-zeroed** trunk single is still handed to the atom
+        encoder below (`diffusion_module.py:198-204`), so the drop is partial.
         """
+        cond_single, cond_pair = embeddings["single"], embeddings["pair"]
+        if not use_conditioning:
+            cond_single = cond_single * 0
+            cond_pair = cond_pair * 0
         single_cond_pre_noise, pair_cond = self.conditioning.compute_static(
-            single_emb=embeddings["single"],
-            pair_emb=embeddings["pair"],
+            single_emb=cond_single,
+            pair_emb=cond_pair,
             target_feat=embeddings["target_feat"],
             rel_feat=rel_feat,
         )
@@ -760,6 +829,7 @@ class DiffusionHead(nn.Module):
         seq_mask: torch.Tensor | None = None,  # [B?, N]
         rel_feat: torch.Tensor | None = None,  # [B?, N, N, rel_feat_dim]
         static: DiffusionStatic | None = None,
+        use_conditioning: bool = True,
     ) -> torch.Tensor:
         """Run one denoising step. Returns denoised positions [B?, N, M, 3].
 
@@ -780,6 +850,7 @@ class DiffusionHead(nn.Module):
                 ref_space_uid=ref_space_uid,
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,
+                use_conditioning=use_conditioning,
             )
 
         ref_mask_eff = static.ref_mask
@@ -833,6 +904,7 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor | None = None,
         static: DiffusionStatic | None = None,
         static_bs: DiffusionStatic | None = None,
+        use_conditioning: bool = True,
     ) -> torch.Tensor:
         """Denoise S diffusion samples in a SINGLE batched ``denoise`` call.
 
@@ -903,6 +975,7 @@ class DiffusionHead(nn.Module):
                     ref_space_uid=_b(ref_space_uid),
                     seq_mask=_b(seq_mask),
                     rel_feat=_b(rel_feat),
+                    use_conditioning=use_conditioning,
                 )
             static_bs = static.expand_for_samples(S)
 
@@ -1082,8 +1155,15 @@ class DiffusionHead(nn.Module):
         num_samples: int = 1,
         static: DiffusionStatic | None = None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
+        clean_mask: torch.Tensor | None = None,  # [B?, S, N] bool
+        use_conditioning: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward: augment GT, add noise, denoise once (AF3 §3.7.1).
+
+        ``clean_mask`` marks tokens whose (augmented) ground-truth coordinates
+        are substituted back into the noisy input — masked / partial diffusion,
+        see ``DiffusionConfig.diffusion_mask_prob``. ``use_conditioning=False``
+        is OF3's trunk-conditioning drop.
 
         Returns:
             gt_augmented: Augmented ground truth [B?, S, N, M, 3].
@@ -1118,6 +1198,8 @@ class DiffusionHead(nn.Module):
                 num_samples,
                 static,
                 ref_space_uid=ref_space_uid,
+                clean_mask=clean_mask,
+                use_conditioning=use_conditioning,
             )
 
     def _sample_training_impl(
@@ -1135,6 +1217,8 @@ class DiffusionHead(nn.Module):
         num_samples: int,
         static: DiffusionStatic | None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
+        clean_mask: torch.Tensor | None = None,  # [B?, S, N] bool
+        use_conditioning: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         batch_shape = gt_positions.shape[:-3]  # () or (B,)
@@ -1177,6 +1261,16 @@ class DiffusionHead(nn.Module):
             nl = nl.unsqueeze(-1)
         noisy_pos = gt_aug + torch.randn_like(gt_aug) * nl  # [B?, S, N, M, 3]
 
+        # Masked / partial diffusion: hand the clean tokens' augmented GT back
+        # to the denoiser instead of their noised copy (RePaint-style
+        # replacement at the single global σ). Applied AFTER the per-sample
+        # augmentation, so the anchor is in the same frame as its sample.
+        if clean_mask is not None:
+            cm = clean_mask
+            while cm.dim() < gt_aug.dim():
+                cm = cm.unsqueeze(-1)
+            noisy_pos = torch.where(cm, gt_aug, noisy_pos)
+
         # Denoise.  When ``static`` is provided, conditioning + atom-encoder
         # cache is reused across all S samples (saved compute).  Otherwise
         # ``_denoise_samples`` builds the cache inline once per call.
@@ -1195,6 +1289,7 @@ class DiffusionHead(nn.Module):
                 ref_space_uid,
                 seq_mask,
                 rel_feat,
+                use_conditioning=use_conditioning,
             )
 
         return gt_aug, denoised, noise_levels

@@ -17,7 +17,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F  # noqa: N812
 
-from deepfold3.data.masking import MASK_FIXED, MASK_LOSS_WEIGHT, MASK_REGION
+from deepfold3.data.masking import MASK_FIXED, MASK_LOSS_WEIGHT
 from deepfold3.model.config import TrainingConfig
 
 # ---------------------------------------------------------------------------
@@ -643,7 +643,7 @@ def diffusion_mse_loss(
     mol_type: torch.Tensor | None = None,  # [N] int64 (0=prot, 1=DNA, 2=RNA, 3=ligand)
     nucleotide_loss_weight: float = 5.0,
     ligand_loss_weight: float = 10.0,
-    region_weights: torch.Tensor | None = None,  # [N] float — per-token loss weight from region labels
+    noised_mask: torch.Tensor | None = None,  # [S, N] bool — tokens whose INPUT was noised
     atom_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] (token, M_a, M_b)
     ligand_swap_pairs: torch.Tensor | None = None,  # [N_pairs, 3] atomized-residue inter-token swaps
     ligand_perms: torch.Tensor | None = None,  # [R, 4] (ligand_id, perm_id, dst, src) CCD automorphisms
@@ -684,7 +684,11 @@ def diffusion_mse_loss(
         mol_type: Per-token molecule type [N].
         nucleotide_loss_weight: Weight multiplier for RNA/DNA atoms.
         ligand_loss_weight: Weight multiplier for ligand atoms.
-        region_weights: Per-token loss multiplier from region labels.
+        noised_mask: ``[S, N]`` bool for masked / partial diffusion — True where
+            the denoiser's input was noise, False where it was handed the clean
+            ground truth. Only the True tokens are scored, with a per-sample
+            denominator. ``None`` (the default, and every unmasked run) leaves
+            the reduction bit-identical to the unmasked form.
         atom_swap_pairs: Optional ``[N_pairs, 3]`` int tensor produced by
             ``compute_token_atom_symmetry_pairs`` and routed through the
             featurizer (``"atom_swap_pairs"`` feature key).
@@ -768,8 +772,6 @@ def diffusion_mse_loss(
         weight_2d = mask * token_weight.unsqueeze(-1)  # [N, M]
     else:
         weight_2d = mask
-    if region_weights is not None:
-        weight_2d = weight_2d * region_weights.unsqueeze(-1)  # [N, M]
 
     # AF3 §3.7.1 eq. 2: rigidly align GT onto pred per sample. This MUST run
     # BEFORE the symmetric-atom resolution below: a swap decision compares
@@ -806,19 +808,33 @@ def diffusion_mse_loss(
 
         gt_pos = apply_ligand_token_permutation(pred_pos, gt_pos, atom_mask.bool(), ligand_perms)
 
-    weight_mask = weight_2d.unsqueeze(-1)  # [N, M, 1]
     # AF3 §5.3 eq. 3 / OF3 ``mse_loss`` / Protenix ``MSELoss``: divide by
     # *atom count* (not sum-of-weights) so the absolute scale tracks the
-    # number of supervised atoms; the mol-type and region weights only
-    # reweight the numerator. The leading 1/3 averages over the three
-    # spatial coordinates.
-    n_atoms = mask.sum().clamp(min=1)
+    # number of supervised atoms; the mol-type weights only reweight the
+    # numerator. The leading 1/3 averages over the three spatial coordinates.
+    if noised_mask is None:
+        weight_mask = weight_2d.unsqueeze(-1).unsqueeze(0)  # [1, N, M, 1]
+        n_atoms = mask.sum().clamp(min=1)  # scalar
+    else:
+        # Masked / partial diffusion: score ONLY the atoms whose input was noise.
+        # Including the clean anchor would (a) reward copying — at low σ
+        # ``c_skip = σ_d²/(σ²+σ_d²) → 1`` passes the input through nearly
+        # unchanged — and (b) inflate the denominator, shrinking the real task's
+        # loss by up to the clean fraction.
+        nm = noised_mask.to(weight_2d.dtype).unsqueeze(-1)  # [S, N, 1]
+        weight_mask = (weight_2d.unsqueeze(0) * nm).unsqueeze(-1)  # [S, N, M, 1]
+        # Per-sample denominator: a masked sample supervises fewer atoms, and a
+        # shared one would quietly scale its loss down instead of keeping the
+        # per-atom magnitude comparable across the diffusion batch. Samples that
+        # did not fire have an all-True row, so this reproduces the scalar form
+        # exactly for them.
+        n_atoms = (mask.unsqueeze(0) * nm).sum(dim=(-2, -1)).clamp(min=1)  # [S]
 
     # Per-sample EDM weight [S]
     w = (noise_levels**2 + sigma_data**2) / (noise_levels * sigma_data) ** 2
 
     # Vectorized MSE: [S, N, M, 3] → [S]
-    mse_per_sample = ((pred_pos - gt_pos) ** 2 * weight_mask.unsqueeze(0)).sum(dim=(-3, -2, -1)) / (3.0 * n_atoms)
+    mse_per_sample = ((pred_pos - gt_pos) ** 2 * weight_mask).sum(dim=(-3, -2, -1)) / (3.0 * n_atoms)
     return (w * mse_per_sample).mean()
 
 
@@ -2055,25 +2071,6 @@ def _compute_per_atom_lddt(
 
 
 # ---------------------------------------------------------------------------
-# Region → per-token weight mapping
-# ---------------------------------------------------------------------------
-
-
-def _region_to_weight(
-    region_label: torch.Tensor,  # [N] int
-    region_loss_weights: dict[int, float],
-) -> torch.Tensor:
-    """Convert region labels to per-token weight multipliers.
-
-    Tokens with region_id 0 (unset) or not in the mapping get weight 1.0.
-    """
-    weights = torch.ones_like(region_label, dtype=torch.float32)
-    for region_id, weight in region_loss_weights.items():
-        weights[region_label == int(region_id)] = weight
-    return weights
-
-
-# ---------------------------------------------------------------------------
 # Combined training loss
 # ---------------------------------------------------------------------------
 
@@ -2132,11 +2129,6 @@ def diffusion_only_loss(
     if mini_ref is not None:
         gt_pos = resolve_gt_atom_symmetry(mini_ref[0], features, gt_pos, atom_mask)
 
-    region_label = features.get(f"mask_{MASK_REGION}")
-    region_weights: torch.Tensor | None = None
-    if region_label is not None and cfg.region_loss_weights:
-        region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
-
     # Per-token loss-weight mask (1.0 keep, 0.0 drop). Set per-dataset via
     # ``DatasetConfig.exclude_loss_mol_types`` (e.g. PATCHR ligands carry 0.0
     # here). Equivalent to multiplying the per-atom ``atom_mask`` by the
@@ -2175,6 +2167,9 @@ def diffusion_only_loss(
         if mini_ref is not None and not features.get("__gt_prepermuted__"):
             gt_aug = resolve_gt_atom_symmetry(mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, atom_mask)
         mse_kwargs = {}
+    # Masked / partial diffusion (``DiffusionConfig.diffusion_mask_prob``): score
+    # only the atoms the denoiser actually had to invent.
+    _clean = pred.get("diffusion_clean_mask")  # [S, N] bool or None
     l_mse = diffusion_mse_loss(
         denoised,
         gt_aug,
@@ -2183,7 +2178,7 @@ def diffusion_only_loss(
         mol_type=features.get("mol_type"),
         nucleotide_loss_weight=cfg.nucleotide_loss_weight,
         ligand_loss_weight=cfg.ligand_loss_weight,
-        region_weights=region_weights,
+        noised_mask=(~_clean.bool()) if _clean is not None else None,
         apply_rigid_align=cfg.use_rigid_align,
         **mse_kwargs,
     )
@@ -2396,10 +2391,6 @@ def training_loss(
     # datasets). Treat all-zero as absent so the default atom_mask path is used.
     if fixed_mask is not None and not fixed_mask.any():
         fixed_mask = None
-    region_label = features.get(f"mask_{MASK_REGION}")  # [N] int or None
-    region_weights: torch.Tensor | None = None
-    if region_label is not None and cfg.region_loss_weights:
-        region_weights = _region_to_weight(region_label, cfg.region_loss_weights)
 
     # Per-token loss-weight mask (set per-dataset via
     # ``DatasetConfig.exclude_loss_mol_types``; e.g. PATCHR drops ligand tokens).
@@ -2530,6 +2521,7 @@ def training_loss(
                     mini_ref[0].unsqueeze(0).expand_as(gt_aug), features, gt_aug, loss_atom_mask
                 )
             mse_kwargs = {}
+        _clean = pred.get("diffusion_clean_mask")  # [S, N] bool or None — see diffusion_only_loss
         l_mse = diffusion_mse_loss(
             denoised,
             gt_aug,
@@ -2538,7 +2530,7 @@ def training_loss(
             mol_type=features.get("mol_type"),
             nucleotide_loss_weight=cfg.nucleotide_loss_weight,
             ligand_loss_weight=cfg.ligand_loss_weight,
-            region_weights=region_weights,
+            noised_mask=(~_clean.bool()) if _clean is not None else None,
             apply_rigid_align=cfg.use_rigid_align,
             **mse_kwargs,
         )

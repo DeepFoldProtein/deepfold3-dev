@@ -23,7 +23,8 @@ from deepfold3.model.bucket import next_bucket, pad_features
 # Feature keys whose neutral (no-masking) value is 1.0, not 0.0: zero-filling a
 # sample that lacks these (mixed-dataset batch) would mark it model-generated
 # (mask_fixed) or zero its loss weight (mask_loss_weight), silently dropping its
-# loss. mask_region stays zero-filled (0 == unset -> weight 1.0 in _region_to_weight).
+# loss. mask_region stays zero-filled (0 == unset); it feeds `atomize_source="region"`,
+# not the loss.
 _ONES_FILL_KEYS = frozenset({f"mask_{MASK_FIXED}", f"mask_{MASK_LOSS_WEIGHT}"})
 
 

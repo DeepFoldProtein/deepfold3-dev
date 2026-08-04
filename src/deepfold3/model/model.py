@@ -677,6 +677,33 @@ class DeepFold3(nn.Module):
             features["chain_perm_keep"] = cp_keep
 
         # --- 3. Diffusion training step ---
+        # Trunk-conditioning dropout (OF3 ``use_conditioning_prob``): ONE draw
+        # per forward, shared by every diffusion sample, exactly as OF3 does it
+        # (`projects/of3_all_atom/model.py:487`). Training-only. Zeroing an
+        # input still reaches every parameter, so DDP ``static_graph`` is safe.
+        diff_cfg_t = self.diffusion_head.cfg
+        use_conditioning = True
+        if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
+            use_conditioning = bool(torch.rand(()) < diff_cfg_t.use_conditioning_prob)
+
+        # Masked / partial diffusion (motif scaffolding) — see
+        # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs
+        # ``asym_id``, and AFTER the chain permutation above so a "clean chain"
+        # names the same copy the GT was permuted to.
+        clean_mask = None
+        if self.training and diff_cfg_t.diffusion_mask_prob > 0.0 and features.get("asym_id") is not None:
+            from deepfold3.model.diffusion import build_diffusion_clean_mask
+
+            clean_mask = build_diffusion_clean_mask(
+                features["asym_id"],
+                seq_mask,
+                diffusion_batch_size,
+                prob=diff_cfg_t.diffusion_mask_prob,
+                mode=diff_cfg_t.diffusion_mask_mode,
+                min_frac=diff_cfg_t.diffusion_mask_min_frac,
+                max_frac=diff_cfg_t.diffusion_mask_max_frac,
+            )
+
         chunked = (
             diffusion_chunk_size > 0
             and backward_fn is not None
@@ -714,7 +741,12 @@ class DeepFold3(nn.Module):
             # Always slice per batch element (batch dim is always kept).
             B_pair = pair_real.shape[0]  # [B, N, N, C]
 
-            for _ in range(num_chunks):
+            for chunk_i in range(num_chunks):
+                # ``clean_mask`` is [B, diffusion_batch_size, N]; hand each chunk
+                # its own slice so the per-sample fire decisions are preserved.
+                cm_c = None
+                if clean_mask is not None:
+                    cm_c = clean_mask[:, chunk_i * diffusion_chunk_size : (chunk_i + 1) * diffusion_chunk_size]
                 gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
                     gt_positions=diffusion_gt_pos,
                     gt_mask=diffusion_gt_mask,
@@ -722,6 +754,8 @@ class DeepFold3(nn.Module):
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
                     num_samples=diffusion_chunk_size,
+                    clean_mask=cm_c,
+                    use_conditioning=use_conditioning,
                     **ref_kwargs,
                 )
                 # chunk_pred shapes:
@@ -737,6 +771,8 @@ class DeepFold3(nn.Module):
                         "noise_levels": noise_levels_c[b],
                         "mini_rollout_pos": mini_pos_batched[b],
                     }
+                    if cm_c is not None:
+                        chunk_pred_b["diffusion_clean_mask"] = cm_c[b]
                     if "chain_perm_gate_pos" in pred:
                         chunk_pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
                     features_b = {
@@ -771,11 +807,18 @@ class DeepFold3(nn.Module):
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,
                 num_samples=diffusion_batch_size,
+                clean_mask=clean_mask,
+                use_conditioning=use_conditioning,
                 **ref_kwargs,
             )
             pred["denoised"] = denoised
             pred["gt_augmented"] = gt_aug
             pred["noise_levels"] = noise_levels
+            if clean_mask is not None:
+                # Read by ``training_loss`` so the diffusion MSE scores only the
+                # atoms whose input was noise. [B, S, N] — ``slice_batch_dict``
+                # peels the batch dim to [S, N] for the per-example loss.
+                pred["diffusion_clean_mask"] = clean_mask
 
         # --- 4. Confidence head ---
         # ``compute_confidence`` gates only the confidence head forward so
@@ -791,8 +834,17 @@ class DeepFold3(nn.Module):
             # AF3 §3.7: confidence head trains over fixed (detached) trunk
             # outputs and the (already-detached) mini-rollout positions, so
             # confidence-loss gradients update only confidence-head parameters.
+            # OF3 ``use_confidence_emb_prob`` (`head_modules.py:195-196`):
+            # zero the trunk PAIR embedding into the confidence head with some
+            # probability, training-only, pair-only. The distogram head below
+            # reads the un-zeroed ``embeddings["pair"]``, matching OF3's
+            # ordering, so the distogram loss is never affected.
+            conf_pair = embeddings["pair"].detach()
+            if self.training and self.cfg.confidence.use_pair_emb_prob < 1.0:
+                if not bool(torch.rand(()) < self.cfg.confidence.use_pair_emb_prob):
+                    conf_pair = conf_pair * 0
             conf_out = self.confidence_head(
-                pair=embeddings["pair"].detach(),
+                pair=conf_pair,
                 single=embeddings["single"].detach(),
                 pair_mask=pair_mask,
                 seq_mask=seq_mask,
