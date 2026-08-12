@@ -168,14 +168,23 @@ def _run_one_job(
     job_name = job.name
     job_title = job.description or job.name
 
+    # Chain names as written in the input JSON, in asym_id order — otherwise the
+    # output is renamed A, B, C, … and name-keyed consumers (bench per-interface
+    # ids, chain_pair_iptm) silently mismatch.
+    from deepfold3.data.module.dataset import job_chain_ids
+    from deepfold3.io.mmcif import resolve_chain_name
+
+    chain_names = job_chain_ids(job)
+
     chain_idx = 0
     desc_map: dict[str, str] = {}
     for chain_list in [job.protein_chains, job.dna_chains, job.rna_chains, job.ligand_chains]:
         for chain in chain_list:
-            chain_name = chr(ord("A") + chain_idx)
-            if chain.description:
-                desc_map[chain_name] = chain.description
-            chain_idx += 1
+            n_expanded = len(chain.ccd_ids) if getattr(chain, "ccd_ids", None) else 1
+            for _ in range(n_expanded):
+                if chain.description:
+                    desc_map[resolve_chain_name(chain_idx, chain_names)] = chain.description
+                chain_idx += 1
     entity_descriptions = desc_map or None
 
     feats = InferenceInput.from_job(job)
@@ -249,9 +258,17 @@ def _run_one_job(
                 entity_descriptions=entity_descriptions,
                 title=job_title,
                 sample_idx=s,
+                chain_names=chain_names,
             )
             conf_path = sample_dir / "confidences.json"
-            summary = save_confidences_json(conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed))
+            summary = save_confidences_json(
+                conf_path,
+                model_output,
+                iter_feats,
+                sample_idx=s,
+                seed=int(current_seed),
+                chain_names=chain_names,
+            )
             summary = {**summary, "seed": int(current_seed), "sample": int(s)}
             summaries.append(summary)
             if plot_confidences:

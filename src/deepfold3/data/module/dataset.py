@@ -1254,6 +1254,37 @@ class InferenceInput:
         )
 
 
+def job_chain_ids(job) -> list[str | None]:
+    """Chain names from the input JSON, in ``asym_id`` order.
+
+    ``InferenceInput.from_job`` names its internal chains ``A``, ``B``, ``C``, …
+    in the order protein → DNA → RNA → ligand, so ``asym_id`` follows that order
+    and the ids the caller wrote in the JSON are otherwise lost by output time.
+    This returns the original ids in the same order, with ``None`` wherever the
+    dialect supplies no name (AlphaFold-Server / Protenix are count-based) so
+    writers can fall back to the synthetic letter for that chain.
+
+    A ligand entry with several ``ccdCodes`` is expanded by ``from_job`` into one
+    chain per code, so a single id cannot label them all: such a group yields
+    ``None`` throughout rather than guessing which expanded chain owns the name.
+
+    The ordering here MUST match ``from_job``; ``tests/test_json_chain_ids.py``
+    pins the two together.
+    """
+    ids: list[str | None] = []
+    for pc in job.protein_chains:
+        ids.append(getattr(pc, "chain_id", None))
+    for dc in job.dna_chains:
+        ids.append(getattr(dc, "chain_id", None))
+    for rc in job.rna_chains:
+        ids.append(getattr(rc, "chain_id", None))
+    for lig in job.ligand_chains:
+        n = len(lig.ccd_ids) if lig.ccd_ids else 1
+        cid = getattr(lig, "chain_id", None)
+        ids.extend([cid if n == 1 else None] * n)
+    return ids
+
+
 def _letter_to_res_name(letter: str, mol_type: int) -> str:
     """Map a single-character residue letter to its canonical residue name."""
     if mol_type == const.MOL_PROTEIN:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -870,6 +871,7 @@ def save_confidences_json(
     sample_idx: int = 0,
     cfg: ConfidenceConfig | None = None,
     seed: int | None = None,
+    chain_names: Sequence[str | None] | None = None,
 ) -> dict:
     """Compute all confidence metrics and save as JSON.
 
@@ -911,10 +913,13 @@ def save_confidences_json(
     result: dict = {}
 
     # Chain IDs per token
-    from deepfold3.io.mmcif import asym_id_to_chain_name
+    from deepfold3.io.mmcif import normalize_chain_names, resolve_chain_name
 
     asym_cpu = asym_id.cpu()
-    token_chain_ids = [asym_id_to_chain_name(int(a)) for a in asym_cpu]
+    # Same vetting the mmCIF writers apply, so the names in confidences.json and
+    # in model.cif cannot disagree.
+    chain_names = normalize_chain_names(chain_names, asym_cpu.unique().tolist())
+    token_chain_ids = [resolve_chain_name(int(a), chain_names) for a in asym_cpu]
     result["token_chain_ids"] = token_chain_ids
     result["token_res_ids"] = residue_index.cpu().tolist()
 
@@ -1016,7 +1021,8 @@ def save_confidences_json(
     # Keyed by chain name (``"A-B"``) so consumers can look an interface up by the
     # names they already carry, e.g. the bench's per-interface (ic1, ic2).
     chain_pair_iptm = {
-        f"{asym_id_to_chain_name(a)}-{asym_id_to_chain_name(b)}": round(v, 4) for (a, b), v in pair_iptm.items()
+        f"{resolve_chain_name(a, chain_names)}-{resolve_chain_name(b, chain_names)}": round(v, 4)
+        for (a, b), v in pair_iptm.items()
     }
 
     summary = {

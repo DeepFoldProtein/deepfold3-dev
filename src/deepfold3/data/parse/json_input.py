@@ -64,6 +64,11 @@ class ProteinChainInput:
             at ``position`` should be assembled using ``ccd_code`` (e.g. ``"SEP"``)
             instead of the canonical amino acid.
         description: Optional textual description of this chain.
+        chain_id: Chain name from the input JSON (AF3-style ``id``), carried so
+            the output mmCIF / confidences can be labelled with the ids the
+            caller asked for instead of synthetic A, B, C, … ``None`` for
+            dialects that do not name chains (AlphaFold-Server, Protenix), which
+            fall back to the synthetic naming.
     """
 
     sequence: str
@@ -73,6 +78,7 @@ class ProteinChainInput:
     template_hits: list[TemplateHitInput] = field(default_factory=list)
     modifications: list[tuple[str, int]] = field(default_factory=list)
     description: str | None = None
+    chain_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -89,6 +95,7 @@ class NucleotideChainInput:
             tuples where ``position`` is 1-based within the chain (e.g.
             ``("5MC", 4)`` for 5-methylcytosine at position 4).
         description: Optional textual description of this chain.
+        chain_id: Chain name from the input JSON; see ``ProteinChainInput``.
     """
 
     sequence: str
@@ -98,6 +105,7 @@ class NucleotideChainInput:
     unpaired_msa: MSA | None = None
     modifications: list[tuple[str, int]] = field(default_factory=list)
     description: str | None = None
+    chain_id: str | None = None
 
 
 @dataclasses.dataclass
@@ -111,12 +119,14 @@ class LigandChainInput:
         smiles: SMILES string for a custom molecule.
         count: Number of copies of this ligand.
         description: Optional textual description of this ligand.
+        chain_id: Chain name from the input JSON; see ``ProteinChainInput``.
     """
 
     ccd_ids: list[str] | None = None
     smiles: str | None = None
     count: int = 1
     description: str | None = None
+    chain_id: str | None = None
 
 
 BondedAtom = tuple[str, int, str]  # (chain_id, residue_index_1based, atom_name)
@@ -308,9 +318,10 @@ def _parse_af3_entry(
                 )
             mods = _parse_modifications(p.get("modifications"))
             desc = p.get("description")
-            for _ in ids or [None]:
+            for cid in ids or [None]:
                 protein_chains.append(
                     ProteinChainInput(
+                        chain_id=cid,
                         sequence=seq,
                         count=1,
                         paired_msa=paired,
@@ -328,9 +339,10 @@ def _parse_af3_entry(
             paired = _resolve_msa(base_dir, const.MOL_DNA, d.get("pairedMsaPath"), d.get("pairedMsa"))
             mods = _parse_modifications(d.get("modifications"))
             desc = d.get("description")
-            for _ in ids or [None]:
+            for cid in ids or [None]:
                 dna_chains.append(
                     NucleotideChainInput(
+                        chain_id=cid,
                         sequence=seq,
                         count=1,
                         mol_type=const.MOL_DNA,
@@ -348,9 +360,10 @@ def _parse_af3_entry(
             paired = _resolve_msa(base_dir, const.MOL_RNA, r.get("pairedMsaPath"), r.get("pairedMsa"))
             mods = _parse_modifications(r.get("modifications"))
             desc = r.get("description")
-            for _ in ids or [None]:
+            for cid in ids or [None]:
                 rna_chains.append(
                     NucleotideChainInput(
+                        chain_id=cid,
                         sequence=seq,
                         count=1,
                         mol_type=const.MOL_RNA,
@@ -366,11 +379,13 @@ def _parse_af3_entry(
             ccd_codes = lig.get("ccdCodes")
             smiles_str = lig.get("smiles")
             desc = lig.get("description")
-            for _ in ids or [None]:
+            for cid in ids or [None]:
                 if ccd_codes:
-                    ligand_chains.append(LigandChainInput(ccd_ids=list(ccd_codes), count=1, description=desc))
+                    ligand_chains.append(
+                        LigandChainInput(chain_id=cid, ccd_ids=list(ccd_codes), count=1, description=desc)
+                    )
                 elif smiles_str:
-                    ligand_chains.append(LigandChainInput(smiles=smiles_str, count=1, description=desc))
+                    ligand_chains.append(LigandChainInput(chain_id=cid, smiles=smiles_str, count=1, description=desc))
 
     if not protein_chains and not dna_chains and not rna_chains and not ligand_chains:
         raise ValueError(f"No chains found in job {name!r}")

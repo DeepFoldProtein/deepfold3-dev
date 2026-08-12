@@ -306,6 +306,7 @@ def inference(
     job_name: str | None = None
     entity_descriptions: dict[str, str] | None = None
     job_title: str | None = None
+    chain_names: list[str | None] | None = None
     if json_input is not None:
         click.echo(f"[inference] featurizing {json_input} …")
         from deepfold3.data.parse.json_input import parse_json_input
@@ -317,15 +318,26 @@ def inference(
         job_name = job.name
         job_title = job.description or job.name
 
-        # Build entity descriptions from chain descriptions
-        chain_idx = 0
+        # Chain names as written in the input JSON, in asym_id order. Without
+        # this the output is renamed A, B, C, … so a job asking for A/B/D/E gets
+        # A/B/C/D back and every name-keyed consumer silently mismatches.
+        from deepfold3.data.module.dataset import job_chain_ids
+        from deepfold3.io.mmcif import resolve_chain_name
+
+        chain_names = job_chain_ids(job)
+
+        # Build entity descriptions from chain descriptions, keyed by the same
+        # names the writers will use. A multi-CCD ligand expands to several
+        # chains, so walk asym_id and let job_chain_ids define the ordering.
         desc_map: dict[str, str] = {}
+        chain_idx = 0
         for chain_list in [job.protein_chains, job.dna_chains, job.rna_chains, job.ligand_chains]:
             for chain in chain_list:
-                chain_name = chr(ord("A") + chain_idx)
-                if chain.description:
-                    desc_map[chain_name] = chain.description
-                chain_idx += 1
+                n_expanded = len(chain.ccd_ids) if getattr(chain, "ccd_ids", None) else 1
+                for _ in range(n_expanded):
+                    if chain.description:
+                        desc_map[resolve_chain_name(chain_idx, chain_names)] = chain.description
+                    chain_idx += 1
         if desc_map:
             entity_descriptions = desc_map
 
@@ -450,6 +462,7 @@ def inference(
                 iter_feats,
                 entity_descriptions=entity_descriptions,
                 title=job_title,
+                chain_names=chain_names,
             )
             click.echo(f"  saved  {cif_path.resolve()}")
 
@@ -464,6 +477,7 @@ def inference(
                     entity_descriptions=entity_descriptions,
                     title=job_title,
                     sample_idx=s,
+                    chain_names=chain_names,
                 )
                 conf_path = sample_dir / "confidences.json"
                 logits_npz = sample_dir / "logits.npz"
@@ -473,7 +487,14 @@ def inference(
                 conf_path = output_dir / f"{stem}{suffix}_confidences.json"
                 logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
 
-            summary = save_confidences_json(conf_path, model_output, iter_feats, sample_idx=s, seed=int(current_seed))
+            summary = save_confidences_json(
+                conf_path,
+                model_output,
+                iter_feats,
+                sample_idx=s,
+                seed=int(current_seed),
+                chain_names=chain_names,
+            )
             summary = {**summary, "seed": int(current_seed), "sample": int(s)}
             summaries.append(summary)
 

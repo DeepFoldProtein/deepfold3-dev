@@ -9,6 +9,8 @@ _ma_qa_metric_local per-residue confidence scores.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -21,6 +23,8 @@ except ImportError as e:
 from deepfold3.data.const import ELEMENT_TO_INT, MOL_NONPOLYMER, RES_TYPE_INDEX_TO_NAME, THREE_LETTER_TO_ONE
 from deepfold3.io.confidences import compute_plddt
 from deepfold3.model.model import DeepFold3Output
+
+logger = logging.getLogger(__name__)
 
 # Reverse element map: atomic number -> symbol
 _INT_TO_ELEMENT: dict[int, str] = {v: k for k, v in ELEMENT_TO_INT.items()}
@@ -58,6 +62,45 @@ _CHEM_COMP_TYPE: dict[str, str] = {
     "DC": "DNA linking",
     "DT": "DNA linking",
 }
+
+
+def normalize_chain_names(chain_names: Sequence[str | None] | None, unique_asym_ids: Sequence[int]) -> list[str] | None:
+    """Vet caller-supplied chain names, or return ``None`` to use synthetic ones.
+
+    Mixing supplied and missing names can collide: with ``["A", None, "D"]`` the
+    unnamed chain falls back to its synthetic ``"B"`` — fine — but a supplied
+    ``"C"`` on chain 3 would clash with chain 2's synthetic ``"C"``. Duplicate
+    chain names silently merge chains in downstream mmCIF consumers, so if the
+    resolved set is not unique we drop the whole mapping and log it rather than
+    emit an ambiguous file.
+    """
+    if chain_names is None:
+        return None
+    resolved = [resolve_chain_name(int(a), chain_names) for a in unique_asym_ids]
+    if len(set(resolved)) != len(resolved):
+        logger.warning(
+            "chain_names %r resolve to duplicate names %r for asym_ids %r; falling back to synthetic A, B, C, … naming",
+            list(chain_names),
+            resolved,
+            list(unique_asym_ids),
+        )
+        return None
+    return resolved
+
+
+def resolve_chain_name(asym_id: int, chain_names: Sequence[str | None] | None = None) -> str:
+    """Chain name for ``asym_id``: the caller's id if it supplied one, else synthetic.
+
+    ``chain_names`` is indexed by ``asym_id`` (see
+    ``deepfold3.data.module.dataset.job_chain_ids``). Any missing or ``None``
+    entry falls back to ``asym_id_to_chain_name``, so dialects that do not name
+    chains keep the historical A, B, C, … output.
+    """
+    if chain_names is not None and 0 <= asym_id < len(chain_names):
+        name = chain_names[asym_id]
+        if name:
+            return str(name)
+    return asym_id_to_chain_name(asym_id)
 
 
 def asym_id_to_chain_name(asym_id: int) -> str:
@@ -260,6 +303,7 @@ def save_mmcif(
     entity_descriptions: dict[str, str] | None = None,
     title: str | None = None,
     sample_idx: int | None = None,
+    chain_names: Sequence[str | None] | None = None,
 ) -> None:
     """Write predicted structure(s) to an mmCIF file.
 
@@ -285,6 +329,10 @@ def save_mmcif(
     sample_idx :     If provided, write only this single sample (one MODEL
                      block). Used by the AF3-compatible per-(seed, sample)
                      output layout.
+    chain_names :    Optional chain names indexed by asym_id (from
+                     ``dataset.job_chain_ids``). Without it, chains are named
+                     synthetically A, B, C, … which silently renames any input
+                     whose ids are not exactly that sequence.
     """
     from deepfold3.io.structure_builder import prediction_to_structure
     from deepfold3.io.structure_mmcif import save_structure_mmcif
@@ -299,20 +347,33 @@ def save_mmcif(
         if sample_idx < 0 or sample_idx >= num_samples:
             raise IndexError(f"sample_idx={sample_idx} out of range for {num_samples} samples")
         structure = prediction_to_structure(
-            output, features, sample_idx=sample_idx, name=path.stem, num_plddt_bins=num_plddt_bins
+            output,
+            features,
+            sample_idx=sample_idx,
+            name=path.stem,
+            num_plddt_bins=num_plddt_bins,
+            chain_names=chain_names,
         )
         save_structure_mmcif(path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title)
         return
 
     if num_samples == 1:
         structure = prediction_to_structure(
-            output, features, sample_idx=0, name=path.stem, num_plddt_bins=num_plddt_bins
+            output, features, sample_idx=0, name=path.stem, num_plddt_bins=num_plddt_bins, chain_names=chain_names
         )
         save_structure_mmcif(path, structure, entry_id=path.stem, entity_descriptions=entity_descriptions, title=title)
     else:
         # For backward compatibility: write multi-model mmCIF using legacy path
         # for multi-sample outputs, since Structure only holds one model.
-        _save_mmcif_legacy(path, output, features, num_plddt_bins, entity_descriptions=entity_descriptions, title=title)
+        _save_mmcif_legacy(
+            path,
+            output,
+            features,
+            num_plddt_bins,
+            entity_descriptions=entity_descriptions,
+            title=title,
+            chain_names=chain_names,
+        )
 
 
 def _save_mmcif_legacy(
@@ -322,6 +383,7 @@ def _save_mmcif_legacy(
     num_plddt_bins: int = 50,
     entity_descriptions: dict[str, str] | None = None,
     title: str | None = None,
+    chain_names: Sequence[str | None] | None = None,
 ) -> None:
     """Legacy multi-model mmCIF writer (used when num_samples > 1)."""
     atom_positions = output.atom_positions.cpu()
@@ -358,12 +420,13 @@ def _save_mmcif_legacy(
     st.spacegroup_hm = "P 1"
 
     unique_asym_ids = asym_id.unique().tolist()
+    chain_names = normalize_chain_names(chain_names, unique_asym_ids)
 
     for sample_idx in range(num_samples):
         model = gemmi.Model(str(sample_idx + 1))
 
         for asym in unique_asym_ids:
-            chain_name = asym_id_to_chain_name(int(asym))
+            chain_name = resolve_chain_name(int(asym), chain_names)
             chain = gemmi.Chain(chain_name)
 
             token_indices = (asym_id == asym).nonzero(as_tuple=True)[0]
@@ -460,7 +523,7 @@ def _save_mmcif_legacy(
 
     plddt_per_residue: dict[tuple[str, str, int], float] = {}
     for asym in unique_asym_ids:
-        chain_name = asym_id_to_chain_name(int(asym))
+        chain_name = resolve_chain_name(int(asym), chain_names)
         token_indices = (asym_id == asym).nonzero(as_tuple=True)[0]
         for token_i in token_indices.tolist():
             mask_i = ref_mask[token_i]

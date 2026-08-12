@@ -6,6 +6,8 @@ output to the Structure-centric I/O layer.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 
@@ -19,7 +21,7 @@ from deepfold3.data.types import (
     Structure,
 )
 from deepfold3.io.confidences import compute_plddt
-from deepfold3.io.mmcif import _decode_atom_name, asym_id_to_chain_name
+from deepfold3.io.mmcif import _decode_atom_name, normalize_chain_names, resolve_chain_name
 from deepfold3.model.model import DeepFold3Output
 
 
@@ -40,6 +42,7 @@ def prediction_to_structure(
     sample_idx: int = 0,
     name: str = "prediction",
     num_plddt_bins: int = 50,
+    chain_names: Sequence[str | None] | None = None,
 ) -> Structure:
     """Convert a model prediction to a Structure.
 
@@ -50,6 +53,9 @@ def prediction_to_structure(
     sample_idx   : Which diffusion sample to use.
     name         : Structure name/identifier.
     num_plddt_bins : Number of pLDDT bins (default 50).
+    chain_names  : Optional chain names indexed by asym_id (from
+                   ``dataset.job_chain_ids``); ``None`` entries fall back to the
+                   synthetic A, B, C, … naming.
 
     Returns
     -------
@@ -84,6 +90,7 @@ def prediction_to_structure(
 
     # Group tokens by asym_id to build chains
     unique_asym_ids = asym_id.unique(sorted=True).tolist()
+    chain_names = normalize_chain_names(chain_names, unique_asym_ids)
 
     all_atoms: list[tuple] = []
     all_residues: list[tuple] = []
@@ -98,7 +105,7 @@ def prediction_to_structure(
 
     for asym in unique_asym_ids:
         token_indices = (asym_id == asym).nonzero(as_tuple=True)[0].tolist()
-        chain_name = asym_id_to_chain_name(int(asym))
+        chain_name = resolve_chain_name(int(asym), chain_names)
 
         # Determine mol_type from feature tensor (definitive) or infer from res_type (fallback)
         if mol_type_feat is not None:
@@ -218,6 +225,7 @@ def prediction_to_structures(
     features: dict[str, torch.Tensor],
     name: str = "prediction",
     num_plddt_bins: int = 50,
+    chain_names: Sequence[str | None] | None = None,
 ) -> list[Structure]:
     """Convert all diffusion samples to Structure objects.
 
@@ -225,6 +233,13 @@ def prediction_to_structures(
     """
     num_samples = output.atom_positions.shape[0]
     return [
-        prediction_to_structure(output, features, sample_idx=s, name=f"{name}_s{s}", num_plddt_bins=num_plddt_bins)
+        prediction_to_structure(
+            output,
+            features,
+            sample_idx=s,
+            name=f"{name}_s{s}",
+            num_plddt_bins=num_plddt_bins,
+            chain_names=chain_names,
+        )
         for s in range(num_samples)
     ]
