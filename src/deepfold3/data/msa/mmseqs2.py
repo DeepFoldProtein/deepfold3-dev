@@ -280,6 +280,13 @@ def _save_cache(cache_dir: Path, key: str, result: MsaResult) -> None:
 
 _DEFAULT_SERVER = "https://api.colabfold.com"
 _CONNECT_TIMEOUT = 6.02  # slightly > multiple of 3, per requests best practice
+# Result downloads need their own, far larger budget: `timeout` is a *per-read*
+# socket deadline, and the public server streams result tars at a few KB/s. A
+# 5-chain search yields a ~4 MB tar (~10 min at the observed rate), which cannot
+# finish inside _CONNECT_TIMEOUT — so the download died after _MAX_RETRIES even
+# though the search itself had completed. Submit/poll keep the short timeout
+# (small JSON bodies, where fast failure is what we want).
+_DOWNLOAD_TIMEOUT = 1800.0
 _MAX_RETRIES = 5
 
 
@@ -339,7 +346,7 @@ def _poll(url: str, ticket_id: str, headers: dict[str, str], timeout: float) -> 
 def _download(url: str, ticket_id: str, headers: dict[str, str]) -> bytes:
     """Download result tar.gz as bytes."""
     req = urllib.request.Request(f"{url}/result/download/{ticket_id}", headers=headers)
-    return _urlopen_with_retry(req, timeout=_CONNECT_TIMEOUT)
+    return _urlopen_with_retry(req, timeout=_DOWNLOAD_TIMEOUT)
 
 
 def _extract_a3m(tar_bytes: bytes, n_chains: int, use_env: bool, use_pairing: bool) -> MsaResult:
