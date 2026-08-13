@@ -169,11 +169,14 @@ def test_sentinel_free_tokenizer_packs_without_delimiters():
     plm._tok = replace(_TOK, cls_id=None, eos_id=None)
     ids = torch.tensor([10, 11, 12, 20, 21])
     asym = torch.tensor([0, 0, 0, 1, 1])
-    packed, seq_id, pos = plm._pack(ids, asym)
+    res_idx = torch.tensor([0, 1, 2, 5, 6])
+    packed, seq_id, pos, pos_ids = plm._pack(ids, asym, res_idx)
 
     assert torch.equal(packed, ids)  # no delimiters inserted
     assert torch.equal(seq_id, torch.tensor([0, 0, 0, 1, 1]))
     assert torch.equal(pos, torch.arange(5))
+    # each chain rebased to 0; spacing preserved
+    assert torch.equal(pos_ids, torch.tensor([0, 1, 2, 0, 1]))
 
 
 def test_sentinel_packing_assigns_delimiters_to_their_chain():
@@ -181,8 +184,54 @@ def test_sentinel_packing_assigns_delimiters_to_their_chain():
     plm._tok = _TOK
     ids = torch.tensor([10, 11, 20])
     asym = torch.tensor([0, 0, 1])
-    packed, seq_id, pos = plm._pack(ids, asym)
+    res_idx = torch.tensor([0, 1, 3])
+    packed, seq_id, pos, pos_ids = plm._pack(ids, asym, res_idx)
 
     assert torch.equal(packed, torch.tensor([_CLS, 10, 11, _EOS, _CLS, 20, _EOS]))
     assert torch.equal(seq_id, torch.tensor([0, 0, 0, 0, 1, 1, 1]))
     assert torch.equal(packed[pos], ids)
+    assert torch.equal(pos_ids, torch.tensor([0, 1, 2, 3, 0, 1, 2]))
+
+
+def test_unresolved_gaps_widen_rotary_spacing():
+    """A break in residue numbering must survive into position_ids, or RoPE
+    reports a separation of 1 across an unresolved loop."""
+    plm = FrozenPLM("/nonexistent", join="per_chain")
+    plm._tok = _TOK
+    ids = torch.tensor([10, 11, 12])
+    asym = torch.zeros(3, dtype=torch.long)
+    res_idx = torch.tensor([0, 1, 30])  # 28 residues unresolved
+    _, _, _, pos_ids = plm._pack(ids, asym, res_idx)
+    assert torch.equal(pos_ids, torch.tensor([0, 1, 2, 31, 32]))
+
+
+def test_chain_offset_is_invariant_under_per_chain():
+    """Shifting one chain's positions must not change its embedding when
+    attention is block-diagonal: RoPE is relative, so a constant offset inside
+    a block cancels. This is what licenses rebasing each chain to 0, which in
+    turn keeps positions inside the range ESM2 was pre-trained on."""
+    model = _tiny()
+    ids = torch.tensor([[_CLS, 5, 6, 7, _EOS, _CLS, 8, 9, _EOS]])
+    seq_id = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 1, 1]])
+    base = torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2, 3]])
+
+    with torch.no_grad():
+        ref = model(ids, sequence_id=seq_id, position_ids=base)
+        shifted = base.clone()
+        shifted[0, :5] += 250  # move chain A only
+        moved = model(ids, sequence_id=seq_id, position_ids=shifted)
+
+    assert (moved[0, 1:4] - ref[0, 1:4]).abs().max() < 1e-4  # chain A unchanged
+    assert torch.equal(moved[0, 6:8], ref[0, 6:8])  # chain B untouched
+
+
+def test_joined_positions_are_monotonic_and_non_negative():
+    """Chains share one position axis under ``joined``, so restarting each at 0
+    would give residue k of chain A and residue k of chain B the same phase —
+    a relative distance of zero across the interface."""
+    plm = FrozenPLM("/nonexistent", join="joined")
+    plm._tok = _TOK
+    _, _, _, pos = plm._pack(torch.tensor([10, 11, 20]), torch.tensor([0, 0, 1]), torch.tensor([0, 5, 3]))
+    assert int(pos.min()) >= 0
+    assert bool((pos[1:] >= pos[:-1]).all())
+    assert len(set(pos.tolist())) == len(pos)  # no collisions between chains

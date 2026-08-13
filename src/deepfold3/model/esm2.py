@@ -147,12 +147,27 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``q``/``k``: ``[B, H, L, D]``."""
-        t = torch.arange(k.shape[-2], device=k.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos, sin = emb.cos()[None, None], emb.sin()[None, None]
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``q``/``k``: ``[B, H, L, D]``; ``position_ids``: ``[B, L]``.
+
+        Explicit positions matter because the sequence handed to the LM is not
+        always contiguous: unresolved residues are absent from the structure and
+        a training crop removes more, so consecutive input rows can be far apart
+        in the real chain. With the default ``arange`` those gaps vanish and RoPE
+        reports a separation of 1 across a break of twenty.
+        """
+        if position_ids is None:
+            t = torch.arange(k.shape[-2], device=k.device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq)[None]  # [1, L, D/2]
+        else:
+            freqs = position_ids.to(self.inv_freq.dtype)[..., None] * self.inv_freq
+        emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(1)  # [B?, 1, L, D]
+        cos, sin = emb.cos(), emb.sin()
         return (
             (q * cos + _rotate_half(q) * sin).to(q.dtype),
             (k * cos + _rotate_half(k) * sin).to(k.dtype),
@@ -169,7 +184,12 @@ class ESM2SelfAttention(nn.Module):
         self.value = nn.Linear(cfg.hidden_size, cfg.hidden_size)
         self.rotary_embeddings = RotaryEmbedding(self.head_dim)
 
-    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_bias: torch.Tensor | None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, L, _ = x.shape
         shape = (B, L, self.num_heads, self.head_dim)
         q = self.query(x).view(shape).transpose(1, 2)
@@ -178,7 +198,7 @@ class ESM2SelfAttention(nn.Module):
         # ESM scales the *query* before RoPE rather than scaling the logits
         # after; with rotary the two are not interchangeable.
         q = q * self.head_dim**-0.5
-        q, k = self.rotary_embeddings(q, k)
+        q, k = self.rotary_embeddings(q, k, position_ids)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, scale=1.0)
         return out.transpose(1, 2).reshape(B, L, -1)
 
@@ -193,8 +213,13 @@ class ESM2Layer(nn.Module):
         self.fc1 = nn.Linear(cfg.hidden_size, cfg.intermediate_size)
         self.fc2 = nn.Linear(cfg.intermediate_size, cfg.hidden_size)
 
-    def forward(self, x: torch.Tensor, attn_bias: torch.Tensor | None) -> torch.Tensor:
-        h = self.self_attn(self.attention_ln(x), attn_bias)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_bias: torch.Tensor | None,
+        position_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        h = self.self_attn(self.attention_ln(x), attn_bias, position_ids)
         x = x + self.attn_out(h)
         h = _gelu(self.fc1(self.ffn_ln(x)))
         return x + self.fc2(h)
@@ -253,8 +278,14 @@ class ESM2Encoder(nn.Module):
         self,
         input_ids: torch.Tensor,  # [B, L]
         sequence_id: torch.Tensor | None = None,  # [B, L], -1 for padding
+        position_ids: torch.Tensor | None = None,  # [B, L]
     ) -> torch.Tensor:
-        """Returns ``[B, L, num_hidden_layers + 1, hidden_size]``."""
+        """Returns ``[B, L, num_hidden_layers + 1, hidden_size]``.
+
+        ``position_ids`` should carry true residue numbering when the input has
+        gaps (unresolved regions, or a crop); ``None`` falls back to contiguous
+        positions, which is only correct for a complete chain.
+        """
         pad_mask = input_ids.ne(self.cfg.pad_token_id)
         x = self.word_embeddings(input_ids)
 
@@ -276,7 +307,7 @@ class ESM2Encoder(nn.Module):
         attn_bias = self._attn_bias(input_ids, sequence_id, x.dtype)
         states = [x]
         for layer in self.layers:
-            x = layer(x, attn_bias)
+            x = layer(x, attn_bias, position_ids)
             states.append(x)
         states[-1] = self.emb_ln_after(x)
         return torch.stack(states, dim=-2)

@@ -170,8 +170,10 @@ class FrozenPLM(nn.Module):
         rank[order] = torch.arange(n_res, device=keep.device)
         return keep[first[order]], rank[inverse]
 
-    def _pack(self, ids: torch.Tensor, asym: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pack one example's chains into ``(input_ids, sequence_id, position_of_residue)``.
+    def _pack(
+        self, ids: torch.Tensor, asym: torch.Tensor, res_idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack chains into ``(input_ids, sequence_id, position_of_residue, position_ids)``.
 
         Layout is ``[CLS] c1 [EOS CLS] c2 ... [EOS]`` when the tokenizer has
         sentinels, and plain ``c1 c2 ...`` when it does not.
@@ -187,27 +189,49 @@ class FrozenPLM(nn.Module):
         has_sentinel = tok.cls_id is not None and tok.eos_id is not None
         parts: list[torch.Tensor] = []
         seg: list[torch.Tensor] = []
+        pos_ids: list[torch.Tensor] = []
         positions: list[torch.Tensor] = []
-        cursor = 0
+        cursor = 0  # index into the packed sequence
+        base = 0  # start of the current chain on the position axis
 
-        def emit(values: list[int], chain: int) -> None:
+        def emit(value: int, chain: int, pos: int) -> None:
             nonlocal cursor
-            parts.append(torch.tensor(values, device=device, dtype=torch.long))
-            seg.append(torch.full((len(values),), chain, device=device, dtype=torch.long))
-            cursor += len(values)
+            parts.append(torch.tensor([value], device=device, dtype=torch.long))
+            seg.append(torch.tensor([chain], device=device, dtype=torch.long))
+            pos_ids.append(torch.tensor([pos], device=device, dtype=torch.long))
+            cursor += 1
 
-        chains = torch.unique_consecutive(asym).tolist()
-        for i, cid in enumerate(chains):
-            if has_sentinel:
-                emit([tok.cls_id], i)
+        for i, cid in enumerate(torch.unique_consecutive(asym).tolist()):
             idx = (asym == cid).nonzero(as_tuple=True)[0]
+            # Spacing is what has to survive: it encodes the unresolved and
+            # cropped-away residues that would otherwise look adjacent.
+            #
+            # The base differs by join. Under per_chain the offset provably
+            # cancels — RoPE is relative and attention is block-diagonal, which
+            # ``test_chain_offset_is_invariant_under_per_chain`` pins down — so
+            # restarting every chain at 0 is free, and it keeps positions inside
+            # the range ESM2 was pre-trained on (author numbering can start
+            # negative or in the thousands). Under joined the chains share one
+            # position axis, so restarting would give residue 5 of chain A and
+            # residue 5 of chain B the same phase, i.e. a relative distance of
+            # zero; there the axis has to keep running.
+            rel = res_idx[idx] - res_idx[idx].min()
+            if self.join != "joined":
+                base = 0
+            if has_sentinel:
+                emit(tok.cls_id, i, base)
+                base += 1
             parts.append(ids[idx])
             seg.append(torch.full((idx.numel(),), i, device=device, dtype=torch.long))
+            pos_ids.append(rel + base)
             positions.append(torch.arange(cursor, cursor + idx.numel(), device=device))
             cursor += idx.numel()
+            end = base + int(rel.max())
             if has_sentinel:
-                emit([tok.eos_id], i)
-        return torch.cat(parts), torch.cat(seg), torch.cat(positions)
+                emit(tok.eos_id, i, end + 1)
+                end += 1
+            base = end + 1
+        return torch.cat(parts), torch.cat(seg), torch.cat(positions), torch.cat(pos_ids)
 
     # -- forward ---------------------------------------------------------
 
@@ -234,6 +258,7 @@ class FrozenPLM(nn.Module):
         rows: list[int] = []
         packed: list[torch.Tensor] = []
         seq_ids: list[torch.Tensor] = []
+        pos_id_list: list[torch.Tensor] = []
         gathers: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         table = tok.res_type_to_id.to(res_type.device)
 
@@ -246,7 +271,9 @@ class FrozenPLM(nn.Module):
             if self.mask_pct > 0:
                 drop = torch.rand(ids.shape, device=ids.device) < self.mask_pct
                 ids = torch.where(drop, torch.full_like(ids, tok.mask_id), ids)
-            input_ids, seq_id, pos_of_res = self._pack(ids, asym_id[b][tok_of_res])
+            input_ids, seq_id, pos_of_res, pos_ids = self._pack(
+                ids, asym_id[b][tok_of_res], residue_index[b][tok_of_res]
+            )
             if input_ids.numel() > self.max_tokens:
                 logger.warning(
                     "PLM input %d tokens exceeds max_tokens=%d; truncating",
@@ -254,12 +281,14 @@ class FrozenPLM(nn.Module):
                     self.max_tokens,
                 )
                 input_ids, seq_id = input_ids[: self.max_tokens], seq_id[: self.max_tokens]
+                pos_ids = pos_ids[: self.max_tokens]
                 fits = pos_of_res < self.max_tokens
                 pos_of_res = pos_of_res[fits]
                 res_of_tok = res_of_tok.clamp(max=max(int(fits.sum()) - 1, 0))
             rows.append(b)
             packed.append(input_ids)
             seq_ids.append(seq_id)
+            pos_id_list.append(pos_ids)
             gathers.append((keep, res_of_tok, pos_of_res))
 
         if not rows:
@@ -270,12 +299,18 @@ class FrozenPLM(nn.Module):
         max_len = max(p.numel() for p in packed)
         batch_ids = torch.full((len(rows), max_len), tok.pad_id, device=res_type.device, dtype=torch.long)
         batch_seq = torch.full((len(rows), max_len), -1, device=res_type.device, dtype=torch.long)
+        batch_pos = torch.zeros((len(rows), max_len), device=res_type.device, dtype=torch.long)
         for r in range(len(rows)):
             n = packed[r].numel()
             batch_ids[r, :n] = packed[r]
             batch_seq[r, :n] = seq_ids[r]
+            batch_pos[r, :n] = pos_id_list[r]
 
-        hidden = backbone(batch_ids, sequence_id=batch_seq if self.join == "per_chain" else None)
+        hidden = backbone(
+            batch_ids,
+            sequence_id=batch_seq if self.join == "per_chain" else None,
+            position_ids=batch_pos,
+        )
 
         for r, b in enumerate(rows):
             keep, res_of_tok, pos_of_res = gathers[r]
