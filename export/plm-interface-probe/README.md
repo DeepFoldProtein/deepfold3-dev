@@ -1,8 +1,8 @@
 # PLM interface probe — is there interface signal in a frozen ESM2 embedding?
 
 **Date:** 2026-08-13 · **Status:** interim; no training arm launched
-**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py), [`vs_r16.py`](vs_r16.py), [`decompose.py`](decompose.py), [`probe_pplm.py`](probe_pplm.py)
-**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`, `vs_r16_*_step17000.csv`, `decompose_pair_signal.csv`, `probe_pplm.csv`
+**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py), [`vs_r16.py`](vs_r16.py), [`decompose.py`](decompose.py), [`probe_pplm.py`](probe_pplm.py), [`pairwise.py`](pairwise.py), [`within_interface.py`](within_interface.py)
+**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`, `vs_r16_*_step17000.csv`, `decompose_pair_signal.csv`, `probe_pplm.csv`, `pairwise_interface.csv`, `within_interface.csv`
 
 ## Why measure this first
 
@@ -138,7 +138,7 @@ ESM2's ρ = +0.107 at p = 0.395 is simply no relationship: its interface signal 
 
 ## Result 5 — why each model fails, and why the reasons differ
 
-Code: [`decompose.py`](decompose.py) · data: `decompose_pair_signal.csv`, `probe_pplm.csv`
+Code: [`decompose.py`](decompose.py) · data: `decompose_pair_signal.csv`, `probe_pplm.csv`, `pairwise_interface.csv`, `within_interface.csv`
 
 ### The pair signal is real, but it is rank-1
 
@@ -268,6 +268,61 @@ ESM2's earlier 0.666 was on the easy label; on the hard one it is 0.630, so the 
 
 **The `score_sd_across_partners` column is structural, not empirical.** A per-chain model returns one embedding per chain, so its prediction for chain A is identical no matter who the partner is — the variance is exactly zero by construction, and it *cannot* discriminate partners. PPLM re-embeds against each partner and its predictions do move (0.18). Under a linear readout that movement does not improve the AUC; whether a triangle-update trunk could use it is precisely the question Result 7 reopens.
 
+## Result 8 — contact prediction is higher-order, and the metric was hiding it
+
+Code: [`within_interface.py`](within_interface.py) · data: `within_interface.csv`
+
+Every increment in Results 1–7 came out near zero. The cause is the metric, not the models.
+
+**Contact maps are not low-rank.** Singular-value energy of the true cross-chain contact matrix:
+
+| | rank-1 | rank-2 | rank-5 |
+|---|---|---|---|
+| PPI | **22.6%** | 39.4% | 71.7% |
+| AbAg | **28.2%** | 48.3% | 76.7% |
+
+So $Y \approx \phi(p_i)\,\psi(p_j)$ discards three quarters of the structure by construction. Contacts are genuinely higher-order.
+
+**But AUC over all pairs is answered entirely by the marginals.** Contacts are 0.12% of cross-chain pairs, and **100% of them lie in the 1.6% of pairs where both residues are interface residues**:
+
+| | share of all pairs | contact rate inside | oracle-marginal AUC |
+|---|---|---|---|
+| all pairs | 100% | 0.12% | **0.9927** |
+| both-interface region | **1.6%** | 7.1% | **0.5059** |
+
+Knowing the two marginals eliminates 98.4% of candidates and reaches AUC 0.99 on its own — leaving at most ~0.01 for any pair feature. **Inside the region the same oracle is at chance.** Every increment reported earlier was measured where there was nothing left to gain.
+
+### Re-scored inside the region
+
+| | AUC within | top-L precision |
+|---|---|---|
+| **PPI** | | |
+| oracle marginals | 0.4981 | 11.21% |
+| ESM2 cosine | 0.5268 | 1.45% |
+| SaESM2 cosine | 0.5682 | 1.64% |
+| PPLM cosine | 0.5244 | 1.43% |
+| **PPLM inter-attn** | **0.6075** | 1.66% |
+| **AbAg** | | |
+| oracle marginals | 0.5127 | 11.39% |
+| ESM2 cosine | 0.6259 | 1.72% |
+| SaESM2 cosine | 0.6689 | 2.62% |
+| **PPLM cosine** | **0.6706** | 2.15% |
+| PPLM inter-attn | 0.6378 | 0.98% |
+
+**PPLM's inter-chain attention leads on PPI (0.6075)** — the same feature that ranked last on all-pairs AUC (+0.0039). Measured where the marginals are blind, the pair-trained channel is the only one carrying real pairing signal.
+
+Absolute levels stay low: top-L tops out at 2.6% against the paper's 77.8%, and the oracle marginals beat every model on top-L (11.2%). The linear probe still cannot compose rank-5 structure, which is Result 7's diagnosis restated — this measures that the signal exists, not that a linear readout can use it.
+
+### Three layers, and which one is r16's problem
+
+| layer | order | who solves it | status |
+|---|---|---|---|
+| which residues are at an interface | first | the marginals; carries all-pairs AUC to 0.99 | ESM2/SaESM2 have it — **and so does r16** |
+| which interface residue pairs with which | higher | marginals at chance; PPLM inter-attn 0.61 | **weak signal exists, linearly inaccessible** |
+| reconstructing the contact map | rank-5+ | triangle composition | needs the trunk |
+
+This maps onto r16 exactly: mean DockQ and interface lDDT — closer to the first layer — have passed r14's plateau, while **success rate, which requires getting the pairing right, has not**. The deficit is in layers 2 and 3.
+
 ## Weaknesses — what this probe cannot answer
 
 **1. Every example is a complex that binds.** The benchmark targets are all real complexes; there are no non-binding pairs. The probe therefore **never tests specificity**. "Does this surface have an interface-like patch" and "which of several candidate patches is the real one" are different questions, and the second is where we fail. An interface-residue AUC of 0.70 speaks only to the first.
@@ -293,7 +348,7 @@ ESM2's earlier 0.666 was on the easy label; on the hard one it is 0.630, so the 
 | Can it find the epitope? | **No** (antigen side 0.44–0.61, near chance) |
 | Does joining chains help? | **No — it hurts** (AbAg 0.88 → 0.73) |
 | Is SaESM2 better than ESM2? | **Yes on PPI** (+0.03 to +0.06); marginal on AbAg, epitope stays at chance |
-| Does a pair-trained LM (PPLM) help? | **Unresolved** — my linear probe says no (+0.004), their trained ablation says yes (w/o PPLM: 100% → 20.8% top-L). See Result 7 |
+| Does a pair-trained LM (PPLM) help? | **Plausibly yes** — measured inside the interface it leads on PPI (0.608 vs 0.52–0.57); all-pairs AUC was blind to this. See Results 7–8 |
 | Is the signal informative where r16 fails? | **No — it is anti-informative** (ρ = +0.34, strong where r16 already wins) |
 
 Three findings compound into one recommendation. The embedding supplies an **interface-residue prior**, not contact predictions. It has **no epitope signal**, which is r16's actual AbAg failure. And on protein–protein its prior is **strongest exactly where r16 already succeeds** and weakest where it fails.
@@ -304,7 +359,9 @@ Result 7 is a retraction of the strongest version of that. My probe found PPLM's
 
 So the shim arm is **not ruled out** — it is unevaluated. What my evidence does establish is narrower and still worth acting on: the *per-residue* interface prior these models supply is redundant with what r16 already does well (ρ = +0.34 against per-target DockQ), and the antigen side sits at chance for every model and depth tested.
 
-The honest ordering is therefore: **the paired-MSA depth A/B first**, because it is cheap and aims at the same channel; and if a PLM arm is run afterwards, feed `lm_z` into `z` where DF3's 48 triangle-multiplication layers can act on it, which is the setting their ablation says works and mine could not emulate.
+Result 8 then explains why every increment in this report came out near zero: contacts occupy 1.6% of cross-chain pairs, all-pairs AUC is saturated by the marginals at 0.99, and the region where pairing actually matters was never scored on its own. Re-scored there, **PPLM's inter-chain attention leads on PPI (0.608 against 0.52–0.57 for every cosine)** — the same feature that came last under the old metric.
+
+So the ordering is: **the paired-MSA depth A/B first**, because it is cheap and aims at the same channel. A PLM arm afterwards is now justified, but with two changes from the original design — the backend must be a pair model (PPLM, not ESM2), which means [`plm.py`](../../src/deepfold3/model/plm.py) has to accept chain pairs rather than one packed sequence; and `lm_z` must go into `z` where DF3's 48 triangle-multiplication layers can compose it, which is the setting the paper's ablation validates and no probe here could emulate.
 
 ## Next
 
