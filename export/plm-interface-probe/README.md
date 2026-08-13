@@ -268,29 +268,36 @@ ESM2's earlier 0.666 was on the easy label; on the hard one it is 0.630, so the 
 
 **The `score_sd_across_partners` column is structural, not empirical.** A per-chain model returns one embedding per chain, so its prediction for chain A is identical no matter who the partner is — the variance is exactly zero by construction, and it *cannot* discriminate partners. PPLM re-embeds against each partner and its predictions do move (0.18). Under a linear readout that movement does not improve the AUC; whether a triangle-update trunk could use it is precisely the question Result 7 reopens.
 
-## Result 8 — contact prediction is higher-order, and the metric was hiding it
+## Result 8 — the metric was saturated; scoring where it is not changes the ranking
 
 Code: [`within_interface.py`](within_interface.py) · data: `within_interface.csv`
 
 Every increment in Results 1–7 came out near zero. The cause is the metric, not the models.
 
-**Contact maps are not low-rank.** Singular-value energy of the true cross-chain contact matrix:
-
-| | rank-1 | rank-2 | rank-5 |
-|---|---|---|---|
-| PPI | **22.6%** | 39.4% | 71.7% |
-| AbAg | **28.2%** | 48.3% | 76.7% |
-
-So $Y \approx \phi(p_i)\,\psi(p_j)$ discards three quarters of the structure by construction. Contacts are genuinely higher-order.
-
-**But AUC over all pairs is answered entirely by the marginals.** Contacts are 0.12% of cross-chain pairs, and **100% of them lie in the 1.6% of pairs where both residues are interface residues**:
+**AUC over all pairs is answered entirely by the interface marginals.** Contacts are 0.12% of cross-chain pairs, and **100% of them lie in the 1.6% of pairs where both residues are interface residues**:
 
 | | share of all pairs | contact rate inside | oracle-marginal AUC |
 |---|---|---|---|
 | all pairs | 100% | 0.12% | **0.9927** |
 | both-interface region | **1.6%** | 7.1% | **0.5059** |
 
-Knowing the two marginals eliminates 98.4% of candidates and reaches AUC 0.99 on its own — leaving at most ~0.01 for any pair feature. **Inside the region the same oracle is at chance.** Every increment reported earlier was measured where there was nothing left to gain.
+Knowing the two marginals eliminates 98.4% of candidates and reaches AUC 0.99 on its own — leaving at most ~0.01 for any pair feature. Every increment reported earlier was measured where there was nothing left to gain.
+
+**Why the region isolates what the marginals cannot express.** Restrict to
+
+$$
+\mathcal{R} = \{(i,j) : s_i = 1 \ \wedge\ s_j = 1\}
+$$
+
+On $\mathcal{R}$ both indicators are constant, so *any* function of the two marginals alone is constant there:
+
+$$
+(i,j) \in \mathcal{R} \;\Longrightarrow\; h(s_i, s_j) = h(1,1)
+$$
+
+and a constant score has AUC exactly 0.5. The oracle's measured 0.4981 / 0.5127 is that identity confirmed, not a coincidence. Anything scoring above 0.5 inside $\mathcal{R}$ therefore depends on the pair in a way no function of the two interface labels can reproduce. The argument conditions on the sufficient statistic of the first-order model, so it needs no assumptions.
+
+**Its exact scope.** What is excluded is functions of the *interface indicators*. A separable score over the full embeddings, $f(h_i)\,g(h_j)$, is **not** excluded — $h_i$ still varies among interface residues. So a score above 0.5 here means "not explained by interface membership", which is weaker than "not separable". The two were conflated in an earlier draft of this section.
 
 ### Re-scored inside the region
 
@@ -309,19 +316,32 @@ Knowing the two marginals eliminates 98.4% of candidates and reaches AUC 0.99 on
 | **PPLM cosine** | **0.6706** | 2.15% |
 | PPLM inter-attn | 0.6378 | 0.98% |
 
-**PPLM's inter-chain attention leads on PPI (0.6075)** — the same feature that ranked last on all-pairs AUC (+0.0039). Measured where the marginals are blind, the pair-trained channel is the only one carrying real pairing signal.
+**PPLM's inter-chain attention leads on PPI (0.6075)** — the same feature that ranked last on all-pairs AUC (+0.0039). Measured where interface membership is uninformative by construction, the pair-trained channel is the only one clearly above chance.
 
-Absolute levels stay low: top-L tops out at 2.6% against the paper's 77.8%, and the oracle marginals beat every model on top-L (11.2%). The linear probe still cannot compose rank-5 structure, which is Result 7's diagnosis restated — this measures that the signal exists, not that a linear readout can use it.
+Absolute levels stay low: top-L tops out at 2.6% against the paper's 77.8%, and the oracle marginals beat every model on top-L (11.2%). This measures that a signal exists, not that a linear readout can use it — Result 7's diagnosis restated.
 
-### Three layers, and which one is r16's problem
+### A retracted argument
 
-| layer | order | who solves it | status |
-|---|---|---|---|
-| which residues are at an interface | first | the marginals; carries all-pairs AUC to 0.99 | ESM2/SaESM2 have it — **and so does r16** |
-| which interface residue pairs with which | higher | marginals at chance; PPLM inter-attn 0.61 | **weak signal exists, linearly inaccessible** |
-| reconstructing the contact map | rank-5+ | triangle composition | needs the trunk |
+An earlier version of this section argued that contact maps are "intrinsically higher-order" because rank-1 explains only 22.6% (PPI) / 28.2% (AbAg) of the true matrix's singular-value energy. **That argument does not survive its null.** Placing the same number of contacts at random inside the same interface region gives 20.8% / 24.9% — within 2 points of the real matrices:
 
-This maps onto r16 exactly: mean DockQ and interface lDDT — closer to the first layer — have passed r14's plateau, while **success rate, which requires getting the pairing right, has not**. The deficit is in layers 2 and 3.
+| | rank-1 | rank-5 |
+|---|---|---|
+| real $Y$ (PPI) | 22.6% | 71.7% |
+| null: contacts shuffled inside $\mathcal{R}$ | **20.8%** | 60.3% |
+| null: row/column sums only, $P_{ij} = r_i c_j / m$ | 100% | 100% |
+
+A sparse binary matrix scores about that low whether or not it has pairwise structure, so the number reflects sparsity rather than order. (The second null is a consistency check in the other direction: a matrix built from margins alone is rank-1 by construction, confirming the marginal model corresponds to rank 1.) Two further weaknesses: Frobenius rank does not determine AUC-optimal ranking, and the spectrum of a binary sparse matrix is driven by its sparsity pattern rather than its information content.
+
+**What survives is only the conditioning argument**: contacts concentrate in 1.6% of pairs, all-pairs AUC is saturated by interface membership at 0.99, membership carries exactly zero information inside that region, and PPLM's inter-attn is the one feature above chance there. "Higher-order" in this report means **"beyond interface membership"**, nothing stronger.
+
+### Two layers, and which one is r16's problem
+
+| layer | who solves it | status |
+|---|---|---|
+| which residues are at an interface | the marginals; carries all-pairs AUC to 0.99 | ESM2/SaESM2 have it — **and so does r16** |
+| which interface residue pairs with which | membership at chance; PPLM inter-attn 0.61 | **weak signal exists, linearly inaccessible** |
+
+This maps onto r16: mean DockQ and interface lDDT — closer to the first layer — have passed r14's plateau, while **success rate, which requires getting the pairing right, has not**.
 
 ## Weaknesses — what this probe cannot answer
 
