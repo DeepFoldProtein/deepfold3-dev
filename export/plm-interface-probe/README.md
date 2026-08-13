@@ -209,6 +209,65 @@ Interface AUC on PPI is *lower* than either ESM2 (0.666) or SaESM2 (0.698) — t
 
 That is the cleanest statement of what all six results converge on: **pairing information lives in the paired MSA, not in sequence-model weights.** DF3 already has a paired-MSA channel; the question was never whether to add a new source but whether that channel is being used to its depth.
 
+## Result 7 — retraction: the probe cannot support the claim it made about PPLM
+
+Result 6 concluded that PPLM's inter-chain attention carries no pairing information, on the strength of a +0.0039 AUC increment. **The PPLM paper's own ablation says the opposite, and it is the better evidence.**
+
+From [Liu, Chen & Zhang (*Nat. Commun.* 2026)](https://www.nature.com/articles/s41467-026-70457-5), Fig. 4D–E, on the 2PMY example:
+
+| variant | top-N precision | top-L precision |
+|---|---|---|
+| **w/o PPLM features** | 16.7% | 20.8% |
+| **w/o MSA features** | 78.2% | 100% |
+| full model | 81.3% | 100% |
+
+and on Homodimer300, PPLM-Contact reaches 77.8% top-L against DeepInter 68.9%, CDPred 63.0%, DeepHomo2.0 51.4%. Removing the language model collapses it; removing coevolution barely moves it. In their architecture the PPLM features carry the contact signal and the MSA is nearly dispensable — the reverse of what Result 6 asserted.
+
+**The discrepancy is not the metric and not feature scaling.** Both were checked:
+
+| | AUC | top-L precision |
+|---|---|---|
+| marginals only | 0.6884 | 0.6% |
+| + inter-attn (raw) | 0.6923 | 0.7% |
+| inter-attn, channel z-score | 0.6542 | 1.2% |
+| inter-attn, log | 0.7312 | 1.0% |
+| inter-attn, APC-corrected | 0.5353 | 0.8% |
+| inter-attn, z-score + APC | 0.4959 | 0.2% |
+
+Top-L precision tops out at 1.2% against their 77.8%. No normalization rescues it.
+
+**The difference is probe capacity.** `PPLM_Contact` is a 12-block network: `Inter_ResNet` over the 806-channel pair input (660 of which are PPLM attention), then triangle-multiplication blocks coupling the inter-chain map to both intra-chain maps, then transformer blocks. Triangle multiplication is exactly the operation that composes "$i$ contacts $k$" and "$k$ contacts $j$" into a statement about $(i,j)$ — a higher-order function of the pair map that **a logistic regression on raw attention values cannot express, at any normalization.**
+
+This is the third time in this investigation that an underpowered probe returned a misleading negative: the rank-32 bilinear form in Result 1 (0.53 where the marginal product gave 0.70), the mean/max summary of `inter_attn` in Result 6's first pass, and now the linear readout itself.
+
+### What survives and what does not
+
+**Retracted:** "PPLM's inter-chain attention carries no pairing information", and with it the sweeping form of Result 6's conclusion — *pairing information lives in the paired MSA, not in sequence-model weights*. Their w/o-MSA ablation retaining 78.2% top-N is direct evidence against it.
+
+**Still standing**, because these are per-residue linear probes on embeddings, which is what a linear probe is for:
+
+- interface-residue AUC and its amino-acid nulls (Result 1)
+- the antigen side sitting at chance across every depth and all three models (Results 2, 6)
+- partner-specific AUC and the zero partner-to-partner variance of per-chain models (Result 7 table below)
+- the positive correlation with r16's per-target DockQ (Result 4) — the signal is redundant with what r16 already does well
+
+**Now reopened:** whether a PLM pair channel could help DF3. The mechanism their result depends on — triangle multiplication over the pair map — is not exotic; **DF3's trunk already has 48 layers of it.** A shim feeding `lm_z` into `z` puts the PLM's pair signal exactly where triangle updates can act on it, which is the setting their ablation says works and the setting my probe could not emulate.
+
+## Result 7b — partner specificity, on a common footing
+
+The interface numbers in Results 1 and 6 used different labels: `probe.py` asked "does residue $i$ touch *any* other chain", `probe_pplm.py` asked "does it touch *this partner*". On the harder, partner-specific label, all three models on identical targets:
+
+| | partner-specific AUC | partner-to-partner score sd | contact: marginals | + pair feature | increment |
+|---|---|---|---|---|---|
+| ESM2 | 0.6296 | **0.0** | 0.6941 | 0.7019 (cosine) | +0.0078 |
+| SaESM2 | **0.6584** | **0.0** | **0.7446** | **0.7496** (cosine) | +0.0050 |
+| PPLM | 0.6159 | **0.1818** | 0.6885 | 0.6924 (660 ch.) | +0.0039 |
+| PPLM | — | — | 0.6885 | 0.6917 (cosine) | +0.0032 |
+
+ESM2's earlier 0.666 was on the easy label; on the hard one it is 0.630, so the three models are much closer than Result 6 implied.
+
+**The `score_sd_across_partners` column is structural, not empirical.** A per-chain model returns one embedding per chain, so its prediction for chain A is identical no matter who the partner is — the variance is exactly zero by construction, and it *cannot* discriminate partners. PPLM re-embeds against each partner and its predictions do move (0.18). Under a linear readout that movement does not improve the AUC; whether a triangle-update trunk could use it is precisely the question Result 7 reopens.
+
 ## Weaknesses — what this probe cannot answer
 
 **1. Every example is a complex that binds.** The benchmark targets are all real complexes; there are no non-binding pairs. The probe therefore **never tests specificity**. "Does this surface have an interface-like patch" and "which of several candidate patches is the real one" are different questions, and the second is where we fail. An interface-residue AUC of 0.70 speaks only to the first.
@@ -234,16 +293,18 @@ That is the cleanest statement of what all six results converge on: **pairing in
 | Can it find the epitope? | **No** (antigen side 0.44–0.61, near chance) |
 | Does joining chains help? | **No — it hurts** (AbAg 0.88 → 0.73) |
 | Is SaESM2 better than ESM2? | **Yes on PPI** (+0.03 to +0.06); marginal on AbAg, epitope stays at chance |
-| Does a pair-trained LM (PPLM) help? | **No** — pairing increment +0.004/+0.000, antigen side 0.569 |
+| Does a pair-trained LM (PPLM) help? | **Unresolved** — my linear probe says no (+0.004), their trained ablation says yes (w/o PPLM: 100% → 20.8% top-L). See Result 7 |
 | Is the signal informative where r16 fails? | **No — it is anti-informative** (ρ = +0.34, strong where r16 already wins) |
 
 Three findings compound into one recommendation. The embedding supplies an **interface-residue prior**, not contact predictions. It has **no epitope signal**, which is r16's actual AbAg failure. And on protein–protein its prior is **strongest exactly where r16 already succeeds** and weakest where it fails.
 
 **Do not launch the shim arm on this evidence.** The infrastructure ([`esm2.py`](../../src/deepfold3/model/esm2.py), [`plm.py`](../../src/deepfold3/model/plm.py), [`lm_pair.py`](../../src/deepfold3/model/lm_pair.py)) is committed, tested and backend-agnostic, so it costs nothing to leave idle.
 
-Result 6 closes the obvious escape route. The natural objection to Results 1–5 was that they only tested single-chain models, and a pair-trained LM would carry what they cannot. PPLM is that model — purpose-built inter-chain attention, released weights — and its pairing increment is +0.004 on PPI and +0.000 on antibody–antigen, no better than the outer-product baseline. Its own contact predictor tells the same story from the other direction: it runs HHblits, builds a paired MSA and computes DCA couplings, using the language model as one feature among several.
+Result 7 is a retraction of the strongest version of that. My probe found PPLM's inter-chain attention adds +0.004, but PPLM's own ablation shows the opposite — remove the language-model features and top-L precision collapses from 100% to 20.8%, while removing MSA barely moves it. The gap is probe capacity: their contact head runs triangle multiplication over the pair map, and a logistic regression cannot express that at any normalization (checked across five feature transforms; top-L never exceeds 1.2% against their 77.8%).
 
-**The pairing information lives in the paired MSA, not in sequence-model weights.**
+So the shim arm is **not ruled out** — it is unevaluated. What my evidence does establish is narrower and still worth acting on: the *per-residue* interface prior these models supply is redundant with what r16 already does well (ρ = +0.34 against per-target DockQ), and the antigen side sits at chance for every model and depth tested.
+
+The honest ordering is therefore: **the paired-MSA depth A/B first**, because it is cheap and aims at the same channel; and if a PLM arm is run afterwards, feed `lm_z` into `z` where DF3's 48 triangle-multiplication layers can act on it, which is the setting their ablation says works and mine could not emulate.
 
 ## Next
 
