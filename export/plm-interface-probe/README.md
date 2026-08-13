@@ -1,8 +1,8 @@
 # PLM interface probe — is there interface signal in a frozen ESM2 embedding?
 
 **Date:** 2026-08-13 · **Status:** interim; no training arm launched
-**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py), [`vs_r16.py`](vs_r16.py), [`decompose.py`](decompose.py)
-**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`, `vs_r16_*_step17000.csv`, `decompose_pair_signal.csv`
+**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py), [`vs_r16.py`](vs_r16.py), [`decompose.py`](decompose.py), [`probe_pplm.py`](probe_pplm.py)
+**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`, `vs_r16_*_step17000.csv`, `decompose_pair_signal.csv`, `probe_pplm.csv`
 
 ## Why measure this first
 
@@ -138,7 +138,7 @@ ESM2's ρ = +0.107 at p = 0.395 is simply no relationship: its interface signal 
 
 ## Result 5 — why each model fails, and why the reasons differ
 
-Code: [`decompose.py`](decompose.py) · data: `decompose_pair_signal.csv`
+Code: [`decompose.py`](decompose.py) · data: `decompose_pair_signal.csv`, `probe_pplm.csv`
 
 ### The pair signal is real, but it is rank-1
 
@@ -188,6 +188,27 @@ The paratope *is* intrinsic — CDRs are the binding site by construction — wh
 
 Three of the four reduce to one fact: **these are single-chain models.** A complex-trained PLM is aimed at exactly that, which is why the backend-agnostic plumbing was worth keeping.
 
+## Result 6 — PPLM, a pair-trained LM, does not break the ceiling either
+
+Code: [`probe_pplm.py`](probe_pplm.py) · data: `probe_pplm.csv`
+
+Result 5 traced three of the four failure modes to the models being single-chain, which makes a pair-trained LM the obvious test. [PPLM](https://github.com/junliu621/PPLM) (Liu, Chen & Zhang, *Nat. Commun.* 2026) is exactly that: same shape as ESM2-650M (33 layers, 1280 wide, 20 heads) but taking two sequences at once with a dedicated inter-chain attention path, gated per layer by a learned `inter_attn_weight` and exposed as **660 genuine $L_A \times L_B$ maps** — not an outer product. Weights load with zero missing or unexpected keys.
+
+| | interface AUC | antigen side | marginals only | + inter-attn (660 ch.) | inter-attn alone | **increment** |
+|---|---|---|---|---|---|---|
+| PPI | 0.616 | — | 0.6885 | 0.6924 | 0.6449 | **+0.0039** |
+| AbAg | 0.818 | **0.569** | 0.8736 | 0.8738 | 0.6837 | **+0.0002** |
+
+**The increment is no better than ESM2's** (+0.0102) or SaESM2's (+0.0071) — on antibody–antigen it is zero. The inter-chain attention does carry real signal on its own (0.64 / 0.68, well above chance) but it is **entirely redundant with the two marginals**. Purpose-built cross-chain attention lands in the same place as an outer product of independent embeddings.
+
+The antigen side stays at **0.569**, inside the 0.44–0.61 band the single-chain models occupy, even though PPLM sees the antibody while embedding the antigen. The epitope ceiling is therefore not about architecture.
+
+Interface AUC on PPI is *lower* than either ESM2 (0.666) or SaESM2 (0.698) — the pair-trained representation is specialized in a way that costs it on the per-residue task.
+
+**The strongest evidence is PPLM's own contact predictor.** `run_pplm-contact.py` does not feed the language model to a head and stop. It runs HHblits against UniRef, extracts HHM profiles and DCA couplings, builds a **paired MSA**, extracts features from that too, and only then adds the PPLM attention as one input among several. A pair language model with a released interface-contact predictor still needs co-evolution to predict contacts.
+
+That is the cleanest statement of what all six results converge on: **pairing information lives in the paired MSA, not in sequence-model weights.** DF3 already has a paired-MSA channel; the question was never whether to add a new source but whether that channel is being used to its depth.
+
 ## Weaknesses — what this probe cannot answer
 
 **1. Every example is a complex that binds.** The benchmark targets are all real complexes; there are no non-binding pairs. The probe therefore **never tests specificity**. "Does this surface have an interface-like patch" and "which of several candidate patches is the real one" are different questions, and the second is where we fail. An interface-residue AUC of 0.70 speaks only to the first.
@@ -213,15 +234,20 @@ Three of the four reduce to one fact: **these are single-chain models.** A compl
 | Can it find the epitope? | **No** (antigen side 0.44–0.61, near chance) |
 | Does joining chains help? | **No — it hurts** (AbAg 0.88 → 0.73) |
 | Is SaESM2 better than ESM2? | **Yes on PPI** (+0.03 to +0.06); marginal on AbAg, epitope stays at chance |
+| Does a pair-trained LM (PPLM) help? | **No** — pairing increment +0.004/+0.000, antigen side 0.569 |
 | Is the signal informative where r16 fails? | **No — it is anti-informative** (ρ = +0.34, strong where r16 already wins) |
 
 Three findings compound into one recommendation. The embedding supplies an **interface-residue prior**, not contact predictions. It has **no epitope signal**, which is r16's actual AbAg failure. And on protein–protein its prior is **strongest exactly where r16 already succeeds** and weakest where it fails.
 
-**Do not launch the shim arm on this evidence.** The infrastructure ([`esm2.py`](../../src/deepfold3/model/esm2.py), [`plm.py`](../../src/deepfold3/model/plm.py), [`lm_pair.py`](../../src/deepfold3/model/lm_pair.py)) is committed, tested and backend-agnostic, so it costs nothing to leave idle until a PLM appears that clears these bars — a complex-trained model is exactly the case that could, since every failure above traces back to ESM2 having seen only single chains.
+**Do not launch the shim arm on this evidence.** The infrastructure ([`esm2.py`](../../src/deepfold3/model/esm2.py), [`plm.py`](../../src/deepfold3/model/plm.py), [`lm_pair.py`](../../src/deepfold3/model/lm_pair.py)) is committed, tested and backend-agnostic, so it costs nothing to leave idle.
+
+Result 6 closes the obvious escape route. The natural objection to Results 1–5 was that they only tested single-chain models, and a pair-trained LM would carry what they cannot. PPLM is that model — purpose-built inter-chain attention, released weights — and its pairing increment is +0.004 on PPI and +0.000 on antibody–antigen, no better than the outer-product baseline. Its own contact predictor tells the same story from the other direction: it runs HHblits, builds a paired MSA and computes DCA couplings, using the language model as one feature among several.
+
+**The pairing information lives in the paired MSA, not in sequence-model weights.**
 
 ## Next
 
-1. **Address weaknesses 1 and 2** by adding non-binding chain pairs (random pairings) as negatives. Specificity is the one property this probe never measured, and Result 4 makes it the deciding question: a prior that is redundant on binders might still discriminate binders from non-binders.
-2. **Replace the antibody heuristic with ANARCI** and re-confirm Result 2, which currently rests on a hand-written rule.
-3. **Re-run Result 4 against AbAg DockQ**, not just PPI. The epitope null and the redundancy finding are separate claims and only the second has been tested on PPI.
-4. The **paired-MSA depth A/B** remains the cheaper and more direct test of the same underlying hypothesis — that `z` lacks cross-chain information — and is now the clear next experiment.
+1. **The paired-MSA depth A/B is now the experiment**, not a fallback. Six results point at the same channel, and DF3 already has it: `patchr` carries 411 paired shards against 256 unpaired. What has never been measured is how much of r16's cross-chain deficit is depth-limited there — the monomer A/B found half of r14's monomer failures were MSA-limited, and the interface equivalent is untested.
+2. **Address weaknesses 1 and 2** by adding non-binding chain pairs as negatives. Specificity is the one property no probe here measured, and Result 4 makes it the open question: a prior that is redundant on binders might still separate binders from non-binders.
+3. **Replace the antibody heuristic with ANARCI** and re-confirm Result 2, which rests on a hand-written rule.
+4. **Re-run Result 4 against AbAg DockQ.** The epitope null and the redundancy finding are separate claims and only the second has been tested, on PPI.

@@ -1,0 +1,3 @@
+auc_antibody,auc_antigen,auc_iface,category,inter_attn_increment,inter_attn_only,marginals_only,marginals_plus_inter_attn,model,n_res,n_res_antibody,n_res_antigen
+,,0.6159,ppi,0.0039,0.6449,0.6885,0.6924,pplm,56929,,
+0.8799,0.5687,0.8177,agab,0.0002,0.6837,0.8736,0.8738,pplm,29569,22272,7297
