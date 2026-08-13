@@ -1,8 +1,8 @@
 # PLM interface probe — is there interface signal in a frozen ESM2 embedding?
 
 **Date:** 2026-08-13 · **Status:** interim; no training arm launched
-**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py)
-**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`
+**Code:** [`probe.py`](probe.py), [`layer_sweep.py`](layer_sweep.py), [`vs_r16.py`](vs_r16.py), [`decompose.py`](decompose.py)
+**Raw data:** `probe_results_{esm2,saesm2}.csv`, `probe_per_target_{esm2,saesm2}.csv`, `layer_sweep_{esm2,saesm2}.csv`, `vs_r16_*_step17000.csv`, `decompose_pair_signal.csv`
 
 ## Why measure this first
 
@@ -88,7 +88,7 @@ Final layer (33), `per_chain`, 40 targets per category, after both corrections:
 | **AbAg** | 0.881 | **0.888** | 0.577 | 0.686 / **0.786** | 0.785 / **0.802** | 0.576 |
 
 - **Interface residues are encoded.** PPI at 0.67–0.70 against a null of 0.51 is information beyond residue identity — though weaker than the 0.71–0.76 the uncorrected pass reported.
-- **PPI contact pairs essentially are not** — bilinear 0.53–0.55 against a null of 0.52. The embedding knows which residues sit at an interface but not **which pairs with which**.
+- **The contact-pair row is superseded by Result 5.** The rank-32 bilinear probe reported here (0.53–0.55) failed to fit; the marginal product reaches 0.69–0.75 on the same task. The conclusion survives in a sharper form — the pair signal exists but is rank-1, carrying no pairing information.
 - **SaESM2 is better on PPI** (+0.032 interface, +0.059 cosine) and marginal on AbAg. Its config is identical to ESM2's, so it drops into the same loader unchanged.
 
 ## Result 2 — the AbAg number is the antibody side (the important finding)
@@ -136,6 +136,58 @@ Neither covariate correlates much with DockQ on its own ($\rho = +0.083$ and $+0
 
 ESM2's ρ = +0.107 at p = 0.395 is simply no relationship: its interface signal is uninformative about r16's outcome either way.
 
+## Result 5 — why each model fails, and why the reasons differ
+
+Code: [`decompose.py`](decompose.py) · data: `decompose_pair_signal.csv`
+
+### The pair signal is real, but it is rank-1
+
+Result 1's rank-32 bilinear probe reported ~0.53 on contact pairs. That was a **probe failure**: the plain product of the two marginal interface probabilities scores **0.69 (ESM2) / 0.74 (SaESM2)** on the same task, and its rank correlation with the fitted bilinear score is ~0.00 — the bilinear form never found the solution. Result 1's "contact pairs are not encoded" is withdrawn; the correct statement is below.
+
+Conditioning on the marginals settles what kind of signal it is:
+
+| | marginals only $(\text{logit}\,p_i,\ \text{logit}\,p_j)$ | + cosine | cosine alone | **increment** |
+|---|---|---|---|---|
+| ESM2 | 0.6926 | 0.7028 | 0.6492 | **+0.0102** |
+| SaESM2 | 0.7439 | 0.7510 | 0.7079 | **+0.0071** |
+
+Given both residues' interface probabilities, the embedding cosine adds **one AUC point**. So
+
+$$
+z_{ij} \;\approx\; \phi(p_i)\,\psi(p_j)
+$$
+
+— **rank-1 along the interface-propensity direction.** The pair representation says "both of these look like interface residues," never "these two touch each other." That is the ceiling of an outer product over two chains embedded independently: no co-evolutionary term is ever formed, so none can be projected.
+
+### ESM2 — the signal is generic, and misses the target
+
+Interface AUC 0.666, and **ρ = +0.107 (p = 0.395)** against r16's DockQ — no relationship in either direction.
+
+A UniRef50 masked LM learns conservation and hydrophobicity, which produces a **generic surface-property readout**. Interfaces are enriched in conserved hydrophobic patches, hence 0.67 pooled. But the same signature fires on active sites, crystal contacts, and exposed core — it is not interface-specific, so *which* targets it reads correctly is close to random. Attaching it is harmless, and harmlessly uninformative.
+
+### SaESM2 — the signal is real, and we already have it
+
+Interface AUC 0.698 (+0.032 over ESM2), cosine 0.708 (+0.059), and **ρ = +0.338 (p = 0.006)**, with probe AUC 0.603 on r16's failing half against 0.673 on its succeeding half.
+
+Structure-aware pre-training genuinely buys a better surface readout. The problem is that this is what r16 **already does well**: monomer lDDT 0.875 sits +6.5σ above r14's plateau, and PPI interface lDDT is above plateau too. Folding and surface geometry are solved; SaESM2 duplicates them. Hence the positive correlation — both are strong on well-behaved targets and both fail on the same hard ones — and it survives controlling for interface fraction and chain length, so it is not merely a difficulty effect.
+
+### AbAg — an information ceiling, not a model limitation
+
+The antigen side sits at chance for both models at every depth. This is expected and no single-chain PLM can fix it: **an epitope is not an intrinsic property of the antigen sequence.** The same antigen surface is bound at different sites by different antibodies, so there is no function from antigen sequence to epitope to learn.
+
+The paratope *is* intrinsic — CDRs are the binding site by construction — which is exactly why that side reaches 0.94. Reading an epitope requires seeing the antibody and the antigen together, which is what `joined` attempted; ESM2 has never seen a multi-chain input, and it degraded (0.88 → 0.73).
+
+### Summary
+
+| Model | Why it fails | Character |
+|---|---|---|
+| **ESM2** | encodes generic surface properties, not interface specificity → target-level near-random | **harmless noise** |
+| **SaESM2** | real structural signal, but duplicates what r16 already has → weakest where r16 fails | **redundant** |
+| **both** | independent per-chain embeddings make the outer product rank-1; pairing adds +0.01 | **structural ceiling** |
+| **AbAg** | epitope is not a function of antigen sequence | **information ceiling** |
+
+Three of the four reduce to one fact: **these are single-chain models.** A complex-trained PLM is aimed at exactly that, which is why the backend-agnostic plumbing was worth keeping.
+
 ## Weaknesses — what this probe cannot answer
 
 **1. Every example is a complex that binds.** The benchmark targets are all real complexes; there are no non-binding pairs. The probe therefore **never tests specificity**. "Does this surface have an interface-like patch" and "which of several candidate patches is the real one" are different questions, and the second is where we fail. An interface-residue AUC of 0.70 speaks only to the first.
@@ -157,7 +209,7 @@ ESM2's ρ = +0.107 at p = 0.395 is simply no relationship: its interface signal 
 | Question | Answer |
 |---|---|
 | Is interface information in the embedding? | **Yes** (PPI 0.70 vs 0.52 null) |
-| Is cross-chain contact-pair information there? | **Essentially not for PPI** (0.55 vs 0.52 null) |
+| Is cross-chain *pairing* information there? | **No** — pair score is rank-1; cosine adds +0.01 over the two marginals |
 | Can it find the epitope? | **No** (antigen side 0.44–0.61, near chance) |
 | Does joining chains help? | **No — it hurts** (AbAg 0.88 → 0.73) |
 | Is SaESM2 better than ESM2? | **Yes on PPI** (+0.03 to +0.06); marginal on AbAg, epitope stays at chance |
