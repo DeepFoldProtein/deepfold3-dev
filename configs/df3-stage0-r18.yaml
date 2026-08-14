@@ -23,12 +23,14 @@ base: df3-stage0-r17.yaml
 #   deepfold3 train --config configs/df3-stage0-r18.yaml \
 #       --params runs/r17/checkpoint_<step>.pt --output runs/r18
 #
-# Parameter shapes are identical to r17 — the per-head affine reuses
-# norm_center.weight/bias viewed as [H, d] — so load_strict can stay on. But
-# LN_c != RMSNorm_d is a function change, so this needs re-equilibration rather
-# than the ~2-3k an identity-initialized change would read in. The optimizer
-# state is reset: its second moments were accumulated under a different
-# post-contraction normalization and carrying them over would fight the change.
+# The per-head gain reuses norm_center.weight viewed as [H, d], so shapes line
+# up — but head_rms is RMSNorm proper (gain, no shift), so norm_center.bias does
+# not exist here while r17's checkpoint has it. Hence load_strict: false; the
+# only key it forgives is that bias. And LN_c != RMSNorm_d is a function change,
+# so this needs re-equilibration rather than the ~2-3k an identity-initialized
+# change would read in. The optimizer state is reset: its second moments were
+# accumulated under a different post-contraction normalization and carrying them
+# over would fight the change.
 #
 # ── Ablation grid ────────────────────────────────────────────────────────────
 # The remaining two cells need no config file — they are one-line overrides,
@@ -54,6 +56,8 @@ base: df3-stage0-r17.yaml
 
 training:
   wandb_project: deepfold3-v2
+  # r17's checkpoint carries norm_center.bias, which head_rms does not define.
+  load_strict: false
   # Second moments were accumulated under LN_c; they do not describe the
   # RMSNorm_d parameterization and would fight the change.
   skip_load_optimizer: true

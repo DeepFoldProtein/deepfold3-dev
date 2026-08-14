@@ -132,9 +132,8 @@ def test_invalid_head_config_is_rejected():
 def test_every_parameter_receives_gradient(head_norm, pair):
     """No orphan parameters in any mode — DDP errors on unused parameters.
 
-    ``head_rms`` is the one at risk: RMSNorm has no shift of its own, so
-    dropping ``norm_center.bias`` from the forward would leave it with no
-    consumer.
+    ``head_rms`` is the one at risk: RMSNorm has no shift, so the mode is built
+    with ``norm_center`` bias-free rather than leaving the parameter unconsumed.
     """
     z, mask = pair
     mod = TriangleMulOutgoing(C_Z, num_heads=H, head_norm=head_norm, router=True)
@@ -143,3 +142,10 @@ def test_every_parameter_receives_gradient(head_norm, pair):
     mod(z, mask).sum().backward()
     orphans = [n for n, p in mod.named_parameters() if p.grad is None or not p.grad.any()]
     assert orphans == [], f"{head_norm}: parameters with no gradient: {orphans}"
+
+
+def test_head_rms_has_no_shift():
+    """RMSNorm means gain-only — the shift is absent, not merely unused."""
+    mod = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="head_rms", router=True)
+    assert mod.norm_center.bias is None
+    assert TriangleMulOutgoing(C_Z, num_heads=H, head_norm="head_ln").norm_center.bias is not None

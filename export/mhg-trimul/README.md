@@ -163,6 +163,15 @@ error $\sqrt{2/(d-1)}\approx 25\%$. RMSNorm drops the mean subtraction and
 halves the noise sources. The repo already has RMSNorm branch machinery
 (`residual_branch_rmsnorm`).
 
+`head_rms` is RMSNorm proper — gain, no shift — so `norm_center` is built
+bias-free in that mode rather than carrying a parameter with no consumer (which
+DDP reports as unused). This is also aligned with the measured trunk-bias
+finding: the LN and linear biases wander with no compensating benefit. The cost
+is that `head_rms` then differs from `head_ln` by two things rather than only
+the mean subtraction, so the B-vs-C comparison is slightly less clean; the shift
+contributes $\sigma(G_o(x_{ij}))\odot(W_o c)$, a pair-dependent scaling of one
+fixed direction, so the impurity is rank-1 and small.
+
 **Head normalization and the router are coupled, not independent.**
 $\operatorname{RMSNorm}_d$ forces $\lVert\hat T^{(h)}_{ij}\rVert=\sqrt d$ for
 every head and every pair, which *destroys* the signal "this head has nothing to
@@ -255,9 +264,9 @@ routing that a fuller version would not have produced.
 That asymmetry is the practical shape of the ablation grid: the router column is
 cheap to probe post hoc, the norm row is not. To keep the
 follow-ups cheap, every cell of the grid carries **identical `state_dict` keys**
-(the per-head affine reuses `norm_center.weight/bias` viewed as `[H, d]`, and
-`router.weight` is the only extra tensor), so any cell warm-starts from any
-other with `load_strict=false`.
+(the per-head gain reuses `norm_center.weight` viewed as `[H, d]`, `router.weight`
+is the only extra tensor, and `head_rms` alone drops `norm_center.bias`), so any
+cell warm-starts from any other with `load_strict=false`.
 
 ## 5. Sequencing, and the confound to avoid
 

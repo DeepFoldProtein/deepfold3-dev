@@ -167,7 +167,11 @@ class _TriangleMulBase(nn.Module):
         self.proj = LinearNoBias(c_z, c_z * 2)
         # AF3: gate uses final_init (zeros)
         self.gate = LinearNoBias(c_z, c_z * 2, initializer="zeros")
-        self.norm_center = LayerNorm(c_z)
+        # ``head_rms`` is RMSNorm proper — gain, no shift. Dropping the shift
+        # also removes a parameter that would otherwise have no consumer, which
+        # DDP reports as unused; and the trunk's LN/linear biases are already
+        # measured to wander with no compensating benefit.
+        self.norm_center = LayerNorm(c_z, bias=head_norm != "head_rms")
         # AF3: output_projection uses final_init (zeros)
         self.out_proj = LinearNoBias(c_z, c_z, initializer="zeros")
         # AF3: gating_linear uses final_init (zeros)
@@ -195,9 +199,10 @@ class _TriangleMulBase(nn.Module):
         # Jacobian at p = 1/H is (δ_hh' − 1/H), i.e. O(1): the router receives a
         # real gradient from step 0 rather than waking up through a sigmoid.
         self.router = LinearNoBias(c_z, num_heads, initializer="zeros") if self.use_router else None
-        # Per-head affine reuses norm_center's parameters viewed as [H, d], so
-        # the state_dict keys are identical across every cell of the ablation
-        # grid and any cell can warm-start from any other.
+        # Per-head affine reuses norm_center's gain viewed as [H, d], so the
+        # state_dict keys line up across the ablation grid; ``head_rms`` is the
+        # one cell that drops ``norm_center.bias``, so warm-starting into or out
+        # of it needs ``load_strict=false``.
         self._router_stats: dict[str, float] | None = None
         self.router_stats_enabled = False
 
@@ -321,15 +326,9 @@ class _TriangleMulBase(nn.Module):
             # RMSNorm, not LayerNorm: at d = 32 the LN mean carries
             # σ/sqrt(32) ≈ 0.18σ of estimation noise and subtracts it from the
             # signal. Dropping the mean removes that noise source outright.
-            #
-            # The learnable shift is kept. Two reasons: it leaves ``head_rms``
-            # and ``head_ln`` differing by *exactly* the mean subtraction, which
-            # is the comparison the ablation is meant to make; and dropping it
-            # would leave ``norm_center.bias`` with no consumer, which DDP
-            # reports as an unused parameter.
+            # No shift — ``norm_center`` is built without a bias in this mode.
             t32 = t.float()
             t = (t32 * torch.rsqrt(t32.pow(2).mean(-1, keepdim=True) + eps)).to(act.dtype) * w
-            t = t + self.norm_center.bias.view(h, d)
         else:  # head_ln
             t32 = t.float()
             mu = t32.mean(-1, keepdim=True)
