@@ -47,15 +47,29 @@ def _forward_without_triangle_attention(self, pair, single, pair_mask, seq_mask)
     return pair, single + self.single_transition(single)
 
 
-def timed(step, warmup: int = 2, iters: int = 5) -> float:
+def timed(step, warmup: int = 8, iters: int = 10, reps: int = 3) -> float:
+    """Milliseconds per call, min over repeats.
+
+    Warmup matters more than it looks: the Triton kernels autotune on first
+    sight of a shape and persist the result, so a short warmup charges the
+    first-measured variant for tuning that later variants inherit for free.
+    An earlier version of this script used two warmup iterations and produced
+    ``tri_mul`` slower than ``tri_attn`` at N=384 while the same run's block
+    delta said the opposite, and a ``tri_mul`` that grew only 1.3x from N=384 to
+    N=640 for an O(N^3) contraction. Taking the min over repeats after a long
+    warmup removes both.
+    """
     for _ in range(warmup):
         step()
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for _ in range(iters):
-        step()
-    torch.cuda.synchronize()
-    return 1000.0 * (time.time() - t0) / iters
+    best = float("inf")
+    for _ in range(reps):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(iters):
+            step()
+        torch.cuda.synchronize()
+        best = min(best, 1000.0 * (time.time() - t0) / iters)
+    return best
 
 
 def main() -> None:
@@ -74,46 +88,70 @@ def main() -> None:
         single = torch.randn(n, C_S, device=dev, dtype=dt, requires_grad=True)
         pmask = torch.ones(n, n, device=dev, dtype=dt)
         smask = torch.ones(n, device=dev, dtype=dt)
+        zb, mb = pair.unsqueeze(0), pmask.unsqueeze(0)
 
-        # --- individual modules
-        zb = pair.unsqueeze(0)
-        mb = pmask.unsqueeze(0)
-        for name, mod in (
-            ("tri_mul", TriangleMulOutgoing(C_Z, optim=optim)),
-            ("tri_attn", GridSelfAttention(C_Z, num_heads=N_HEADS, transpose=False, optim=optim)),
-        ):
-            mod = mod.to(dev).to(dt)
-            ms = timed(lambda mod=mod, zb=zb, mb=mb: mod(zb, mb).sum().backward())
-            rows.append(dict(scope="module", variant=name, n=n, ms=round(ms, 2)))
-
-        # --- whole block, with and without triangle attention
-        per_block = {}
+        mods = {
+            "tri_mul": TriangleMulOutgoing(C_Z, optim=optim).to(dev).to(dt),
+            "tri_attn": GridSelfAttention(C_Z, num_heads=N_HEADS, transpose=False, optim=optim).to(dev).to(dt),
+        }
+        blocks = {}
         for tag in ("full", "no_triattn"):
             blk = PairFormerBlock(C_Z, C_S, num_pair_heads=N_HEADS, optim=optim).to(dev).to(dt)
             if tag == "no_triattn":
                 blk.forward = types.MethodType(_forward_without_triangle_attention, blk)
+            blocks[tag] = blk
 
-            def step(blk=blk, pair=pair, single=single, pmask=pmask, smask=smask):
-                a, b = blk(pair, single, pmask, smask)
-                (a.sum() + b.sum()).backward()
+        def mod_step(m, zb=zb, mb=mb):
+            return lambda: m(zb, mb).sum().backward()
 
-            per_block[tag] = timed(step)
+        def blk_step(b, pair=pair, single=single, pmask=pmask, smask=smask):
+            def go():
+                x, y = b(pair, single, pmask, smask)
+                (x.sum() + y.sum()).backward()
+
+            return go
+
+        # Autotune every shape before timing anything, so no variant is charged
+        # for tuning that the others inherit.
+        for m in mods.values():
+            for _ in range(3):
+                mod_step(m)()
+        for b in blocks.values():
+            for _ in range(3):
+                blk_step(b)()
+
+        for name, m in mods.items():
+            rows.append(dict(scope="module", variant=name, n=n, ms=round(timed(mod_step(m)), 2)))
+            print(rows[-1], flush=True)
+        per_block = {}
+        for tag, b in blocks.items():
+            per_block[tag] = timed(blk_step(b))
             rows.append(dict(scope="block", variant=tag, n=n, ms=round(per_block[tag], 2)))
+            print(rows[-1], flush=True)
         rows.append(
-            dict(
-                scope="block",
-                variant="speedup",
-                n=n,
-                ms=round(per_block["full"] / per_block["no_triattn"], 3),
-            )
+            dict(scope="block", variant="speedup", n=n, ms=round(per_block["full"] / per_block["no_triattn"], 3))
         )
+        print(rows[-1], flush=True)
+
+    # Self-consistency: the block delta must agree with 2x the module time, and
+    # an O(N^3) op must grow ~(640/384)^3 = 4.63x. Print both rather than
+    # silently trusting the numbers.
+    def get(scope, variant, n):
+        return next(r["ms"] for r in rows if r["scope"] == scope and r["variant"] == variant and r["n"] == n)
+
+    print("")
+    print("consistency checks")
+    for n in (384, 640):
+        delta = get("block", "full", n) - get("block", "no_triattn", n)
+        print(f"  N={n}: block delta {delta:7.2f} ms  vs  2 x tri_attn {2 * get('module', 'tri_attn', n):7.2f} ms")
+    for v in ("tri_mul", "tri_attn"):
+        r = get("module", v, 640) / get("module", v, 384)
+        print(f"  {v:9s} N 384->640 grew {r:.2f}x  (O(N^3) predicts 4.63x)")
 
     with open(OUT / "bench_pair_track.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["scope", "variant", "n", "ms"])
         w.writeheader()
         w.writerows(rows)
-    for r in rows:
-        print(r)
 
 
 if __name__ == "__main__":

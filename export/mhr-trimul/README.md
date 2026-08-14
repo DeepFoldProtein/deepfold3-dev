@@ -28,51 +28,69 @@ Both keep r16's widths: `c_z = 256`, `c_s = 384`, `H = 8`, `d = c_z / H = 32`.
 
 ## 1. What triangle attention costs
 
-Measured with r16's exact fusion flags (`configs/initial.yaml:334-352` — fused
-evo-attention on, fused pair-bias off, fused triangle-mul on), bf16, forward +
-backward, single GPU. Reproduce with `bench_pair_track.py`; raw numbers in
-`bench_pair_track.csv`.
+All numbers below were taken on an **idle GPU**, with every shape autotuned
+before timing and the minimum taken over repeats. Earlier revisions of this note
+carried figures that were wrong by ~2x; see *Measurement pitfalls* at the end of
+this section for what went wrong, because the same traps are easy to re-enter.
+
+### Training shape (forward + backward, one PairFormer block, c_z=256)
 
 | N | `tri_mul` | `tri_attn` | full block | block w/o tri-attn | speedup |
 | --- | --- | --- | --- | --- | --- |
-| 384 | 10.7 ms | 19.2 ms | 68.7 ms | 29.2 ms | **2.35x** |
-| 640 | 29.5 ms | 78.0 ms | 240.5 ms | 78.7 ms | **3.06x** |
+| 384 | 4.50 ms | 8.22 ms | 33.36 ms | 12.46 ms | **2.68x** |
+| 640 | 12.45 ms | 33.52 ms | 103.76 ms | 34.83 ms | **2.98x** |
 
-The ratio grows with N because triangle attention's softmax over `k` is
-$O(N^3)$ with a larger constant than the triangle-multiply GEMM, and its
-backward materializes more.
+### Inference shape (forward only, whole trunk, 4 Evoformer + 48 PairFormer, 128 MSA rows)
 
-**Caveat 1 — this is a training-shaped measurement.** Forward *and* backward,
-so it does not describe inference. Triangle attention's backward is relatively
-more expensive than its forward, so the forward-only advantage is smaller. Do
-not quote 2.35x as an inference number.
+| N | r16 trunk | r17 trunk | speedup | peak r16 | peak r17 |
+| --- | --- | --- | --- | --- | --- |
+| 384 | 451.5 ms | 401.5 ms | **1.12x** | 3.87 GiB | 3.68 GiB |
+| 768 | 2648.5 ms | 1672.7 ms | **1.58x** | 9.18 GiB | 8.57 GiB |
+| 1280 | 13933.7 ms | 8831.9 ms | **1.58x** | 21.76 GiB | 20.15 GiB |
 
-**Caveat 2 — it is a single-block microbenchmark.** No activation
-checkpointing, no DDP, no recycling, and the MSA stack, atom encoder, diffusion
-module and confidence head are untouched.
+**Forward-only buys far less than forward+backward** — 1.58x against 2.98x — for
+two compounding reasons. Triangle attention's backward is disproportionately
+expensive relative to triangle multiplication's, and the trunk contains an
+unchanged MSA stack (row attention, outer-product mean) that dilutes a
+PairFormer-only win. Quote 2.7-3.0x for training and 1.6x for the trunk at
+inference; they are different quantities.
 
-**Caveat 3 — GPU exclusivity was not verified.** These numbers were taken on a
-shared host and there is no retroactive way to confirm the device was idle. The
-supporting evidence is reproducibility: `tri_mul` at N=384 measured 11.21 /
-10.29 / 10.7 ms across three independent runs (spanning a fusion-flag change),
-and the full block measured 68.48 / 68.74 ms across two — 0.4% apart, which
-contention does not usually permit. Re-confirm on a quiet device before these
-numbers carry any weight.
+**The trunk is not all of inference.** Diffusion sampling (200 steps x 5
+samples) is untouched by this arm, so end-to-end inference speedup is strictly
+below 1.58x. That measurement has not been made.
 
-**What was actually measured end to end.** r16 ran at a median 23.12 s/step
-(n=2301 intervals, warm) and r17 at 21.66 s/step (n=7 intervals, cold start),
-i.e. **~1.07x** — far below the block figure. Same crop (384) and same
-world_size (112), so those axes are controlled. A training step is dominated by
-the diffusion side (64 noise samples plus a 20-step mini-rollout at crop 384),
-not by the trunk, so removing triangle attention buys little there. Inference is
-the opposite regime and is where the win should appear; that measurement is
-**still outstanding** — the first attempt was taken while an 8-GPU inference job
-saturated the host and its non-monotonic result (1.13x / 1.96x / 1.61x at
-N = 384 / 768 / 1280) has been discarded.
+### Measurement pitfalls (all of these produced wrong numbers here first)
 
-**Trunk parameters: 239.7M -> 205.6M** (-34.1M), matching the two
-`GridSelfAttention` modules removed from each of 48 PairFormer + 4 Evoformer
-blocks. Full model 465M -> 431.3M.
+1. **Autotune contamination.** The Triton kernels tune on first sight of a shape
+   and persist the result, so a short warmup charges the first-measured variant
+   for tuning the rest inherit free. This produced `tri_mul` *slower* than
+   `tri_attn` at N=384 while the same run's block delta said the opposite. Fix:
+   autotune every shape before timing anything; min over repeats.
+2. **GPU sharing.** An 8-GPU inference job on the same host inflated an earlier
+   set by ~2x and made the speedup non-monotonic in N. Check `nvidia-smi` for
+   *other* processes, not just free memory.
+3. **Measuring one config then the other.** Clock and thermal drift masquerade as
+   a speedup. `bench_inference_trunk.py` interleaves at each length.
+4. **Casting the model to bf16.** The trunk LayerNorms are fp32-always, so
+   `.to(bfloat16)` raises a dtype mismatch at the first `pair_logits` GEMM.
+   Inference runs fp32 parameters under `autocast`; the benchmark must too.
+
+### Consistency checks (these are in `bench_pair_track.py`, and they matter)
+
+* N=640: block delta 68.93 ms vs 2 x `tri_attn` 67.04 ms — 2.8% apart.
+* N=384: 20.90 vs 16.44 ms — 27% apart. Expected: the block runs a row *and* a
+  transposed column attention, and only the row variant is timed standalone. The
+  gap closes at N=640, so the transpose penalty is relatively smaller there.
+* `tri_mul` grew **2.77x** from N=384 to 640. The naive O(N^3) expectation
+  (4.63x) is **wrong for these sizes**: at c_z=256 the projections cost
+  N^2 x 6C^2 = 5.8e10 against a contraction of N^3 x C = 1.45e10, so triangle
+  multiplication is projection-dominated here and should scale as N^2 — which
+  predicts 2.78x. It is width, not length, that sets its cost in this regime.
+* `tri_attn` grew 4.08x, near the O(N^3) prediction, as a contraction-dominated
+  op should.
+* Both trunks grow faster than N^3 between 768 and 1280 (5.26x / 5.28x vs 4.63x),
+  and r16's N=1280 repeats were still descending (15.6 -> 14.8 -> 13.9 s), so the
+  1280 row is the least settled of the three.
 
 ## 2. Why removing triangle attention is a real subtraction, not a simplification
 
