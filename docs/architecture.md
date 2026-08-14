@@ -122,6 +122,22 @@ Components:
 - Outgoing: `equation="ikc,jkc->ijc"` (default); Incoming: `equation="kic,kjc->ijc"`
 - LayerNorm -> project to 2xchannels -> sigmoid gate -> einsum -> LayerNorm -> project back + sigmoid gate
 
+**MHG-TriMul** (off by default; `num_heads=0` is AF3). With `num_heads=H`, the
+contraction is unchanged -- `einsum("ikhd,jkhd->ijhd")` is bitwise equal to
+`einsum("ikc,jkc->ijc")` under `c=(h,d)`, since only `k` is contracted -- and
+two steps are inserted between the einsum and `out_proj`:
+
+- `head_norm="head_rms"` / `"head_ln"`: normalize over `d` within each head
+  instead of over all `c_z`. The affine reuses `norm_center.weight/bias` viewed
+  as `[H, d]`, so `state_dict` keys are unchanged.
+- `router=True`: `g = H * softmax_h(W_r(LN(z)_ij))`, applied per head before
+  `out_proj`. Zero-init gives `g == 1`, i.e. exact AF3 behaviour at step 0.
+  This makes `out_proj` input-dependent over its column blocks, which the
+  output gate (applied *after* `out_proj`) cannot express.
+
+`router/entropy` is logged with the activation meter; `1.0` means the router is
+still uniform, i.e. inert. See `export/mhg-trimul/README.md`.
+
 **`OuterProductMean`** -- MSA-to-pair information flow
 
 - MSA `[S, N, c_msa]` -> two projections `[S, N, 32]` -> outer product -> mean over S -> pair `[N, N, c_pair]`
@@ -131,6 +147,15 @@ Components:
 **`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition
 
 **`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition
+
+`use_triangle_attention=False` (on either `EvoformerConfig` or
+`PairFormerConfig`) drops the two `GridSelfAttention` branches from every block
+of that stack; the branches are still metered, as exactly zero, so per-branch
+`rho_l` stays comparable against a run that has them. Triangle attention is the
+only pair operator whose selection over the intermediate node `k` is
+conditioned on the target pair `(i, j)` -- MHG-TriMul's router selects a
+relation subspace, not an intermediate node, so it does not replace it.
+Template and confidence-head PairFormers are unaffected.
 
 Optional Residual Output Scaling (ROS) on every block branch: when `PairFormerConfig.residual_output_scaling=True` (and equivalently `ConfidenceConfig.residual_output_scaling`), the block multiplies every branch's output by `s_ros = 1/sqrt(layer_idx + 1)` before adding to the residual stream. The depth-uniform variant `uniform_residual_scale` uses `1/sqrt(num_layer)` instead. The single-track stability ablation adds branch-specific multipliers `single_transition_residual_gain` and `pair_transition_residual_gain` (each composes with `s_ros`); see `docs/single-track-stability-experiments.md` §11. Output projections retain zero-init throughout.
 

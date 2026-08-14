@@ -77,6 +77,15 @@ def _resolve_branch_residual_gain(layer_idx: int, base_gain: float | None, per_l
     return base
 
 
+def _trimul_kwargs(cfg) -> dict:
+    """MHG-TriMul kwargs from an Evoformer/PairFormer config."""
+    return dict(
+        num_heads=cfg.trimul_num_heads,
+        head_norm=cfg.trimul_head_norm,
+        router=cfg.trimul_router,
+    )
+
+
 # Backwards-compatible alias for older imports during the deepnet-removal
 # refactor; remove once no callers reference the old name.
 _resolve_single_transition_gain = _resolve_branch_residual_gain
@@ -99,6 +108,8 @@ class EvoformerBlock(nn.Module):
         pair_dropout: float = 0.25,
         optim: OptimConfig | None = None,
         residual_out_scale: float = 1.0,
+        use_triangle_attention: bool = True,
+        trimul_kwargs: dict | None = None,
     ):
         super().__init__()
         # ``residual_out_scale = s`` policy in this block — F-output side for every
@@ -110,10 +121,13 @@ class EvoformerBlock(nn.Module):
         self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=outer_product_hidden)
         if optim is not None and optim.tiled_opm_chunk > 0:
             self.outer_product._chunk_size = optim.tiled_opm_chunk
-        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
-        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
-        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
-        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
+        tk = trimul_kwargs or {}
+        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim, **tk)
+        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim, **tk)
+        self.use_triangle_attention = bool(use_triangle_attention)
+        if self.use_triangle_attention:
+            self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
+            self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
         self.msa_transition = make_transition_block(c_msa, config=optim)
         self.msa_dropout = msa_dropout
@@ -137,8 +151,9 @@ class EvoformerBlock(nn.Module):
         msa = msa + s * self.msa_transition(msa)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
-        pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
-        pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
+        if self.use_triangle_attention:
+            pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
+            pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
         pair = pair + s * self.pair_transition(pair)
         return msa, pair
 
@@ -169,6 +184,8 @@ class PairFormerBlock(nn.Module):
         single_transition_residual_gain: float | None = None,
         pair_transition_residual_gain: float | None = None,
         branch_scaler: str = "identity",
+        use_triangle_attention: bool = True,
+        trimul_kwargs: dict | None = None,
     ):
         super().__init__()
         # ``residual_out_scale`` (= s_ros) policy — F-output side only:
@@ -185,10 +202,13 @@ class PairFormerBlock(nn.Module):
         #  * ``{single,pair}_transition_residual_gain`` (defaults 1.0)
         #    multiplies ``s_ros`` on the corresponding transition branch
         #    only — used by the trunk transition aligned-gain ablation.
-        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim)
-        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim)
-        self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
-        self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
+        tk = trimul_kwargs or {}
+        self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim, **tk)
+        self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim, **tk)
+        self.use_triangle_attention = bool(use_triangle_attention)
+        if self.use_triangle_attention:
+            self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
+            self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
         self.single_to_pair_norm = LayerNorm(c_pair)
         self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
@@ -255,10 +275,15 @@ class PairFormerBlock(nn.Module):
         pair = dropout_add_rowwise(pair, b_tri_out, p, training, use_fused)
         b_tri_in = s_tri * rmsn(self.tri_mul_in(pair, pair_mask))
         pair = dropout_add_rowwise(pair, b_tri_in, p, training, use_fused)
-        b_pair_attn_row = s_pa * rmsn(self.pair_attn_row(pair, pair_mask))
-        pair = dropout_add_rowwise(pair, b_pair_attn_row, p, training, use_fused)
-        b_pair_attn_col = s_pa * rmsn(self.pair_attn_col(pair, pair_mask))
-        pair = dropout_add_columnwise(pair, b_pair_attn_col, p, training, use_fused)
+        if self.use_triangle_attention:
+            b_pair_attn_row = s_pa * rmsn(self.pair_attn_row(pair, pair_mask))
+            pair = dropout_add_rowwise(pair, b_pair_attn_row, p, training, use_fused)
+            b_pair_attn_col = s_pa * rmsn(self.pair_attn_col(pair, pair_mask))
+            pair = dropout_add_columnwise(pair, b_pair_attn_col, p, training, use_fused)
+        else:
+            # Meter the deleted branches as exactly zero rather than dropping the
+            # rows — ρ_l stays comparable against a run that has them.
+            b_pair_attn_row = b_pair_attn_col = pair.new_zeros(())
         b_pair_ffn = s_pf * rmsn(self.pair_transition(pair))
         pair = pair + b_pair_ffn
         # Single update: pair → logits, then single attention.
@@ -371,6 +396,8 @@ class Evoformer(nn.Module):
                     residual_out_scale=block_residual_scale(
                         i, cfg.num_layer, cfg.residual_output_scaling, cfg.uniform_residual_scale
                     ),
+                    use_triangle_attention=cfg.use_triangle_attention,
+                    trimul_kwargs=_trimul_kwargs(cfg),
                 )
                 for i in range(cfg.num_layer)
             ]
@@ -405,6 +432,8 @@ class Evoformer(nn.Module):
                         pf_cfg.pair_transition_residual_per_layer_extra,
                     ),
                     branch_scaler=pf_cfg.branch_scaler,
+                    use_triangle_attention=pf_cfg.use_triangle_attention,
+                    trimul_kwargs=_trimul_kwargs(pf_cfg),
                 )
                 for i in range(pf_cfg.num_layer)
             ]

@@ -88,6 +88,24 @@ class EvoformerConfig:
     #   uniform_residual_scale  : depth-uniform ``s = 1/sqrt(num_layer)``
     residual_output_scaling: bool = False
     uniform_residual_scale: bool = False
+    # ── Pair-track architecture (r17: MHG-TriMul + triangle-attention removal;
+    # see export/mhg-trimul/README.md) ────────────────────────────────────────
+    # ``use_triangle_attention`` deletes the two GridSelfAttention branches from
+    # every block of this stack. That is a real subtraction, not a
+    # simplification: triangle attention is the only pair operator whose
+    # selection over the intermediate node ``k`` is conditioned on the *target*
+    # pair ``(i, j)`` (it is the query) and the only one whose mixing over ``k``
+    # is softmax-normalized. Triangle multiplication weights ``k`` by functions
+    # of ``(i, k)`` and ``(j, k)`` alone. MHG-TriMul does not restore this — its
+    # router selects which relation *subspace* explains a pair, not which
+    # intermediate node does.
+    #
+    # ``trimul_*`` configure MHG-TriMul (``TriangleMul`` docstring for the
+    # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
+    use_triangle_attention: bool = True
+    trimul_num_heads: int = 0
+    trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
+    trimul_router: bool = False
 
 
 @dataclass
@@ -154,6 +172,24 @@ class PairFormerConfig:
     # them redundant (branch is already unit-RMS so an extra constant gain
     # just rescales the block-wide ``γ``).
     branch_scaler: Literal["identity", "rmsnorm"] = "identity"
+    # ── Pair-track architecture (r17: MHG-TriMul + triangle-attention removal;
+    # see export/mhg-trimul/README.md) ────────────────────────────────────────
+    # ``use_triangle_attention`` deletes the two GridSelfAttention branches from
+    # every block of this stack. That is a real subtraction, not a
+    # simplification: triangle attention is the only pair operator whose
+    # selection over the intermediate node ``k`` is conditioned on the *target*
+    # pair ``(i, j)`` (it is the query) and the only one whose mixing over ``k``
+    # is softmax-normalized. Triangle multiplication weights ``k`` by functions
+    # of ``(i, k)`` and ``(j, k)`` alone. MHG-TriMul does not restore this — its
+    # router selects which relation *subspace* explains a pair, not which
+    # intermediate node does.
+    #
+    # ``trimul_*`` configure MHG-TriMul (``TriangleMul`` docstring for the
+    # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
+    use_triangle_attention: bool = True
+    trimul_num_heads: int = 0
+    trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
+    trimul_router: bool = False
 
     def __post_init__(self) -> None:
         if self.branch_scaler != "identity":

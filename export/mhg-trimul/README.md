@@ -5,8 +5,13 @@ from-scratch arms:
 
 | arm | change | question it answers |
 | --- | --- | --- |
-| **r17** | delete `pair_attn_row` / `pair_attn_col` from every block | is triangle attention worth 2.4x the block cost? |
-| **r18** | r17 + replace `TriangleMul` with `MHG-TriMul` | does target-pair-conditioned routing over relation subspaces recover what was lost, and more? |
+| **r17** | delete `pair_attn_row` / `pair_attn_col` from every block, **and** add the MHG router (per-head norm off) | is triangle attention worth 2.4x the block cost, and does target-pair-conditioned routing over relation subspaces help? |
+| **r18** | r17 + per-head normalization (`head_rms`) | does giving the router sole authority over head magnitude complete the mechanism? |
+
+r17 is a combined arm by choice, but only one of its two changes carries risk at
+initialization: the router is zero-initialized to `g == 1`, so MHG-TriMul is
+*bitwise* AF3 TriMul at step 0. Per-head normalization is held back to r18 for
+the attribution reason in §4, not because it is dangerous.
 
 Both keep r16's widths: `c_z = 256`, `c_s = 384`, `H = 8`, `d = c_z / H = 32`.
 
@@ -181,34 +186,93 @@ routing — separate as a 2x2, and the informative cell is the one that is
 
 | | no router | router |
 | --- | --- | --- |
-| $\operatorname{LN}_{c_z}$ (AF3) | r17 baseline | **A** — routing only; exactly identity at init |
-| $\operatorname{RMSNorm}_d$ | **B** — predicted harmful (dead heads amplified to unit scale) | **C** — full MHG-TriMul |
+| $\operatorname{LN}_{c_z}$ (AF3) | plain no-TriAttn baseline | **A = r17** — routing only; exactly identity at init |
+| $\operatorname{RMSNorm}_d$ | **B** — predicted harmful (dead heads amplified to unit scale) | **C = r18** — full MHG-TriMul |
 
 If C beats the baseline but B also matches it, the per-head norm is inert and
 all of the gain is A. If B is *not* worse than the baseline, the coupling story
 above is wrong.
 
-Arm A is exactly function-identical to r17's `TriangleMul` at initialization
-($g\equiv1$, $\operatorname{LN}_{c_z}$ retained), so it warm-starts from an r17
-checkpoint with `load_strict=false` and reads in ~2-3k steps. Arm C does not:
-$\operatorname{LN}_{c_z}\neq\operatorname{RMSNorm}_{d}$, so it needs
-re-equilibration.
+Arm A is what r17 runs. Arm C (= r18) warm-starts from an r17 checkpoint with
+`load_strict=false`, but not for free:
+$\operatorname{LN}_{c_z}\neq\operatorname{RMSNorm}_{d}$ is a function change,
+so it needs re-equilibration rather than reading in the ~2-3k an
+identity-initialized change would.
 
-## 4. Sequencing, and the confound to avoid
+## 4. r17 is the combined arm — what can and cannot be recovered afterward
 
-Running `MHG + no-TriAttn` as a single first arm is cheaper only if it works.
-If it does not, the loss is unattributable and decomposing it costs two further
-runs — worst case three full runs against the sequential plan's one full run
-plus short warm-started branches. The sequential order also makes r17 a
-deliverable on its own (a 2.35x cheaper pair track at crop 384), and lets r18's
-arm A warm-start from it for free.
+r17 ships two changes at once (`configs/df3-stage0-r17.yaml`, from scratch,
+depth 48 and crop held at r16's values). That buys one run instead of two and
+costs attribution: a shortfall against r16 cannot be split between the deleted
+attention and the new routing. How much of that cost is recoverable depends
+entirely on *which* pieces are in the arm, and the pieces are not symmetric —
+which is why r17 carries the router but not the per-head norm.
 
-**Open decision: what to do with the freed compute.** Three options, and they
+**The router is instrumented, and separately lesionable.**
+
+- *Free, from step 0.* `router/entropy` is logged on the activation-meter
+  window (`collect_router_stats` in `ops.py`, wired in `trainer.py`). It is
+  $H(g)/\log H$ averaged over pairs and layers. **1.0 means the router never
+  left uniform, i.e. it is inert and the module is functionally AF3 TriMul.**
+  If it stays at 1.0, the routing question is answered with no second run and
+  no lesion. `router/entropy_by_module/*` gives the depth profile, so "only the
+  late layers route" is visible too.
+- *One eval.* Zero the router in a trained checkpoint and re-bench:
+  ```python
+  for m in model.modules():
+      if getattr(m, "router", None) is not None:
+          m.router.weight.zero_()          # g ≡ 1
+  ```
+  This is a **lesion**, not a training ablation. It measures how much the
+  trained model *depends* on routing, which is not the same as whether training
+  with a router produced a better model — a network trained with a router can
+  route its computation through it so thoroughly that removing it is
+  catastrophic even where training without one would have reached the same
+  place by another path. Directional evidence only.
+- Note where the lesion lands: zeroing the router in full MHG leaves
+  $\operatorname{RMSNorm}_d$ with no router, which is **cell B** — the cell
+  predicted to be harmful. A large drop is consistent with the coupling story
+  (the router is holding up a representation that per-head norm flattened). No
+  drop means the router was inert, and by the same coupling argument the
+  per-head norm is then doing nothing either.
+
+**The per-head norm is not lesionable at all**, and that is why it is not in
+r17. There is no setting of the parameters that turns
+$\operatorname{RMSNorm}_d$ back into $\operatorname{LN}_{c_z}$ — they are
+different functions with different statistics. Shipping it in r17 would make a
+shortfall a three-way confound {triangle attention, per-head norm, router} that
+no logging resolves. Holding it back keeps the failure case clean: **r17 loses
+and `router/entropy` is 1.0 ⇒ the loss is the triangle-attention removal,
+single cause, established from inside the run.**
+
+The cost of that choice is real. Without per-head norm the router's authority is
+partial — head magnitudes at a given $(i,j)$ still vary freely, so scaling a
+head that is already small does little. The two pieces were designed as one
+mechanism ("head magnitude is decided by the router, not by the contraction")
+and r17 runs half of it, which may under-deliver and read as a weak negative on
+routing that a fuller version would not have produced.
+
+That asymmetry is the practical shape of the ablation grid: the router column is
+cheap to probe post hoc, the norm row is not. To keep the
+follow-ups cheap, every cell of the grid carries **identical `state_dict` keys**
+(the per-head affine reuses `norm_center.weight/bias` viewed as `[H, d]`, and
+`router.weight` is the only extra tensor), so any cell warm-starts from any
+other with `load_strict=false`.
+
+## 5. Sequencing, and the confound to avoid
+
+Running `MHG + no-TriAttn` as a single arm is cheaper only if it works. If it
+does not, the loss is unattributable and decomposing it costs further runs. That
+was the argument for splitting r17/r18; the arm was combined anyway, so the
+mitigation is §4 — instrument the half that can be instrumented, and accept
+that the norm half needs a run.
+
+**Decided: depth 48 and crop 384 held at r16's values.** The speedup is banked
+as steps, and the r16 comparison is to be reported at **both** iso-step and
+iso-wall-clock — they will disagree, and both are honest. The alternatives, for
+the record: Three options, and they
 answer different questions.
 
-- *Keep depth 48 and crop 384.* Cleanest attribution; the speedup shows up as
-  more steps in the same wall-clock. Report the r16 comparison at **both**
-  iso-step and iso-wall-clock — they will disagree, and both are honest.
 - *Iso-compute depth (48 -> ~114 at N=384).* Tests "is triangle attention worth
   its FLOPs" head-on, but 114 residual blocks is deep for a stack that already
   shows layer-0 amplitude dominance and an aligned-branch budget
@@ -219,5 +283,22 @@ answer different questions.
   1.15-1.38x horizontal shift along that axis — but it changes the data
   distribution, which confounds the architecture comparison in a different way.
 
-Recommendation: keep depth and crop fixed for r17 so the subtraction is clean,
-bank the speedup as steps, and decide how to spend the surplus at r18.
+The surplus gets spent at r18, once r17 has said whether the pair track
+survives without triangle attention.
+
+## 6. Where it lives
+
+| | |
+| --- | --- |
+| module | `TriangleMulOutgoing` / `TriangleMulIncoming` (`model/ops.py`), `num_heads` / `head_norm` / `router` |
+| block | `use_triangle_attention` on `PairFormerBlock` and `EvoformerBlock` (`model/evoformer.py`) |
+| config | `use_triangle_attention`, `trimul_num_heads`, `trimul_head_norm`, `trimul_router` on `EvoformerConfig` / `PairFormerConfig` |
+| run | `configs/df3-stage0-r17.yaml` |
+| read-out | `router/entropy*`, `router/occupancy_*` on the `act_rms` log window |
+| tests | `tests/test_mhg_trimul.py` |
+| benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |
+
+Scope: **trunk only**. The template PairFormer (2 layers, its own block class in
+`template_embedding.py`) and the confidence-head PairFormer keep AF3 triangle
+attention and AF3 `TriangleMul`, so the read-out heads are not confounded with
+the trunk arm.

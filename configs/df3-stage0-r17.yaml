@@ -1,0 +1,62 @@
+base: df3-stage0-r16.yaml
+
+# r17 — pair-track arm on top of r16's widths (c_z=256, c_m=128).
+# Design note + measurements: export/mhg-trimul/README.md
+#
+# Two changes, both confined to the trunk pair track:
+#
+#   1. Triangle attention deleted from every Evoformer and PairFormer block.
+#      Measured with r16's fusion flags at c_z=256, a full PairFormer block
+#      costs 2.35x the no-triangle-attention block at N=384 (3.06x at N=640).
+#      This is a subtraction of capability, not just of FLOPs: triangle
+#      attention is the only pair operator whose selection over the
+#      intermediate node k is conditioned on the target pair (i,j), and the
+#      only one whose mixing over k is softmax-normalized.
+#
+#   2. TriangleMul -> MHG-TriMul, routing half only. The contraction and the
+#      LayerNorm over all c_z are untouched; the output is routed per head by
+#      g = H*softmax(R(x_ij)) before the output projection. The router makes
+#      W_o input-dependent over its column blocks, which the AF3 output gate
+#      (acting *after* W_o) cannot express. Zero-init => g == 1, so the module
+#      is EXACTLY AF3 TriMul at step 0 (tests/test_mhg_trimul.py asserts bit
+#      equality) -- r17's only architectural risk at initialization is (1).
+#
+#      Per-head normalization (trimul_head_norm: head_rms) is deliberately NOT
+#      enabled here, and the reason is attribution rather than risk. The router
+#      is instrumented (router/entropy; 1.0 == inert) and separately lesionable
+#      (zero W_r), so if r17 loses to r16 with the router inert, the loss is
+#      attributable to (1) alone, from inside the run. Per-head norm is neither
+#      instrumented nor lesionable -- there is no parameter setting that turns
+#      RMSNorm_d back into LN_c -- so shipping it here would make a shortfall a
+#      three-way confound that no logging resolves. It goes to r18, warm-started
+#      from r17.
+#
+# Depth (48) and crop are held at r16's values so the subtraction stays clean;
+# the speedup is banked as steps, and the r16 comparison should be reported at
+# BOTH iso-step and iso-wall-clock. From-scratch — not warm-startable from r16
+# (the deleted attention blocks and the router change the parameter set).
+#
+# Scope: trunk only. The template PairFormer (2 layers, its own block class)
+# and the confidence-head PairFormer keep AF3 triangle attention and AF3
+# TriangleMul, so the read-out heads are not confounded with the trunk arm.
+
+training:
+  wandb_project: deepfold3-v2
+  # Unchanged from r16 on purpose. The block now carries 5 residual branches
+  # instead of 7, which changes residual variance accumulation; holding lr
+  # fixed keeps that as part of what the arm measures rather than a
+  # co-varying knob. Revisit only on evidence.
+  lr: 0.9e-3
+
+model:
+  evoformer:
+    use_triangle_attention: false
+    trimul_num_heads: 8 # 256 / 8 = 32 per head
+    trimul_head_norm: channel # r18: head_rms
+    trimul_router: true
+
+  pairformer:
+    use_triangle_attention: false
+    trimul_num_heads: 8
+    trimul_head_norm: channel # r18: head_rms
+    trimul_router: true

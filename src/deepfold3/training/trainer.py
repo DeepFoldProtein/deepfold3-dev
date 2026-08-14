@@ -800,6 +800,14 @@ class Trainer:
                 f"Activation-RMS meter attached ({self._act_meter.num_points} points × 2 tracks, "
                 f"flush every {cfg.log_interval} steps)"
             )
+        # MHG-TriMul router read-out rides the same window as the activation
+        # meter. ``router/entropy`` at 1.0 means the router never left uniform,
+        # i.e. it is inert — the one question the combined r17 arm can answer
+        # from inside the run rather than from a second run.
+        from deepfold3.model.ops import collect_router_stats, set_router_stats_enabled
+
+        self._collect_router_stats = collect_router_stats
+        self._set_router_stats_enabled = set_router_stats_enabled
 
         if cfg.eval_before and eval_dl is not None:
             self._run_eval_and_track_best(eval_dl, output_dir)
@@ -866,6 +874,7 @@ class Trainer:
                 # so they don't contaminate train-window averages.
                 if self._act_meter is not None:
                     self._act_meter.enabled = True
+                    self._set_router_stats_enabled(self.model, True)
                 # GPU-time bracket start (records on the current CUDA stream,
                 # after the dataloader fetch so inter-microstep wait is out).
                 step_time_meter.start()
@@ -877,6 +886,7 @@ class Trainer:
                     loss, loss_dict, loss_counts = self._training_step(features)
                 if self._act_meter is not None:
                     self._act_meter.enabled = False
+                    self._set_router_stats_enabled(self.model, False)
 
                 # NaN/Inf detection is deferred to the opt-step boundary inside
                 # ``_optimizer_step`` — a single all-reduce per window replaces
@@ -1061,6 +1071,7 @@ class Trainer:
                     ):
                         act_rms = self._act_meter.flush_to_dict()
                         self._act_meter.reset()
+                        act_rms.update(self._collect_router_stats(self.model))
 
                     # data_wait flush (compute_time_window came from the event
                     # meter above). Reset on all ranks so the flag can flip.
