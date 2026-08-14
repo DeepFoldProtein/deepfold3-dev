@@ -1,0 +1,11 @@
+scope,variant,n,ms
+module,tri_mul,384,10.7
+module,tri_attn,384,19.24
+block,full,384,68.74
+block,no_triattn,384,29.24
+block,speedup,384,2.351
+module,tri_mul,640,29.45
+module,tri_attn,640,77.96
+block,full,640,240.45
+block,no_triattn,640,78.66
+block,speedup,640,3.057
