@@ -15,7 +15,7 @@ the MSA stack, atom encoder, diffusion module and confidence head are unchanged.
 Measure the full step before committing a run.
 
 Usage:
-    python export/mhg-trimul/bench_pair_track.py
+    python export/mhr-trimul/bench_pair_track.py
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def main() -> None:
             ("tri_attn", GridSelfAttention(C_Z, num_heads=N_HEADS, transpose=False, optim=optim)),
         ):
             mod = mod.to(dev).to(dt)
-            ms = timed(lambda mod=mod: mod(zb, mb).sum().backward())
+            ms = timed(lambda mod=mod, zb=zb, mb=mb: mod(zb, mb).sum().backward())
             rows.append(dict(scope="module", variant=name, n=n, ms=round(ms, 2)))
 
         # --- whole block, with and without triangle attention
@@ -93,7 +93,7 @@ def main() -> None:
             if tag == "no_triattn":
                 blk.forward = types.MethodType(_forward_without_triangle_attention, blk)
 
-            def step(blk=blk):
+            def step(blk=blk, pair=pair, single=single, pmask=pmask, smask=smask):
                 a, b = blk(pair, single, pmask, smask)
                 (a.sum() + b.sum()).backward()
 

@@ -1,15 +1,24 @@
-# MHG-TriMul and the triangle-attention removal — design note
+# MHR-TriMul and the triangle-attention removal — design note
+
+**MHR = Multi-Head *Routed* triangle multiplication.** Not "gated": every gate
+in the module — $\sigma(G_a)$, $\sigma(G_b)$, $\sigma(G_o)$ — is AF3's and
+unchanged. What is new is the router, and a softmax router is not a gate. A gate
+is an independent per-channel multiplier in $(0,1)$; the router is bound by
+$\sum_h g^{(h)} = H$, so it **reallocates across heads rather than gating
+them**. That constraint is the design: the router answers *which* head explains
+a pair, and the retained output gate answers *whether* the module should fire at
+all.
 
 Two independent changes to the PairFormer pair track, planned as two
 from-scratch arms:
 
 | arm | change | question it answers |
 | --- | --- | --- |
-| **r17** | delete `pair_attn_row` / `pair_attn_col` from every block, **and** add the MHG router (per-head norm off) | is triangle attention worth 2.4x the block cost, and does target-pair-conditioned routing over relation subspaces help? |
+| **r17** | delete `pair_attn_row` / `pair_attn_col` from every block, **and** add the MHR router (per-head norm off) | is triangle attention worth 2.4x the block cost, and does target-pair-conditioned routing over relation subspaces help? |
 | **r18** | r17 + per-head normalization (`head_rms`) | does giving the router sole authority over head magnitude complete the mechanism? |
 
 r17 is a combined arm by choice, but only one of its two changes carries risk at
-initialization: the router is zero-initialized to `g == 1`, so MHG-TriMul is
+initialization: the router is zero-initialized to `g == 1`, so MHR-TriMul is
 *bitwise* AF3 TriMul at step 0. Per-head normalization is held back to r18 for
 the attribution reason in §4, not because it is dangerous.
 
@@ -33,11 +42,37 @@ The ratio grows with N because triangle attention's softmax over `k` is
 $O(N^3)$ with a larger constant than the triangle-multiply GEMM, and its
 backward materializes more.
 
-**Caveat, and it is a large one.** This is a single-block microbenchmark: no
-activation checkpointing, no DDP, no recycling, and the MSA stack, atom
-encoder, diffusion module and confidence head are untouched. The end-to-end
-step speedup is strictly lower than 2.35x and must be measured on the real
-config before a run is committed.
+**Caveat 1 — this is a training-shaped measurement.** Forward *and* backward,
+so it does not describe inference. Triangle attention's backward is relatively
+more expensive than its forward, so the forward-only advantage is smaller. Do
+not quote 2.35x as an inference number.
+
+**Caveat 2 — it is a single-block microbenchmark.** No activation
+checkpointing, no DDP, no recycling, and the MSA stack, atom encoder, diffusion
+module and confidence head are untouched.
+
+**Caveat 3 — GPU exclusivity was not verified.** These numbers were taken on a
+shared host and there is no retroactive way to confirm the device was idle. The
+supporting evidence is reproducibility: `tri_mul` at N=384 measured 11.21 /
+10.29 / 10.7 ms across three independent runs (spanning a fusion-flag change),
+and the full block measured 68.48 / 68.74 ms across two — 0.4% apart, which
+contention does not usually permit. Re-confirm on a quiet device before these
+numbers carry any weight.
+
+**What was actually measured end to end.** r16 ran at a median 23.12 s/step
+(n=2301 intervals, warm) and r17 at 21.66 s/step (n=7 intervals, cold start),
+i.e. **~1.07x** — far below the block figure. Same crop (384) and same
+world_size (112), so those axes are controlled. A training step is dominated by
+the diffusion side (64 noise samples plus a 20-step mini-rollout at crop 384),
+not by the trunk, so removing triangle attention buys little there. Inference is
+the opposite regime and is where the win should appear; that measurement is
+**still outstanding** — the first attempt was taken while an 8-GPU inference job
+saturated the host and its non-monotonic result (1.13x / 1.96x / 1.61x at
+N = 384 / 768 / 1280) has been discarded.
+
+**Trunk parameters: 239.7M -> 205.6M** (-34.1M), matching the two
+`GridSelfAttention` modules removed from each of 48 PairFormer + 4 Evoformer
+blocks. Full model 465M -> 431.3M.
 
 ## 2. Why removing triangle attention is a real subtraction, not a simplification
 
@@ -55,10 +90,10 @@ selection over intermediate nodes, and it is the only pair operator whose
 mixing over `k` is normalized (competitive) rather than an unnormalized dense
 sum.
 
-MHG-TriMul does **not** restore this. Its router selects *which relation
+MHR-TriMul does **not** restore this. Its router selects *which relation
 subspace* explains a pair, not *which intermediate node* does. The two are
 orthogonal axes. This is why the arms are sequential: if a combined
-`MHG + no-TriAttn` arm underperforms r16, the loss cannot be attributed.
+`MHR + no-TriAttn` arm underperforms r16, the loss cannot be attributed.
 
 ### Pre-registered diagnostic
 
@@ -81,7 +116,7 @@ A drop confined to (1)-(3) with (4) intact says triangle attention is doing
 strand register and nothing else, which is actionable. A uniform drop says it
 is doing general pair reasoning and the FLOPs are earned.
 
-## 3. MHG-TriMul
+## 3. MHR-TriMul
 
 ### Definition
 
@@ -196,7 +231,7 @@ routing — separate as a 2x2, and the informative cell is the one that is
 | | no router | router |
 | --- | --- | --- |
 | $\operatorname{LN}_{c_z}$ (AF3) | plain no-TriAttn baseline | **A = r17** — routing only; exactly identity at init |
-| $\operatorname{RMSNorm}_d$ | **B** — predicted harmful (dead heads amplified to unit scale) | **C = r18** — full MHG-TriMul |
+| $\operatorname{RMSNorm}_d$ | **B** — predicted harmful (dead heads amplified to unit scale) | **C = r18** — full MHR-TriMul |
 
 If C beats the baseline but B also matches it, the per-head norm is inert and
 all of the gain is A. If B is *not* worse than the baseline, the coupling story
@@ -219,13 +254,36 @@ which is why r17 carries the router but not the per-head norm.
 
 **The router is instrumented, and separately lesionable.**
 
-- *Free, from step 0.* `router/entropy` is logged on the activation-meter
-  window (`collect_router_stats` in `ops.py`, wired in `trainer.py`). It is
-  $H(g)/\log H$ averaged over pairs and layers. **1.0 means the router never
-  left uniform, i.e. it is inert and the module is functionally AF3 TriMul.**
-  If it stays at 1.0, the routing question is answered with no second run and
-  no lesion. `router/entropy_by_module/*` gives the depth profile, so "only the
-  late layers route" is visible too.
+- *Free, from step 0.* Two statistics are logged on the activation-meter window
+  (`collect_router_stats` in `ops.py`, wired in `trainer.py`), and **entropy
+  alone is not enough**:
+
+  - `router/entropy` = $H(p)/\log H$ averaged over pairs and layers. 1.0 means
+    the router never left uniform — inert, functionally AF3 TriMul.
+  - `router/g_std` = the **across-pair** standard deviation of $g$, averaged
+    over heads. This is the one that decides whether the router is *earning* its
+    place. A router that is sharp but the same for every pair scales each column
+    block of $W_o$ by a constant, which is a reparameterization of $W_o$ and
+    therefore inside AF3's function class — it contributes nothing, yet its
+    entropy is low and would read as "active". Only the pair-conditional part
+    is outside the class, and only `g_std` sees it. Since
+    $\tfrac1H\sum_h g^{(h)}=1$ by construction, 0.1 is a modest effect.
+
+  | `entropy` | `g_std` | reading |
+  | --- | --- | --- |
+  | $\approx 1$ | $\approx 0$ | inert — the router never engaged |
+  | $< 1$ | $\approx 0$ | active but **redundant** with $W_o$ |
+  | $< 1$ | $> 0$ | genuinely pair-conditional routing |
+
+  `router/{entropy,g_std}_by_module/*` give the depth profile, so "only the late
+  layers route" is visible too.
+
+  Two caveats on `g_std`. It is accumulated over every forward in the window and
+  reported as a mean — recycling means several forwards per step, so this is not
+  "whichever forward was last". And it measures only *within-example* variation:
+  a router that varied across examples while staying constant within one would
+  also be outside the function class and would read as 0 here, so `g_std` is a
+  **conservative lower bound** on the conditioning the router carries.
 - *One eval.* Zero the router in a trained checkpoint and re-bench:
   ```python
   for m in model.modules():
@@ -238,7 +296,7 @@ which is why r17 carries the router but not the per-head norm.
   route its computation through it so thoroughly that removing it is
   catastrophic even where training without one would have reached the same
   place by another path. Directional evidence only.
-- Note where the lesion lands: zeroing the router in full MHG leaves
+- Note where the lesion lands: zeroing the router in full MHR leaves
   $\operatorname{RMSNorm}_d$ with no router, which is **cell B** — the cell
   predicted to be harmful. A large drop is consistent with the coupling story
   (the router is holding up a representation that per-head norm flattened). No
@@ -270,7 +328,7 @@ cell warm-starts from any other with `load_strict=false`.
 
 ## 5. Sequencing, and the confound to avoid
 
-Running `MHG + no-TriAttn` as a single arm is cheaper only if it works. If it
+Running `MHR + no-TriAttn` as a single arm is cheaper only if it works. If it
 does not, the loss is unattributable and decomposing it costs further runs. That
 was the argument for splitting r17/r18; the arm was combined anyway, so the
 mitigation is §4 — instrument the half that can be instrumented, and accept
@@ -305,7 +363,8 @@ survives without triangle attention.
 | run | `configs/df3-stage0-r17.yaml` (arm A), `configs/df3-stage0-r18.yaml` (arm C, warm-started from r17) |
 | grid cells B and the plain baseline | `--override model.{evoformer,pairformer}.trimul_router=false` on r18 / r17 — no config file |
 | read-out | `router/entropy*`, `router/occupancy_*` on the `act_rms` log window |
-| tests | `tests/test_mhg_trimul.py` |
+| tests | `tests/test_mhr_trimul.py` |
+| known pre-existing failure | `tests/triton/test_evo_attn_robustness.py::test_row_norm_heterogeneity` (`fail_frac=4.69e-2` vs a `1e-2` limit). Confirmed identical, bit for bit, at `023c064` — before any of this work — so it is unrelated to the pair-track changes and is *not* fixed here. |
 | benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |
 
 Scope: **trunk only**. The template PairFormer (2 layers, its own block class in
