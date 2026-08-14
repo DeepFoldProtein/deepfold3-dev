@@ -321,8 +321,15 @@ class _TriangleMulBase(nn.Module):
             # RMSNorm, not LayerNorm: at d = 32 the LN mean carries
             # σ/sqrt(32) ≈ 0.18σ of estimation noise and subtracts it from the
             # signal. Dropping the mean removes that noise source outright.
+            #
+            # The learnable shift is kept. Two reasons: it leaves ``head_rms``
+            # and ``head_ln`` differing by *exactly* the mean subtraction, which
+            # is the comparison the ablation is meant to make; and dropping it
+            # would leave ``norm_center.bias`` with no consumer, which DDP
+            # reports as an unused parameter.
             t32 = t.float()
             t = (t32 * torch.rsqrt(t32.pow(2).mean(-1, keepdim=True) + eps)).to(act.dtype) * w
+            t = t + self.norm_center.bias.view(h, d)
         else:  # head_ln
             t32 = t.float()
             mu = t32.mean(-1, keepdim=True)

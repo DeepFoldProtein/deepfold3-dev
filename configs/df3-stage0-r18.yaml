@@ -1,0 +1,66 @@
+base: df3-stage0-r17.yaml
+
+# r18 — the second half of MHG-TriMul, warm-started from r17.
+# Design note: export/mhg-trimul/README.md §3-4
+#
+# r17 runs the router against AF3's LayerNorm over all c_z. That leaves the
+# router's authority partial: head magnitudes at a given (i,j) still vary
+# freely, so scaling a head that is already small does little. r18 adds the
+# other half of the mechanism — RMSNorm over d within each head — so that
+# g = H*softmax(R(x_ij)) becomes the *sole* determinant of a head's
+# contribution magnitude.
+#
+# The two are coupled by design, not independent effects. Per-head norm forces
+# ||T̂^(h)|| = sqrt(d) for every head and every pair, which destroys the signal
+# "this head has nothing to say about this pair" that LN over c_z preserves as
+# relative head magnitude. After it, every head speaks at the same volume and
+# only the router can turn one down: per-head norm creates the problem the
+# router solves. This is why the no-router cell of the grid (B below) is
+# predicted to be *harmful*, and why r17 ships the router first.
+#
+# Warm start (not from scratch):
+#
+#   deepfold3 train --config configs/df3-stage0-r18.yaml \
+#       --params runs/r17/checkpoint_<step>.pt --output runs/r18
+#
+# Parameter shapes are identical to r17 — the per-head affine reuses
+# norm_center.weight/bias viewed as [H, d] — so load_strict can stay on. But
+# LN_c != RMSNorm_d is a function change, so this needs re-equilibration rather
+# than the ~2-3k an identity-initialized change would read in. The optimizer
+# state is reset: its second moments were accumulated under a different
+# post-contraction normalization and carrying them over would fight the change.
+#
+# ── Ablation grid ────────────────────────────────────────────────────────────
+# The remaining two cells need no config file — they are one-line overrides,
+# passed through EXTRA_ARGS so the trainjob YAML is never edited:
+#
+#   plain no-TriAttn baseline (no router, LN_c):
+#     --config configs/df3-stage0-r17.yaml \
+#     --override model.evoformer.trimul_router=false \
+#     --override model.pairformer.trimul_router=false
+#
+#   cell B (per-head norm, no router) — the reference-class cell, predicted
+#   harmful; if it is NOT worse than the baseline, the coupling argument above
+#   is wrong and r18's premise fails:
+#     --config configs/df3-stage0-r18.yaml \
+#     --override model.evoformer.trimul_router=false \
+#     --override model.pairformer.trimul_router=false
+#
+# Read `router/entropy` on both r17 and r18. It is H(g)/log H averaged over
+# pairs and layers; 1.0 means the router never left uniform, i.e. it is inert
+# and the module is functionally AF3 TriMul. If r18's entropy drops well below
+# r17's, the per-head norm did what it was added to do — hand the router real
+# authority — regardless of which way the benchmark moves.
+
+training:
+  wandb_project: deepfold3-v2
+  # Second moments were accumulated under LN_c; they do not describe the
+  # RMSNorm_d parameterization and would fight the change.
+  skip_load_optimizer: true
+
+model:
+  evoformer:
+    trimul_head_norm: head_rms
+
+  pairformer:
+    trimul_head_norm: head_rms

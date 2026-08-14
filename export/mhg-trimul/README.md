@@ -293,7 +293,8 @@ survives without triangle attention.
 | module | `TriangleMulOutgoing` / `TriangleMulIncoming` (`model/ops.py`), `num_heads` / `head_norm` / `router` |
 | block | `use_triangle_attention` on `PairFormerBlock` and `EvoformerBlock` (`model/evoformer.py`) |
 | config | `use_triangle_attention`, `trimul_num_heads`, `trimul_head_norm`, `trimul_router` on `EvoformerConfig` / `PairFormerConfig` |
-| run | `configs/df3-stage0-r17.yaml` |
+| run | `configs/df3-stage0-r17.yaml` (arm A), `configs/df3-stage0-r18.yaml` (arm C, warm-started from r17) |
+| grid cells B and the plain baseline | `--override model.{evoformer,pairformer}.trimul_router=false` on r18 / r17 — no config file |
 | read-out | `router/entropy*`, `router/occupancy_*` on the `act_rms` log window |
 | tests | `tests/test_mhg_trimul.py` |
 | benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |

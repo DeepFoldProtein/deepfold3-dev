@@ -126,3 +126,20 @@ def test_invalid_head_config_is_rejected():
         TriangleMulOutgoing(C_Z, router=True)
     with pytest.raises(ValueError, match="head_norm"):
         TriangleMulOutgoing(C_Z, num_heads=H, head_norm="groupnorm")
+
+
+@pytest.mark.parametrize("head_norm", ["channel", "head_rms", "head_ln"])
+def test_every_parameter_receives_gradient(head_norm, pair):
+    """No orphan parameters in any mode — DDP errors on unused parameters.
+
+    ``head_rms`` is the one at risk: RMSNorm has no shift of its own, so
+    dropping ``norm_center.bias`` from the forward would leave it with no
+    consumer.
+    """
+    z, mask = pair
+    mod = TriangleMulOutgoing(C_Z, num_heads=H, head_norm=head_norm, router=True)
+    for m in (mod.out_proj, mod.out_gate, mod.gate):
+        torch.nn.init.normal_(m.weight, std=0.05)
+    mod(z, mask).sum().backward()
+    orphans = [n for n, p in mod.named_parameters() if p.grad is None or not p.grad.any()]
+    assert orphans == [], f"{head_norm}: parameters with no gradient: {orphans}"
