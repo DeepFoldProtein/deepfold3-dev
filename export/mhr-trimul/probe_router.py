@@ -47,7 +47,22 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True, type=Path)
     ap.add_argument("--n-examples", type=int, default=8)
-    ap.add_argument("--recycles", type=int, default=4)
+    ap.add_argument(
+        "--recycles",
+        type=int,
+        default=3,
+        help="trunk passes = recycles + 1. Default matches what the run's own eval does "
+        "(min(max_recycles, 4) = 3), so the probe sees the same depth of pair representation.",
+    )
+    ap.add_argument(
+        "--snapshot",
+        default="shadow",
+        choices=("shadow", "live"),
+        help="Which weights to probe. The run is AdamW with ema_decay=0.999 and "
+        "eval_snapshot='average', which for a non-Schedule-Free optimizer with EMA present is "
+        "upgraded to the EMA shadow — so every eval metric reported for this run comes from the "
+        "shadow, and 'live' would measure a different network.",
+    )
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None)
     ap.add_argument("--far-threshold", type=int, default=32, help="|i-j| above which an intra-chain pair is 'distant'")
@@ -92,7 +107,7 @@ def main() -> None:
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model_cfg, train_cfg = blob["model_cfg"], blob["train_cfg"]
     step = blob.get("effective_step", blob.get("global_step"))
-    log.info("checkpoint step %s", step)
+    log.info("checkpoint step %s, snapshot=%s, recycles=%s", step, args.snapshot, args.recycles)
 
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(
@@ -100,6 +115,24 @@ def main() -> None:
     )
     if missing or unexpected:
         log.warning("load: %d missing, %d unexpected", len(missing), len(unexpected))
+    if args.snapshot == "shadow":
+        ema = blob.get("ema")
+        if not ema or not ema.get("shadow"):
+            raise SystemExit("--snapshot shadow requested but the checkpoint has no EMA shadow")
+        shadow = {k.removeprefix("module."): v for k, v in ema["shadow"].items()}
+        applied = 0
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in shadow:
+                    param.copy_(shadow[name])
+                    applied += 1
+        log.info(
+            "EMA shadow applied to %d/%d parameters (decay %.4f, %d updates)",
+            applied,
+            sum(1 for _ in model.parameters()),
+            ema.get("decay", float("nan")),
+            ema.get("num_updates", -1),
+        )
     model = model.eval().to(args.device)
 
     ds_cfg = train_cfg.eval_datasets[0]

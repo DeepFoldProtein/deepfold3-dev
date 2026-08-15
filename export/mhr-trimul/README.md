@@ -522,7 +522,130 @@ Re-measure on nucleic-rich records with a distance control before relying on it.
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.
 
-## 5. Sequencing, and the confound to avoid
+## 6. How the router numbers are computed
+
+Every router figure in §5 comes from `probe_router.py`. The procedure and the
+reason for each choice:
+
+### Capture point
+
+Inside `_TriangleMulBase._mhr_head_mix`, immediately after the gate is formed
+from the router logits $r_{ij} = W_r\,\operatorname{LN}(z)_{ij}$:
+
+$$g_{ij}^{(h)} = H\cdot\operatorname{softmax}_h(r_{ij}) \qquad [B, N, N, H]$$
+
+$g$ is measured rather than $r$ or the product $g\hat T$ because $g$ is the
+quantity that actually multiplies the head block — it is the causal variable.
+Logits are pre-nonlinearity and have no scale interpretation; the product mixes
+in the variance of $\hat T$.
+
+### Per-call statistics
+
+Over the $P = B\!\cdot\!N\!\cdot\!N$ pairs of one forward:
+
+$$p_{ij}^{(h)} = \frac{g_{ij}^{(h)}}{\sum_{h'} g_{ij}^{(h')}}
+\qquad
+\texttt{entropy} = \frac1P\sum_{ij}\frac{H(p_{ij})}{\log H}
+\qquad
+\texttt{marginal} = \frac{H(\bar p)}{\log H},\ \ \bar p^{(h)} = \frac1P\sum_{ij} p_{ij}^{(h)}$$
+
+$$\texttt{g\_std} = \frac1H\sum_h \operatorname{std}_{ij}\big(g_{ij}^{(h)}\big)$$
+
+Normalizing by $\log H$ makes the entropies comparable across head counts and
+across `router_kind`. Deriving $p$ as $g/\sum_h g$ reduces **exactly** to the
+softmax probabilities when $\sum_h g = H$, and gives the sigmoid variant the same
+ruler. `g_std` is taken on $g$ rather than $p$ because $g$ is what multiplies the
+block and its scale is pinned — under softmax $\operatorname{mean}_h g = 1$, so
+0.5 reads directly as "swings by half its mean".
+
+### Why the gap is a mutual information, not an ad-hoc index
+
+Let the pair index be a uniform random variable $J$ and the head $Y \sim p_J$.
+Then $H(Y\mid J) = \mathbb{E}_J[H(p_J)] = \texttt{entropy}$ and
+$H(Y) = H(\mathbb{E}_J[p_J]) = \texttt{marginal}$, so
+
+$$\texttt{marginal} - \texttt{entropy} \;=\; H(Y) - H(Y\mid J) \;=\; \frac{I(J;Y)}{\log H}$$
+
+This is an identity — it holds whatever the router is doing, with no modelling
+assumption, and Jensen guarantees it is non-negative.
+
+### Aggregation
+
+Each call adds its scalars to a running sum with a counter;
+`_flush_router_stats` divides and resets, so a reported value is the mean over
+**every forward in the window** rather than whichever forward happened to be
+last (recycling means several per example). `collect_router_stats` then takes an
+arithmetic mean over the 104 router-bearing modules (PairFormer 48x2 +
+Evoformer 4x2); only `occupancy_max/min` are extrema.
+
+### Derived quantities
+
+**Effective heads** $= H^{\texttt{entropy}}$. With $e = H_{\text{nats}}/\ln H$,
+perplexity $= \exp(H_{\text{nats}}) = H^{e}$ — the number of equally likely heads
+with the same entropy. Band figures are the mean of $H^{e}$, not $H^{\text{mean }e}$;
+by Jensen these differ.
+
+**Bits** $=$ gap $\times \log_2 H =$ gap $\times 3$.
+
+**Pair-class separation.** A wrapper around `_record_router_stats` receives the
+same $g$ and averages it over the pairs selected by $[N,N]$ masks built from
+`asym_id` and `mol_type`:
+
+$$\texttt{sep}(A,B) = \sum_h \big\lvert \bar g_A^{(h)} - \bar g_B^{(h)} \big\rvert,
+\qquad \bar g_A^{(h)} = \operatorname{mean}_{(i,j)\in A} g_{ij}^{(h)}$$
+
+$L_1$ because $g$'s scale is pinned at 1 per head, so the sum of absolute
+differences reads as "how many units of gate got reallocated between the two
+classes".
+
+### What the procedure gets wrong
+
+Two of these were found only while writing this section, and both have been
+fixed in the script. **They matter: re-measuring step 2500 on the corrected
+settings moved `g_std` from 0.583 to 0.385 (-34%) and the specialization gap
+from 0.0997 to 0.0539 (-46%)** — far outside the ~2-4% run-to-run noise. Every
+router number in §5 predates the fix and is being re-measured; treat those
+figures as provisional and the *relative* depth and pair-class patterns as more
+trustworthy than the absolute levels.
+
+The direction is what you would expect. At `decay = 0.999` the EMA shadow is an
+average over roughly the last thousand updates, and $\lVert W_r\rVert$ is growing
+fast at this stage (PF mean 0.32 -> 0.72 -> 1.16 over steps 500 / 1000 / 1500),
+so the shadow's router is systematically smaller, hence flatter, than the live
+one. Both are real; they answer different questions. **Shadow** is the network
+the `eval/*` metrics describe and the one that would be deployed. **Live** is
+what the model currently is, and during rapid growth it leads.
+
+1. **EMA snapshot (fixed).** The run is AdamW with `ema_decay = 0.999` and
+   `eval_snapshot: average`, which for a non-Schedule-Free optimizer with EMA
+   present is upgraded to the **shadow** — so every `eval/*` metric quoted for
+   r17 comes from the shadow weights. The probe loaded `blob["model"]`, the raw
+   live weights, and was therefore measuring a different network from the one
+   the eval numbers describe. `--snapshot` now defaults to `shadow`.
+2. **Recycle count (fixed).** The run's eval uses
+   `num_recycles = min(max_recycles, 4) = 3`, i.e. 4 trunk passes. The probe
+   used 4, i.e. 5 passes, so its last pass saw a pair representation one stage
+   more developed than training or eval ever produces. `--recycles` now
+   defaults to 3.
+3. **Recycle stages are pooled.** Every forward gets equal weight, so a reported
+   value averages over recycle depth as well as over pairs. Early recycles have
+   a less-developed $z$ and therefore less for the router to condition on.
+4. **Example size is ignored.** Pairs are averaged *within* a forward before
+   forwards are averaged, so a 153-token example counts as much as a 384-token
+   one despite having six times fewer pairs.
+5. **Class size is ignored**, which is the flaw that lands on the largest number
+   in the modality table: `nucl_nucl` can be 4 pairs in one example and 1681 in
+   another, weighted equally.
+6. **Module weight is uniform.** A module whose branch barely reaches the
+   residual stream votes as loudly as a dominant one.
+7. **Sample.** 12 examples, one draw per checkpoint. Measured run-to-run noise
+   is ~2% on `g_std` and ~4% on `sep`.
+
+Padding is *not* a problem here, which was checked: examples are collated one at
+a time and no bucket padding is applied (token counts came out 153 / 204 / 303 /
+306 / 384), so no invalid pairs enter the statistics.
+
+## 7. Sequencing, and the confound to avoid
 
 Running `MHR + no-TriAttn` as a single arm is cheaper only if it works. If it
 does not, the loss is unattributable and decomposing it costs further runs. That
@@ -549,7 +672,7 @@ answer different questions.
 The surplus gets spent at r18, once r17 has said whether the pair track
 survives without triangle attention.
 
-## 6. Where it lives
+## 8. Where it lives
 
 | | |
 | --- | --- |
