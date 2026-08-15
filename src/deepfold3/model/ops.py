@@ -132,6 +132,9 @@ def collect_router_stats(model: nn.Module, prefix: str = "router", reset: bool =
     out = {
         f"{prefix}/entropy": sum(ent) / len(ent),
         f"{prefix}/entropy_min": min(ent),
+        # marginal - entropy = I(pair; head) / log H. Near zero ⇒ head death.
+        f"{prefix}/marginal_entropy": sum(r["marginal_entropy"] for _, r in rows) / len(rows),
+        f"{prefix}/specialization_gap": sum(r["marginal_entropy"] - r["entropy"] for _, r in rows) / len(rows),
         # The one that decides whether the router is redundant with W_o.
         f"{prefix}/g_std": sum(std) / len(std),
         f"{prefix}/g_std_max": max(std),
@@ -142,6 +145,7 @@ def collect_router_stats(model: nn.Module, prefix: str = "router", reset: bool =
     }
     for name, r in rows:
         out[f"{prefix}/entropy_by_module/{name}"] = r["entropy"]
+        out[f"{prefix}/marginal_entropy_by_module/{name}"] = r["marginal_entropy"]
         out[f"{prefix}/g_std_by_module/{name}"] = r["g_std"]
     return out
 
@@ -416,6 +420,22 @@ class _TriangleMulBase(nn.Module):
         and free to drift for the sigmoid one, where it measures the branch
         rescaling that ``out_gate`` then has to absorb.
 
+        ``marginal_entropy`` is the same functional with the averaging order
+        swapped: the entropy of the pair-averaged shares ``H(E_ij[p])`` rather
+        than the average of the per-pair entropies ``E_ij[H(p)]``. By Jensen the
+        former is never smaller, and their difference is exactly the normalized
+        mutual information between which pair it is and which head fires,
+        ``I(pair; head) / log H``. That separates two states ``entropy`` alone
+        cannot tell apart, because both drive it down:
+
+        * **specialization** — each pair commits to one head, but *which* head
+          varies across pairs. Low ``entropy``, high ``marginal_entropy``.
+        * **head death** — the same few heads win for every pair and the rest
+          are permanently off. Both are low.
+
+        A gap near zero means the head choice carries no information about the
+        pair: the module has simply stopped using most of its heads.
+
         So: ``entropy ≈ 1`` ⇒ inert. ``entropy < 1`` with ``g_std ≈ 0`` ⇒
         active but redundant. ``g_std > 0`` ⇒ genuinely conditional routing.
 
@@ -429,12 +449,20 @@ class _TriangleMulBase(nn.Module):
         p = g / g.sum(-1, keepdim=True).clamp_min(1e-9)
         ent = -(p * (p + 1e-9).log()).sum(-1).mean() / math.log(self.num_heads)
         share = p.mean(0)
+        marg = -(share * (share + 1e-9).log()).sum() / math.log(self.num_heads)
         acc = self._router_stats
         if acc is None:
             acc = self._router_stats = dict(
-                entropy=0.0, g_std=0.0, g_mean=0.0, occupancy_max=0.0, occupancy_min=0.0, n=0.0
+                entropy=0.0,
+                marginal_entropy=0.0,
+                g_std=0.0,
+                g_mean=0.0,
+                occupancy_max=0.0,
+                occupancy_min=0.0,
+                n=0.0,
             )
         acc["entropy"] += float(ent)
+        acc["marginal_entropy"] += float(marg)
         acc["g_std"] += float(g.std(0).mean())
         acc["g_mean"] += float(g.mean())
         acc["occupancy_max"] += float(share.max())

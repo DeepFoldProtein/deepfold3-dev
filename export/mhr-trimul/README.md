@@ -462,6 +462,62 @@ in contact probability and in whether paired-MSA coevolution signal exists. The
 cleaner control would compare contacting interfaces against non-contacting chain
 pairs; not done.
 
+**Specialization or head death?** Low `entropy` alone cannot tell them apart —
+each pair committing to a *different* head, and the same few heads winning
+everywhere, both drive it down. `marginal_entropy` = $H(\mathbb{E}_{ij}[p])/\log H$
+swaps the averaging order, and by Jensen the gap
+`marginal_entropy - entropy` is exactly $I(\text{pair};\text{head})/\log H$.
+At step 2000, in effective heads ($8^{\text{entropy}}$):
+
+| band | per pair | used at all | dead | $I$(pair; head) |
+| --- | --- | --- | --- | --- |
+| L0-11 | 6.16 | 6.54 | 1.46 | 0.09 bits |
+| L12-23 | 4.14 | 4.55 | 3.45 | 0.13 bits |
+| L24-35 | 2.83 | 3.41 | 4.59 | 0.25 bits |
+| L36-47 | 2.20 | 3.24 | **4.76** | 0.54 bits |
+
+**Death dominates.** In the late trunk roughly 4.8 of 8 heads are unused *at
+all* — not selected against per pair, simply off. Overall the router carries
+0.25 bits about the pair out of a possible 3, which is 27% of what a perfect
+intra/inter-chain split would yield at the observed 34% inter-chain rate. So the
+chain specialization reported above is real but is a split among the ~3
+surviving heads, not an 8-way one. Specialization does grow with depth (0.09 ->
+0.54 bits), but so does death (1.5 -> 4.8 heads), in the same layers.
+
+This settles what the sigmoid arm is for: mostly **reclaiming dead capacity**,
+not extending specialization. Whether those 4.8 heads died because softmax
+forced a budget, or because three subspaces is genuinely enough for those
+layers, is exactly what removing the competition would decide.
+
+**Modality (12 nucleic-containing complexes, step 2000).** The first probe drew
+12 protein-only examples — patchr is only 4.6% nucleic+protein — so it never
+tested the motivation MHR was designed around. Selecting for nucleic content
+(11 with nucleic, 6 with ligand, 1-24 chains) gives, per module, the $L_1$
+distance between per-head profiles of each mol-type pair class:
+
+| | prot_prot | prot_nucl | nucl_nucl | prot_lig |
+| --- | --- | --- | --- | --- |
+| **prot_prot** | — | 1.572 | **3.843** | 1.719 |
+| **prot_nucl** | | — | **4.046** | 0.826 |
+| **nucl_nucl** | | | — | **4.362** |
+
+Chain relationship in the same sample, sequence-controlled, is 1.557 — the
+reference scale.
+
+`nucl_nucl` is the strongest routing signal measured anywhere in this probe, at
+~2.5x the chain effect. But the router does **not** appear to code modality
+*identity*: `prot_nucl` vs `prot_lig` is only 0.826, smaller than either is from
+`prot_prot`. The separation instead orders by **how many partners are
+non-protein** (0 / 1 / 2), which is a coarser thing than "protein, nucleic,
+ligand and ion each want their own composition rule".
+
+Weakest number in the table, and it is the biggest one: nucleic tokens run 2-41
+out of 384, so `nucl_nucl` can be as few as 4 pairs in an example against 147k
+total, and every example was weighted equally regardless. `nucl_nucl` pairs are
+also spatially clustered (same strand, or complementary strands of a duplex), so
+the same distance control applied to the chain result has not been applied here.
+Re-measure on nucleic-rich records with a distance control before relying on it.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.

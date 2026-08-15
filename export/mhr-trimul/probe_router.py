@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 
+from deepfold3.data import const
 from deepfold3.data.module.collate import collate_fn
 from deepfold3.data.module.dataset import TrainingDataset
 from deepfold3.data.prepare.manifest import discover_records
@@ -50,6 +51,15 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None)
     ap.add_argument("--far-threshold", type=int, default=32, help="|i-j| above which an intra-chain pair is 'distant'")
+    ap.add_argument(
+        "--select",
+        default="any",
+        choices=("any", "nucleic", "ligand"),
+        help="restrict to records containing DNA/RNA (with protein), or a non-polymer chain. "
+        "MHR exists because protein / nucleic / ligand plausibly want different pair composition "
+        "rules, so 'any' — which draws ~95%% protein-only examples from patchr — does not test the "
+        "premise it was designed for.",
+    )
     args = ap.parse_args()
 
     # Per-pair-class accumulators. The pooled g_std says the router is
@@ -59,32 +69,22 @@ def main() -> None:
     # owns contacts within a chain and head h' owns the interface, the per-head
     # mean of g should differ between the two classes.
     acc: dict[str, dict] = {}
-    holder: dict[str, torch.Tensor | None] = {"intra": None, "intra_far": None}
+    holder: dict[str, dict[str, torch.Tensor]] = {"masks": {}}
 
     def wrap(mod: _TriangleMulBase, name: str):
         orig = mod._record_router_stats
 
         def hooked(g, _mod=mod, _name=name, _orig=orig):
             _orig(g)
-            intra = holder["intra"]
-            if intra is None or g.shape[1:3] != intra.shape[-2:]:
+            masks = holder["masks"]
+            if not masks or g.shape[1] != next(iter(masks.values())).shape[-1]:
                 return
             flat = g.reshape(-1, _mod.num_heads).float()
-            a = acc.setdefault(_name, dict.fromkeys(("intra", "inter", "intra_far"), 0.0))
-            for cls, mask in (
-                ("intra", intra.reshape(-1)),
-                ("inter", ~intra.reshape(-1)),
-                # The control. Intra- and inter-chain pairs differ in more than
-                # chain identity — most obviously sequence separation, since
-                # intra-chain includes every |i-j| = 1 neighbour while
-                # inter-chain has no sequence relation at all. A router keyed on
-                # separation rather than on chain relationship would show the
-                # same profile split. Comparing inter-chain against *distant*
-                # intra-chain pairs removes that confound.
-                ("intra_far", holder["intra_far"].reshape(-1)),
-            ):
-                if mask.any():
-                    a[cls] = a[cls] + flat[mask].mean(0).cpu()
+            a = acc.setdefault(_name, {})
+            for cls, mask in masks.items():
+                m = mask.reshape(-1)
+                if m.any():
+                    a[cls] = a.get(cls, 0.0) + flat[m].mean(0).cpu()
                     a[f"n_{cls}"] = a.get(f"n_{cls}", 0) + 1
 
         mod._record_router_stats = hooked
@@ -105,6 +105,15 @@ def main() -> None:
     ds_cfg = train_cfg.eval_datasets[0]
     records = discover_records(Path(ds_cfg.data_dir))
     log.info("eval dataset %s: %d records", ds_cfg.name, len(records))
+    if args.select != "any":
+        want = {const.MOL_DNA, const.MOL_RNA} if args.select == "nucleic" else {const.MOL_NONPOLYMER}
+        records = [
+            r
+            for r in records
+            if {ch.mol_type for ch in r.chains} & want and const.MOL_PROTEIN in {ch.mol_type for ch in r.chains}
+        ]
+        log.info("select=%s: %d records", args.select, len(records))
+
     if ds_cfg.cutoff_date:
         records = [
             r
@@ -139,15 +148,38 @@ def main() -> None:
             continue
         features = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in features.items()}
         features.pop("_record_id", None)
-        asym = features["asym_id"]
+        asym, mt = features["asym_id"], features["mol_type"]
         same = (asym[..., :, None] == asym[..., None, :]).to(args.device)
         n = same.shape[-1]
         ij = torch.arange(n, device=args.device)
         far = (ij[:, None] - ij[None, :]).abs() > args.far_threshold
-        holder["intra"] = same
-        holder["intra_far"] = same & far
+        prot = (mt == const.MOL_PROTEIN).to(args.device)
+        nucl = ((mt == const.MOL_DNA) | (mt == const.MOL_RNA)).to(args.device)
+        lig = (mt == const.MOL_NONPOLYMER).to(args.device)
+
+        def outer(u, v):
+            return (u[..., :, None] & v[..., None, :]) | (v[..., :, None] & u[..., None, :])
+
+        holder["masks"] = {
+            "intra": same,
+            "inter": ~same,
+            "intra_far": same & far,
+            # The classes MHR was designed for: does the router compose a
+            # protein-protein pair differently from a protein-nucleic one?
+            "prot_prot": outer(prot, prot),
+            "prot_nucl": outer(prot, nucl),
+            "nucl_nucl": outer(nucl, nucl),
+            "prot_lig": outer(prot, lig),
+        }
         n_chain = int(asym.max().item() + 1)
-        composition.append(n_chain)
+        composition.append(
+            dict(
+                chains=n_chain,
+                prot=int(prot.sum()),
+                nucl=int(nucl.sum()),
+                lig=int(lig.sum()),
+            )
+        )
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             model.forward_training(
                 features,
@@ -164,23 +196,49 @@ def main() -> None:
             )
         n_done += 1
         n_tok = features["res_type"].shape[1]
-        frac_inter = float((~holder["intra"]).float().mean())
+        frac_inter = float((~holder["masks"]["intra"]).float().mean())
         log.info(
-            "example %d/%d  n_tokens=%d  n_chains=%d (%s)  inter-chain pairs %.1f%%",
+            "example %d/%d  n_tokens=%d  chains=%d  prot=%d nucl=%d lig=%d  inter-chain %.0f%%",
             n_done,
             args.n_examples,
             n_tok,
             n_chain,
-            "monomer" if n_chain == 1 else "multimer",
+            composition[-1]["prot"],
+            composition[-1]["nucl"],
+            composition[-1]["lig"],
             100 * frac_inter,
         )
 
     log.info(
-        "\ncomposition: %d monomer / %d multimer  (chains: %s)",
-        sum(1 for c in composition if c == 1),
-        sum(1 for c in composition if c > 1),
-        composition,
+        "\ncomposition: %d monomer / %d multimer;  %d with nucleic, %d with ligand",
+        sum(1 for c in composition if c["chains"] == 1),
+        sum(1 for c in composition if c["chains"] > 1),
+        sum(1 for c in composition if c["nucl"]),
+        sum(1 for c in composition if c["lig"]),
     )
+
+    # Separation between every pair of mol-type classes present. This is the
+    # measurement MHR's original motivation calls for: if protein, nucleic and
+    # ligand want different pair-composition rules, the per-head profiles should
+    # differ between these classes.
+    CLASSES = ("prot_prot", "prot_nucl", "nucl_nucl", "prot_lig")
+    present = [c for c in CLASSES if any(a.get(f"n_{c}") for a in acc.values())]
+    if len(present) > 1:
+        log.info("\nmol-type head separation (mean L1 over modules)")
+        log.info("  %-12s %s", "", "  ".join(f"{c:>10}" for c in present))
+        for i, ci in enumerate(present):
+            cells = []
+            for j, cj in enumerate(present):
+                if j <= i:
+                    cells.append(f"{'':>10}")
+                    continue
+                vals = [
+                    float((a[ci] / a[f"n_{ci}"] - a[cj] / a[f"n_{cj}"]).abs().sum())
+                    for a in acc.values()
+                    if a.get(f"n_{ci}") and a.get(f"n_{cj}")
+                ]
+                cells.append(f"{sum(vals) / len(vals):10.3f}" if vals else f"{'-':>10}")
+            log.info("  %-12s %s", ci, "  ".join(cells))
 
     # Per-head mean of g on intra- vs inter-chain pairs. ``sep`` is the L1
     # distance between the two per-head profiles: 0 means the router treats the
@@ -241,7 +299,7 @@ def main() -> None:
 
     rows = []
     for k, v in stats.items():
-        m = re.match(r"router/(entropy|g_std)_by_module/(.+)", k)
+        m = re.match(r"router/(entropy|marginal_entropy|g_std)_by_module/(.+)", k)
         if m:
             rows.append(dict(module=m.group(2), metric=m.group(1), value=round(v, 5)))
     wide: dict[str, dict] = {}
@@ -255,7 +313,7 @@ def main() -> None:
     out = sorted(wide.values(), key=lambda r: ("pairformer" not in r["module"], depth(r["module"])))
     path = Path(args.out) if args.out else OUT / f"router_stats_step{step}.csv"
     with open(path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=["module", "entropy", "g_std"])
+        w = csv.DictWriter(fh, fieldnames=["module", "entropy", "marginal_entropy", "g_std"])
         w.writeheader()
         w.writerows(out)
     log.info("wrote %s (%d modules)", path, len(out))
@@ -263,9 +321,10 @@ def main() -> None:
     pf = [r for r in out if "pairformer" in r["module"]]
     if pf:
         log.info("\nPairFormer depth profile (every 8th layer)")
-        log.info(f"{'module':58s} {'entropy':>8} {'g_std':>8}")
+        log.info(f"{'module':50s} {'entropy':>8} {'marginal':>9} {'gap':>7} {'g_std':>8}")
         for r in pf[::16]:
-            log.info(f"{r['module']:58s} {r.get('entropy', float('nan')):8.4f} {r.get('g_std', float('nan')):8.4f}")
+            e, mg = r.get("entropy", float("nan")), r.get("marginal_entropy", float("nan"))
+            log.info(f"{r['module']:50s} {e:8.4f} {mg:9.4f} {mg - e:7.4f} {r.get('g_std', float('nan')):8.4f}")
 
 
 if __name__ == "__main__":
