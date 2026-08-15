@@ -1,7 +1,7 @@
 base: df3-stage0-r16.yaml
 
 # r17 — pair-track arm on top of r16's widths (c_z=256, c_m=128).
-# Design note + measurements: export/mhg-trimul/README.md
+# Design note + measurements: export/mhr-trimul/README.md
 #
 # Two changes, both confined to the trunk pair track:
 #
@@ -13,24 +13,27 @@ base: df3-stage0-r16.yaml
 #      intermediate node k is conditioned on the target pair (i,j), and the
 #      only one whose mixing over k is softmax-normalized.
 #
-#   2. TriangleMul -> MHG-TriMul, routing half only. The contraction and the
-#      LayerNorm over all c_z are untouched; the output is routed per head by
-#      g = H*softmax(R(x_ij)) before the output projection. The router makes
-#      W_o input-dependent over its column blocks, which the AF3 output gate
-#      (acting *after* W_o) cannot express. Zero-init => g == 1, so the module
-#      is EXACTLY AF3 TriMul at step 0 (tests/test_mhg_trimul.py asserts bit
-#      equality) -- r17's only architectural risk at initialization is (1).
+#   2. TriangleMul -> MHR-TriMul, with BOTH halves active. The contraction is
+#      untouched; its output is normalized per head (LayerNorm over d=32) and
+#      then routed by g = H*softmax(R(x_ij)) before the output projection. The
+#      router makes W_o input-dependent over its column blocks, which the AF3
+#      output gate (acting *after* W_o) cannot express.
 #
-#      Per-head normalization (trimul_head_norm: head_rms) is deliberately NOT
-#      enabled here, and the reason is attribution rather than risk. The router
-#      is instrumented (router/entropy; 1.0 == inert) and separately lesionable
-#      (zero W_r), so if r17 loses to r16 with the router inert, the loss is
-#      attributable to (1) alone, from inside the run. Per-head norm is neither
-#      instrumented nor lesionable -- there is no parameter setting that turns
-#      RMSNorm_d back into LN_c -- so shipping it here would make a shortfall a
-#      three-way confound that no logging resolves. It goes to r18, warm-started
-#      from r17.
+#      NOTE — this file previously said `trimul_head_norm: channel`, i.e. the
+#      router alone against AF3's LayerNorm over all of c_z. It did not run that
+#      way: `_mhr_head_mix` had no branch for "channel" and fell through to the
+#      per-head LayerNorm case, so from step 0 this run has had per-head
+#      normalization as well. The code is fixed (see 24b501c); the config is
+#      changed here to `head_ln` to match what the run has actually been doing
+#      rather than to change the model mid-flight.
 #
+#      The cost is attribution. Holding per-head norm back was meant to keep a
+#      shortfall traceable -- the router is instrumented (router/entropy,
+#      router/g_std) and lesionable by zeroing W_r, per-head norm is neither. As
+#      it stands a shortfall against r16 has three possible causes, not one.
+#      What is gained: with per-head norm active the head magnitudes are
+#      equalized, so the logged g *is* the per-head contribution.
+
 # Depth (48) and crop are held at r16's values so the subtraction stays clean;
 # the speedup is banked as steps, and the r16 comparison should be reported at
 # BOTH iso-step and iso-wall-clock. From-scratch — not warm-startable from r16
@@ -52,11 +55,11 @@ model:
   evoformer:
     use_triangle_attention: false
     trimul_num_heads: 8 # 256 / 8 = 32 per head
-    trimul_head_norm: channel # r18: head_rms
+    trimul_head_norm: head_ln # r18: head_rms (drops the mean subtraction)
     trimul_router: true
 
   pairformer:
     use_triangle_attention: false
     trimul_num_heads: 8
-    trimul_head_norm: channel # r18: head_rms
+    trimul_head_norm: head_ln # r18: head_rms (drops the mean subtraction)
     trimul_router: true

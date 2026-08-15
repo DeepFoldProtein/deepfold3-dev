@@ -1,23 +1,23 @@
 base: df3-stage0-r17.yaml
 
-# r18 — the second half of MHG-TriMul, warm-started from r17.
-# Design note: export/mhg-trimul/README.md §3-4
+# r18 — the second half of MHR-TriMul, warm-started from r17.
+# Design note: export/mhr-trimul/README.md §3-4
 #
-# r17 runs the router against AF3's LayerNorm over all c_z. That leaves the
-# router's authority partial: head magnitudes at a given (i,j) still vary
-# freely, so scaling a head that is already small does little. r18 adds the
-# other half of the mechanism — RMSNorm over d within each head — so that
-# g = H*softmax(R(x_ij)) becomes the *sole* determinant of a head's
-# contribution magnitude.
+# r17 runs the router against *per-head LayerNorm* (see the note in
+# df3-stage0-r17.yaml: it was configured for AF3's LayerNorm over c_z but a
+# missing branch gave it per-head normalization from step 0). So the change here
+# is smaller than originally planned: head_ln -> head_rms, i.e. drop the mean
+# subtraction, keep the gain.
 #
-# The two are coupled by design, not independent effects. Per-head norm forces
-# ||T̂^(h)|| = sqrt(d) for every head and every pair, which destroys the signal
-# "this head has nothing to say about this pair" that LN over c_z preserves as
-# relative head magnitude. After it, every head speaks at the same volume and
-# only the router can turn one down: per-head norm creates the problem the
-# router solves. This is why the no-router cell of the grid (B below) is
-# predicted to be *harmful*, and why r17 ships the router first.
+# Why drop it: at d = 32 the LayerNorm mean is estimated from 32 samples, so it
+# carries sigma/sqrt(32) ~ 0.18 sigma of noise and subtracts that from the
+# signal, while the variance estimate has ~25% relative error. RMSNorm removes
+# the mean term outright. head_rms also has no shift at all -- norm_center is
+# built without a bias in that mode -- which is why load_strict has to be off.
 #
+# Both modes equalize head magnitudes, so the property r17 already has (logged g
+# equals the per-head contribution) is preserved.
+
 # Warm start (not from scratch):
 #
 #   deepfold3 train --config configs/df3-stage0-r18.yaml \
@@ -56,10 +56,10 @@ base: df3-stage0-r17.yaml
 
 training:
   wandb_project: deepfold3-v2
-  # r17's checkpoint carries norm_center.bias, which head_rms does not define.
+  # r17 (head_ln) carries norm_center.bias; head_rms does not define it.
   load_strict: false
-  # Second moments were accumulated under LN_c; they do not describe the
-  # RMSNorm_d parameterization and would fight the change.
+  # Second moments were accumulated under head_ln; they do not describe the
+  # head_rms parameterization and would fight the change.
   skip_load_optimizer: true
 
 model:
