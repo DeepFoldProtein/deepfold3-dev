@@ -630,6 +630,41 @@ figures may themselves be partly distance effects, since intra-chain pairs are
 on average much closer and only *sequence* separation was controlled, not 3D
 distance. The clean version compares mol-type classes *within* a distance band.
 
+**Drawn out per layer, the router does nothing over the first half of the
+trunk.** `plot_router_map.py` renders, for one target at a time, the top-1 head
+$\arg\max_h g_{ij}^{(h)}$ and the per-pair entropy $H(p_{ij})/\log H$ as $N\times N$
+maps over all 48x2 modules, plus a depth curve and a reference figure (GT
+contact, *predicted* contact from the distogram, GT distance, chain and entity
+blocks). Outputs in `router_maps/` for a monomer (8vc8), a homomer (8s9q) and a
+heteromer (7ykg) at step 2500 on shadow weights.
+
+The depth curve is the decisive one: **per-pair and marginal entropy lie on top
+of each other from L0 to about L25**, so the gap — $I(\text{pair};\text{head})/\log H$ —
+is ~0 there, and only from L25 does it separate, reaching ~0.2 by L44-47. Over
+the first half of the trunk the router carries no pair information at all,
+whether its entropy is high (uniform, a no-op) or low (collapsed, a constant
+per-head rescale — which §4 shows is *inside* AF3's function class). **The router
+does real work only in roughly the last twenty layers.** Band averages hid this.
+
+**This corrects the "effective heads" reading.** L0-11 was reported as using 6.5
+of 8 heads against 3.2 late, which invited the conclusion that the early trunk
+uses its subspaces more richly. The maps say otherwise: early layers are
+speckled at pixel granularity with no spatial structure, while late layers show
+few colours in large coherent regions that resemble contact patterns (L39,
+L44-47 especially). High entropy there is *undifferentiated*, not richly used —
+so what looked like head death late may be the specialization itself. The gap
+was already saying this; leading with effective-head counts obscured it.
+
+Three things visible in the maps and consistent with the numbers: many panels
+give the near-diagonal a distinct colour (L18/L20/L22/L28/L30 out), matching
+distance dominance; single-colour panels cluster in the middle of the trunk and
+overwhelmingly on the `in` direction, matching the measured collapse asymmetry
+(9/48 `in` vs 3/48 `out`); and the small chain of 7ykg appears as an edge strip
+that takes its own head in some layers.
+
+Caveat on the heteromer: 7ykg is 250 tokens with chain B at ~20 of them, so it
+is a large chain plus a short peptide rather than a balanced heterodimer.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.
