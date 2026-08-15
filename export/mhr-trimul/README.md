@@ -136,7 +136,36 @@ A drop confined to (1)-(3) with (4) intact says triangle attention is doing
 strand register and nothing else, which is actionable. A uniform drop says it
 is doing general pair reasoning and the FLOPs are earned.
 
-## 3. MHR-TriMul
+## 3. Why a router at all
+
+The arm exists for four reasons, and they are worth separating because the
+measurements bear on them unequally.
+
+1. **Homomeric and heteromeric interfaces bind by the same physicochemistry but
+   arrive with very different input priors** — above all in coevolution. Two
+   copies of the same entity have a paired MSA that is the same sequence twice,
+   so the cross-chain covariance signal is degenerate; two different entities
+   have a genuine one. A single composition rule has to serve both. This is the
+   sharpest of the four because it is *not* a claim about physics, only about
+   what the model is given, and it is directly testable with the `entity_id`
+   split in §5.
+2. **Triangle attention may not be needed.** Other pair tracks (Pairmixer, MSA
+   Pairformer) drop or replace it. r17 tests that empirically rather than
+   arguing it — see §2 for what is being given up and the pre-registered
+   beta-topology diagnostic for how a loss would show itself.
+3. **Not every interaction is the same kind of interaction.** Protein-protein,
+   protein-nucleic and protein-ligand contacts differ in chemistry, in
+   geometry, and in which input features carry the evidence. §5 measures whether
+   the router actually separates them; the answer so far is "partly, and along a
+   coarser axis than modality identity".
+4. **Triangle multiplication is already router-like.** It composes $i\!-\!j$
+   through an intermediate $k$, weighting each $k$ by a learned, input-dependent
+   gate — a soft selection. What it cannot do is condition that selection on the
+   target pair (§2). Adding an explicit, target-conditioned router over relation
+   subspaces extends a mechanism the module already has rather than bolting on a
+   foreign one.
+
+## 4. MHR-TriMul
 
 ### Definition
 
@@ -298,7 +327,7 @@ $\operatorname{LN}_{c_z}\neq\operatorname{RMSNorm}_{d}$ is a function change,
 so it needs re-equilibration rather than reading in the ~2-3k an
 identity-initialized change would.
 
-## 4. r17 is the combined arm — what can and cannot be recovered afterward
+## 5. r17 is the combined arm — what can and cannot be recovered afterward
 
 r17 ships two changes at once (`configs/df3-stage0-r17.yaml`, from scratch,
 depth 48 and crop held at r16's values). That buys one run instead of two and
@@ -381,7 +410,7 @@ follow-ups cheap, every cell of the grid carries **identical `state_dict` keys**
 is the only extra tensor, and `head_rms` alone drops `norm_center.bias`), so any
 cell warm-starts from any other with `load_strict=false`.
 
-## 5. Measured: the router is pair-conditional (r17, step 1500)
+## 6. Measured: the router is pair-conditional (r17, step 1500)
 
 `probe_router.py` on 8 real examples from the run's own eval set
 (`patchr_training`, post-2021-09-30, 153-384 tokens). Raw per-module numbers in
@@ -518,11 +547,48 @@ also spatially clustered (same strand, or complementary strands of a duplex), so
 the same distance control applied to the chain result has not been applied here.
 Re-measure on nucleic-rich records with a distance control before relying on it.
 
+**Homomeric vs heteromeric interfaces (motivation 1).** Splitting inter-chain
+pairs by `entity_id` — same entity across different chains is a homomeric
+interface, different entities a heteromeric one — separates the per-head
+profiles by **0.739** (20 examples, shadow weights, step 2500), against a
+sequence-controlled chain-relationship reference of 1.009 in the same run. Real,
+and about three quarters the size of the chain effect.
+
+| comparison | sep |
+| --- | --- |
+| `nucl_nucl` vs everything else | 2.97 - 3.35 |
+| intra- vs inter-chain (sequence-controlled) | 1.009 |
+| `prot_prot` vs `prot_nucl` | 1.136 |
+| **`inter_homo` vs `inter_hetero`** | **0.739** |
+| `prot_lig` vs `inter_hetero` | 0.168 |
+
+**Read this carefully: the router did not *discover* the distinction.**
+`entity_id_same` is an explicit channel of the relative-position encoding
+(`embedders.py`), and `asym_id_same` feeds `rel_pos` and `rel_chain`, so both the
+homo/hetero and the intra/inter splits are flags the input hands to the router
+rather than structure it inferred. What the measurement does establish is
+narrower and still worth having: the router is **using a given prior to select a
+composition rule**. AF3 receives the same flags, but all it can do with them is
+change the pair representation; MHR lets them choose how $W_o$'s column blocks
+are mixed, which by the argument in §4 is outside AF3's function class. That is
+the correct strength of support for motivation 1 — the prior is exploited, not
+learned.
+
+`nucl_nucl` is different in kind. `mol_type` has no dedicated pair channel; it
+enters only through `res_type` at the token embedding. So the nucleic separation
+is closer to the router reading something the trunk *composed*. The sample
+caveat above still applies, and it is the weakest number in the table.
+
+**`prot_lig` vs `inter_hetero` is 0.168** — protein-ligand pairs are routed
+essentially the same as heteromeric protein interfaces. That is evidence
+*against* motivation 3, at least for ligands: the router is not applying a
+distinct rule to them.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.
 
-## 6. How the router numbers are computed
+## 7. How the router numbers are computed
 
 Every router figure in §5 comes from `probe_router.py`. The procedure and the
 reason for each choice:
@@ -645,7 +711,7 @@ Padding is *not* a problem here, which was checked: examples are collated one at
 a time and no bucket padding is applied (token counts came out 153 / 204 / 303 /
 306 / 384), so no invalid pairs enter the statistics.
 
-## 7. Sequencing, and the confound to avoid
+## 8. Sequencing, and the confound to avoid
 
 Running `MHR + no-TriAttn` as a single arm is cheaper only if it works. If it
 does not, the loss is unattributable and decomposing it costs further runs. That
@@ -672,7 +738,7 @@ answer different questions.
 The surplus gets spent at r18, once r17 has said whether the pair track
 survives without triangle attention.
 
-## 8. Where it lives
+## 9. Where it lives
 
 | | |
 | --- | --- |

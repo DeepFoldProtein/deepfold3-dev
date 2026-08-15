@@ -181,7 +181,7 @@ def main() -> None:
             continue
         features = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in features.items()}
         features.pop("_record_id", None)
-        asym, mt = features["asym_id"], features["mol_type"]
+        asym, mt, ent_id = features["asym_id"], features["mol_type"], features["entity_id"]
         same = (asym[..., :, None] == asym[..., None, :]).to(args.device)
         n = same.shape[-1]
         ij = torch.arange(n, device=args.device)
@@ -193,10 +193,19 @@ def main() -> None:
         def outer(u, v):
             return (u[..., :, None] & v[..., None, :]) | (v[..., :, None] & u[..., None, :])
 
+        # Homomeric vs heteromeric interface. Same entity across different
+        # chains means the two partners are copies, so their paired MSA is the
+        # same sequence and the cross-chain coevolution signal is degenerate;
+        # different entities have a genuine one. The physics of binding is the
+        # same either way — what differs is the *input prior*, which is exactly
+        # the kind of thing a router over composition rules could exploit.
+        same_ent = (ent_id[..., :, None] == ent_id[..., None, :]).to(args.device)
         holder["masks"] = {
             "intra": same,
             "inter": ~same,
             "intra_far": same & far,
+            "inter_homo": (~same) & same_ent,
+            "inter_hetero": (~same) & (~same_ent),
             # The classes MHR was designed for: does the router compose a
             # protein-protein pair differently from a protein-nucleic one?
             "prot_prot": outer(prot, prot),
@@ -254,7 +263,7 @@ def main() -> None:
     # measurement MHR's original motivation calls for: if protein, nucleic and
     # ligand want different pair-composition rules, the per-head profiles should
     # differ between these classes.
-    CLASSES = ("prot_prot", "prot_nucl", "nucl_nucl", "prot_lig")
+    CLASSES = ("prot_prot", "prot_nucl", "nucl_nucl", "prot_lig", "inter_homo", "inter_hetero")
     present = [c for c in CLASSES if any(a.get(f"n_{c}") for a in acc.values())]
     if len(present) > 1:
         log.info("\nmol-type head separation (mean L1 over modules)")
