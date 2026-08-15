@@ -420,6 +420,48 @@ late trunk many modules are using roughly one reasoning subspace, not $H$.
 Whether that is wasted capacity or the right answer for those layers is not
 decidable from this measurement.
 
+**What it routes *on*: chain relationship.** The pooled `g_std` says the router
+is pair-conditional but not what it conditions on. Splitting the pairs by
+`asym_id` (12 examples: 3 monomers, 9 multimers of 2-25 chains) gives, per
+module, the per-head mean of $g$ on intra- vs inter-chain pairs, and the $L_1$
+distance between those two profiles:
+
+| comparison | mean $L_1$ | median |
+| --- | --- | --- |
+| inter-chain vs **all** intra-chain | 1.398 | 1.193 |
+| **inter-chain vs *distant* intra-chain** ($\lvert i-j\rvert > 32$) | **1.078** | 0.926 |
+| distant vs near intra-chain (pure sequence-separation effect) | 0.462 | 0.252 |
+
+The middle row is the controlled number. Intra- and inter-chain pairs differ in
+more than chain identity — most obviously sequence separation, since
+intra-chain includes every $\lvert i-j\rvert = 1$ neighbour while inter-chain has
+no sequence relation at all — so a router keyed on separation would show the
+same split. Restricting the intra-chain side to distant pairs retains **77%** of
+the raw separation, and the pure separation effect is less than half the size.
+The specialization is by chain relationship, not by a sequence-distance proxy.
+
+Individual heads split cleanly. L46 `tri_mul_in`, per-head $g$ (mean 1 per head
+by construction):
+
+| head | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| intra-chain | 2.42 | **3.59** | 0.04 | 0.13 | 0.06 | 1.06 | 0.54 | 0.15 |
+| inter-chain | **5.19** | 1.54 | 0.01 | 0.02 | 0.01 | 1.09 | 0.11 | 0.02 |
+
+Head 0 is the interface head, head 1 the intra-chain head. The five most
+chain-selective modules are all in **L44-47** — the same late band where `g_std`
+peaks. This is MHR's "relation subspace" premise doing what it was designed to
+do, via a mechanism AF3 has no equivalent for.
+
+Measurement noise: across two runs the mean separation moved 1.453 -> 1.398
+(4%) and `g_std` 0.396 / 0.388 / 0.391 across three (2%). Crop-anchor randomness
+changes the drawn examples slightly between runs.
+
+Remaining confound: inter-chain pairs also differ from distant intra-chain pairs
+in contact probability and in whether paired-MSA coevolution signal exists. The
+cleaner control would compare contacting interfaces against non-contacting chain
+pairs; not done.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.

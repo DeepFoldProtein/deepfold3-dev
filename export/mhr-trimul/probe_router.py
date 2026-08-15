@@ -35,7 +35,7 @@ from deepfold3.data.module.collate import collate_fn
 from deepfold3.data.module.dataset import TrainingDataset
 from deepfold3.data.prepare.manifest import discover_records
 from deepfold3.model.model import DeepFold3
-from deepfold3.model.ops import collect_router_stats, set_router_stats_enabled
+from deepfold3.model.ops import _TriangleMulBase, collect_router_stats, set_router_stats_enabled
 
 OUT = Path(__file__).resolve().parent
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -49,7 +49,45 @@ def main() -> None:
     ap.add_argument("--recycles", type=int, default=4)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--far-threshold", type=int, default=32, help="|i-j| above which an intra-chain pair is 'distant'")
     args = ap.parse_args()
+
+    # Per-pair-class accumulators. The pooled g_std says the router is
+    # pair-conditional but not *what it conditions on*. The first thing worth
+    # asking is whether it separates intra-chain from inter-chain pairs, which
+    # is the cheapest direct test of the "relation subspace" premise: if head h
+    # owns contacts within a chain and head h' owns the interface, the per-head
+    # mean of g should differ between the two classes.
+    acc: dict[str, dict] = {}
+    holder: dict[str, torch.Tensor | None] = {"intra": None, "intra_far": None}
+
+    def wrap(mod: _TriangleMulBase, name: str):
+        orig = mod._record_router_stats
+
+        def hooked(g, _mod=mod, _name=name, _orig=orig):
+            _orig(g)
+            intra = holder["intra"]
+            if intra is None or g.shape[1:3] != intra.shape[-2:]:
+                return
+            flat = g.reshape(-1, _mod.num_heads).float()
+            a = acc.setdefault(_name, dict.fromkeys(("intra", "inter", "intra_far"), 0.0))
+            for cls, mask in (
+                ("intra", intra.reshape(-1)),
+                ("inter", ~intra.reshape(-1)),
+                # The control. Intra- and inter-chain pairs differ in more than
+                # chain identity — most obviously sequence separation, since
+                # intra-chain includes every |i-j| = 1 neighbour while
+                # inter-chain has no sequence relation at all. A router keyed on
+                # separation rather than on chain relationship would show the
+                # same profile split. Comparing inter-chain against *distant*
+                # intra-chain pairs removes that confound.
+                ("intra_far", holder["intra_far"].reshape(-1)),
+            ):
+                if mask.any():
+                    a[cls] = a[cls] + flat[mask].mean(0).cpu()
+                    a[f"n_{cls}"] = a.get(f"n_{cls}", 0) + 1
+
+        mod._record_router_stats = hooked
 
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model_cfg, train_cfg = blob["model_cfg"], blob["train_cfg"]
@@ -85,7 +123,12 @@ def main() -> None:
     )
 
     set_router_stats_enabled(model, True)
+    for name, mod in model.named_modules():
+        if isinstance(mod, _TriangleMulBase) and mod.use_router:
+            wrap(mod, name)
+
     n_done = 0
+    composition = []
     for i in range(len(dataset)):
         if n_done >= args.n_examples:
             break
@@ -96,6 +139,15 @@ def main() -> None:
             continue
         features = {k: (v.to(args.device) if torch.is_tensor(v) else v) for k, v in features.items()}
         features.pop("_record_id", None)
+        asym = features["asym_id"]
+        same = (asym[..., :, None] == asym[..., None, :]).to(args.device)
+        n = same.shape[-1]
+        ij = torch.arange(n, device=args.device)
+        far = (ij[:, None] - ij[None, :]).abs() > args.far_threshold
+        holder["intra"] = same
+        holder["intra_far"] = same & far
+        n_chain = int(asym.max().item() + 1)
+        composition.append(n_chain)
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             model.forward_training(
                 features,
@@ -111,7 +163,77 @@ def main() -> None:
                 msa_precropped=False,
             )
         n_done += 1
-        log.info("example %d/%d  n_tokens=%d", n_done, args.n_examples, features["res_type"].shape[1])
+        n_tok = features["res_type"].shape[1]
+        frac_inter = float((~holder["intra"]).float().mean())
+        log.info(
+            "example %d/%d  n_tokens=%d  n_chains=%d (%s)  inter-chain pairs %.1f%%",
+            n_done,
+            args.n_examples,
+            n_tok,
+            n_chain,
+            "monomer" if n_chain == 1 else "multimer",
+            100 * frac_inter,
+        )
+
+    log.info(
+        "\ncomposition: %d monomer / %d multimer  (chains: %s)",
+        sum(1 for c in composition if c == 1),
+        sum(1 for c in composition if c > 1),
+        composition,
+    )
+
+    # Per-head mean of g on intra- vs inter-chain pairs. ``sep`` is the L1
+    # distance between the two per-head profiles: 0 means the router treats the
+    # two classes identically, i.e. whatever it conditions on, it is not chain
+    # relationship.
+    sep_rows = []
+    for name, a in acc.items():
+        if not a.get("n_intra") or not a.get("n_inter"):
+            continue
+        gi, ge = a["intra"] / a["n_intra"], a["inter"] / a["n_inter"]
+        row = dict(module=name, sep_l1=float((gi - ge).abs().sum()), intra=gi, inter=ge)
+        if a.get("n_intra_far"):
+            gf = a["intra_far"] / a["n_intra_far"]
+            row["sep_far_l1"] = float((gf - ge).abs().sum())
+            row["sep_seq_l1"] = float((gf - gi).abs().sum())
+        sep_rows.append(row)
+    if sep_rows:
+        sep_rows.sort(key=lambda r: -r["sep_l1"])
+        vals = [r["sep_l1"] for r in sep_rows]
+        log.info(
+            "\nintra vs inter-chain head separation (L1 over %d heads, %d modules)"
+            "\n  mean %.4f   median %.4f   max %.4f",
+            len(sep_rows[0]["intra"]),
+            len(sep_rows),
+            sum(vals) / len(vals),
+            sorted(vals)[len(vals) // 2],
+            max(vals),
+        )
+    far = [r["sep_far_l1"] for r in sep_rows if "sep_far_l1" in r]
+    seq = [r["sep_seq_l1"] for r in sep_rows if "sep_seq_l1" in r]
+    if far:
+        log.info(
+            "\ncontrol — inter-chain vs *distant* intra-chain (|i-j| > %d)"
+            "\n  mean %.4f   median %.4f   max %.4f"
+            "\n  for reference, near vs distant intra-chain (pure sequence-separation effect):"
+            "\n  mean %.4f   median %.4f",
+            args.far_threshold,
+            sum(far) / len(far),
+            sorted(far)[len(far) // 2],
+            max(far),
+            sum(seq) / len(seq),
+            sorted(seq)[len(seq) // 2],
+        )
+    if sep_rows:
+        log.info("\n  most chain-selective modules:")
+        for r in sep_rows[:5]:
+            log.info(
+                "    %-52s sep=%.3f  intra=%s  inter=%s",
+                r["module"],
+                r["sep_l1"],
+                " ".join(f"{v:4.2f}" for v in r["intra"].tolist()),
+                " ".join(f"{v:4.2f}" for v in r["inter"].tolist()),
+            )
 
     stats = collect_router_stats(model)
     summary = {k: v for k, v in stats.items() if "by_module" not in k}
