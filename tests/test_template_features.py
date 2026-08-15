@@ -15,6 +15,7 @@ from deepfold3.data import const
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.parse.templates import TemplateFeatures
 from deepfold3.data.types import TOKEN_DTYPE
+from tests._util import wake_zero_init
 
 
 def _make_template(length: int) -> TemplateFeatures:
@@ -205,7 +206,9 @@ def test_pad_templates_matches_unpadded_output():
     """Padding must not change the template embedding — bit-exact."""
     import torch
 
-    mod = _template_embedding()
+    # Wake the zero-init output projections: without this both the padded and
+    # the unpadded embedding are exactly zero and the comparison is vacuous.
+    mod = wake_zero_init(_template_embedding())
     n_tokens, n_real, t_max = 12, 2, 4
     gen = torch.Generator().manual_seed(1)
 

@@ -17,6 +17,7 @@ from deepfold3.model.config import (
     PairFormerConfig,
 )
 from deepfold3.model.model import DeepFold3
+from tests._util import wake_zero_init
 
 
 def _tiny_config() -> ModelConfig:
@@ -391,6 +392,7 @@ class TestBatchedDistogram:
     def test_distogram_batch(self):
         cfg = _tiny_config()
         model = DeepFold3(cfg)
+        wake_zero_init(model)
         model.eval()
 
         B, N = 2, 8

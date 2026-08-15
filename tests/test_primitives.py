@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from tests._util import wake_zero_init
+
 
 def ref_layernorm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """Manual LayerNorm: (x - mean) / sqrt(var + eps) * weight + bias."""
@@ -250,6 +252,7 @@ class TestSwiGLU:
         from deepfold3.model.primitives import SwiGLU
 
         swiglu = SwiGLU()
+        wake_zero_init(swiglu)
         x = torch.randn(8, 128)
         y = swiglu(x)
         y_ref = ref_swiglu(x)
@@ -281,6 +284,7 @@ class TestTransitionBlock:
         from deepfold3.model.primitives import TransitionBlock
 
         tb = TransitionBlock(32, num_intermediate_factor=2)
+        wake_zero_init(tb)
         tb.eval()
         x = torch.randn(4, 32)
         with torch.no_grad():
@@ -320,6 +324,7 @@ class TestAdaLayerNorm:
         from deepfold3.model.primitives import AdaLayerNorm
 
         aln = AdaLayerNorm(32, 64)
+        wake_zero_init(aln)
         aln.eval()
         x = torch.randn(4, 32)
         cond = torch.randn(4, 64)

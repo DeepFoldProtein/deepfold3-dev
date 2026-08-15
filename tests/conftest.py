@@ -19,6 +19,11 @@ AF3_PARAMS_PATH = Path(__file__).parent.parent / "resources" / "af3.bin.zst"
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--check-vacuous",
+        action="store_true",
+        help="report tensor comparisons where both sides are all zero (see wake_zero_init)",
+    )
+    parser.addoption(
         "--device",
         default="cpu",
         help="Torch device for tests (cpu, cuda, cuda:0, etc.)",
@@ -152,3 +157,82 @@ def rng_generator():
 def np_rng():
     """Deterministic numpy random generator."""
     return np.random.default_rng(42)
+
+
+# ── Zero-init output paths make comparison tests vacuous ────────────────────
+#
+# Every AF3-style module zero-initializes its output projection, so a freshly
+# constructed one emits exactly zero. A test of the form
+#
+#     assert_close(module(x), hand_written_reference(x))
+#
+# then compares zero with zero and passes whatever the module did in between —
+# the reference body (interleaved channel split, einsum direction, LayerNorm
+# placement) is never exercised. A missing ``head_norm == "channel"`` branch in
+# MHR-TriMul survived a test named ``..._is_exactly_af3`` exactly this way.
+
+
+@pytest.fixture
+def wake():
+    """Fixture form of :func:`tests._util.wake_zero_init`."""
+    from tests._util import wake_zero_init
+
+    return wake_zero_init
+
+
+# ── Opt-in scan for vacuous comparisons: pytest --check-vacuous ─────────────
+_VACUOUS = {"hits": None, "total": None, "id": "?"}
+
+
+def _install_vacuous_scan():
+    import collections
+
+    import torch as _torch
+
+    _VACUOUS["hits"] = collections.Counter()
+    _VACUOUS["total"] = collections.Counter()
+    originals = {
+        "equal": _torch.equal,
+        "allclose": _torch.allclose,
+        "assert_close": getattr(_torch.testing, "assert_close", None),
+    }
+
+    def zeroish(x):
+        return _torch.is_tensor(x) and x.numel() > 1 and not bool(x.any())
+
+    def wrap(name, fn):
+        def inner(a, b, *args, **kwargs):
+            _VACUOUS["total"][name] += 1
+            if zeroish(a) and zeroish(b):
+                _VACUOUS["hits"][f"{_VACUOUS['id']}  [{name}]  shape={tuple(a.shape)}"] += 1
+            return fn(a, b, *args, **kwargs)
+
+        return inner
+
+    _torch.equal = wrap("equal", originals["equal"])
+    _torch.allclose = wrap("allclose", originals["allclose"])
+    if originals["assert_close"] is not None:
+        _torch.testing.assert_close = wrap("assert_close", originals["assert_close"])
+
+
+def pytest_configure(config):
+    if config.getoption("--check-vacuous"):
+        _install_vacuous_scan()
+
+
+def pytest_runtest_setup(item):
+    if _VACUOUS["hits"] is not None:
+        _VACUOUS["id"] = item.nodeid
+
+
+def pytest_sessionfinish(session, exitstatus):
+    hits = _VACUOUS["hits"]
+    if hits is None:
+        return
+    report = [f"comparisons intercepted: {dict(_VACUOUS['total'])}", f"{len(hits)} vacuous (both sides all zero):"]
+    report += [f"  x{n:<4d} {k}" for k, n in hits.most_common()]
+    text = "\n".join(report)
+    out = Path(session.config.rootpath) / "tmp" / "vacuous_hits.txt"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(text + "\n")
+    print("\n" + text)

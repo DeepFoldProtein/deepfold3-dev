@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tests._util import wake_zero_init
+
 
 class TestDistogram:
     """Verify distogram head properties with real weights."""
@@ -84,6 +86,7 @@ class TestDistogramHead:
         from deepfold3.model.model import DistogramHead
 
         dh = DistogramHead(pair_channels=128).to(device)
+        wake_zero_init(dh)
         pair = torch.randn(8, 8, 128, device=device)
         with torch.no_grad():
             out = dh(pair)

@@ -9,6 +9,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from tests._util import wake_zero_init
+
 
 def ref_layernorm(x, weight, bias, eps=1e-5):
     return F.layer_norm(x, [x.shape[-1]], weight, bias, eps)
@@ -44,6 +46,7 @@ class TestGridSelfAttention:
         torch.manual_seed(42)
         N, C, H = 5, 32, 4
         attn = GridSelfAttention(c=C, num_heads=H, transpose=False)
+        wake_zero_init(attn)
         attn.eval()
         D = attn.head_dim  # C // H = 8
 
@@ -111,6 +114,7 @@ class TestGridSelfAttention:
 
         torch.manual_seed(42)
         attn = GridSelfAttention(c=32, num_heads=4, transpose=False)
+        wake_zero_init(attn)
         attn.eval()
         z = torch.randn(4, 4, 32)
         mask = torch.ones(4, 4)
@@ -152,6 +156,7 @@ class TestMSAAttention:
         torch.manual_seed(42)
         S, N, c_msa, c_pair, H = 3, 5, 32, 16, 4
         attn = MSAAttention(c_msa=c_msa, c_pair=c_pair, num_heads=H)
+        wake_zero_init(attn)
         attn.eval()
         D = attn.head_dim
 
@@ -186,6 +191,7 @@ class TestMSAAttention:
 
         torch.manual_seed(42)
         attn = MSAAttention(c_msa=32, c_pair=16, num_heads=4)
+        wake_zero_init(attn)
         attn.eval()
         msa = torch.randn(3, 5, 32)
         mask = torch.ones(3, 5)
@@ -222,6 +228,7 @@ class TestSingleAttention:
         Dv = C // H
 
         attn = SingleAttention(c=C, num_heads=H, key_dim=C, value_dim=C)
+        wake_zero_init(attn)
         attn.eval()
 
         x = torch.randn(N, C)
@@ -264,6 +271,7 @@ class TestSingleAttention:
 
         torch.manual_seed(42)
         attn = SingleAttention(c=64, num_heads=4, key_dim=64, value_dim=64)
+        wake_zero_init(attn)
         attn.eval()
         x = torch.randn(5, 64)
         mask = torch.ones(5)

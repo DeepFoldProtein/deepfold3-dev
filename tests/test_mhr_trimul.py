@@ -43,11 +43,13 @@ def test_head_reshape_leaves_the_contraction_unchanged():
 def test_zero_init_router_is_exactly_af3(cls, pair):
     """g = H·softmax(0) = 1, so arm A is function-identical at initialization."""
     z, mask = pair
-    base = cls(C_Z).eval()
-    routed = cls(C_Z, num_heads=H, head_norm="channel", router=True).eval()
+    base = _wake(cls(C_Z).eval())
+    routed = _wake(cls(C_Z, num_heads=H, head_norm="channel", router=True).eval())
     missing, unexpected = routed.load_state_dict(base.state_dict(), strict=False)
     assert unexpected == [] and set(missing) == {"router.weight"}
-    assert torch.equal(base(z, mask), routed(z, mask))
+    out_base, out_routed = base(z, mask), routed(z, mask)
+    assert out_base.abs().max() > 1e-3, "the comparison must not be zero vs zero"
+    assert torch.allclose(out_base, out_routed, atol=1e-5)
 
 
 def test_per_head_affine_shares_norm_center_keys(pair):

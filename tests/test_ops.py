@@ -9,6 +9,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from tests._util import wake_zero_init
+
 
 def ref_layernorm(x, weight, bias, eps=1e-5):
     return F.layer_norm(x, [x.shape[-1]], weight, bias, eps)
@@ -34,6 +36,7 @@ class TestTriangleMulOutgoing:
         torch.manual_seed(42)
         N, c = 6, 32
         tm = TriangleMulOutgoing(c_z=c)
+        wake_zero_init(tm)
         tm.eval()
         z = torch.randn(N, N, c)
         mask = torch.ones(N, N)
@@ -90,6 +93,7 @@ class TestTriangleMulOutgoing:
 
         torch.manual_seed(42)
         tm = TriangleMulOutgoing(c_z=32)
+        wake_zero_init(tm)
         tm.eval()
         z = torch.randn(4, 4, 32)
         mask = torch.ones(4, 4)
@@ -106,6 +110,7 @@ class TestTriangleMulOutgoing:
 
         torch.manual_seed(42)
         tm = TriangleMulOutgoing(c_z=32)
+        wake_zero_init(tm)
         tm.eval()
         z = torch.randn(4, 4, 32)
         mask = torch.ones(4, 4)
@@ -146,6 +151,7 @@ class TestTriangleMulIncoming:
         torch.manual_seed(42)
         N, c = 6, 32
         tm = TriangleMulIncoming(c_z=c)
+        wake_zero_init(tm)
         tm.eval()
         z = torch.randn(N, N, c)
         mask = torch.ones(N, N)
@@ -177,6 +183,7 @@ class TestTriangleMulIncoming:
 
         torch.manual_seed(42)
         tm = TriangleMulIncoming(c_z=32)
+        wake_zero_init(tm)
         tm.eval()
         z = torch.randn(4, 4, 32)
         mask = torch.ones(4, 4)
@@ -208,6 +215,7 @@ class TestOuterProductMean:
         torch.manual_seed(42)
         S, N, c_msa, c_z, c_h = 3, 5, 16, 8, 4
         opm = OuterProductMean(c_msa=c_msa, c_z=c_z, c_hidden=c_h)
+        wake_zero_init(opm)
         opm.eval()
         msa = torch.randn(S, N, c_msa)
         mask = torch.ones(S, N)
@@ -252,6 +260,7 @@ class TestOuterProductMean:
 
         torch.manual_seed(42)
         opm = OuterProductMean(c_msa=16, c_z=8, c_hidden=4)
+        wake_zero_init(opm)
         opm.eval()
         msa = torch.randn(3, 5, 16)
         mask = torch.ones(3, 5)

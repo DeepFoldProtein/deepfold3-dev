@@ -194,3 +194,40 @@ print({k: tuple(v.shape) for k, v in feats.items()})
 - `atom_cross_attn` is not yet batch-aware — subset building is per-sample
 
 **Subset sizes**: `queries_subset_size=32` and `keys_subset_size=128` in `AtomCrossAttConfig` control the atom cross-attention window. Larger K gives better spatial coverage but increases memory quadratically within each subset.
+
+
+## Zero-init output paths make comparison tests vacuous
+
+Every AF3-style module zero-initializes its output projection (`out_proj`,
+`out_gate`, `linear2`, AdaLN-zero conditioners), so a freshly constructed one
+emits exactly zero. A test of the form
+
+```python
+assert_close(module(x), hand_written_reference(x))
+```
+
+then compares zero with zero and passes whatever the module did in between — the
+reference body (interleaved channel split, einsum direction, LayerNorm
+placement) is never exercised. A missing `head_norm == "channel"` branch in
+MHR-TriMul survived a test named `..._is_exactly_af3` exactly this way, and a
+sweep found 46 such comparison sites across the suite.
+
+Call `wake_zero_init` from `tests/_util.py` on any module whose output you are
+about to compare, and assert the compared tensor is non-zero:
+
+```python
+from tests._util import wake_zero_init
+
+mod = wake_zero_init(TriangleMulOutgoing(c_z=32))
+out = mod(z, mask)
+assert out.abs().max() > 1e-3
+```
+
+Run `uv run pytest --check-vacuous` to list comparisons where both sides are
+all zero; the report is written to `tmp/vacuous_hits.txt`. Four remain and are
+legitimate — they verify that a result *is* zero.
+
+Related: `torch.autograd.gradcheck` in fp64 does not work on any module using
+`primitives.LayerNorm`, which always runs its forward in fp32; under `.double()`
+the finite differences are swamped by fp32 rounding. Compare analytic gradients
+against a reference implementation instead.
