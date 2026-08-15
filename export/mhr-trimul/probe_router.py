@@ -48,6 +48,14 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, type=Path)
     ap.add_argument("--n-examples", type=int, default=8)
     ap.add_argument(
+        "--ids-file",
+        type=Path,
+        default=None,
+        help="restrict to record ids listed one per line. Use it to probe the benchmark's own "
+        "targets, so routing can be read against measured per-target quality instead of an "
+        "arbitrary slice of the eval set.",
+    )
+    ap.add_argument(
         "--recycles",
         type=int,
         default=3,
@@ -151,6 +159,11 @@ def main() -> None:
     ds_cfg = train_cfg.eval_datasets[0]
     records = discover_records(Path(ds_cfg.data_dir))
     log.info("eval dataset %s: %d records", ds_cfg.name, len(records))
+    if args.ids_file:
+        want = {ln.strip().lower() for ln in args.ids_file.read_text().split() if ln.strip()}
+        records = [r for r in records if r.id.lower() in want]
+        log.info("ids-file %s: %d of %d requested records found", args.ids_file.name, len(records), len(want))
+
     if args.select != "any":
         want = {const.MOL_DNA, const.MOL_RNA} if args.select == "nucleic" else {const.MOL_NONPOLYMER}
         records = [

@@ -733,6 +733,62 @@ Two numbers in that table must not be quoted as secondary-structure results:
 `ss_pair` vs `ss_far` (5.36) and `hh_local` vs `geo_far` (6.53) are contact
 versus non-contact, i.e. the distance axis measured again.
 
+**Layer roles split: chemistry early, geometry late.** Restricting to contacts
+(<8 Å, |i-j| >= 3, so the distance axis and the self-pairs are both out of the
+way) and binning by the two residues' amino-acid types gives a 20x20 map per
+module of which head wins — `plot_residue_heatmap.py`, on 32 held-out
+single-chain benchmark monomers. A within-cell null (random halves of the same
+cell) sets the floor, which matters here because cells hold hundreds of pairs
+where the class-level nulls held 1e4-1e6.
+
+| band | distinct/null | cells off the modal head | aromatic x aromatic | D/E x D/E | polar x polar |
+| --- | --- | --- | --- | --- | --- |
+| **L0-11** | **5.93** | **0.215** | 0.181 | 0.208 | 0.267 |
+| L12-23 | 3.85 | 0.144 | 0.160 | 0.229 | 0.110 |
+| L24-35 | 2.87 | 0.095 | 0.090 | 0.177 | 0.132 |
+| **L36-47** | **2.31** | **0.093** | 0.083 | 0.240 | 0.108 |
+
+Amino-acid identity changes *which head wins* mostly in the early trunk. The
+eight most chemistry-sensitive modules are all at L16 or below (off-modal
+0.41-0.57, ratios 4.2-7.9), while **10 of the 24 late modules put every one of
+their ~350 populated cells on a single head** — L40 out is 348/348. So the
+router's early layers separate by composition and its late layers ignore it and
+separate by contact geometry, which is where `I(pair; head)` lives.
+
+The chemistry it uses is interpretable, and it is not the same chemistry at
+every depth:
+
+* **L24 out** splits aromatics and large hydrophobics from polars, monotonically:
+  aromatic x aromatic 100% off the modal head, aromatic x hydrophobic 81%,
+  **aromatic x positive 67%** — cation-pi — then hydrophobic x hydrophobic 46%,
+  hydrophobic x polar 11%, polar x polar 5%, D/E x polar 0%.
+* **L0 out** is the reverse: the charged and polar pairs are the distinctive
+  ones (D/E x D/E 75%, D/E x positive 67%, D/E x polar 60%) and hydrophobic x
+  hydrophobic is 11%.
+
+A candidate reading, not tested: at L0 the pair representation has no geometry
+in it yet, only sequence and composition, where charge is the most salient
+signal; by L24 structure has begun to form and buried hydrophobic contact is
+what there is to distinguish.
+
+**This corrects an earlier statement.** The depth curve showed
+`I(pair; head)` ~ 0 through L0-L25 and I wrote that the router "does nothing
+over the first half of the trunk". It does: it routes on chemistry there. What
+it does not do is carry information *about which pair it is* — consistent with
+composition being a property of the two tokens separately rather than of the
+pair, which is exactly what a mutual information between pair identity and head
+choice would miss.
+
+Two caveats. `off_modal` inflates where the routing is near-uniform, because
+heads sitting at g ~ 1 have their argmax flipped by a small perturbation, and
+the early trunk is exactly that regime (entropy 0.85-0.92 against 0.33 late) —
+so the early-vs-late off-modal gap contains that bias. The magnitude-based
+`distinct/null` ratio moves the same way (5.93 -> 2.31), which is why the
+conclusion stands on both. And amino-acid composition is correlated with
+secondary structure and with burial, so "chemistry" here is not cleanly
+separated from either; the control would measure amino-acid distinctiveness
+*within* a single secondary-structure class.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.
