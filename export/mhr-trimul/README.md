@@ -199,11 +199,46 @@ and the change was a reparameterization with zero expressivity gain.
 
 ### Design points worth stating explicitly
 
-**Division of labor.** The softmax constraint $\sum_h g^{(h)}=H$ means the
-router answers *which* subspace, never *whether* the module should fire at all.
-The retained output gate $\sigma(G_o)$ answers *whether*. Keeping both is
-deliberate; a sigmoid router would conflate them and reintroduce the
-multiplicative-suppression pathology of v1.
+**Division of labor, and why it is now a config choice.** The softmax
+constraint $\sum_h g^{(h)}=H$ means the router answers *which* subspace, never
+*whether* the module should fire at all; the retained output gate
+$\sigma(G_o)$ answers *whether*.
+
+That constraint has a cost the r17 measurement made visible. It is an
+architectural claim — that heads **compete for a fixed budget** — and for
+relation subspaces that is probably wrong: two heads capturing complementary
+relations (local backbone geometry, long-range contact) should be able to be on
+for the same pair at once. Worse, with no temperature and no regularizer (and
+r17 runs `weight_decay = 0.0`), a vertex is the *fixed point*: as
+$\lVert W_r\rVert$ grows the softmax sharpens monotonically, so collapse to one
+head is the default outcome rather than a finding about the task. Under softmax
+"route harder" and "use fewer heads" are the same operation, which confounds the
+two.
+
+`trimul_router_kind="sigmoid"` gives $g^{(h)} = 2\sigma(R(x))^{(h)}$ instead:
+independent per head, bounded in $(0,2)$, so complementary subspaces can
+co-activate and there is no winner-take-all attractor. **The novelty claim does
+not depend on this choice** — being outside AF3's function class comes from
+acting *before* $W_o$ on its column blocks, not from the normalization. Its cost
+is that $\mathrm{mean}_h\, g$ may drift from 1, so the branch magnitude drifts
+and `out_gate` has to absorb it; `router/g_mean` logs exactly that (pinned at
+1.0 for softmax, free for sigmoid).
+
+This is **not** the v1 pathology. v1 stacked sigmoids on the *operands*
+$a_{ik}, b_{jk}$ alongside free full-width gates, so it started at
+$0.25^2 = 1/16$ and was absorbed by those gates. Here the gate is
+post-contraction and pre-$W_o$, starts at exactly 1, and is not absorbable.
+
+**A load-balancing loss is deliberately not offered.** In MoE, balance exists for
+a *systems* reason — routing sends each token to $k$ of $N$ experts, so
+imbalance idles devices and drops tokens. MHR computes **all $H$ heads for every
+pair regardless of $g$**: no capacity, no dropping, no device imbalance. The only
+remaining reason to want balance would be a belief that more subspaces is
+better, which nothing here supports, and the loss would push heads on against
+what the main objective says. Removing the competition is the cause-level fix;
+balancing it is a counterforce.
+
+Default is `softmax`, which is what r17 trains.
 
 **Initialization.** $W_R=0$ gives $g^{(h)}\equiv 1$, so the router is an exact
 no-op at step 0. Its gradient is nonetheless healthy: at $p=1/H$,

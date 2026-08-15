@@ -88,24 +88,35 @@ class EvoformerConfig:
     #   uniform_residual_scale  : depth-uniform ``s = 1/sqrt(num_layer)``
     residual_output_scaling: bool = False
     uniform_residual_scale: bool = False
-    # ── Pair-track architecture (r17: MHG-TriMul + triangle-attention removal;
-    # see export/mhg-trimul/README.md) ────────────────────────────────────────
+    # ── Pair-track architecture (r17: MHR-TriMul + triangle-attention removal;
+    # see export/mhr-trimul/README.md) ────────────────────────────────────────
     # ``use_triangle_attention`` deletes the two GridSelfAttention branches from
     # every block of this stack. That is a real subtraction, not a
     # simplification: triangle attention is the only pair operator whose
     # selection over the intermediate node ``k`` is conditioned on the *target*
     # pair ``(i, j)`` (it is the query) and the only one whose mixing over ``k``
     # is softmax-normalized. Triangle multiplication weights ``k`` by functions
-    # of ``(i, k)`` and ``(j, k)`` alone. MHG-TriMul does not restore this — its
+    # of ``(i, k)`` and ``(j, k)`` alone. MHR-TriMul does not restore this — its
     # router selects which relation *subspace* explains a pair, not which
     # intermediate node does.
     #
-    # ``trimul_*`` configure MHG-TriMul (``TriangleMul`` docstring for the
+    # ``trimul_*`` configure MHR-TriMul (``TriangleMul`` docstring for the
     # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
     use_triangle_attention: bool = True
     trimul_num_heads: int = 0
     trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
     trimul_router: bool = False
+    # Router nonlinearity. ``softmax`` gives g = H*softmax_h(R(x)), so mean_h g
+    # = 1 and the router can only reallocate — heads compete for a fixed budget
+    # and, with no temperature or regularizer, collapse to one head is the
+    # unregularized fixed point (measured in r17: effective heads fall 6.2 ->
+    # 2.4 from L0-11 to L36-47, and the collapsed modules route *less*).
+    # ``sigmoid`` gives g = 2*sigmoid(R(x)): independent per head, bounded in
+    # (0, 2), so complementary relation subspaces can co-activate and there is
+    # no winner-take-all attractor to balance away. Its cost is that mean_h g
+    # may drift from 1, so the branch magnitude drifts and out_gate absorbs it.
+    # Both are exactly g == 1 at zero-init. Default softmax = the r17 behaviour.
+    trimul_router_kind: Literal["softmax", "sigmoid"] = "softmax"
 
 
 @dataclass
@@ -172,24 +183,35 @@ class PairFormerConfig:
     # them redundant (branch is already unit-RMS so an extra constant gain
     # just rescales the block-wide ``γ``).
     branch_scaler: Literal["identity", "rmsnorm"] = "identity"
-    # ── Pair-track architecture (r17: MHG-TriMul + triangle-attention removal;
-    # see export/mhg-trimul/README.md) ────────────────────────────────────────
+    # ── Pair-track architecture (r17: MHR-TriMul + triangle-attention removal;
+    # see export/mhr-trimul/README.md) ────────────────────────────────────────
     # ``use_triangle_attention`` deletes the two GridSelfAttention branches from
     # every block of this stack. That is a real subtraction, not a
     # simplification: triangle attention is the only pair operator whose
     # selection over the intermediate node ``k`` is conditioned on the *target*
     # pair ``(i, j)`` (it is the query) and the only one whose mixing over ``k``
     # is softmax-normalized. Triangle multiplication weights ``k`` by functions
-    # of ``(i, k)`` and ``(j, k)`` alone. MHG-TriMul does not restore this — its
+    # of ``(i, k)`` and ``(j, k)`` alone. MHR-TriMul does not restore this — its
     # router selects which relation *subspace* explains a pair, not which
     # intermediate node does.
     #
-    # ``trimul_*`` configure MHG-TriMul (``TriangleMul`` docstring for the
+    # ``trimul_*`` configure MHR-TriMul (``TriangleMul`` docstring for the
     # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
     use_triangle_attention: bool = True
     trimul_num_heads: int = 0
     trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
     trimul_router: bool = False
+    # Router nonlinearity. ``softmax`` gives g = H*softmax_h(R(x)), so mean_h g
+    # = 1 and the router can only reallocate — heads compete for a fixed budget
+    # and, with no temperature or regularizer, collapse to one head is the
+    # unregularized fixed point (measured in r17: effective heads fall 6.2 ->
+    # 2.4 from L0-11 to L36-47, and the collapsed modules route *less*).
+    # ``sigmoid`` gives g = 2*sigmoid(R(x)): independent per head, bounded in
+    # (0, 2), so complementary relation subspaces can co-activate and there is
+    # no winner-take-all attractor to balance away. Its cost is that mean_h g
+    # may drift from 1, so the branch magnitude drifts and out_gate absorbs it.
+    # Both are exactly g == 1 at zero-init. Default softmax = the r17 behaviour.
+    trimul_router_kind: Literal["softmax", "sigmoid"] = "softmax"
 
     def __post_init__(self) -> None:
         if self.branch_scaler != "identity":

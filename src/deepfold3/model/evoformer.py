@@ -78,11 +78,12 @@ def _resolve_branch_residual_gain(layer_idx: int, base_gain: float | None, per_l
 
 
 def _trimul_kwargs(cfg) -> dict:
-    """MHG-TriMul kwargs from an Evoformer/PairFormer config."""
+    """MHR-TriMul kwargs from an Evoformer/PairFormer config."""
     return dict(
         num_heads=cfg.trimul_num_heads,
         head_norm=cfg.trimul_head_norm,
         router=cfg.trimul_router,
+        router_kind=cfg.trimul_router_kind,
     )
 
 

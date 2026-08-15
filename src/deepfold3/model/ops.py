@@ -96,42 +96,53 @@ _TRIANGLE_MATMUL = {
 
 
 def set_router_stats_enabled(model: nn.Module, enabled: bool) -> None:
-    """Toggle MHG router read-out on every triangle-multiply in ``model``."""
+    """Toggle MHR router read-out on every triangle-multiply in ``model``."""
     for mod in model.modules():
         if isinstance(mod, _TriangleMulBase) and mod.use_router:
             mod.router_stats_enabled = bool(enabled)
 
 
-def collect_router_stats(model: nn.Module, prefix: str = "router") -> dict[str, float]:
-    """Depth-averaged router read-out, and the depth profile of its entropy.
+def collect_router_stats(model: nn.Module, prefix: str = "router", reset: bool = True) -> dict[str, float]:
+    """Router read-out, averaged over the logging window and over depth.
 
-    ``entropy`` is ``H(g)/log H``: **1.0 means the router is inert** — still
-    uniform, i.e. the module is functionally AF3 TriMul. This is the cheap
-    instrument that answers "is the router being used at all" from inside the
-    run, without the second training run that a proper ablation needs.
+    Read the two statistics together (see ``_record_router_stats``):
+    ``entropy`` at 1.0 means the router never left uniform, and ``g_std`` at ~0
+    means whatever it settled on is the same for every pair — a constant
+    per-head rescale, which is a reparameterization of ``W_o`` and therefore
+    inside AF3's function class. Only ``g_std > 0`` is evidence of routing AF3
+    could not already do.
+
+    Values are accumulated across every forward in the window (recycling means
+    several per step) and reset here, matching the activation meter rather than
+    reporting whichever forward happened to be last.
 
     Rank-local (the caller logs from rank 0); no collective, so it is safe to
     call on any subset of ranks.
     """
-    ent, occ_max, occ_min, per_layer = [], [], [], []
-    for name, mod in model.named_modules():
-        stats = getattr(mod, "_router_stats", None) if isinstance(mod, _TriangleMulBase) else None
-        if stats is None:
-            continue
-        ent.append(stats["entropy"])
-        occ_max.append(stats["occupancy_max"])
-        occ_min.append(stats["occupancy_min"])
-        per_layer.append((name, stats["entropy"]))
-    if not ent:
+    rows = [
+        (name, mod._flush_router_stats(reset))
+        for name, mod in model.named_modules()
+        if isinstance(mod, _TriangleMulBase) and mod.use_router
+    ]
+    rows = [(n, r) for n, r in rows if r is not None]
+    if not rows:
         return {}
+    ent = [r["entropy"] for _, r in rows]
+    std = [r["g_std"] for _, r in rows]
     out = {
         f"{prefix}/entropy": sum(ent) / len(ent),
         f"{prefix}/entropy_min": min(ent),
-        f"{prefix}/occupancy_max": max(occ_max),
-        f"{prefix}/occupancy_min": min(occ_min),
+        # The one that decides whether the router is redundant with W_o.
+        f"{prefix}/g_std": sum(std) / len(std),
+        f"{prefix}/g_std_max": max(std),
+        # 1.0 by construction for softmax; drift for sigmoid.
+        f"{prefix}/g_mean": sum(r["g_mean"] for _, r in rows) / len(rows),
+        f"{prefix}/occupancy_max": max(r["occupancy_max"] for _, r in rows),
+        f"{prefix}/occupancy_min": min(r["occupancy_min"] for _, r in rows),
     }
-    for name, e in per_layer:
-        out[f"{prefix}/entropy_by_module/{name}"] = e
+    for name, r in rows:
+        out[f"{prefix}/entropy_by_module/{name}"] = r["entropy"]
+        out[f"{prefix}/g_std_by_module/{name}"] = r["g_std"]
     return out
 
 
@@ -150,17 +161,25 @@ class _TriangleMulBase(nn.Module):
         num_heads: int = 0,
         head_norm: str = "channel",
         router: bool = False,
+        router_kind: str = "softmax",
     ):
         """
         Args:
             c_z: Pair channel width.
             optim: Fused-kernel configuration.
-            num_heads: MHG head count ``H`` (``0`` ≡ off ≡ AF3). ``d = c_z / H``.
+            num_heads: MHR head count ``H`` (``0`` ≡ off ≡ AF3). ``d = c_z / H``.
             head_norm: Post-contraction normalization —
                 ``"channel"`` = AF3's LayerNorm over all ``c_z``;
                 ``"head_rms"`` = RMSNorm over ``d`` within each head;
                 ``"head_ln"`` = LayerNorm over ``d`` within each head.
-            router: Target-pair-conditioned softmax router over heads.
+            router: Target-pair-conditioned router over heads.
+            router_kind: ``"softmax"`` — ``g = H·softmax_h(R(x))``, so
+                ``mean_h g = 1`` and the router can only *reallocate*; heads
+                compete for a fixed budget. ``"sigmoid"`` — ``g = 2σ(R(x))``,
+                per-head independent and bounded in (0, 2); heads can
+                co-activate, at the cost of letting the branch magnitude drift
+                (which ``out_gate`` then has to absorb). Both are exactly
+                ``g ≡ 1`` at zero-init. Default ``"softmax"``.
         """
         super().__init__()
         self.norm_left = LayerNorm(c_z)
@@ -177,13 +196,24 @@ class _TriangleMulBase(nn.Module):
         # AF3: gating_linear uses final_init (zeros)
         self.out_gate = LinearNoBias(c_z, c_z, initializer="zeros")
 
-        # ── MHG-TriMul (see export/mhg-trimul/README.md) ──────────────────
+        # ── MHR-TriMul: Multi-Head **Routed** triangle multiplication ─────
+        # (see export/mhr-trimul/README.md)
+        #
+        # "Routed", not "gated": every gate in this module — sigma(G_a),
+        # sigma(G_b), sigma(G_o) — is AF3's, unchanged. What is new is the
+        # router, and a softmax router is not a gate: sum_h g^(h) = H binds the
+        # heads together, so it *reallocates* rather than gates. Whether the
+        # module fires at all stays with out_gate; the router only chooses which
+        # head explains the pair.
+        #
         # The contraction is untouched: einsum("ikhd,jkhd->ijhd") is bitwise
         # equal to einsum("ikc,jkc->ijc") under c = (h, d), because only k is
         # contracted. The head axis earns its keep in the *normalization* and
         # the *router*, both of which sit between the contraction and out_proj.
         if head_norm not in ("channel", "head_rms", "head_ln"):
             raise ValueError(f"head_norm must be channel|head_rms|head_ln, got {head_norm!r}")
+        if router_kind not in ("softmax", "sigmoid"):
+            raise ValueError(f"router_kind must be softmax|sigmoid, got {router_kind!r}")
         if head_norm != "channel" or router:
             if num_heads <= 0:
                 raise ValueError("num_heads > 0 is required for per-head norm or routing")
@@ -193,7 +223,8 @@ class _TriangleMulBase(nn.Module):
         self.head_dim = c_z // num_heads if num_heads else 0
         self.head_norm = head_norm
         self.use_router = bool(router)
-        self.is_mhg = head_norm != "channel" or self.use_router
+        self.router_kind = router_kind
+        self.is_mhr = head_norm != "channel" or self.use_router
         # Router logits from the *target* pair x_ij. Zero-init ⇒ g ≡ 1, so the
         # module starts function-identical to AF3 TriMul, while the softmax
         # Jacobian at p = 1/H is (δ_hh' − 1/H), i.e. O(1): the router receives a
@@ -230,9 +261,9 @@ class _TriangleMulBase(nn.Module):
                 # Level 1 never materializes LN(z), which the router reads.
                 self._fused_gate = None
             # Level 2: Fused LN+Linear for post-einsum norm_center + out_proj.
-            # Incompatible with MHG — per-head norm and routing sit between the
+            # Incompatible with MHR — per-head norm and routing sit between the
             # two fused halves.
-            if not self.is_mhg:
+            if not self.is_mhr:
                 try:
                     from deepfold3.model.triton.layernorm_linear import FusedLayerNormLinear
 
@@ -291,8 +322,8 @@ class _TriangleMulBase(nn.Module):
         del m
         act = _TRIANGLE_MATMUL[self._equation](a, b)
         del a, b  # free masked projections before output gating
-        if self.is_mhg:
-            act = self._mhg_head_mix(act, router_logits)
+        if self.is_mhr:
+            act = self._mhr_head_mix(act, router_logits)
             act = self.out_proj(act)
         elif self._fused_center_proj is not None and act.is_cuda:
             act = self._fused_center_proj(
@@ -306,7 +337,7 @@ class _TriangleMulBase(nn.Module):
             act = self.out_proj(act)
         return act * out_gate
 
-    def _mhg_head_mix(self, act: torch.Tensor, router_logits: torch.Tensor | None) -> torch.Tensor:
+    def _mhr_head_mix(self, act: torch.Tensor, router_logits: torch.Tensor | None) -> torch.Tensor:
         """Per-head normalization then target-pair-conditioned routing.
 
         ``act`` is the raw contraction ``T_ij`` of shape ``[B, N, N, c_z]``;
@@ -336,34 +367,90 @@ class _TriangleMulBase(nn.Module):
             t = t32.to(act.dtype) * w + self.norm_center.bias.view(h, d)
 
         if router_logits is not None:
-            # g = H · softmax_h(R(x_ij)) ⇒ mean_h g = 1. The router reallocates
-            # across heads and can never change the global scale; whether the
-            # module fires at all stays with ``out_gate``, which is kept.
-            g = torch.softmax(router_logits.float(), dim=-1)
+            # Both forms are exactly g ≡ 1 at zero-init; they differ in whether
+            # the heads compete.
+            #
+            #   softmax: g = H·softmax_h(R) ⇒ mean_h g = 1. The router can only
+            #     reallocate, never change the branch's global scale — that
+            #     stays with ``out_gate``. But raising one head necessarily
+            #     lowers the others, which is an architectural claim that heads
+            #     share a fixed budget. Its fixed point under an unregularized,
+            #     growing W_r is a vertex, i.e. collapse to one head.
+            #
+            #   sigmoid: g = 2σ(R), independent per head, bounded in (0, 2).
+            #     Complementary relation subspaces can co-activate, and there is
+            #     no winner-take-all attractor to balance away. The cost is that
+            #     mean_h g may drift from 1, so the branch magnitude drifts and
+            #     competes with ``out_gate``.
+            r = router_logits.float()
+            g = float(h) * torch.softmax(r, dim=-1) if self.router_kind == "softmax" else 2.0 * torch.sigmoid(r)
             if self.router_stats_enabled:
                 self._record_router_stats(g)
-            t = t * (float(h) * g).to(t.dtype).unsqueeze(-1)
+            t = t * g.to(t.dtype).unsqueeze(-1)
         return t.flatten(-2)
 
     @torch.no_grad()
     def _record_router_stats(self, g: torch.Tensor) -> None:
-        """Detached read-out of how much the router is actually being used.
+        """Accumulate a detached read-out of whether the router is doing anything.
 
-        ``entropy`` is ``H(g)/log H`` averaged over pairs: 1.0 means the router
-        is inert (still uniform, i.e. functionally AF3), lower means it is
-        selecting. ``occupancy_max`` is the largest per-head mean share; a value
-        near 1/H with entropy near 1 says the head decomposition is not being
-        exploited, which is the outcome that would otherwise need a second run
-        to establish.
+        Two statistics, because entropy alone cannot answer the question.
+
+        ``entropy`` is ``H(p)/log H`` averaged over pairs. 1.0 means the router
+        never left uniform — inert, functionally AF3 TriMul.
+
+        ``g_std`` is the **across-pair** standard deviation of ``g`` itself,
+        averaged over heads, and it is what separates useful routing from a
+        redundant one. A router that is sharp but the *same* for every pair
+        (low entropy, ``g_std ≈ 0``) merely scales each column block of
+        ``W_o`` by a constant — a reparameterization of ``W_o``, inside AF3's
+        function class, contributing nothing. Only the pair-conditional part,
+        which ``g_std`` measures, is outside it. ``g`` sits at 1 per head when
+        the router is inert, so 0.1 is a modest effect.
+
+        ``entropy`` and ``occupancy`` are computed from the *normalized* shares
+        ``p = g / Σ_h g``, which makes them identical to the softmax
+        probabilities under ``router_kind="softmax"`` (where ``Σ_h g = H``) and
+        keeps the two parameterizations directly comparable.
+
+        ``g_mean`` is exactly 1.0 for the softmax router — a free sanity check —
+        and free to drift for the sigmoid one, where it measures the branch
+        rescaling that ``out_gate`` then has to absorb.
+
+        So: ``entropy ≈ 1`` ⇒ inert. ``entropy < 1`` with ``g_std ≈ 0`` ⇒
+        active but redundant. ``g_std > 0`` ⇒ genuinely conditional routing.
+
+        One forward is already a precise estimate — there are ``N²`` pairs in
+        it — but it measures only *within-example* variation. A router that
+        varied across examples while staying constant within one would also be
+        outside the function class and would read here as 0, so this is a
+        conservative lower bound on how much conditioning the router carries.
         """
-        p = g.reshape(-1, self.num_heads)
+        g = g.reshape(-1, self.num_heads)
+        p = g / g.sum(-1, keepdim=True).clamp_min(1e-9)
         ent = -(p * (p + 1e-9).log()).sum(-1).mean() / math.log(self.num_heads)
         share = p.mean(0)
-        self._router_stats = {
-            "entropy": float(ent),
-            "occupancy_max": float(share.max()),
-            "occupancy_min": float(share.min()),
-        }
+        acc = self._router_stats
+        if acc is None:
+            acc = self._router_stats = dict(
+                entropy=0.0, g_std=0.0, g_mean=0.0, occupancy_max=0.0, occupancy_min=0.0, n=0.0
+            )
+        acc["entropy"] += float(ent)
+        acc["g_std"] += float(g.std(0).mean())
+        acc["g_mean"] += float(g.mean())
+        acc["occupancy_max"] += float(share.max())
+        acc["occupancy_min"] += float(share.min())
+        acc["n"] += 1.0
+
+    def _flush_router_stats(self, reset: bool = True) -> dict[str, float] | None:
+        """Window means of the accumulated read-out, or ``None`` if nothing ran."""
+        acc = self._router_stats
+        if acc is None or acc["n"] == 0:
+            return None
+        n = acc["n"]
+        out = {k: v / n for k, v in acc.items() if k != "n"}
+        if reset:
+            self._router_stats = None
+        return out
 
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
