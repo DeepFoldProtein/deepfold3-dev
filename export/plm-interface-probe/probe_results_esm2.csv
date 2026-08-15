@@ -1,5 +1,0 @@
-model,layer,join,category,auc_iface_emb_per_target_mean,auc_iface_emb_per_target_sd,n_target_auc,n_train,n_test,n_res_test,iface_frac,contact_frac,auc_iface_emb,auc_iface_aa,auc_contact_cosine,auc_contact_bilinear_emb,auc_contact_bilinear_aa
-esm2,33,per_chain,ppi,0.6593,0.1083,20,20,20,16000,0.2498,0.00085,0.6655,0.5147,0.6492,0.5469,0.5173
-esm2,33,per_chain,agab,0.8627,0.1172,20,20,20,11688,0.2307,0.00141,0.8813,0.5766,0.686,0.7851,0.5756
-esm2,33,joined,ppi,0.6187,0.1009,20,20,20,16000,0.2498,0.00085,0.6603,0.5147,0.6454,0.5208,0.5147
-esm2,33,joined,agab,0.7291,0.0993,20,20,20,11688,0.2307,0.00141,0.7297,0.5766,0.5469,0.6648,0.5803

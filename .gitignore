@@ -197,3 +197,7 @@ wandb/
 
 # Claude Code
 .claude/
+
+# Research notebooks and their raw plot data live on disk, not in git
+# (4.4 GB of predictions/figures; the tracked slice alone was 44 MB of png/csv).
+export/
