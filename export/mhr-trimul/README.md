@@ -327,7 +327,42 @@ $\operatorname{LN}_{c_z}\neq\operatorname{RMSNorm}_{d}$ is a function change,
 so it needs re-equilibration rather than reading in the ~2-3k an
 identity-initialized change would.
 
-## 5. r17 is the combined arm — what can and cannot be recovered afterward
+## 5. Correction: r17 is not the arm it was configured to be
+
+`head_norm == "channel"` had **no branch** in `_mhr_head_mix`. It fell through
+to the `head_ln` case, so a module configured for AF3's LayerNorm over $c_z$
+silently received per-head LayerNorm instead. Measured on the pre-fix code, the
+per-head RMS after the mix was `[1.000, 1.000, ...]` where AF3 gives
+`[0.841, 0.576, 0.888, ...]`.
+
+**r17 has therefore been training with per-head normalization plus the router —
+grid cell C — not the router alone (cell A) that its config asks for**, for its
+whole life so far.
+
+The identity test that was supposed to catch this,
+`test_zero_init_router_is_exactly_af3`, passed **vacuously**: `out_proj` and
+`out_gate` are zero-initialized, so both sides of `torch.equal` were exactly
+zero and the comparison said nothing about what happened in between. It now
+perturbs those weights first and asserts the compared tensors are non-zero, and
+a second test asserts that `channel` leaves head magnitudes free while
+`head_ln` equalizes them.
+
+Consequences, in order of importance:
+
+1. **The attribution argument for choosing cell A is void.** The next section
+   argued that holding per-head norm back to r18 keeps a shortfall
+   attributable, because the router is instrumented and lesionable while the
+   norm is neither. r17 has both changes, so a shortfall is exactly the
+   three-way confound that choice was meant to avoid.
+2. **One earlier caveat dissolves.** With per-head norm actually active,
+   the per-head norm of $\hat T$ is 1 for every head and pair, so the measured
+   $g$ *is* the per-head contribution. The router numbers are cleaner than they
+   would have been under the configured behaviour, not dirtier.
+3. **r18's plan shrinks** from "add per-head norm" to "switch head_ln to
+   head_rms", i.e. drop the mean subtraction — a much smaller change than
+   planned.
+
+## 6. r17 is the combined arm — what can and cannot be recovered afterward
 
 r17 ships two changes at once (`configs/df3-stage0-r17.yaml`, from scratch,
 depth 48 and crop held at r16's values). That buys one run instead of two and
@@ -410,7 +445,7 @@ follow-ups cheap, every cell of the grid carries **identical `state_dict` keys**
 is the only extra tensor, and `head_rms` alone drops `norm_center.bias`), so any
 cell warm-starts from any other with `load_strict=false`.
 
-## 6. Measured: the router is pair-conditional (r17, step 1500)
+## 7. Measured: the router is pair-conditional (r17, step 1500)
 
 `probe_router.py` on 8 real examples from the run's own eval set
 (`patchr_training`, post-2021-09-30, 153-384 tokens). Raw per-module numbers in
@@ -702,7 +737,7 @@ versus non-contact, i.e. the distance axis measured again.
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.
 
-## 7. How the router numbers are computed
+## 8. How the router numbers are computed
 
 Every router figure in §5 comes from `probe_router.py`. The procedure and the
 reason for each choice:
@@ -825,7 +860,7 @@ Padding is *not* a problem here, which was checked: examples are collated one at
 a time and no bucket padding is applied (token counts came out 153 / 204 / 303 /
 306 / 384), so no invalid pairs enter the statistics.
 
-## 8. Sequencing, and the confound to avoid
+## 9. Sequencing, and the confound to avoid
 
 Running `MHR + no-TriAttn` as a single arm is cheaper only if it works. If it
 does not, the loss is unattributable and decomposing it costs further runs. That
@@ -852,7 +887,7 @@ answer different questions.
 The surplus gets spent at r18, once r17 has said whether the pair track
 survives without triangle attention.
 
-## 9. Where it lives
+## 10. Where it lives
 
 | | |
 | --- | --- |
