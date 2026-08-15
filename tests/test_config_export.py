@@ -26,7 +26,6 @@ def test_round_trip_full(tmp_path):
         max_steps=12345,
         max_tokens=512,
         dtype="fp32",
-        region_loss_weights={3: 5.0},
         extra_datasets=[
             DatasetConfig(
                 name="patchr",

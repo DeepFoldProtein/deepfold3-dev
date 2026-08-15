@@ -84,7 +84,9 @@ def test_unnamed_dialect_falls_back_to_synthetic(tmp_path):
 
 def test_multi_ccd_ligand_declines_to_guess(tmp_path):
     """from_job expands ccdCodes into one chain each; one id can't label them all."""
-    job = _job(tmp_path, [{"protein": {"id": "A", "sequence": "AAAA"}}, {"ligand": {"id": "L", "ccdCodes": ["ATP", "MG"]}}])
+    job = _job(
+        tmp_path, [{"protein": {"id": "A", "sequence": "AAAA"}}, {"ligand": {"id": "L", "ccdCodes": ["ATP", "MG"]}}]
+    )
     assert job_chain_ids(job) == ["A", None, None]
 
 
