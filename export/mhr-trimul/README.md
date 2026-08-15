@@ -824,6 +824,65 @@ secondary structure and with burial, so "chemistry" here is not cleanly
 separated from either; the control would measure amino-acid distinctiveness
 *within* a single secondary-structure class.
 
+**Separating the confounded factors.** Every number above measures one factor
+at a time, which cannot attribute anything: inter-chain pairs are on average
+farther apart, hydrophobic contacts are closer, large residues are hydrophobic,
+and beta pairing sits at a characteristic separation. Measured singly, the same
+signal is counted several times.
+
+`probe_factor_decomposition.py` builds **one joint contingency table per
+module** — (distance bin, chemistry-pair class, size-pair class, SS-pair class,
+chain) -> summed head mass — and derives every marginal and conditional from it,
+so the pieces are consistent with each other by construction. Units are
+$\log H$, so 1.0 would be the full 3 bits.
+
+| factor | $I(h;V)$ | $I(h;V \mid D)$ | survives | $I(h;D \mid V)$ | of $I(h;D)$ |
+| --- | --- | --- | --- | --- | --- |
+| **chain** | **0.0127** | 0.0085 | 67% | 0.0042 | 50% |
+| distance | 0.0084 | — | — | — | — |
+| chemistry | 0.0019 | 0.0020 | 103% | 0.0085 | 101% |
+| size | 0.0009 | 0.0009 | 107% | 0.0085 | 101% |
+| secondary structure | 0.0002 | 0.0003 | 160%* | 0.0085 | 101% |
+
+**1. Chain leads, not distance.** This reverses the ordering the $L_1$ class
+separations gave (distance 5.9, chain 3.0). The two answer different questions.
+A separation compares two extreme classes; contacts are 2-3% of pairs, so a
+large difference on a rare class produces a large separation and modest
+information. Mutual information weights by frequency. The separations are not
+wrong — they were answering "how differently are these treated", not "how much
+of the routing is this".
+
+**2. The factors are nearly independent** — which is the opposite of what
+prompted the analysis. Chemistry, size and SS survive conditioning on distance
+at 100%+, and distance survives conditioning on each of them at 101%. Only chain
+and distance genuinely share information (67% and 50% surviving). The conditional
+is computed in both directions deliberately: privileging distance as *the*
+control would have assumed the conclusion.
+
+**3. All five together explain 42%.** $I(h; \text{all five}) = 0.0207$ against
+$I(h;\text{pair}) = 0.0494$ measured on the same pairs. **More than half of what
+the router conditions on is not any physical quantity tested here.**
+
+Caveats. Discretization makes 42% a floor, not a ceiling — nine distance bins
+and six chemistry groups throw away within-bin variation. The `160% surviving`
+for SS is noise on 0.0002 -> 0.0003; small absolute terms should not be read as
+ratios. MI is biased upward at finite sample, and this is 24 examples. And the
+router sees only $\operatorname{LN}(z)$: these labels are correlates of what it
+conditions on, not its inputs.
+
+What the missing 58% is cannot be settled from this. It could be a physical
+quantity not tested — solvent accessibility, local density, conservation — or it
+could be structure in the learned representation that reduces to no simple
+label, in which case this approach cannot reach it.
+
+*Two consistency fixes were needed to get a trustworthy ratio. The denominator
+first came from a separate run whose pair set had no $|i-j|$ filter, which alone
+halved the distance term, and whose gap moved ~15% between draws. Numerator and
+denominator now come from one table. Separately, several patch scripts had been
+chained with newlines rather than `&&`, so a failed patch did not stop the run
+that followed — which is how an unpatched script produced a result that looked
+like a measurement.*
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.

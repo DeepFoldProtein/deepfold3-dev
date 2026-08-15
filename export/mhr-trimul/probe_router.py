@@ -92,6 +92,10 @@ def main() -> None:
     # owns contacts within a chain and head h' owns the interface, the per-head
     # mean of g should differ between the two classes.
     acc: dict[str, dict] = {}
+    # Per-distance-bin head mass, for I(head; distance) — see the report below.
+    dbin_acc: dict[str, torch.Tensor] = {}
+    dbin_n: dict[str, torch.Tensor] = {}
+    DBINS = [0, 4, 6, 8, 10, 12, 15, 20, 30, 50, 1e9]
     rng = torch.Generator(device=args.device).manual_seed(0)
     holder: dict[str, dict[str, torch.Tensor]] = {"masks": {}}
 
@@ -104,6 +108,13 @@ def main() -> None:
             if not masks or g.shape[1] != next(iter(masks.values())).shape[-1]:
                 return
             flat = g.reshape(-1, _mod.num_heads).float()
+            db, dok = holder.get("dbin"), holder.get("dok")
+            if db is not None and db.numel() == flat.shape[0]:
+                nb = len(DBINS) - 1
+                s_ = dbin_acc.setdefault(_name, torch.zeros(nb, _mod.num_heads))
+                c_ = dbin_n.setdefault(_name, torch.zeros(nb))
+                s_.index_add_(0, db[dok].cpu(), flat[dok].cpu())
+                c_.index_add_(0, db[dok].cpu(), torch.ones(int(dok.sum())))
             a = acc.setdefault(_name, {})
             for cls, mask in masks.items():
                 m = mask.reshape(-1)
@@ -268,6 +279,8 @@ def main() -> None:
         helix = (d2 - 5.5).abs().lt(0.6) & (d3 - 5.3).abs().lt(0.6) & (d4 - 6.4).abs().lt(0.7) & prot1
         strand = (d2 - 6.7).abs().lt(0.7) & (d3 - 9.9).abs().lt(1.0) & (d4 - 12.4).abs().lt(1.2) & prot1
         seqsep = (ar[:, None] - ar[None, :]).abs().to(args.device)
+        holder["dbin"] = torch.bucketize(dist, torch.tensor(DBINS[1:-1], device=args.device)).reshape(-1)
+        holder["dok"] = okp.reshape(-1)
         holder["masks"] = {
             "intra": same,
             "inter": ~same,
@@ -471,6 +484,40 @@ def main() -> None:
                 " ".join(f"{v:4.2f}" for v in r["intra"].tolist()),
                 " ".join(f"{v:4.2f}" for v in r["inter"].tolist()),
             )
+
+    # How much of the router's pair-conditional information is just distance?
+    #
+    # I(head; pair) is the specialization gap already reported. I(head; distance)
+    # is the same functional with the conditioning variable coarsened to a
+    # distance bin. Distance is a function of the pair, so by the data-processing
+    # inequality the second cannot exceed the first; their ratio is the share of
+    # the router's conditioning that a distance map alone would reproduce.
+    if dbin_acc:
+        import math as _math
+
+        shares = []
+        for name, s_ in dbin_acc.items():
+            c_ = dbin_n[name]
+            keep = c_ > 0
+            if keep.sum() < 2:
+                continue
+            p_bin = s_[keep] / s_[keep].sum(-1, keepdim=True)
+            w = (c_[keep] / c_[keep].sum()).unsqueeze(-1)
+            marg = (p_bin * w).sum(0)
+            ent_marg = float(-(marg * (marg + 1e-9).log()).sum())
+            ent_cond = float((-(p_bin * (p_bin + 1e-9).log()).sum(-1) * w.squeeze(-1)).sum())
+            mod = dict(model.named_modules())[name]
+            shares.append((name, (ent_marg - ent_cond) / _math.log(mod.num_heads)))
+        vals = [v for _, v in shares]
+        log.info(
+            "\nI(head; distance bin) / log H over %d modules: mean %.4f  max %.4f",
+            len(vals),
+            sum(vals) / len(vals),
+            max(vals),
+        )
+        by_layer = sorted(shares, key=lambda kv: -kv[1])[:6]
+        for nm, v in by_layer:
+            log.info("   %-52s %.4f", nm, v)
 
     stats = collect_router_stats(model)
     summary = {k: v for k, v in stats.items() if "by_module" not in k}
