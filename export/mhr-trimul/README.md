@@ -50,10 +50,12 @@ this section for what went wrong, because the same traps are easy to re-enter.
 
 **Forward-only buys far less than forward+backward** — 1.58x against 2.98x — for
 two compounding reasons. Triangle attention's backward is disproportionately
-expensive relative to triangle multiplication's, and the trunk contains an
-unchanged MSA stack (row attention, outer-product mean) that dilutes a
-PairFormer-only win. Quote 2.7-3.0x for training and 1.6x for the trunk at
-inference; they are different quantities.
+expensive relative to triangle multiplication's, and much of the trunk is
+untouched by the arm and dilutes the win: MSA row attention, outer-product mean,
+the MSA transition, both pair transitions, and the PairFormer single track.
+(The Evoformer stack's *pair* sub-track is **not** in that list — it changed
+exactly as the PairFormer's did; see the scope table below.) Quote 2.7-3.0x for
+training and 1.6x for the trunk at inference; they are different quantities.
 
 **The trunk is not all of inference.** Diffusion sampling (200 steps x 5
 samples) is untouched by this arm, so end-to-end inference speedup is strictly
@@ -385,7 +387,29 @@ survives without triangle attention.
 | known pre-existing failure | `tests/triton/test_evo_attn_robustness.py::test_row_norm_heterogeneity` (`fail_frac=4.69e-2` vs a `1e-2` limit). Confirmed identical, bit for bit, at `023c064` — before any of this work — so it is unrelated to the pair-track changes and is *not* fixed here. |
 | benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |
 
-Scope: **trunk only**. The template PairFormer (2 layers, its own block class in
-`template_embedding.py`) and the confidence-head PairFormer keep AF3 triangle
-attention and AF3 `TriangleMul`, so the read-out heads are not confounded with
-the trunk arm.
+### Scope
+
+Verified against the live r17 checkpoint at step 1500 (`pair_attn` tensors
+remaining: 96, all outside the trunk):
+
+| stack | changed | untouched |
+| --- | --- | --- |
+| `msa_stack` (Evoformer, 4 blocks) | `pair_attn` **removed**; `tri_mul` -> MHR (8 routers) | `row_attn`, `outer_product`, `msa_transition`, `pair_transition` |
+| `trunk_pairformer` (48 blocks) | `pair_attn` **removed**; `tri_mul` -> MHR (96 routers) | everything else |
+| template stack (2 blocks) | — | `pair_attn` (32 tensors), AF3 `TriangleMul` |
+| confidence head (4 blocks) | — | `pair_attn` (64 tensors), AF3 `TriangleMul` |
+
+The Evoformer stack's pair sub-track changed **identically** to the
+PairFormer's. This is deliberate: the pair representation is shared between the
+two stacks, so leaving triangle attention in one would be a hybrid. In cost
+terms it is minor — 4 blocks against 48.
+
+It does carry a distinct risk, though. The MSA stack is where the pair
+representation is first formed, out of the outer-product mean; removing triangle
+attention there hands the PairFormer a less-refined pair prior, which is not the
+same kind of change as removing it from a 48-block stack that already has one.
+
+The read-out heads are left at AF3 so they are not confounded with the trunk
+arm. The consequence is that the confidence head now has a different pair
+architecture from the trunk it reads; if the arm succeeds, r18+ should make them
+consistent.
