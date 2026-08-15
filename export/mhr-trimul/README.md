@@ -1037,7 +1037,101 @@ answer different questions.
 The surplus gets spent at r18, once r17 has said whether the pair track
 survives without triangle attention.
 
-## 10. Where it lives
+## 10. The first quality read: iso-step, iso-wall-clock, and one number that survives both
+
+§9 promised the r16 comparison at both iso-step and iso-wall-clock, and that
+they would disagree. They do.
+
+### Iso-step, r17 loses
+
+FoldBench-small `monomer_protein`, 333 targets, 2 seeds x 5 samples, EMA shadow
+weights:
+
+| step | r16 TM | r17 TM | dTM | r16 lDDT | r17 lDDT | dlDDT |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2000 | 0.1335 | 0.0969 | -0.0366 | 0.0625 | 0.0518 | -0.0107 |
+| 3000 | 0.6850 | 0.6507 | -0.0343 | 0.4881 | 0.4484 | -0.0397 |
+
+### Iso-wall-clock, the deficit mostly disappears
+
+r17's block is cheaper, and the saving shows up in the step time rather than in
+a throughput number that has to be argued about:
+
+| | r16 | r17 | r17 faster |
+| --- | --- | --- | --- |
+| s/step, cumulative to step 4000 | 23.59 | 21.51 | 8.8% |
+| s/step, trailing 200 steps | 22.98 | 20.32 | 11.6% |
+
+Banked as steps, that is **+356 steps of credit at step 4000** — when r17 saved
+`checkpoint_4000`, r16 at the same wall-clock was at step 3644. Inverting it:
+
+| metric | r17 level | r16 reaches it at | r17's wall-clock margin |
+| --- | --- | --- | --- |
+| TM @ 3000 | 0.6507 | step 2938, t=69502 s | **+7.4%** |
+| lDDT @ 3000 | 0.4484 | step 2907, t=68784 s | **+6.4%** |
+| TM @ 2000 | 0.0969 | step 1281, t=30813 s | -38.6% |
+| lDDT @ 2000 | 0.0518 | step 1549, t=37091 s | -15.1% |
+
+So at step 3000 a 5% iso-step deficit is roughly a 7% iso-wall-clock *surplus*.
+The step-2000 rows are in the table for honesty, not for weight: at TM 0.10 both
+runs are pre-structure and the curve there is nearly flat, so a level-crossing
+lands anywhere. The same objection is a milder one at step 3000 — the
+interpolation that locates r16's crossing runs through its steepest stretch
+(TM 0.13 -> 0.69 across 2000 -> 3000), where a straight line is a poor model of
+the curve. The step-4000 bench replaces it with a 3000 -> 4000 interpolation
+over a flatter rise and should be trusted over this one.
+
+### One number that does not care about the phase
+
+Everything above compares two runs at different points on the same steep curve,
+which is exactly the confound §9 warned about. There is one quantity that steps
+around it. In r16, the ratio of 8-state strand F1 to 8-state helix F1 is
+**flat across the entire run**:
+
+| | mean | sd | CV | range | spans |
+| --- | --- | --- | --- | --- | --- |
+| r16 `f1_8_E / f1_8_H`, 21 checkpoints | 1.0257 | 0.0064 | **0.6%** | 1.0141-1.0383 | lDDT 0.49 -> 0.88 |
+
+Quality rises by 0.39 lDDT over those checkpoints and the strand/helix balance
+does not move. It is a property of the architecture, not of how far along
+training is. And r17 sits well outside it:
+
+| | E (`f1_8_E`) | H (`f1_8_H`) | E/H |
+| --- | --- | --- | --- |
+| r16 @ 3000 | 0.8607 | 0.8350 | 1.0308 |
+| r17 @ 3000 | 0.7854 | 0.8091 | **0.9707** |
+
+-5.8% against r16's own step-3000 value, and 8.6 sd below r16's long-run mean.
+r16 builds strands slightly *better* than helices; r17 builds them worse. This
+is the pre-registered diagnostic, and it is the first r17 result that a phase
+lag cannot explain.
+
+### What this does not yet say
+
+- **Not attributable.** r17 is `no-TriAttn + MHR-TriMul` in one arm. The 5.8%
+  is charged to the pair of them. Separating it needs an arm that removes
+  triangle attention *without* the router, or keeps it *with* one — §9's
+  original split, which was not run.
+- **The rarer states are not yet separable from the phase.** G, I, T, S, B and P
+  are all down 10-54% at iso-step, but unlike E/H their ratios to H are still
+  climbing in r16 at step 3000 (G/H 0.489 there against a 0.751 long-run mean),
+  so a run that is behind will score low on them for that reason alone. They
+  need matched quality, which the step-4000 point begins to supply.
+- **`monomer_protein` only.** The interface categories for step 3000 are scored
+  but the strand argument is a monomer argument; whether the router's
+  chain-leading factor structure (§9 of the factor table: chain 0.0127 vs
+  distance 0.0084) buys anything at interfaces is a separate read.
+
+### Housekeeping
+
+`eval/diffusion_mse` at step 4000 read 61.4 against a 0.094 trend, carrying
+`eval/total` to 246.8. `eval/tm_true` was 0.7582 at the same evaluation, up from
+0.7486 at 3900, and the step-4000 training loss was ordinary (8.99, mse 1.96), so
+this is one catastrophic sample inside a small eval set, consistent with the
+documented `diffusion_mse` spike distribution, and not a model event. Prior r17
+evals spiked to 2.36 (step 1300) and 1.04 (step 3700).
+
+## 11. Where it lives
 
 | | |
 | --- | --- |
@@ -1050,6 +1144,7 @@ survives without triangle attention.
 | tests | `tests/test_mhr_trimul.py` |
 | known pre-existing failure | `tests/triton/test_evo_attn_robustness.py::test_row_norm_heterogeneity` (`fail_frac=4.69e-2` vs a `1e-2` limit). Confirmed identical, bit for bit, at `023c064` — before any of this work — so it is unrelated to the pair-track changes and is *not* fixed here. |
 | benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |
+| r16 comparison | `compare_r16_r17.py` -> `compare_r16_r17.csv` (section 10) |
 
 ### Scope
 
