@@ -66,10 +66,18 @@ class RMSNorm(nn.Module):
         return (x * self.weight.float()).to(dtype)
 
 
-def build_norm(cfg: ComplexLMConfig, dim: int) -> nn.Module:
+def build_norm(cfg: ComplexLMConfig, dim: int, bias: bool | None = None) -> nn.Module:
+    """A norm layer; ``bias`` overrides ``cfg.bias`` for one site.
+
+    The override exists for ``esmc_compat``: ESMC carries a bias on its
+    pre-attention, pre-FFN and head norms and none on its q/k norms or its
+    final norm, and its released weights only load if that pattern is
+    reproduced exactly. RMSNorm has no bias either way, so the argument is
+    inert on the default path.
+    """
     if cfg.norm == "rmsnorm":
         return RMSNorm(dim, cfg.norm_eps)
-    return nn.LayerNorm(dim, eps=cfg.norm_eps, bias=cfg.bias)
+    return nn.LayerNorm(dim, eps=cfg.norm_eps, bias=cfg.bias if bias is None else bias)
 
 
 class RotaryEmbedding(nn.Module):
@@ -122,12 +130,12 @@ class Attention(nn.Module):
         # muP scales attention logits by 1/d_head rather than 1/sqrt(d_head),
         # expressed against the proxy so that the two agree at the base width.
         self.scale = (cfg.base_head_dim**0.5) / self.head_dim if cfg.mup else self.head_dim**-0.5
-        self.norm = build_norm(cfg, cfg.d_model)
+        self.norm = build_norm(cfg, cfg.d_model, bias=True if cfg.esmc_compat else None)
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         # ESMC normalises the whole concatenated query/key, not each head.
-        self.q_norm = build_norm(cfg, cfg.d_model) if cfg.qk_layernorm else nn.Identity()
-        self.k_norm = build_norm(cfg, cfg.d_model) if cfg.qk_layernorm else nn.Identity()
+        self.q_norm = build_norm(cfg, cfg.d_model, bias=False) if cfg.qk_layernorm else nn.Identity()
+        self.k_norm = build_norm(cfg, cfg.d_model, bias=False) if cfg.qk_layernorm else nn.Identity()
         self.rotary = RotaryEmbedding(self.head_dim, cfg.rope_theta) if kind in ("c", "r") else None
 
     def _positions(self, batch: PackedBatch) -> torch.Tensor | None:
@@ -226,7 +234,7 @@ class SwiGLUFFN(nn.Module):
     def __init__(self, cfg: ComplexLMConfig) -> None:
         super().__init__()
         hidden = swiglu_hidden(cfg.d_model, cfg.expansion_ratio)
-        self.norm = build_norm(cfg, cfg.d_model)
+        self.norm = build_norm(cfg, cfg.d_model, bias=True if cfg.esmc_compat else None)
         self.w_in = nn.Linear(cfg.d_model, 2 * hidden, bias=cfg.bias)
         self.w_out = nn.Linear(hidden, cfg.d_model, bias=cfg.bias)
 
@@ -262,8 +270,8 @@ class MLMHead(nn.Module):
 
     def __init__(self, cfg: ComplexLMConfig) -> None:
         super().__init__()
-        self.dense = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
-        self.norm = build_norm(cfg, cfg.d_model)
+        self.dense = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias or cfg.esmc_compat)
+        self.norm = build_norm(cfg, cfg.d_model, bias=True if cfg.esmc_compat else None)
         self.out = nn.Linear(cfg.d_model, cfg.vocab_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -294,7 +302,7 @@ class ComplexLM(nn.Module):
         # only pays for the signal if the gradient asks for it.
         self.chain_gate = nn.Parameter(torch.zeros(1)) if cfg.chain_signal == "random" else None
         self.blocks = nn.ModuleList(Block(cfg, kind) for kind in cfg.kinds)
-        self.norm = build_norm(cfg, cfg.d_model)
+        self.norm = build_norm(cfg, cfg.d_model, bias=False if cfg.esmc_compat else None)
         self.head = MLMHead(cfg)
         self.readout_mult = 1.0 / cfg.width_mult
         self.apply(self._init_weights)

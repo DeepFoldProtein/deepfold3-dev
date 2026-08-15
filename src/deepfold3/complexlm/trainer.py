@@ -86,7 +86,14 @@ class ComplexLMTrainer:
             # eight copies of it in the launcher log is noise.
             logging.getLogger("deepfold3.complexlm").setLevel(logging.WARNING)
         torch.manual_seed(cfg.train.seed + self.rank)
-        self.model = ComplexLM(cfg.model).to(self.device)
+        self.model = ComplexLM(cfg.model)
+        if cfg.train.esmc_weights:
+            from deepfold3.complexlm.esmc import load_esmc
+
+            report = load_esmc(self.model, cfg.train.esmc_weights)
+            if self.is_main:
+                logger.info("warm start: %s", {k: v for k, v in report.items() if k != "unused_source"})
+        self.model = self.model.to(self.device)
         self.raw_model = self.model
         if self.world_size > 1:
             self.model = DistributedDataParallel(self.model, device_ids=[self.local_rank])

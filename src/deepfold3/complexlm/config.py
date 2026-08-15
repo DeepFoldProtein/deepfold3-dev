@@ -57,6 +57,13 @@ class ComplexLMConfig:
             to the standard parameterisation, so the two are comparable at the
             base width.
         init_std: Base initialisation standard deviation, before muP scaling.
+        esmc_compat: Match ESMC's normalisation biases exactly, so its released
+            weights load with nothing missing. ESMC puts a bias on the
+            pre-attention norm, the pre-FFN norm and the head norm, and none on
+            q/k norm or the final norm — a mixture our uniform ``bias`` flag
+            cannot express. Off by default because turning it on changes the
+            parameter set, which would break loading checkpoints trained
+            without it.
         chain_signal: Off by default. ``"random"`` adds a gated random vector
             per chain to the embeddings. It exists because of a provable blind
             spot in the main model: under ``g``, softmax over a duplicated key
@@ -84,6 +91,7 @@ class ComplexLMConfig:
     attn_impl: str = "varlen"  # varlen | sdpa
     embed_dropout: float = 0.0
     chain_signal: str = "none"  # none | random
+    esmc_compat: bool = False
     mup: bool = False
     mup_base_width: int = 256
     init_std: float = 0.02
@@ -241,6 +249,10 @@ class TrainConfig:
     grad_clip: float = 1.0
     accum_steps: int = 1
     dtype: str = "bf16"
+    #: ESMC release to warm-start from, as a path to its ``.pth``. Copied in
+    #: after the model is built and before DDP wraps it, so every rank starts
+    #: identical. Requires ``model.esmc_compat`` and a matching shape.
+    esmc_weights: str | None = None
     compile: bool = False
     log_every: int = 20
     eval_every: int = 2000

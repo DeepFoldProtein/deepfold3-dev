@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 @click.option("--output", required=True, type=click.Path(path_type=Path))
 @click.option("--resume", type=click.Path(exists=True, path_type=Path))
 @click.option("--override", "overrides", multiple=True, metavar="KEY=VALUE", help="Dotted config override.")
+@click.option("--esmc-weights", type=click.Path(exists=True), help="Warm start from an ESMC release.")
 @click.option("--wandb", "wandb_project", help="WandB project (shorthand for train.wandb_project).")
 @click.option("--wandb-entity")
 @click.option("--dry-run", is_flag=True, help="Build everything, run a few steps, and stop.")
@@ -36,6 +37,7 @@ def plm_train(
     output: Path,
     resume: Path | None,
     overrides: tuple[str, ...],
+    esmc_weights: str | None,
     wandb_project: str | None,
     wandb_entity: str | None,
     dry_run: bool,
@@ -46,6 +48,8 @@ def plm_train(
     from deepfold3.complexlm.trainer import ComplexLMTrainer
 
     parsed = dict(item.split("=", 1) for item in overrides)
+    if esmc_weights:
+        parsed["train.esmc_weights"] = esmc_weights
     if wandb_project:
         parsed["train.wandb_project"] = wandb_project
     if wandb_entity:

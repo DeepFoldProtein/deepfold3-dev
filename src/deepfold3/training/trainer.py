@@ -800,7 +800,7 @@ class Trainer:
                 f"Activation-RMS meter attached ({self._act_meter.num_points} points × 2 tracks, "
                 f"flush every {cfg.log_interval} steps)"
             )
-        # MHG-TriMul router read-out rides the same window as the activation
+        # MHR-TriMul router read-out rides the same window as the activation
         # meter. ``router/entropy`` at 1.0 means the router never left uniform,
         # i.e. it is inert — the one question the combined r17 arm can answer
         # from inside the run rather than from a second run.
