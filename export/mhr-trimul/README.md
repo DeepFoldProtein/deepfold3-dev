@@ -1122,16 +1122,90 @@ lag cannot explain.
   chain-leading factor structure (§9 of the factor table: chain 0.0127 vs
   distance 0.0084) buys anything at interfaces is a separate read.
 
-### Housekeeping
+## 11. The distogram deficit is entropy, and it stopped closing at step 3400
 
-`eval/diffusion_mse` at step 4000 read 61.4 against a 0.094 trend, carrying
-`eval/total` to 246.8. `eval/tm_true` was 0.7582 at the same evaluation, up from
-0.7486 at 3900, and the step-4000 training loss was ordinary (8.99, mse 1.96), so
-this is one catastrophic sample inside a small eval set, consistent with the
-documented `diffusion_mse` spike distribution, and not a model event. Prior r17
-evals spiked to 2.36 (step 1300) and 1.04 (step 3700).
+`eval/distogram` is a cross-entropy against one-hot distance bins, and the
+trainer logs `eval/distogram_entropy` next to it, so the loss splits cleanly:
 
-## 11. Where it lives
+$$\underbrace{\mathrm{CE}}_{\text{what is logged}} \;=\; \underbrace{H(p_\theta)}_{\text{sharpness}} \;+\; \underbrace{(\mathrm{CE}-H)}_{\text{calibration}}$$
+
+$\mathrm{CE}-H$ is zero for a model whose confidence matches its accuracy,
+positive when it is overconfident. It is not a KL — it is the gap between the
+probability the model assigns the truth and the probability it assigns its own
+typical prediction. Splitting the r17-vs-r16 deficit along that seam says
+something the loss alone does not.
+
+| step | dCE | dH | d(CE-H) | dH as % of dCE |
+| --- | --- | --- | --- | --- |
+| 2500 | +0.1731 | +0.2594 | -0.0862 | 150% |
+| 3000 | +0.0846 | +0.1192 | -0.0347 | 141% |
+| 3500 | +0.0515 | +0.0722 | -0.0207 | 140% |
+| 4000 | **+0.0507** | **+0.0521** | **-0.0015** | **103%** |
+
+(d = r17 minus r16, both at EMA shadow weights, same eval set.)
+
+**By step 4000 the whole distogram deficit is entropy.** r17's calibration gap
+is within 0.0015 nats of r16's — it is exactly as overconfident, no more, no
+less. What it will not do is commit: its distance distribution is 0.052 nats
+broader, and its cross-entropy is worse by that same 0.052. It knows what r16
+knows per unit of confidence and holds it more loosely.
+
+Earlier that was not true — at step 2500 r17 was 0.086 nats *better* calibrated
+(less overconfident) while being 0.259 broader. That advantage has been spent
+down to nothing over 1500 steps.
+
+### The catch-up ended
+
+Regressing each series on step in the two regimes, per 1000 steps:
+
+| window | | r16 | r17 | gap |
+| --- | --- | --- | --- | --- |
+| 2500-3400 | CE | -0.1396 | **-0.2639** | -0.1243 (closing) |
+| 3400-4000 | CE | -0.1003 | **-0.0971** | +0.0032 (flat) |
+| 3400-4000 | tm_true | +0.0591 | +0.0477 | -0.0114 |
+
+Through step 3400 r17's distogram improved nearly twice as fast as r16's — it
+was catching up, and a phase-lag reading was defensible. Since 3400 the two
+curves fall at the **same rate** (-0.100 vs -0.097 per 1k) and the gap sits at
+**+0.053 +/- 0.005** with a slope indistinguishable from zero. Parallel curves
+at a constant offset are a *level* difference, not a lag: at r16's current rate
+the offset is worth about 530 steps of progress that are no longer being repaid.
+
+`tm_true` never closed at all — the gap was -0.0155 +/- 0.005 through the
+catch-up window and is -0.0216 +/- 0.005 now.
+
+### It is the same finding as the strand deficit
+
+Section 10 measured a strand/helix F1 ratio of 0.971 against r16's phase-invariant
+1.026. This section measures a distance distribution 0.052 nats broader at
+matched calibration. These are two views of one mechanism: triangle attention
+sharpens a pair belief by enforcing consistency around the third vertex, and
+what a broader long-range distance belief costs first is **register** — which
+residue pairs with which. Helices are local ($i, i+4$) and survive a blurred
+long-range distogram; sheets are not, and do not.
+
+### A falsifiable next reading
+
+dH is still closing (-0.036 per 1k) while d(CE-H) has hit zero and can no longer
+absorb it. If the mechanism is ordinary optimization, dCE should resume falling
+at roughly -0.036 per 1k, putting it near +0.031 by step 4500 and +0.013 by
+5000. **If dCE instead stays near +0.05 through step 5000, the offset is
+structural and the no-TriAttn pair track has a sharpness ceiling.** That is the
+reading to take at 4500 and 5000, and it does not need a bench run.
+
+### Not a model event: the step-4000 eval spike
+
+`eval/diffusion_mse` read 61.4 at step 4000 against a 0.094 trend. **r16 read
+60.6 at the same step.** The eval sampler is reseeded with
+`set_epoch(effective_step)`, so the draw is a deterministic function of the step
+and is shared by any run with the same eval set — both runs met the same
+pathological example and both blew up on it by the same amount. Two runs
+agreeing to within 1.3% on a 650x outlier is the signature of a shared input,
+not of a shared instability. r17 training either side of it was ordinary
+(step 4010 loss 2.67, step 4050 loss 3.44) and `eval/tm_true` rose across the
+spike, 0.7486 -> 0.7582.
+
+## 12. Where it lives
 
 | | |
 | --- | --- |
@@ -1145,6 +1219,7 @@ evals spiked to 2.36 (step 1300) and 1.04 (step 3700).
 | known pre-existing failure | `tests/triton/test_evo_attn_robustness.py::test_row_norm_heterogeneity` (`fail_frac=4.69e-2` vs a `1e-2` limit). Confirmed identical, bit for bit, at `023c064` — before any of this work — so it is unrelated to the pair-track changes and is *not* fixed here. |
 | benchmark | `bench_pair_track.py` -> `bench_pair_track.csv` |
 | r16 comparison | `compare_r16_r17.py` -> `compare_r16_r17.csv` (section 10) |
+| distogram split | `probe_distogram_split.py` (section 11) |
 
 ### Scope
 
