@@ -226,6 +226,35 @@ def main() -> None:
         res = gt_ok[0, ar, ctr[0]]
         dist = torch.cdist(cen, cen).to(args.device)
         okp = (res[:, None] & res[None, :]).to(args.device)
+
+        # Secondary structure, from a CA(i)-CA(i+4) geometric proxy rather than
+        # DSSP: an alpha helix puts i and i+4 one turn apart (~6.2 Å) while an
+        # extended strand pushes them to ~12-13 Å. Crude, but it needs no
+        # external tool and only has to be good enough to define pair classes.
+        # The assigned fractions are logged so the proxy can be sanity-checked
+        # against the ~35% helix / ~22% strand of a typical protein set.
+        nres = cen.shape[0]
+        same2 = same[0] if same.dim() == 3 else same
+        prot1 = prot[0] if prot.dim() == 2 else prot
+
+        # Secondary structure from the CA(i)-CA(i+2,3,4) distance signature,
+        # the P-SEA criterion. A single d(i,i+4) threshold is not enough: an
+        # earlier version of this probe used one and assigned 73% helix / 4%
+        # strand on one target and 24% / 51% on another, because turns and
+        # extended coil fall inside a wide single-distance band. Three
+        # distances with tight tolerances separate them.
+        def _d(k, _n=nres, _dist=dist, _same=same2, _ok=okp, _dev=args.device):
+            out = torch.full((_n,), float("nan"), device=_dev)
+            idx = torch.arange(_n - k, device=_dev)
+            good = _same[idx, idx + k] & _ok[idx, idx + k]
+            nan = torch.full_like(good, float("nan"), dtype=_dist.dtype)
+            out[idx] = torch.where(good, _dist[idx, idx + k], nan)
+            return out
+
+        d2, d3, d4 = _d(2), _d(3), _d(4)
+        helix = (d2 - 5.5).abs().lt(0.6) & (d3 - 5.3).abs().lt(0.6) & (d4 - 6.4).abs().lt(0.7) & prot1
+        strand = (d2 - 6.7).abs().lt(0.7) & (d3 - 9.9).abs().lt(1.0) & (d4 - 12.4).abs().lt(1.2) & prot1
+        seqsep = (ar[:, None] - ar[None, :]).abs().to(args.device)
         holder["masks"] = {
             "intra": same,
             "inter": ~same,
@@ -249,6 +278,17 @@ def main() -> None:
             # distance effect is not confounded by mol type or chain identity.
             "pp_iface_contact": (~same) & outer(prot, prot) & okp & (dist < 8),
             "pp_iface_far": (~same) & outer(prot, prot) & okp & (dist >= 15),
+            # Secondary-structure pair classes. The routing maps show the
+            # diagonal, the helical regions and the strand regions taking
+            # different heads; these make that testable. ss_pair is the
+            # beta-sheet register problem — the capability triangle attention
+            # supplied and MHR does not (see section 2), so a dedicated head
+            # there would be the first sign of a compensating mechanism.
+            "hh_local": outer(helix, helix) & (seqsep <= 6) & okp,
+            "hh_contact": outer(helix, helix) & (seqsep > 6) & okp & (dist < 8),
+            "ss_pair": outer(strand, strand) & (seqsep > 4) & okp & (dist < 8),
+            "ss_far": outer(strand, strand) & okp & (dist >= 15),
+            "hs_contact": outer(helix, strand) & okp & (dist < 8),
             # The classes MHR was designed for: does the router compose a
             # protein-protein pair differently from a protein-nucleic one?
             "prot_prot": outer(prot, prot),
@@ -256,6 +296,11 @@ def main() -> None:
             "nucl_nucl": outer(nucl, nucl),
             "prot_lig": outer(prot, lig),
         }
+        log.info(
+            "    SS proxy: helix %.0f%%  strand %.0f%%  (typical protein ~35%% / ~22%%)",
+            100 * float(helix.float().mean()),
+            100 * float(strand.float().mean()),
+        )
         n_chain = int(asym.max().item() + 1)
         composition.append(
             dict(
@@ -316,6 +361,11 @@ def main() -> None:
         "geo_far",
         "pp_iface_contact",
         "pp_iface_far",
+        "hh_local",
+        "hh_contact",
+        "ss_pair",
+        "ss_far",
+        "hs_contact",
     )
     present = [c for c in CLASSES if any(a.get(f"n_{c}") for a in acc.values())]
     if len(present) > 1:

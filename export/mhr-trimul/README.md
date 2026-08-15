@@ -665,6 +665,39 @@ that takes its own head in some layers.
 Caveat on the heteromer: 7ykg is 250 tokens with chain B at ~20 of them, so it
 is a large chain plus a short peptide rather than a balanced heterodimer.
 
+**The axes the router separates, in order of size** (step 3000, shadow, 16
+examples; nulls are the within-class random-half floor):
+
+| axis | comparison | sep | null |
+| --- | --- | --- | --- |
+| **1. distance** | `geo_contact` (<8 Å) vs `geo_far` (≥15 Å) | **5.86** | 0.002-0.017 |
+| **2. chain** | inter-chain contact vs intra-chain contact | **2.98-3.43** | 0.065 |
+| **3. secondary structure** | contact classes against each other | **0.66-1.26** | 0.07-0.12 |
+
+Secondary structure is assigned by the P-SEA criterion — CA(i)-CA(i+2,3,4)
+must *simultaneously* match (5.5, 5.3, 6.4) Å for helix or (6.7, 9.9, 12.4) Å for
+strand. A first attempt used a single d(i,i+4) band and produced impossible
+assignments (73% helix with 4% strand on one target); with three distances the
+spread across targets — 63/2, 39/18, 23/21, 18/24, 4/46 — is ordinary fold
+diversity, all-alpha through all-beta.
+
+Holding contact fixed, `hh_contact` vs `ss_pair` is 1.258, `hh_contact` vs
+`hs_contact` 1.087, `ss_pair` vs `hs_contact` 0.657 — all 8-13x their nulls. So
+the router does give the diagonal, helix packing and sheet pairing different
+heads, which is what the routing maps look like; but the effect is a fifth of
+the distance axis.
+
+**This is negative for the beta diagnostic.** `ss_pair` — the beta-sheet
+register — is the *least* distinctive of the contact classes, not the most.
+There is no sign of a dedicated rule for it, so MHR is not compensating for the
+target-pair-conditioned k-selection that triangle attention supplied (§2). That
+is consistent in direction with the benchmark deficit, though it is
+circumstantial; the actual test is DSSP F1.
+
+Two numbers in that table must not be quoted as secondary-structure results:
+`ss_pair` vs `ss_far` (5.36) and `hh_local` vs `geo_far` (6.53) are contact
+versus non-contact, i.e. the distance axis measured again.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.

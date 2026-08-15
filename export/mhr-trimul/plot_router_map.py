@@ -45,14 +45,23 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("router_map")
 
 
-def classify(record) -> str:
+def classify(record, min_chain_frac: float) -> str:
+    """monomer / homomer / heteromer, requiring the complex to be *balanced*.
+
+    A 250-residue chain with a 20-residue peptide bound to it is formally a
+    heteromer, but its interface is nothing like a heterodimer's and its maps
+    are dominated by the large chain. Requiring every chain to hold at least
+    ``min_chain_frac`` of the residues keeps the three classes comparable.
+    """
     mols = {c.mol_type for c in record.chains}
     if mols - {const.MOL_PROTEIN}:
         return "other"
-    ents = {c.entity_id for c in record.chains}
     if len(record.chains) == 1:
         return "monomer"
-    return "homomer" if len(ents) == 1 else "heteromer"
+    total = sum(c.num_residues for c in record.chains)
+    if min(c.num_residues for c in record.chains) < min_chain_frac * total:
+        return "unbalanced"
+    return "homomer" if len({c.entity_id for c in record.chains}) == 1 else "heteromer"
 
 
 def load_model(ckpt: Path, device: str, snapshot: str):
@@ -196,8 +205,16 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--snapshot", default="shadow", choices=("shadow", "live"))
     ap.add_argument("--recycles", type=int, default=3)
-    ap.add_argument("--scan", type=int, default=400, help="records to scan per class")
-    ap.add_argument("--outdir", type=Path, default=OUT / "router_maps")
+    ap.add_argument("--scan", type=int, default=4000, help="records to scan")
+    ap.add_argument(
+        "--min-chain-frac",
+        type=float,
+        default=0.30,
+        help="every chain must hold at least this fraction of residues, so a big chain with a "
+        "bound peptide is not drawn as a 'heteromer'",
+    )
+    ap.add_argument("--targets", nargs="*", default=None, help="explicit record ids, overriding the search")
+    ap.add_argument("--outdir", type=Path, default=None, help="default: router_maps/step{N}/")
     args = ap.parse_args()
 
     model, tc, step = load_model(args.checkpoint, args.device, args.snapshot)
@@ -211,14 +228,30 @@ def main() -> None:
         ]
 
     picked: dict[str, object] = {}
-    for r in records[: args.scan]:
-        k = classify(r)
-        n_res = sum(c.num_residues for c in r.chains)
-        if k in ("monomer", "homomer", "heteromer") and k not in picked and 120 <= n_res <= 384:
-            picked[k] = r
-        if len(picked) == 3:
-            break
-    log.info("targets: %s", {k: v.id for k, v in picked.items()})
+    if args.targets:
+        by_id = {r.id: r for r in records}
+        for tid in args.targets:
+            r = by_id[tid]
+            picked[f"{classify(r, args.min_chain_frac)}_{tid}"] = r
+    else:
+        for r in records[: args.scan]:
+            k = classify(r, args.min_chain_frac)
+            n_res = sum(c.num_residues for c in r.chains)
+            if k in ("monomer", "homomer", "heteromer") and k not in picked and 120 <= n_res <= 384:
+                picked[k] = r
+            if len(picked) == 3:
+                break
+    log.info(
+        "targets: %s",
+        {k: f"{v.id} ({len(v.chains)}ch, {[c.num_residues for c in v.chains]})" for k, v in picked.items()},
+    )
+    if len(picked) < 3 and not args.targets:
+        log.warning(
+            "only %d of 3 classes found in %d records at min_chain_frac=%.2f",
+            len(picked),
+            args.scan,
+            args.min_chain_frac,
+        )
 
     captured: dict[str, np.ndarray] = {}
     entropy_maps: dict[str, np.ndarray] = {}
@@ -246,7 +279,8 @@ def main() -> None:
             wrap(mod, name)
             n_heads = mod.num_heads
 
-    args.outdir.mkdir(parents=True, exist_ok=True)
+    outdir = args.outdir or (OUT / "router_maps" / f"step{step}")
+    outdir.mkdir(parents=True, exist_ok=True)
     for kind, record in picked.items():
         ds = TrainingDataset(
             records=[record],
@@ -285,30 +319,30 @@ def main() -> None:
         draw_reference(
             {k: v.cpu() if torch.is_tensor(v) else v for k, v in feats.items()},
             pred,
-            args.outdir / f"{kind}_{record.id}_reference.png",
+            outdir / f"{kind}_{record.id}_reference.png",
             head,
         )
         draw_maps(
             dict(captured),
             bounds,
-            args.outdir / f"{kind}_{record.id}_router.png",
+            outdir / f"{kind}_{record.id}_router.png",
             f"top-1 router head — {head}",
             n_heads,
         )
         draw_entropy_maps(
             dict(entropy_maps),
             bounds,
-            args.outdir / f"{kind}_{record.id}_entropy.png",
+            outdir / f"{kind}_{record.id}_entropy.png",
             f"per-pair routing entropy — {head}",
         )
         draw_depth_curves(
             dict(entropy_maps),
             dict(marginals),
-            args.outdir / f"{kind}_{record.id}_depth.png",
+            outdir / f"{kind}_{record.id}_depth.png",
             f"routing vs depth — {head}",
         )
         log.info("%s: %s (%d tokens, %d chains) -> %d panels", kind, record.id, n_tok, n_chain, len(captured))
-    log.info("wrote %s", args.outdir)
+    log.info("wrote %s", outdir)
 
 
 if __name__ == "__main__":
