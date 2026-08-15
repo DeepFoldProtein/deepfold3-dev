@@ -584,6 +584,52 @@ essentially the same as heteromeric protein interfaces. That is evidence
 *against* motivation 3, at least for ligands: the router is not applying a
 distinct rule to them.
 
+**What the router actually keys on: contact geometry, not molecule class.**
+Classing pairs by ground-truth token-centre distance instead of by mol type
+(20 examples, 17 with ligand, shadow weights, step 2500). A within-class null —
+the separation between two random halves of the *same* class, accumulated
+identically — gives the noise floor; it is conservative by about $\sqrt2$ since
+each half holds half the pairs.
+
+| comparison | sep | null | ratio |
+| --- | --- | --- | --- |
+| `geo_contact` (<8 Å) vs `geo_far` (≥15 Å) | **4.967** | 0.001 | ~5000x |
+| `geo_contact` vs `geo_near` (8-15 Å) | 3.770 | 0.013 | ~290x |
+| `geo_near` vs `geo_far` | 2.399 | 0.004 | ~600x |
+| **`pp_iface_contact` vs `pp_iface_far`** | **2.125** | 0.057 | **37x** |
+| `homo_pp` vs `hetero_pl` | 0.790 | 0.003 | ~260x |
+| `hetero_pp` vs `hetero_pl` | 0.595 | 0.003 | ~200x |
+| `homo_pp` vs `hetero_pp` | 0.392 | 0.003 | ~130x |
+
+The decisive row is `pp_iface_contact` vs `pp_iface_far`: distance bands *within*
+protein-protein interfaces, so mol type and chain relationship are both held
+fixed and only distance varies. 2.125 against a 0.057 floor.
+
+**Distance beats molecule class by 3.6-5x**, and at 31% of the maximum possible
+separation (2H = 16) `geo_contact` vs `geo_far` is the largest effect measured
+anywhere in this probe. Molecule-class effects are real — every one is over 100x
+its null — but an order of magnitude smaller. So the router's primary axis is
+the physics of the contact, not the identity of the molecules, which reframes
+motivation 3: grouping a protein-ligand pocket with a heteromeric protein
+interface may be the router getting it *right*, since both are non-covalent
+interfaces of buried surface, while nucleic base-pairing genuinely is a
+different regime.
+
+**Two corrections this forced.** First, the earlier `prot_lig` vs
+`inter_hetero` = 0.168, which I read as evidence against motivation 3, was an
+artifact of overlapping masks: a ligand is its own chain with its own entity, so
+nearly every `prot_lig` pair is *also* an `inter_hetero` pair, and in a
+monomer+ligand example the two classes coincide. On disjoint classes the same
+comparison is **0.595** — larger than the homo/hetero separation, not smaller.
+Second, `inter_homo` vs `inter_hetero` fell from 0.739 to **0.494** once the
+classes were made disjoint. The overlap biased the two comparisons in opposite
+directions.
+
+**Still uncontrolled:** the chain-relationship (1.38) and homo/hetero (0.49)
+figures may themselves be partly distance effects, since intra-chain pairs are
+on average much closer and only *sequence* separation was controlled, not 3D
+distance. The clean version compares mol-type classes *within* a distance band.
+
 **What this does not show.** That the router *helps*. A network will route
 through whatever capacity it is given; being used is necessary for the mechanism
 to matter, not sufficient. Only the benchmark answers that.

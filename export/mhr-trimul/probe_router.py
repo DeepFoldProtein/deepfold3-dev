@@ -84,6 +84,7 @@ def main() -> None:
     # owns contacts within a chain and head h' owns the interface, the per-head
     # mean of g should differ between the two classes.
     acc: dict[str, dict] = {}
+    rng = torch.Generator(device=args.device).manual_seed(0)
     holder: dict[str, dict[str, torch.Tensor]] = {"masks": {}}
 
     def wrap(mod: _TriangleMulBase, name: str):
@@ -99,8 +100,20 @@ def main() -> None:
             for cls, mask in masks.items():
                 m = mask.reshape(-1)
                 if m.any():
-                    a[cls] = a.get(cls, 0.0) + flat[m].mean(0).cpu()
+                    sel = flat[m]
+                    a[cls] = a.get(cls, 0.0) + sel.mean(0).cpu()
                     a[f"n_{cls}"] = a.get(f"n_{cls}", 0) + 1
+                    a[f"pairs_{cls}"] = a.get(f"pairs_{cls}", 0) + int(m.sum())
+                    # Noise floor: sep between two random halves of the SAME
+                    # class. Accumulated the same way as the cross-class means
+                    # (halves first, L1 last) so the two are comparable. It is
+                    # conservative by roughly sqrt(2) — each half has half the
+                    # pairs, so it overstates the noise of a full-class mean.
+                    half = torch.rand(sel.shape[0], device=sel.device, generator=rng) < 0.5
+                    if half.any() and (~half).any():
+                        a[f"nullA_{cls}"] = a.get(f"nullA_{cls}", 0.0) + sel[half].mean(0).cpu()
+                        a[f"nullB_{cls}"] = a.get(f"nullB_{cls}", 0.0) + sel[~half].mean(0).cpu()
+                        a[f"nn_{cls}"] = a.get(f"nn_{cls}", 0) + 1
 
         mod._record_router_stats = hooked
 
@@ -200,12 +213,42 @@ def main() -> None:
         # same either way — what differs is the *input prior*, which is exactly
         # the kind of thing a router over composition rules could exploit.
         same_ent = (ent_id[..., :, None] == ent_id[..., None, :]).to(args.device)
+        # Ground-truth token-centre geometry. Molecule class and binding
+        # physics are confounded in the mol-type split — a protein-ligand
+        # pocket and a heteromeric protein interface are different molecules
+        # but similar physics. Classing by contact distance instead separates
+        # the two hypotheses: a router keyed on physics should track distance,
+        # one keyed on molecule identity should be flat across distance bands
+        # within a mol-type.
+        gt, gt_ok, ctr = features["atom_gt_positions"], features["atom_gt_mask"], features["token_to_center_atom"]
+        ar = torch.arange(gt.shape[1], device=gt.device)
+        cen = gt[0, ar, ctr[0]]
+        res = gt_ok[0, ar, ctr[0]]
+        dist = torch.cdist(cen, cen).to(args.device)
+        okp = (res[:, None] & res[None, :]).to(args.device)
         holder["masks"] = {
             "intra": same,
             "inter": ~same,
             "intra_far": same & far,
             "inter_homo": (~same) & same_ent,
             "inter_hetero": (~same) & (~same_ent),
+            # Disjoint versions. The classes above overlap badly: a ligand is
+            # its own chain with its own entity, so essentially every prot_lig
+            # pair is *also* an inter_hetero pair, and in a monomer+ligand
+            # example inter_hetero is prot_lig, which forces their separation
+            # toward zero by construction rather than by similarity. Comparing
+            # prot_lig against protein-protein hetero pairs only is the
+            # like-for-like test.
+            "hetero_pp": (~same) & (~same_ent) & outer(prot, prot),
+            "homo_pp": (~same) & same_ent & outer(prot, prot),
+            "hetero_pl": (~same) & (~same_ent) & outer(prot, lig),
+            "geo_contact": okp & (dist < 8),
+            "geo_near": okp & (dist >= 8) & (dist < 15),
+            "geo_far": okp & (dist >= 15),
+            # Distance bands *within* protein-protein interfaces only, so the
+            # distance effect is not confounded by mol type or chain identity.
+            "pp_iface_contact": (~same) & outer(prot, prot) & okp & (dist < 8),
+            "pp_iface_far": (~same) & outer(prot, prot) & okp & (dist >= 15),
             # The classes MHR was designed for: does the router compose a
             # protein-protein pair differently from a protein-nucleic one?
             "prot_prot": outer(prot, prot),
@@ -263,10 +306,41 @@ def main() -> None:
     # measurement MHR's original motivation calls for: if protein, nucleic and
     # ligand want different pair-composition rules, the per-head profiles should
     # differ between these classes.
-    CLASSES = ("prot_prot", "prot_nucl", "nucl_nucl", "prot_lig", "inter_homo", "inter_hetero")
+    CLASSES = (
+        "homo_pp",
+        "hetero_pp",
+        "hetero_pl",
+        "nucl_nucl",
+        "geo_contact",
+        "geo_near",
+        "geo_far",
+        "pp_iface_contact",
+        "pp_iface_far",
+    )
     present = [c for c in CLASSES if any(a.get(f"n_{c}") for a in acc.values())]
     if len(present) > 1:
-        log.info("\nmol-type head separation (mean L1 over modules)")
+        any_acc = next(iter(acc.values()))
+        log.info(
+            "\npair counts per class (summed over forwards): %s",
+            "  ".join(f"{c}={any_acc.get(f'pairs_{c}', 0):,}" for c in present),
+        )
+        nulls = {}
+        for c in present:
+            v = [
+                float((a[f"nullA_{c}"] / a[f"nn_{c}"] - a[f"nullB_{c}"] / a[f"nn_{c}"]).abs().sum())
+                for a in acc.values()
+                if a.get(f"nn_{c}")
+            ]
+            if v:
+                nulls[c] = sum(v) / len(v)
+        if nulls:
+            log.info(
+                "\nnoise floor — sep between two random halves of the SAME class"
+                "\n  (conservative by ~sqrt(2); max possible sep is 2H = %d)\n  %s",
+                2 * 8,
+                "  ".join(f"{c}={nulls[c]:.3f}" for c in present if c in nulls),
+            )
+        log.info("\npair-class head separation (mean L1 over modules)")
         log.info("  %-12s %s", "", "  ".join(f"{c:>10}" for c in present))
         for i, ci in enumerate(present):
             cells = []
