@@ -346,6 +346,49 @@ follow-ups cheap, every cell of the grid carries **identical `state_dict` keys**
 is the only extra tensor, and `head_rms` alone drops `norm_center.bias`), so any
 cell warm-starts from any other with `load_strict=false`.
 
+## 5. Measured: the router is pair-conditional (r17, step 1500)
+
+`probe_router.py` on 8 real examples from the run's own eval set
+(`patchr_training`, post-2021-09-30, 153-384 tokens). Raw per-module numbers in
+`router_stats_step1500.csv`.
+
+| | value |
+| --- | --- |
+| `router/entropy` (mean over 104 modules) | 0.607 (min 0.045) |
+| **`router/g_std`** | **0.396** (max 1.098) |
+| `router/occupancy_max` | 0.973 |
+
+Since $\tfrac1H\sum_h g^{(h)} = 1$ by construction, a `g_std` of 0.396 means the
+per-head multipliers swing by about ±40% of their mean from pair to pair. The
+router is **not** a constant rescale, so it is not a reparameterization of $W_o$
+— this is the component that AF3's function class cannot express. Third row of
+the table in §4.
+
+**Routing is a late-trunk phenomenon**, and both statistics agree on that,
+as does the growth of $\lVert W_r\rVert$ (PF mean 0.324 -> 0.720 -> 1.157 at
+steps 500 / 1000 / 1500, with late layers 3.2x early):
+
+| PairFormer band | entropy | `g_std` |
+| --- | --- | --- |
+| L0-11 | 0.856 | 0.212 |
+| L12-23 | 0.637 | 0.313 |
+| L24-35 | 0.456 | 0.402 |
+| L36-47 | 0.388 | 0.730 |
+
+**Head collapse, and what it implies for r18.** 12 of 104 modules sit below
+entropy 0.20 — effectively single-head — concentrated in L30-38, and 40 of 104
+are below 0.5. This is direct evidence for the prediction in §4 that cell **B**
+(per-head norm, *no* router) is harmful: where a module has settled on one head,
+$\operatorname{RMSNorm}_d$ would rescale the seven idle heads to unit norm with
+nothing left to turn them down. It also qualifies MHR's own premise — in the
+late trunk many modules are using roughly one reasoning subspace, not $H$.
+Whether that is wasted capacity or the right answer for those layers is not
+decidable from this measurement.
+
+**What this does not show.** That the router *helps*. A network will route
+through whatever capacity it is given; being used is necessary for the mechanism
+to matter, not sufficient. Only the benchmark answers that.
+
 ## 5. Sequencing, and the confound to avoid
 
 Running `MHR + no-TriAttn` as a single arm is cheaper only if it works. If it
