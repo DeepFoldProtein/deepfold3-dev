@@ -755,21 +755,34 @@ their ~350 populated cells on a single head** — L40 out is 348/348. So the
 router's early layers separate by composition and its late layers ignore it and
 separate by contact geometry, which is where `I(pair; head)` lives.
 
-The chemistry it uses is interpretable, and it is not the same chemistry at
-every depth:
+The axis it uses is **side-chain size**, and the two ends swap which end gets
+the special head. Ranking residues by how often a cell containing them leaves
+the modal head:
 
-* **L24 out** splits aromatics and large hydrophobics from polars, monotonically:
-  aromatic x aromatic 100% off the modal head, aromatic x hydrophobic 81%,
-  **aromatic x positive 67%** — cation-pi — then hydrophobic x hydrophobic 46%,
-  hydrophobic x polar 11%, polar x polar 5%, D/E x polar 0%.
-* **L0 out** is the reverse: the charged and polar pairs are the distinctive
-  ones (D/E x D/E 75%, D/E x positive 67%, D/E x polar 60%) and hydrophobic x
-  hydrophobic is 11%.
+* **L0 out** — A 85%, S 80%, G 75%, T 72%, C 69%; any F/W/Y only **11%**. The
+  small residues are the distinctive ones.
+* **L24 out** — W 75%, F 70%, L 62%, Y 59%, H 47%; any G 13%, any D/E 10%. The
+  large ones are.
 
-A candidate reading, not tested: at L0 the pair representation has no geometry
-in it yet, only sequence and composition, where charge is the most salient
-signal; by L24 structure has begun to form and buried hydrophobic contact is
-what there is to distinguish.
+Grouping L24's cells reproduces this as a monotone hydrophobicity ordering —
+aromatic x aromatic 100% off the modal head, aromatic x hydrophobic 81%,
+**aromatic x positive 67%** (cation-pi), hydrophobic x hydrophobic 46%,
+polar x polar 5%, D/E x polar 0% — but size and hydrophobicity are confounded
+across the amino acids, and the per-residue ranking says size is the cleaner
+description: at L0 the top five are the five smallest residues regardless of
+polarity (A hydrophobic, S/T polar, G none, C thiol).
+
+An earlier version of this section read L0 as routing on *charge* (D/E x D/E
+75%). That came from a grouped table where glycine sat inside the "polar" set;
+per residue, D/E is 54% against 37% for pairs containing neither G nor D/E, i.e.
+middling, while the small residues are the extreme. Corrected after looking at
+the map rather than the group summary.
+
+**The early trunk is not uniform.** Off-modal by module runs L0 0.44, L3 0.45,
+L8 0.49, L10 **0.03**, L11 0.51, L14 0.53, L16 0.57 — L10 is essentially inert
+(any F/W/Y: 0%). The band mean of 0.215 for L0-11 averages values spanning
+0.03 to 0.57, so "early layers route on chemistry" is a statement about the band,
+not about every layer in it.
 
 **This corrects an earlier statement.** The depth curve showed
 `I(pair; head)` ~ 0 through L0-L25 and I wrote that the router "does nothing
