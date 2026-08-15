@@ -204,13 +204,47 @@ def test_router_stats_are_a_window_mean_not_the_last_forward(pair):
     assert mod._flush_router_stats() is None, "flush resets the window"
 
 
+def _wake(mod):
+    """Give the zero-initialized output path non-zero weights.
+
+    Without this every comparison of two TriangleMul variants is vacuous:
+    ``out_proj`` and ``out_gate`` are zero-init, so both sides are exactly
+    zero and ``torch.equal`` passes whatever the module did in between. That is
+    how a missing ``head_norm == "channel"`` branch survived — "channel" fell
+    through to per-head LayerNorm and the identity test still passed.
+    """
+    torch.manual_seed(0)
+    for lin in (mod.out_proj, mod.out_gate, mod.gate):
+        torch.nn.init.normal_(lin.weight, std=0.05)
+    return mod
+
+
 @pytest.mark.parametrize("kind", ["softmax", "sigmoid"])
 def test_both_router_kinds_are_exactly_af3_at_init(kind, pair):
     z, mask = pair
-    base = TriangleMulOutgoing(C_Z).eval()
-    routed = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="channel", router=True, router_kind=kind).eval()
+    base = _wake(TriangleMulOutgoing(C_Z).eval())
+    routed = _wake(TriangleMulOutgoing(C_Z, num_heads=H, head_norm="channel", router=True, router_kind=kind).eval())
     routed.load_state_dict(base.state_dict(), strict=False)
-    assert torch.equal(base(z, mask), routed(z, mask))
+    out_base, out_routed = base(z, mask), routed(z, mask)
+    assert out_base.abs().max() > 1e-3, "the comparison must not be zero vs zero"
+    assert torch.allclose(out_base, out_routed, atol=1e-5)
+
+
+def test_channel_mode_normalizes_over_c_z_not_per_head(pair):
+    """head_norm='channel' must be AF3's LayerNorm(c_z), leaving head magnitudes free.
+
+    Per-head normalization forces every head's RMS to 1; the whole point of the
+    'channel' cell of the ablation grid is that it does not.
+    """
+    act = torch.randn(1, 5, 5, C_Z)
+    logits = torch.zeros(1, 5, 5, H)
+    ch = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="channel", router=True).eval()
+    hn = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="head_ln", router=True).eval()
+    with torch.no_grad():
+        rms_ch = ch._mhr_head_mix(act, logits).unflatten(-1, (H, C_Z // H)).pow(2).mean(-1).sqrt()
+        rms_hn = hn._mhr_head_mix(act, logits).unflatten(-1, (H, C_Z // H)).pow(2).mean(-1).sqrt()
+    assert torch.allclose(rms_hn, torch.ones_like(rms_hn), atol=1e-3), "head_ln should equalize heads"
+    assert rms_ch.std() > 0.05, f"channel must leave head magnitudes free, got std {rms_ch.std():.4f}"
 
 
 def test_sigmoid_heads_are_independent_where_softmax_heads_compete():
@@ -228,11 +262,15 @@ def test_sigmoid_heads_are_independent_where_softmax_heads_compete():
     logits[..., 0] = 3.0
 
     def per_head_gain(kind):
+        # Ratio of per-head RMS, not an elementwise ratio: under channel
+        # normalization individual entries pass through zero, and dividing by
+        # those is what makes an elementwise ratio unusable here.
         mod = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="channel", router=True, router_kind=kind).eval()
         with torch.no_grad():
             flat = mod._mhr_head_mix(act, torch.zeros_like(logits)).unflatten(-1, (H, C_Z // H))
             routed = mod._mhr_head_mix(act, logits).unflatten(-1, (H, C_Z // H))
-        return (routed / flat.where(flat.abs() > 1e-4, torch.ones_like(flat))).mean((0, 1, 2, 4))
+        rms = lambda x: x.pow(2).mean(-1).sqrt().mean((0, 1, 2))  # noqa: E731
+        return rms(routed) / rms(flat).clamp_min(1e-8)
 
     soft, sig = per_head_gain("softmax"), per_head_gain("sigmoid")
     assert soft[0] > 1.0 and sig[0] > 1.0, "the boosted head must go up in both"

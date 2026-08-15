@@ -354,21 +354,31 @@ class _TriangleMulBase(nn.Module):
         replaces.
         """
         h, d = self.num_heads, self.head_dim
-        t = act.unflatten(-1, (h, d))
-        w = self.norm_center.weight.view(h, d)
-        eps = self.norm_center.eps
-        if self.head_norm == "head_rms":
-            # RMSNorm, not LayerNorm: at d = 32 the LN mean carries
-            # σ/sqrt(32) ≈ 0.18σ of estimation noise and subtracts it from the
-            # signal. Dropping the mean removes that noise source outright.
-            # No shift — ``norm_center`` is built without a bias in this mode.
-            t32 = t.float()
-            t = (t32 * torch.rsqrt(t32.pow(2).mean(-1, keepdim=True) + eps)).to(act.dtype) * w
-        else:  # head_ln
-            t32 = t.float()
-            mu = t32.mean(-1, keepdim=True)
-            t32 = (t32 - mu) * torch.rsqrt(t32.var(-1, keepdim=True, unbiased=False) + eps)
-            t = t32.to(act.dtype) * w + self.norm_center.bias.view(h, d)
+        if self.head_norm == "channel":
+            # AF3's LayerNorm over the whole of c_z. This branch was missing —
+            # "channel" fell through to the head_ln case, so a run configured
+            # for AF3 normalization silently got per-head LayerNorm instead.
+            # ``test_zero_init_router_is_exactly_af3`` did not catch it because
+            # out_proj and out_gate are zero-initialized, so both sides of the
+            # comparison were exactly zero. See the regression test that now
+            # perturbs those weights before comparing.
+            t = self.norm_center(act).unflatten(-1, (h, d))
+        else:
+            t = act.unflatten(-1, (h, d))
+            w = self.norm_center.weight.view(h, d)
+            eps = self.norm_center.eps
+            if self.head_norm == "head_rms":
+                # RMSNorm, not LayerNorm: at d = 32 the LN mean carries
+                # σ/sqrt(32) ≈ 0.18σ of estimation noise and subtracts it from
+                # the signal. Dropping the mean removes that noise source
+                # outright. No shift — ``norm_center`` has no bias in this mode.
+                t32 = t.float()
+                t = (t32 * torch.rsqrt(t32.pow(2).mean(-1, keepdim=True) + eps)).to(act.dtype) * w
+            else:  # head_ln
+                t32 = t.float()
+                mu = t32.mean(-1, keepdim=True)
+                t32 = (t32 - mu) * torch.rsqrt(t32.var(-1, keepdim=True, unbiased=False) + eps)
+                t = t32.to(act.dtype) * w + self.norm_center.bias.view(h, d)
 
         if router_logits is not None:
             # Both forms are exactly g ≡ 1 at zero-init; they differ in whether
