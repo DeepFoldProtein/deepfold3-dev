@@ -221,6 +221,7 @@ def main() -> None:
     outdir = OUT / "residue_heatmaps" / f"step{step}"
     outdir.mkdir(parents=True, exist_ok=True)
     summary: list[dict] = []
+    grids: dict[str, tuple] = {}
     ARO, POL, NEG = set("FWY"), set("STNQCG"), set("DE")
     cmap = ListedColormap(plt.get_cmap("tab10").colors[:n_heads])
     norm = BoundaryNorm(np.arange(n_heads + 1) - 0.5, n_heads)
@@ -272,7 +273,8 @@ def main() -> None:
                 polar=off_share(lambda x, y: x in POL and y in POL),
             )
         )
-        if args.draw and not any(short.endswith(d) for d in args.draw):
+        grids[short] = (arg.copy(), dist.copy(), modal)
+        if args.draw and "all" not in args.draw and not any(short.endswith(d) for d in args.draw):
             continue
 
         fig, axes = plt.subplots(1, 4, figsize=(21.5, 5.2))
@@ -363,6 +365,54 @@ def main() -> None:
     axes[1].grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(outdir / "chemistry_by_layer.png", dpi=120)
+
+    # Combined grids. The per-module figures show one layer in detail; these show
+    # every layer at once, which is where the depth trend is legible.
+    keys = sorted(grids, key=lambda k: (int(k.split(".")[0]), k.endswith("in")))
+    ncol, nrow = 8, (len(keys) + 7) // 8
+    for kind in ("argmax", "offmodal"):
+        fig, axes = plt.subplots(nrow, ncol, figsize=(1.9 * ncol, 1.98 * nrow))
+        for ax, key in zip(axes.ravel(), keys, strict=False):
+            a, d, md = grids[key]
+            if kind == "argmax":
+                ax.imshow(a, cmap=cmap, norm=norm, interpolation="nearest")
+            else:
+                # 1 where amino-acid identity changes which head wins. Comparable
+                # across layers in a way the raw argmax colours are not, since
+                # the modal head itself differs from module to module.
+                #
+                # NaN must be carried through rather than compared: `NaN != md`
+                # is True, so under-sampled cells would paint black and the rare
+                # residues (W, C, M, P) would draw an identical cross on every
+                # panel. The summary numbers were never affected — they mask
+                # NaN explicitly — but the first version of this grid was
+                # unreadable because of it.
+                flag = np.where(np.isnan(a), np.nan, (a != md).astype(float))
+                cm = plt.get_cmap("Greys").copy()
+                cm.set_bad("#e8e8e8")
+                ax.imshow(np.ma.masked_invalid(flag), cmap=cm, vmin=0, vmax=1, interpolation="nearest")
+            for b in BOUNDS:
+                ax.axhline(b - 0.5, color="tab:red", lw=0.5)
+                ax.axvline(b - 0.5, color="tab:red", lw=0.5)
+            lay, dr = key.split(".")[0], key.split("_")[-1]
+            ax.set_title(f"L{lay} {dr}", fontsize=6.5, pad=1.5)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        for ax in axes.ravel()[len(keys) :]:
+            ax.axis("off")
+        title = (
+            "argmax head per amino-acid pair"
+            if kind == "argmax"
+            else "where amino-acid identity changes the winning head (black)"
+        )
+        fig.suptitle(
+            f"{title} — contacts <8 Å, |i-j| >= {args.min_seqsep}, r17 step {step} ({args.snapshot}); "
+            "red lines separate hydrophobic / aromatic / polar / + / - / G",
+            fontsize=11,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.985))
+        fig.savefig(outdir / f"aa_grid_{kind}.png", dpi=100)
+        plt.close(fig)
 
     log.info("\nmost chemistry-sensitive modules (by off-modal share):")
     log.info("  %-16s %7s %9s %9s %9s %9s", "module", "ratio", "off-modal", "aromatic", "D/E", "polar")

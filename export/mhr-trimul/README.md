@@ -778,11 +778,33 @@ per residue, D/E is 54% against 37% for pairs containing neither G nor D/E, i.e.
 middling, while the small residues are the extreme. Corrected after looking at
 the map rather than the group summary.
 
-**The early trunk is not uniform.** Off-modal by module runs L0 0.44, L3 0.45,
-L8 0.49, L10 **0.03**, L11 0.51, L14 0.53, L16 0.57 — L10 is essentially inert
-(any F/W/Y: 0%). The band mean of 0.215 for L0-11 averages values spanning
-0.03 to 0.57, so "early layers route on chemistry" is a statement about the band,
-not about every layer in it.
+**It is a switch, not a gradient, and the two directions disagree.** Rendering
+all 96 modules at once (`aa_grid_offmodal.png`) shows chemistry-sensitive
+modules scattered through the whole trunk rather than fading with depth. The
+distribution is bimodal — **21 modules above 0.30, 50 below 0.05**, only 25 in
+between; median 0.033 against a mean of 0.139. And the depth trend splits by
+direction:
+
+| band | `tri_mul_out` | `tri_mul_in` |
+| --- | --- | --- |
+| L0-11 | 0.256 | 0.177 |
+| L12-23 | 0.257 | **0.035** |
+| L24-35 | 0.142 | 0.053 |
+| L36-47 | **0.054** | **0.141** |
+
+Outgoing decays monotonically with depth; **incoming is U-shaped**, bottoming out
+mid-trunk and rising again at the end. So "chemistry early, geometry late" holds
+for the outgoing direction and not for the incoming one — the band means above
+pool the two and hide it. Individual layers vary far more than the bands: L4, L5
+and L7 are near-inert while L43, L45 in and L47 out are dense.
+
+*Three of the corrections in this section came from looking at a figure after
+reading a summary that was not wrong so much as too coarse: the L0 size-vs-charge
+reading, this bimodality, and a rendering bug where under-sampled NaN cells were
+painted as if they were off-modal (the tabulated numbers had masked them
+correctly all along). One correction went the other way — the tabulated
+`off_modal` = 0.000 for L40 was what showed that a cross-shaped pattern in the
+first grid was an artifact. Neither view was sufficient alone.*
 
 **This corrects an earlier statement.** The depth curve showed
 `I(pair; head)` ~ 0 through L0-L25 and I wrote that the router "does nothing
