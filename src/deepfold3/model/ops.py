@@ -142,10 +142,16 @@ def collect_router_stats(model: nn.Module, prefix: str = "router", reset: bool =
         f"{prefix}/g_mean": sum(r["g_mean"] for _, r in rows) / len(rows),
         f"{prefix}/occupancy_max": max(r["occupancy_max"] for _, r in rows),
         f"{prefix}/occupancy_min": min(r["occupancy_min"] for _, r in rows),
+        # sqrt(mean_h g^2): what the branch magnitude actually does. The softmax
+        # constraint pins mean_h g = 1, not the norm, so this rises from 1
+        # toward sqrt(H) as routing sharpens and out_gate has to absorb it.
+        f"{prefix}/g_rms": sum(r["g_rms"] for _, r in rows) / len(rows),
+        f"{prefix}/g_rms_max": max(r["g_rms"] for _, r in rows),
     }
     for name, r in rows:
         out[f"{prefix}/entropy_by_module/{name}"] = r["entropy"]
         out[f"{prefix}/marginal_entropy_by_module/{name}"] = r["marginal_entropy"]
+        out[f"{prefix}/g_rms_by_module/{name}"] = r["g_rms"]
         out[f"{prefix}/g_std_by_module/{name}"] = r["g_std"]
     return out
 
@@ -465,6 +471,7 @@ class _TriangleMulBase(nn.Module):
             acc = self._router_stats = dict(
                 entropy=0.0,
                 marginal_entropy=0.0,
+                g_rms=0.0,
                 g_std=0.0,
                 g_mean=0.0,
                 occupancy_max=0.0,
@@ -473,6 +480,12 @@ class _TriangleMulBase(nn.Module):
             )
         acc["entropy"] += float(ent)
         acc["marginal_entropy"] += float(marg)
+        # ``mean_h g = 1`` under softmax pins the arithmetic mean, not the norm.
+        # What out_proj actually receives scales with sqrt(mean_h g^2), which by
+        # Jensen is >= 1 and grows to sqrt(H) as the routing sharpens. So a
+        # router that is doing its job inflates the branch, and out_gate has to
+        # absorb it. This records the inflation directly.
+        acc["g_rms"] += float(g.pow(2).mean(-1).sqrt().mean())
         acc["g_std"] += float(g.std(0).mean())
         acc["g_mean"] += float(g.mean())
         acc["occupancy_max"] += float(share.max())
