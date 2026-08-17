@@ -181,7 +181,19 @@ class _TriangleMulBase(nn.Module):
             head_norm: Post-contraction normalization —
                 ``"channel"`` = AF3's LayerNorm over all ``c_z``;
                 ``"head_rms"`` = RMSNorm over ``d`` within each head;
-                ``"head_ln"`` = LayerNorm over ``d`` within each head.
+                ``"head_ln"`` = LayerNorm over ``d`` within each head;
+                ``"post_channel"`` = LayerNorm over all ``c_z``, applied
+                *after* the router instead of before it. The other three
+                normalize first, which leaves nothing bounding what the gate
+                then multiplies in: ``sum_h g = H`` pins the mean of ``g`` but
+                not its norm, so what reaches ``out_proj`` grows toward
+                ``sqrt(H)`` as the routing sharpens (measured: 2.26x in r17's
+                deep trunk by step 8000). Normalizing afterwards lets the gate
+                set the *direction* of the ``c_z`` vector while the norm fixes
+                its length. There is deliberately no per-head equivalent: a
+                per-head norm applied after gating divides out ``g^(h)``
+                exactly, since ``g`` is constant within a head, and the router
+                becomes a no-op.
             router: Target-pair-conditioned router over heads.
             router_kind: ``"softmax"`` — ``g = H·softmax_h(R(x))``, so
                 ``mean_h g = 1`` and the router can only *reallocate*; heads
@@ -220,8 +232,13 @@ class _TriangleMulBase(nn.Module):
         # equal to einsum("ikc,jkc->ijc") under c = (h, d), because only k is
         # contracted. The head axis earns its keep in the *normalization* and
         # the *router*, both of which sit between the contraction and out_proj.
-        if head_norm not in ("channel", "head_rms", "head_ln"):
-            raise ValueError(f"head_norm must be channel|head_rms|head_ln, got {head_norm!r}")
+        if head_norm not in ("channel", "head_rms", "head_ln", "post_channel"):
+            raise ValueError(f"head_norm must be channel|head_rms|head_ln|post_channel, got {head_norm!r}")
+        if head_norm == "post_channel" and not router:
+            # Without a gate there is nothing to normalize after, and the mode
+            # would silently equal "channel" — a second spelling for one
+            # behaviour is exactly what section 12's incident was made of.
+            raise ValueError("head_norm='post_channel' is meaningless without router=True")
         if router_kind not in ("softmax", "sigmoid"):
             raise ValueError(f"router_kind must be softmax|sigmoid, got {router_kind!r}")
         if head_norm != "channel" or router:
@@ -360,6 +377,20 @@ class _TriangleMulBase(nn.Module):
         replaces.
         """
         h, d = self.num_heads, self.head_dim
+        if self.head_norm == "post_channel":
+            # Gate first, normalize after: the router chooses the direction and
+            # LayerNorm(c_z) fixes the length, so sharpening cannot inflate the
+            # branch. It also stops the softmax sum constraint from being
+            # load-bearing, which is what makes ``router_kind="sigmoid"``
+            # usable here — the anchor moves from the constraint to the norm.
+            t = act.unflatten(-1, (h, d))
+            if router_logits is not None:
+                r = router_logits.float()
+                g = float(h) * torch.softmax(r, dim=-1) if self.router_kind == "softmax" else 2.0 * torch.sigmoid(r)
+                if self.router_stats_enabled:
+                    self._record_router_stats(g)
+                t = t * g.to(t.dtype).unsqueeze(-1)
+            return self.norm_center(t.flatten(-2))
         if self.head_norm == "channel":
             # AF3's LayerNorm over the whole of c_z. This branch was missing —
             # "channel" fell through to the head_ln case, so a run configured

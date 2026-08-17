@@ -299,3 +299,62 @@ def test_g_mean_is_pinned_for_softmax_and_free_for_sigmoid(pair):
 def test_invalid_router_kind_is_rejected():
     with pytest.raises(ValueError, match="router_kind"):
         TriangleMulOutgoing(C_Z, num_heads=H, router=True, router_kind="gumbel")
+
+
+POST = dict(num_heads=H, head_norm="post_channel", router=True)
+
+
+@pytest.mark.parametrize("cls", [TriangleMulOutgoing, TriangleMulIncoming])
+def test_post_channel_is_exactly_af3_at_zero_init(cls, pair):
+    """g = 1 at zero-init, so LN(1 ⊙ T) is AF3's LN(T) and the arm starts identical."""
+    z, mask = pair
+    base = _wake(cls(C_Z).eval())
+    post = _wake(cls(C_Z, **POST).eval())
+    missing, unexpected = post.load_state_dict(base.state_dict(), strict=False)
+    assert unexpected == [] and set(missing) == {"router.weight"}
+    out_base, out_post = base(z, mask), post(z, mask)
+    assert out_base.abs().max() > 1e-3, "the comparison must not be zero vs zero"
+    assert torch.allclose(out_base, out_post, atol=1e-5)
+
+
+def test_post_channel_keeps_the_branch_length_fixed_while_pre_channel_does_not(pair):
+    """The point of the mode: sharpening the router must not inflate what out_proj sees.
+
+    ``sum_h g = H`` pins the mean of ``g``, not its norm, so a pre-gate norm lets
+    the branch grow toward ``sqrt(H)`` as routing sharpens. A post-gate norm
+    cannot.
+    """
+    z, mask = pair
+    captured: dict[str, torch.Tensor] = {}
+
+    def grab(mod, name):
+        orig = mod._mhr_head_mix
+        mod._mhr_head_mix = lambda act, rl: captured.__setitem__(name, orig(act, rl)) or captured[name]
+
+    rms = {}
+    for name, cell in (("pre", dict(num_heads=H, head_norm="channel", router=True)), ("post", POST)):
+        torch.manual_seed(0)
+        mod = _wake(TriangleMulOutgoing(C_Z, **cell).eval())
+        # A sharp router: large logits drive softmax toward one-hot, g toward H.
+        with torch.no_grad():
+            mod.router.weight.normal_(0, 4.0)
+        grab(mod, name)
+        mod(z, mask)
+        rms[name] = float(captured[name].detach().pow(2).mean(-1).sqrt().mean())
+
+    assert rms["pre"] > 1.5, f"pre-gate norm should let the branch inflate, got {rms['pre']:.3f}"
+    assert rms["post"] < 1.2, f"post-gate norm should hold it near 1, got {rms['post']:.3f}"
+
+
+def test_post_channel_requires_a_router():
+    """Without a gate it would silently be a second spelling of 'channel'."""
+    with pytest.raises(ValueError, match="meaningless without router"):
+        TriangleMulOutgoing(C_Z, num_heads=H, head_norm="post_channel", router=False)
+
+
+def test_post_channel_shares_state_dict_keys_with_channel():
+    """Same parameters as AF3's LayerNorm(c_z), so checkpoints move between cells."""
+    a = TriangleMulOutgoing(C_Z, num_heads=H, head_norm="channel", router=True).state_dict()
+    b = TriangleMulOutgoing(C_Z, **POST).state_dict()
+    assert set(a) == set(b)
+    assert all(a[k].shape == b[k].shape for k in a)

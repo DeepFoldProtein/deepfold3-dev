@@ -104,7 +104,7 @@ class EvoformerConfig:
     # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
     use_triangle_attention: bool = True
     trimul_num_heads: int = 0
-    trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
+    trimul_head_norm: Literal["channel", "head_rms", "head_ln", "post_channel"] = "channel"
     trimul_router: bool = False
     # Router nonlinearity. ``softmax`` gives g = H*softmax_h(R(x)), so mean_h g
     # = 1 and the router can only reallocate — heads compete for a fixed budget
@@ -199,7 +199,7 @@ class PairFormerConfig:
     # per-field meaning). ``trimul_num_heads=0`` ≡ AF3.
     use_triangle_attention: bool = True
     trimul_num_heads: int = 0
-    trimul_head_norm: Literal["channel", "head_rms", "head_ln"] = "channel"
+    trimul_head_norm: Literal["channel", "head_rms", "head_ln", "post_channel"] = "channel"
     trimul_router: bool = False
     # Router nonlinearity. ``softmax`` gives g = H*softmax_h(R(x)), so mean_h g
     # = 1 and the router can only reallocate — heads compete for a fixed budget
