@@ -1,0 +1,58 @@
+base: df3-stage0-r16.yaml
+
+# r19 — no triangle attention, plain AF3 TriangleMul, no trunk single track.
+# The pair-track architecture of arXiv:2510.18870 mapped onto DF3: a trunk block
+# is TriMulOutgoing + TriMulIncoming + FFN, and the per-token track is deleted
+# outright. From scratch — not warm-startable from r16, r17 or r18.
+#
+# Full argument, consumer list and measurements: export/mhr-trimul/README.md §17.
+#
+# Attribution: two subtractions against r16 (triangle attention + single track)
+# and two against r17 (MHR + single track), so neither comparison is a
+# single-knob read. r18, the intermediate cell, was skipped deliberately; the
+# substitute is a probe on r17's existing weights for how much of the diffusion
+# conditioning's single input actually comes from the trunk half.
+#
+# `conditioning_use_trunk_single: false` is not part of the paper's recipe. With
+# the track off the trunk single is `single_activations(target_feat)`, a
+# pointwise map, so AF3's `cat([s_trunk, target_feat])` would carry a 384-wide
+# duplicate and shift the statistics of the LayerNorm that runs over both
+# halves. Leaving it True is legal — the paper-literal configuration — and
+# warns rather than errors.
+#
+# Scope is the trunk. The confidence-head and template PairFormers keep AF3
+# triangle attention, AF3 TriangleMul, and their own single track.
+#
+# Widths follow r17 (same base): c_z 256, c_m 128, c_s 384, 48 layers. Batching
+# does not — 2x1 instead of 1x2 (same global batch), diffusion_batch_size 48.
+#
+# Report at BOTH iso-step and iso-wall-clock; iso-step alone understates an arm
+# this much cheaper per step. `single_l2` stops being a stability metric here —
+# it reports the norm of s_init and nothing else. Confidence is where the two
+# subtractions separate on their own: the head now starts from s_init rather
+# than from a 48-layer per-token summary, so a pLDDT / PAE / PDE regression
+# against clean structure metrics is the single-track deletion's signature.
+
+training:
+  wandb_project: deepfold3-v2
+  # r17's value, kept so the trunk composition is the only difference.
+  lr: 0.9e-3
+
+  diffusion_batch_size: 48
+  diffusion_chunk_size: 8
+
+  batch_size_per_rank: 2
+  accumulate_grad_batches: 1
+
+model:
+  evoformer:
+    use_triangle_attention: false
+    trimul_num_heads: 0 # 0 = MHR off = AF3 TriangleMul, fused path available
+
+  pairformer:
+    use_triangle_attention: false
+    trimul_num_heads: 0
+    use_single_track: false
+
+  diffusion:
+    conditioning_use_trunk_single: false
