@@ -212,6 +212,42 @@ class PairFormerConfig:
     # may drift from 1, so the branch magnitude drifts and out_gate absorbs it.
     # Both are exactly g == 1 at zero-init. Default softmax = the r17 behaviour.
     trimul_router_kind: Literal["softmax", "sigmoid"] = "softmax"
+    # ── Per-token track ───────────────────────────────────────────────────────
+    # ``use_single_track`` deletes SingleAttention (with its ``single_to_pair``
+    # PairBias projection) and the single transition from every block of this
+    # stack, so the block updates the pair representation only and passes
+    # ``single`` through untouched.
+    #
+    # This is cheaper than it looks and more consequential than it looks:
+    #
+    # * Cheap, because ``single`` is a pure *sink* in this block — it reads the
+    #   pair representation through ``pair_logits`` and never writes back. No
+    #   pair-track computation depends on it, so deleting it removes no input
+    #   from anything upstream.
+    # * Consequential, because with the updates gone the trunk's single output
+    #   is ``single_activations(target_feat)`` — a *pointwise* function of the
+    #   input features, with no token mixing anywhere. Its three consumers each
+    #   land differently, and the difference is the whole design:
+    #
+    #     - the diffusion **atom** encoder
+    #       (``AtomEncoder.compute_static(trunk_single=...)``) still needs it,
+    #       and keeps it trained: it takes no ``target_feat`` of its own, so
+    #       this is its only token-level identity channel;
+    #     - the diffusion **conditioning** already has ``target_feat``, so
+    #       concatenating this on top is a duplicate — see
+    #       ``conditioning_use_trunk_single`` on :class:`DiffusionConfig`;
+    #     - the confidence head reads it detached and rebuilds what it needs
+    #       from trunk pair + the predicted distogram.
+    #
+    # At c_z=256, c_s=384, 48 layers this track is 120.6M parameters — 28% of
+    # the whole model and 1.6x the trunk's entire pair track — so whether it
+    # earns its slot is a first-order question, not a tidiness one.
+    #
+    # Trunk PairFormer scope only. The confidence-head PairFormer reads its own
+    # config instance and keeps its single track (it rebuilds a per-token
+    # summary from trunk pair + the predicted distogram, which is the whole
+    # point of that stack).
+    use_single_track: bool = True
 
     def __post_init__(self) -> None:
         if self.branch_scaler != "identity":
@@ -315,6 +351,23 @@ class DiffusionTransformerConfig:
 class DiffusionConfig:
     conditioning_pair_channel: int = 128
     conditioning_seq_channel: int = 384
+    # Whether the diffusion conditioning concatenates the *trunk* single
+    # representation onto ``target_feat`` before the LayerNorm + projection.
+    #
+    # AF3 concatenates both (``cat([s_trunk, target_feat])``, 384 + 447 = 831).
+    # That is right when the trunk updates ``s``: the two carry different
+    # things, one pair-derived and one raw input. It stops being right the
+    # moment ``PairFormerConfig.use_single_track`` is off — then ``s_trunk`` is
+    # a fixed pointwise function of ``target_feat``, so the concatenated half
+    # carries no information the other half lacks. Keeping it would not merely
+    # waste the parameters: the LayerNorm runs over the *concatenated* vector,
+    # so a degenerate half also moves the normalization statistics of the live
+    # half.
+    #
+    # Setting this False drops the trunk half, leaving ``LN(target_feat)`` ->
+    # projection. Nothing is lost — ``s_trunk = W·target_feat``, and a linear
+    # map can absorb ``W``.
+    conditioning_use_trunk_single: bool = True
     fourier_dim: int = 256  # Fourier noise embedding dimension
     conditioning_num_intermediate_factor: int = 2  # transition block expansion factor
     # Sampling
@@ -1607,6 +1660,22 @@ class ModelConfig:
 
         _mirror("fp32_diffusion_sample", "skip_amp_sample")
         _mirror("fp32_diffusion_sample_training", "skip_amp_sample_training")
+
+        # A trunk with no single track still *has* a single output — it is just
+        # ``single_activations(target_feat)``, a pointwise map of the features
+        # the diffusion conditioning already receives. Concatenating it there is
+        # legal (it is what the reference implementation of this ablation does)
+        # but carries no information, so say so once at construction rather than
+        # leaving a 384-wide duplicate to be discovered in a probe later.
+        if not self.pairformer.use_single_track and self.diffusion.conditioning_use_trunk_single:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "pairformer.use_single_track=False with diffusion.conditioning_use_trunk_single=True: "
+                "the trunk single output is a pointwise function of target_feat, so the diffusion "
+                "conditioning is concatenating a duplicate of a channel it already has. Set "
+                "diffusion.conditioning_use_trunk_single=false unless the duplicate is deliberate."
+            )
 
 
 # Key under which ``ModelConfig`` JSON is embedded in ``safetensors`` metadata.

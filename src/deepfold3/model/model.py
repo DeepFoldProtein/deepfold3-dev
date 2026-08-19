@@ -791,11 +791,25 @@ class DeepFold3(nn.Module):
                 for k, v in chunk_components.items():
                     logged[k] = logged.get(k, v.new_zeros(())) + v / num_chunks
 
-            torch.autograd.backward(
-                tensors=[pair_real, single_real, target_feat_real],
-                grad_tensors=[pair_det.grad, single_det.grad, target_feat_det.grad],
-                retain_graph=True,
-            )
+            # Defensive: ``torch.autograd.backward`` cannot take ``None`` as a
+            # grad_tensor for a non-scalar — it raises "grad can be implicitly
+            # created only for scalar outputs" — so a leaf the diffusion path
+            # never read would kill the run on its first backward rather than
+            # being ignored. All three are read today (``single_real`` by the
+            # atom encoder's per-atom conditioning, even when the trunk single
+            # track and the conditioning concat are both off), so this filter is
+            # a guard against a future consumer being removed, not a live path.
+            flow = [
+                (t, d.grad)
+                for t, d in ((pair_real, pair_det), (single_real, single_det), (target_feat_real, target_feat_det))
+                if d.grad is not None
+            ]
+            if flow:
+                torch.autograd.backward(
+                    tensors=[t for t, _ in flow],
+                    grad_tensors=[g for _, g in flow],
+                    retain_graph=True,
+                )
 
             pred["__diffusion_total__"] = weighted_total
             pred["__diffusion_logged__"] = logged

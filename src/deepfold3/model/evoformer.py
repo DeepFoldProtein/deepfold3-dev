@@ -186,6 +186,7 @@ class PairFormerBlock(nn.Module):
         pair_transition_residual_gain: float | None = None,
         branch_scaler: str = "identity",
         use_triangle_attention: bool = True,
+        use_single_track: bool = True,
         trimul_kwargs: dict | None = None,
     ):
         super().__init__()
@@ -211,20 +212,25 @@ class PairFormerBlock(nn.Module):
             self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
-        self.single_to_pair_norm = LayerNorm(c_pair)
-        self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
-        self.single_attn = SingleAttention(
-            c_single,
-            num_heads=num_single_heads,
-            key_dim=single_key_dim,
-            value_dim=single_value_dim,
-            optim=optim,
-            pair_bias_gate=pair_bias_gate,
-            pair_bias_gate_init_tau=pair_bias_gate_init_tau,
-        )
-        self.single_transition = make_transition_block(
-            c_single, config=optim, linear_out_init_gain=single_transition_linear_out_init_gain
-        )
+        # The per-token track. ``single`` is a pure sink in this block — it reads
+        # the pair representation through ``pair_logits`` and never writes back
+        # — so deleting it removes no input from the pair track.
+        self.use_single_track = bool(use_single_track)
+        if self.use_single_track:
+            self.single_to_pair_norm = LayerNorm(c_pair)
+            self.single_to_pair = LinearNoBias(c_pair, num_single_heads)  # pair → per-head logits
+            self.single_attn = SingleAttention(
+                c_single,
+                num_heads=num_single_heads,
+                key_dim=single_key_dim,
+                value_dim=single_value_dim,
+                optim=optim,
+                pair_bias_gate=pair_bias_gate,
+                pair_bias_gate_init_tau=pair_bias_gate_init_tau,
+            )
+            self.single_transition = make_transition_block(
+                c_single, config=optim, linear_out_init_gain=single_transition_linear_out_init_gain
+            )
         self.residual_out_scale = float(residual_out_scale)
         # Branch-specific multipliers on the per-transition residual updates
         # (None ≡ 1.0). Compose with the block-wide ``s_ros`` to give the
@@ -295,15 +301,21 @@ class PairFormerBlock(nn.Module):
         # ``single_to_pair`` is *not* a residual-stream branch (its output is
         # consumed as ``pair_logits`` for the SingleAttention PairBias path);
         # leave it un-RMSNormed.
-        pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
-        pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
-        b_single_attn = s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
-        single = single + b_single_attn
-        u_single = self.single_transition(single)
-        probe = getattr(self, "_probe", None)
-        if probe is not None and probe.enabled:
-            probe.record_block(self._probe_layer_idx, single, u_single, s_single_ffn)
-        b_single_ffn = s_single_ffn * rmsn(u_single)
+        if self.use_single_track:
+            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+            pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
+            b_single_attn = s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
+            single = single + b_single_attn
+            u_single = self.single_transition(single)
+            probe = getattr(self, "_probe", None)
+            if probe is not None and probe.enabled:
+                probe.record_block(self._probe_layer_idx, single, u_single, s_single_ffn)
+            b_single_ffn = s_single_ffn * rmsn(u_single)
+        else:
+            # Same convention as the deleted triangle-attention branches above:
+            # meter them as exactly zero rather than dropping the rows, so ρ_l
+            # stays comparable against a run that has them.
+            b_single_attn = b_single_ffn = pair.new_zeros(())
         act_meter = getattr(self, "_act_meter", None)
         if act_meter is not None and getattr(act_meter, "enabled", False):
             act_meter.record_all_branches(
@@ -316,7 +328,8 @@ class PairFormerBlock(nn.Module):
                 b_single_attn=b_single_attn,
                 b_single_ffn=b_single_ffn,
             )
-        single = single + b_single_ffn
+        if self.use_single_track:
+            single = single + b_single_ffn
         return pair, single
 
 
@@ -366,15 +379,30 @@ class Evoformer(nn.Module):
         # AF3: prev_embedding and prev_single_embedding use final_init (zeros)
         self.prev_embedding_layer_norm = LayerNorm(c_pair)
         self.prev_embedding = LinearNoBias(c_pair, c_pair, initializer="zeros")
-        self.prev_single_embedding_layer_norm = LayerNorm(c_single)
-        self.prev_single_embedding = LinearNoBias(c_single, c_single, initializer="zeros")
+        # Recycling the single track only means something if something updates it.
+        # With ``use_single_track`` off the trunk returns ``s_init`` unchanged,
+        # so ``s = s_init + P(LN(s_prev))`` degenerates into a fixed-point
+        # iteration on ``s_init`` — a pointwise map dressed up as recycling.
+        # Skip it, and the modules with it.
+        self.use_single_track = bool(pf_cfg.use_single_track)
+        if self.use_single_track:
+            self.prev_single_embedding_layer_norm = LayerNorm(c_single)
+            self.prev_single_embedding = LinearNoBias(c_single, c_single, initializer="zeros")
 
         # Position activations for relative encoding
         # rel_feat_dim = rel_pos(66) + rel_token(66) + entity_same(1) + rel_chain(6) = 139
         rel_feat_dim = 2 * (2 * cfg.max_relative_idx + 2) + 1 + (2 * cfg.max_relative_chain + 2)
         self.position_activations = LinearNoBias(rel_feat_dim, c_pair)
 
-        # Single activations from target feat (447-dim input)
+        # Single activations from target feat (447-dim input).
+        #
+        # This survives ``use_single_track=False``, and it is worth saying why:
+        # the diffusion *atom* encoder conditions its per-atom activations on
+        # the trunk single (``AtomEncoder.compute_static(trunk_single=...)``),
+        # and that is its only token-level identity channel — it receives no
+        # ``target_feat`` of its own. So s_init keeps a live consumer and a
+        # gradient path even when the trunk stops updating it and the diffusion
+        # conditioning stops concatenating it.
         self.single_activations = LinearNoBias(_TARGET_FEAT_DIM, c_single)
 
         # Input embeddings use plain per-Linear Lecun init (OF3/AF3 stock): each
@@ -434,6 +462,7 @@ class Evoformer(nn.Module):
                     ),
                     branch_scaler=pf_cfg.branch_scaler,
                     use_triangle_attention=pf_cfg.use_triangle_attention,
+                    use_single_track=pf_cfg.use_single_track,
                     trimul_kwargs=_trimul_kwargs(pf_cfg),
                 )
                 for i in range(pf_cfg.num_layer)
@@ -504,7 +533,8 @@ class Evoformer(nn.Module):
         single = self.single_activations(target_feat)
 
         # Add recycling single
-        single = single + self.prev_single_embedding(self.prev_single_embedding_layer_norm(prev_single))
+        if self.use_single_track:
+            single = single + self.prev_single_embedding(self.prev_single_embedding_layer_norm(prev_single))
 
         # MSA embedding: msa_feat [..., S, N, 34] → [..., S, N, c_msa]
         msa_act = self.msa_activations(msa_feat)
@@ -527,6 +557,9 @@ class Evoformer(nn.Module):
         # rebinds — the original tensors are already saved by the block as its
         # backward inputs, so keeping a reference adds zero memory.
         act_meter = getattr(self, "_act_meter", None)
+        # With no single representation there is nothing to meter on that axis;
+        # the pair columns stay live. Note that a *flat* ``single_l2`` in such a
+        # run means the quantity is absent, not that the track settled.
         if act_meter is not None:
             act_meter.record(0, single, pair)
         for i, layer in enumerate(self.trunk_pairformer):

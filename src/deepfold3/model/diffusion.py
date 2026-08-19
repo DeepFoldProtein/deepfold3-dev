@@ -559,6 +559,7 @@ class DiffusionConditioningBlock(nn.Module):
         c_pair_out: int,
         c_single_out: int,
         target_feat_dim: int = 447,
+        use_trunk_single: bool = True,
         sigma_data: float = 16.0,
         fourier_dim: int = 256,
         num_intermediate_factor: int = 2,
@@ -580,8 +581,15 @@ class DiffusionConditioningBlock(nn.Module):
             c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
         )
 
-        # Single conditioning: concat(single_embedding, target_feat) → linear
-        single_in = c_single_in + target_feat_dim  # 384 + 447 = 831
+        # Single conditioning: concat(single_embedding, target_feat) → linear.
+        # ``use_trunk_single=False`` drops the trunk half and conditions on
+        # ``target_feat`` alone — correct exactly when the trunk stops updating
+        # the single track, at which point ``single_embedding`` is a fixed
+        # pointwise function of ``target_feat`` and the concatenation is a
+        # duplicate that also perturbs the shared LayerNorm's statistics. See
+        # ``DiffusionConfig.conditioning_use_trunk_single``.
+        self.use_trunk_single = bool(use_trunk_single)
+        single_in = (c_single_in if self.use_trunk_single else 0) + target_feat_dim  # 384 + 447 = 831
         self.single_cond_norm_w = nn.Parameter(torch.ones(single_in))
         self.single_cond_proj = LinearNoBias(single_in, c_single_out)
 
@@ -650,7 +658,7 @@ class DiffusionConditioningBlock(nn.Module):
         pair_cond = pair_cond + self.pair_trans1(pair_cond)
 
         # Single cond (without noise)
-        single_in = torch.cat([single_emb, target_feat], dim=-1)
+        single_in = torch.cat([single_emb, target_feat], dim=-1) if self.use_trunk_single else target_feat
         single_norm = layer_norm(single_in, [single_in.shape[-1]]) * self.single_cond_norm_w
         single_cond_pre_noise = self.single_cond_proj(single_norm)
         return single_cond_pre_noise, pair_cond
@@ -709,6 +717,7 @@ class DiffusionHead(nn.Module):
             rel_feat_dim=rel_feat_dim,
             c_pair_out=cfg.conditioning_pair_channel,
             c_single_out=cfg.conditioning_seq_channel,
+            use_trunk_single=cfg.conditioning_use_trunk_single,
             sigma_data=cfg.sigma_data,
             fourier_dim=cfg.fourier_dim,
             num_intermediate_factor=cfg.conditioning_num_intermediate_factor,
