@@ -122,7 +122,7 @@ Components:
 - Outgoing: `equation="ikc,jkc->ijc"` (default); Incoming: `equation="kic,kjc->ijc"`
 - LayerNorm -> project to 2xchannels -> sigmoid gate -> einsum -> LayerNorm -> project back + sigmoid gate
 
-**MHG-TriMul** (off by default; `num_heads=0` is AF3). With `num_heads=H`, the
+**MHR-TriMul** (off by default; `num_heads=0` is AF3). With `num_heads=H`, the
 contraction is unchanged -- `einsum("ikhd,jkhd->ijhd")` is bitwise equal to
 `einsum("ikc,jkc->ijc")` under `c=(h,d)`, since only `k` is contracted -- and
 two steps are inserted between the einsum and `out_proj`:
@@ -136,7 +136,7 @@ two steps are inserted between the einsum and `out_proj`:
   output gate (applied *after* `out_proj`) cannot express.
 
 `router/entropy` is logged with the activation meter; `1.0` means the router is
-still uniform, i.e. inert. See `export/mhg-trimul/README.md`.
+still uniform, i.e. inert. See `export/mhr-trimul/README.md`.
 
 **`OuterProductMean`** -- MSA-to-pair information flow
 
@@ -146,16 +146,48 @@ still uniform, i.e. inert. See `export/mhg-trimul/README.md`.
 
 **`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition
 
-**`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition
+**`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition (the last two are dropped by `use_single_track=False`)
 
 `use_triangle_attention=False` (on either `EvoformerConfig` or
 `PairFormerConfig`) drops the two `GridSelfAttention` branches from every block
 of that stack; the branches are still metered, as exactly zero, so per-branch
 `rho_l` stays comparable against a run that has them. Triangle attention is the
 only pair operator whose selection over the intermediate node `k` is
-conditioned on the target pair `(i, j)` -- MHG-TriMul's router selects a
+conditioned on the target pair `(i, j)` -- MHR-TriMul's router selects a
 relation subspace, not an intermediate node, so it does not replace it.
 Template and confidence-head PairFormers are unaffected.
+
+`PairFormerConfig.use_single_track=False` drops the per-token track from every
+trunk block -- `SingleAttention`, its `single_to_pair` PairBias projection, and
+the single transition -- leaving a block that updates pair only and returns
+`single` untouched. `single` is a pure *sink* in the block (it reads pair
+through the PairBias logits and never writes back), so the pair track is
+bit-identical with and without it; the deleted branches are metered as zero,
+same convention as above. At `c_z=256, c_s=384, L=48` this track is 120.6M
+parameters, 28% of the model.
+
+Two consequences follow, and both are wired to the flag rather than left
+implicit:
+
+- The trunk single output becomes `single_activations(target_feat)` -- a
+  pointwise map with no token mixing and no dependence on MSA, templates, or
+  the recycled pair. The recycle projection (`prev_single_embedding`) is
+  therefore not built at all: `s = s_init + P(LN(s_prev))` would be a
+  fixed-point iteration on `s_init`. The projection itself survives, and its
+  live consumer is the diffusion **atom** encoder
+  (`AtomEncoder.compute_static(trunk_single=...)`), which receives no
+  `target_feat` of its own -- so the trunk single is its only token-level
+  identity channel, and is what keeps `single_activations` trained.
+- `DiffusionConfig.conditioning_use_trunk_single=False` drops the trunk half of
+  the diffusion conditioning's `cat([s_trunk, target_feat])`, which under this
+  arm is a duplicate of a channel the conditioning already has -- and one that
+  moves the shared LayerNorm's statistics, since the LN spans the concatenation.
+  Leaving it `True` is legal and warns at `ModelConfig.__post_init__`.
+
+Scope is the trunk. The confidence head keeps its single track (it rebuilds a
+per-token summary from trunk pair + the predicted distogram) and reads its own
+config class. See `configs/df3-stage0-r19.yaml` and
+`export/mhr-trimul/README.md`.
 
 Optional Residual Output Scaling (ROS) on every block branch: when `PairFormerConfig.residual_output_scaling=True` (and equivalently `ConfidenceConfig.residual_output_scaling`), the block multiplies every branch's output by `s_ros = 1/sqrt(layer_idx + 1)` before adding to the residual stream. The depth-uniform variant `uniform_residual_scale` uses `1/sqrt(num_layer)` instead. The single-track stability ablation adds branch-specific multipliers `single_transition_residual_gain` and `pair_transition_residual_gain` (each composes with `s_ros`); see `docs/single-track-stability-experiments.md` §11. Output projections retain zero-init throughout.
 
@@ -166,7 +198,7 @@ Because these residual scaling factors only affect forward-pass scalars (no para
 - `target_feat [N, 447]` -> single `[N, 384]`, pair `[N, N, 128]` (outer sum of left/right projections)
 - `msa_feat [S, N, 34]` -> msa `[S, N, 64]` (+ broadcast target_feat projection)
 - `rel_feat [N, N, 139]` -> pair (additive)
-- Recycled `prev_pair` and `prev_single` added through LayerNorm + projection
+- Recycled `prev_pair` and `prev_single` added through LayerNorm + projection (the `prev_single` path is absent when `use_single_track=False`)
 - Template embedding (optional): `pair += template_embedding(pair, template_feats)` -- after bonds, before MSA stack
 
 ### `template_embedding.py` -- Template Embedding
