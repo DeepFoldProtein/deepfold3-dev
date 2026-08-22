@@ -179,6 +179,7 @@ af3.bin
 # Training run outputs (checkpoints, logs, tensorboard, etc.)
 /runs/
 /tmp/
+/logs/
 
 # bench/ — FoldBench harness: track scripts + README; ignore symlinks,
 # generated inputs, and run outputs (predictions / OST evals / logs / plots).
