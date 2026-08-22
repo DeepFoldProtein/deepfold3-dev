@@ -88,7 +88,8 @@ def _segment_starts(*keys: np.ndarray) -> np.ndarray:
 def convert_of3_atom_array(
     npz_path: Path,
     pdb_id: str | None = None,
-) -> tuple[Structure, Record, list[str]]:
+    build_record: bool = True,
+) -> tuple[Structure, Record | None, list[str]]:
     """Convert an OpenFold 3 biotite-NPZ file to DeepFold3 Structure + Record.
 
     The OpenFold 3 NPZ is a serialised biotite ``AtomArray``: ``coord`` plus one
@@ -117,11 +118,20 @@ def convert_of3_atom_array(
     Args:
         npz_path: Path to an OpenFold 3 structure NPZ file.
         pdb_id: Override PDB ID (defaults to filename stem).
+        build_record: Also derive a :class:`Record` — per-chain sequences with
+            their SHA256 ``msa_id``, and chain-chain interfaces by atom
+            proximity. **Interface detection is O(n_chains²) KDTree queries**,
+            which is nothing for a monomer and catastrophic for a large
+            assembly: OF3 splits 4v88 into 1779 chains, where the Record half
+            alone measured 28.3 s of a 28.9 s conversion. Pass ``False`` when
+            the caller already has this metadata from elsewhere (``format:
+            of3pdb`` reads it out of the dataset cache) — then the returned
+            record is ``None``.
 
     Returns:
-        ``(Structure, Record, chain_keys)`` where ``chain_keys[asym_id]`` is the
-        OF3 ``chain_id`` string of that chain — the join key into the OF3 dataset
-        cache's per-structure ``chains`` dict.
+        ``(Structure, Record | None, chain_keys)`` where ``chain_keys[asym_id]``
+        is the OF3 ``chain_id`` string of that chain — the join key into the OF3
+        dataset cache's per-structure ``chains`` dict.
     """
     if pdb_id is None:
         pdb_id = npz_path.stem.split(".")[0].lower()
@@ -300,6 +310,9 @@ def convert_of3_atom_array(
     structure = Structure(atoms=atoms_arr, bonds=bonds_arr, residues=residues_arr, chains=chains_arr, name=pdb_id)
 
     # --- record ----------------------------------------------------------
+    if not build_record:
+        return structure, None, chain_keys
+
     chain_infos: list[ChainInfo] = []
     for ci in range(n_chains):
         mol_type = int(ch_mol[ci])
@@ -344,6 +357,7 @@ def convert_of3_structure(npz_path: Path, pdb_id: str | None = None) -> tuple[St
     ``asym_id`` (the monomer ``format: of3`` path and ``deepfold3 import-of3``).
     """
     structure, record, _ = convert_of3_atom_array(npz_path, pdb_id=pdb_id)
+    assert record is not None  # build_record defaults to True
     return structure, record
 
 

@@ -658,7 +658,13 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         struct_npz = self.structures_dir / pdb_id / f"{pdb_id}.npz"
         if not struct_npz.exists():
             raise FileNotFoundError(f"OF3 structure not found: {struct_npz}")
-        structure, _record, chain_keys = convert_of3_atom_array(struct_npz, pdb_id=pdb_id)
+        # build_record=False: every field a Record would carry is already in the
+        # columnar cache (chain metadata, interfaces), and deriving it costs
+        # O(n_chains²) KDTree interface queries. OF3 splits large assemblies very
+        # finely — 4v88 is 1779 chains — where that measured 28.3 s of a 28.9 s
+        # conversion, on the dataloader hot path, before the max_chains pre-crop
+        # even runs. It was the whole of a 29.8 s data_wait in the r19b run.
+        structure, _record, chain_keys = convert_of3_atom_array(struct_npz, pdb_id=pdb_id, build_record=False)
 
         # The cache indexes chains by OF3's chain key; the structure gives the
         # same keys in file order, which is what asym_id counts. Chains the cache
@@ -881,6 +887,16 @@ class OF3PdbDataset(torch.utils.data.Dataset):
             if aid not in surviving or not meta.aln_rep_id:
                 continue
             allowed = set(self.cache.template_ids(chain_row_of_asym[aid])) if self.cache.has_templates else None
+            if allowed is not None and not allowed:
+                # The cache lists no templates for this chain, so OF3 never wrote
+                # a hit file for its representative and there is nothing to look
+                # up. Its template search is protein-only (every RNA / DNA /
+                # ligand chain lands here) and ~7% of protein chains have no hits
+                # either — 12,210 of the training set's representatives in total.
+                # Without this the lookup is a stat() per such chain per sample
+                # that can only ever miss, and it reports each miss as a data
+                # gap, burying any real one.
+                continue
             path = self.template_cache_dir / f"{meta.aln_rep_id}.npz"
             if not path.exists():
                 _count_drop("OF3 template hit list missing", f"{pdb_id} chain {aid}: {path}")
