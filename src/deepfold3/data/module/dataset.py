@@ -123,13 +123,17 @@ def _validate_features(feats: dict[str, torch.Tensor]) -> str | None:
 _DATA_ERRORS = (OSError, EOFError, ValueError, zipfile.BadZipFile)
 
 # Exceptions that are far more likely to be OUR bug than bad data — a KeyError
-# from a tokenizer/CCD lookup, a RuntimeError from the cropper or featurizer.
-# They are still caught, because one malformed record must not kill a multi-day
-# run, but they are reported at ERROR *with a traceback*: logged as bare
-# ``str(e)`` they read as ``Sample 7abc (attempt 1): 'ARG'`` and are
-# indistinguishable from data noise, which is how a bug that rejects an entire
-# subset of the dataset stays invisible.
-_SUSPECT_ERRORS = (RuntimeError, KeyError)
+# from a tokenizer/CCD lookup, a RuntimeError from the cropper or featurizer, an
+# IndexError from a mis-derived index array. They are still caught, because one
+# malformed record must not kill a multi-day run, but they are reported at ERROR
+# *with a traceback*: logged as bare ``str(e)`` they read as
+# ``Sample 7abc (attempt 1): 'ARG'`` and are indistinguishable from data noise,
+# which is how a bug that rejects an entire subset of the dataset stays invisible.
+#
+# IndexError earns its place the hard way: an out-of-range MSA column escaped
+# this handler, killed the worker, and took a 112-rank job with it — the exact
+# desync this function's docstring promises not to cause.
+_SUSPECT_ERRORS = (RuntimeError, KeyError, IndexError)
 
 
 def _retry_getitem(
