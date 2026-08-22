@@ -93,7 +93,7 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
         ValueError: If a required field (``name``, ``data_dir``) is missing.
     """
     valid_strategies = {"uniform", "weighted"}
-    valid_formats = {"df3", "of3"}
+    valid_formats = {"df3", "of3", "of3pdb"}
     result = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
@@ -146,6 +146,9 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                     entry.get("template_struct_space", entry.get("monomer_template_struct_space", False))
                 ),
                 "max_template_date": str(entry.get("max_template_date", "")),
+                # ``format: of3pdb`` only: where `deepfold3 build-of3-cache` wrote
+                # the columnar dataset cache. Empty = ``{data_dir}/df3_cache``.
+                "of3_cache_dir": str(entry.get("of3_cache_dir", "")),
             }
         )
     return result

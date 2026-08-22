@@ -1445,6 +1445,61 @@ def drop_obsolete(data_dir: Path, ids_file: Path | None, delete_files: bool) -> 
     click.echo(f"Dropped {len(dropped)}/{len(records)} obsolete records.")
 
 
+@cli.command("build-of3-cache")
+@click.option(
+    "--cache-file",
+    required=True,
+    type=click.Path(exists=True),
+    help="OpenFold 3 dataset cache JSON (e.g. dataset_caches/training_cache_with_templates.json).",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(),
+    help="Directory to write the columnar cache into (point `of3_cache_dir` at it).",
+)
+@click.option(
+    "--no-templates",
+    is_flag=True,
+    help="Drop the per-chain template id lists (smaller cache, template-free training).",
+)
+def build_of3_cache(cache_file: str, output: str, no_templates: bool) -> None:
+    """Convert an OpenFold 3 dataset cache JSON to DeepFold3's columnar cache.
+
+    ``format: of3pdb`` training reads its metadata — release dates, resolutions,
+    chain molecule types, MSA representatives, template lists and AF3 §2.5.1
+    sequence clusters — from this cache. Converting once turns a ~1.7 GB JSON
+    (which upstream reads whole or through LMDB) into a directory of ``.npy``
+    columns every rank and dataloader worker opens with ``mmap_mode="r"``.
+
+    Run once per dataset cache; re-run when the source JSON changes.
+
+    Examples::
+
+        deepfold3 build-of3-cache \
+            --cache-file /data/pdb_training_set/dataset_caches/training_cache_with_templates.json \
+            --output /data/pdb_training_set/df3_cache
+
+        deepfold3 build-of3-cache \
+            --cache-file /data/pdb_training_set/dataset_caches/validation_cache_with_templates.json \
+            --output /data/pdb_training_set/df3_cache_val
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+    from deepfold3.data.prepare.of3_pdb_cache import build_of3_pdb_cache
+
+    meta = build_of3_pdb_cache(Path(cache_file), Path(output), keep_templates=not no_templates)
+    click.echo(
+        f"Wrote {output}: {meta['n_structures']} structures, {meta['n_chains']} chains, "
+        f"{meta['n_interfaces']} interfaces, {meta['n_templates']} template hits, "
+        f"{meta['n_clusters']} clusters"
+    )
+
+
 # Allow running as module
 if __name__ == "__main__":
     prepare()

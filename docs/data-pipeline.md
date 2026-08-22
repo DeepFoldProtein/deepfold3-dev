@@ -654,7 +654,26 @@ N = number of tokens, M = MAX_ATOMS_PER_TOKEN (24), S = number of MSA sequences.
 | `template_backbone_frame`   | `[T, N, 3, 3]` | float32 | Template backbone frames (Gram-Schmidt from N/CA/C)                                                                                                                                                                                   |
 | `template_backbone_mask`    | `[T, N]`       | bool    | Valid backbone frame mask                                                                                                                                                                                                             |
 | `mask_fixed`                | `[N]`          | float32 | _(optional)_ Token-level fixed mask: 1.0=experimental, 0.0=model-generated (e.g. PATCHR ATLAS). Scales `exp_resolved` loss target.                                                                                                    |
-| `mask_region`               | `[N]`          | int16   | _(optional)_ Region label (0=unset, 1+=app-defined, e.g. CDR-H1/H2/H3). Drives per-token `region_loss_weights` in diffusion MSE.                                                                                                      |
+
+### MSA rows: train small, serve the whole pool
+
+`ModelConfig.msa_crop_size` is the number of MSA rows the Evoformer consumes **per recycle**, drawn
+fresh from the pool (capped at `const.MAX_MSA_ROWS` = 16384) on every recycle with the query row
+always kept (`model.py:339-352`).
+
+Training sets it **deliberately low** — `configs/initial.yaml` uses 1024 — for throughput, and pairs
+it with AF3 §2.3's random-`k` mask (`k ~ Uniform[1, crop]`, rows `k..crop-1` zeroed) so the model
+learns to accept an *arbitrary* number of rows. Serving is therefore meant to use the full pool.
+
+`deepfold3 inference` / `inference-batch` accordingly **default `msa_crop_size` to the pool cap**,
+not to the checkpoint's trained value, and print the substitution. `--msa-crop-size N` overrides it
+— pass the training value to reproduce an old run, or a smaller one to bound memory on long targets.
+`bench/scripts/run_sweep.py` and `slurm_sweep.py` expose the same flag and pass it through.
+
+> Before this default existed, a checkpoint trained at 1024 was also *served* at 1024, so bench
+> numbers were produced with 1/16 of the MSA the model could have used.
+
+| `mask_region`               | `[N]`          | int16   | _(optional)_ Region label (0=unset, 1+=app-defined, e.g. CDR-H1/H2/H3). Selects residues for `atomize_source="region"`. No longer feeds any loss — the `region_loss_weights` path was removed (it was unreachable: disk token masks are disabled).                                                                                                      |
 
 ### Reference Atom Augmentation
 
@@ -724,6 +743,29 @@ class TrainingDataset(torch.utils.data.Dataset):
   (`structure_path`, `unpaired_msa_path`, `paired_msa_path`, `mask_path`,
   `template_path`)
 - Runs the full pipeline: tokenize -> crop -> featurize (with random rotation)
+
+### `OF3Dataset` / `OF3PdbDataset` (OpenFold 3 sources)
+
+Two datasets read OpenFold 3 preprocessed trees directly instead of going through
+`deepfold3 prepare`. Both share the structure converter
+(`data/prepare/openfold3.py:convert_of3_atom_array`) and end in the same
+tokenize -> crop -> featurize pipeline.
+
+| | `format: of3` (`OF3Dataset`) | `format: of3pdb` (`OF3PdbDataset`) |
+| --- | --- | --- |
+| Layout | `{data_dir}/{id}/{structure,alignment,template}.npz` | OF3 `pdb_training_set` root |
+| Metadata | none (ids only) | mmap'd columnar cache (`data/prepare/of3_pdb_cache.py`) |
+| Sampling | uniform / per-record | AF3 §2.5.1 chain+interface clusters, vectorised on the cache |
+| MSA | one `alignment.npz` per record | `alignment_arrays/{alignment_representative_id}.npz`, `aln_order` merge + UniProt species pairing |
+| Templates | `template.npz` `idx_map` + local mmCIF mirror | `template_structure_arrays` (SEQRES-indexed, no mirror) |
+| Ordering | attach MSA, then crop | crop, then load MSA/templates for surviving chains |
+
+The structure converter reads three OF3 annotations that decide correctness:
+`is_atomized` (authoritative for `is_standard` — modified residues such as SEP are
+tokenized per atom, not folded onto their standard parent), `coord` NaNs on
+unresolved atoms (rewritten to `0` + `is_present=False`), and `chain_id`, which is
+OF3's integer-valued chain **key** rather than a chain letter (`label_asym_id`
+supplies the letter). See `docs/training.md` § _Importing from OpenFold 3_.
 
 ## Batch Collation (`data/module/collate.py`)
 

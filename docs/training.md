@@ -123,6 +123,58 @@ not majority, is required**. The K samples live under `pred["chain_perm_gate_pos
 / tm_true / atom-symmetry consumers still see only `mini_rollout_samples` of them via
 `pred["mini_rollout_pos"]`.
 
+### Masked (partial) diffusion & conditioning dropout
+
+Three **off-by-default** knobs on the diffusion training step. At their defaults none of them draws
+from the RNG, so enabling the code cannot perturb an existing run's random stream
+(`tests/test_diffusion_masking.py`).
+
+| knob | default | on | source |
+|---|---|---|---|
+| `model.diffusion.diffusion_mask_prob` | `0.0` | fraction of diffusion samples that keep part of the GT clean | written from scratch — **OF3 has none** |
+| `model.diffusion.use_conditioning_prob` | `1.0` | probability of *keeping* the trunk conditioning | OF3 `use_conditioning_prob`, YAMLs use `0.8` |
+| `model.confidence.use_pair_emb_prob` | `1.0` | probability of *keeping* the trunk pair emb in the confidence head | OF3 `use_confidence_emb_prob`, YAMLs use `0.8` |
+
+**Masked / partial diffusion (motif scaffolding).** With probability `diffusion_mask_prob` a
+diffusion sample keeps a subset of the (augmented) ground truth **clean** and noises only the rest,
+so the model learns to place the noised part relative to a given anchor.
+`diffusion_mask_mode="chain"` keeps a random non-empty *proper* subset of chains (always ≥1 clean
+and ≥1 noised; falls back to `"span"` on a single-chain crop); `"span"` keeps one contiguous token
+run. The clean fraction is uniform in `[diffusion_mask_min_frac, diffusion_mask_max_frac]`. The mask
+is built in `forward_training` **after** the chain permutation, so "clean chain A" names the copy
+the GT was actually permuted to, and applied in `_sample_training_impl` **after** the per-sample
+random augmentation, so the anchor shares its sample's frame.
+
+Motivation (`export/pose-decomposition/`): the inter-chain pose is committed by the *first* denoise
+call and resampling does not escape it, and uniform noising cannot break that — any σ low enough to
+preserve good local structure also preserves the wrong pose, while any σ high enough to erase the
+pose erases everything and re-commits identically. Selective noising is the only way to erase a pose
+while keeping a structure.
+
+Two limitations to know before turning it on:
+
+- **Representation is RePaint-style replacement at the single global σ.** The EDM input scaling
+  `c_in = 1/√(σ²+σ_d²)` is global, so at σ ≫ σ_data the anchor arrives numerically ~300× smaller
+  than the noised cloud. The principled fix is a per-token σ, which needs the noise embedding and
+  the `c_in`/`c_skip`/`c_out` broadcasts to go per-token. (OF3 cannot do it either — its `t` is
+  `[B, S]`.)
+- **The loss is not masked to the noised region.** At high σ `c_skip → 0`, so reproducing the clean
+  region is a real reconstruction task rather than a free copy, and leaving the loss alone keeps
+  this option from touching the loss code at all.
+
+**Conditioning dropout** mirrors OF3 exactly, including a wrinkle worth not "fixing" by accident:
+`single`/`pair` are zeroed only on the way into `DiffusionConditioningBlock.compute_static`, while
+`target_feat`, `rel_feat` and the Fourier noise embedding survive **and the un-zeroed trunk single
+still reaches the atom encoder** (OF3 `diffusion_module.py:198-204`, AF3 Algorithm 20). It is
+therefore a *partial* drop, not an unconditional pass. One draw per forward, shared by all diffusion
+samples. Zeroing an input still reaches every parameter, so DDP `static_graph=True` is unaffected.
+OF3 ships no inference-time guidance that consumes this; training with it is what would make
+classifier-free guidance possible later.
+
+For the confidence head only the **pair** repr is dropped — single, `target_feat` and the predicted
+positions are untouched — and the distogram head reads the un-zeroed `embeddings["pair"]`
+separately, so the distogram loss is never affected (matching OF3's ordering).
+
 ### Loss Components
 
 | Loss            | Weight                             | Description                                                                                                                                                                    |
@@ -507,13 +559,57 @@ deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training \
 deepfold3 msa-batch --data-dir /data/training --db-dir /data/mmseqs_dbs/ --gpu
 ```
 
-The converter handles mol-type mapping (OF3 uses `PROTEIN=0, RNA=1, DNA=2, LIGAND=3` while DeepFold3 uses `PROTEIN=0, DNA=1, RNA=2, NONPOLYMER=3`), bond remapping, and entity/chain grouping.
+The converter (`data/prepare/openfold3.py:convert_of3_atom_array`) handles mol-type mapping (OF3 uses `PROTEIN=0, RNA=1, DNA=2, LIGAND=3` while DeepFold3 uses `PROTEIN=0, DNA=1, RNA=2, NONPOLYMER=3`), bond remapping, and entity/chain grouping. Three details of the OF3 atom array decide whether the result is correct:
+
+- **`is_atomized` is authoritative for `is_standard`.** OF3 stores its own tokenization decision per atom — True for ligands *and* for modified / non-standard polymer residues. Re-deriving it from the residue name instead maps modified residues onto their standard parent (`get_res_type("SEP") → SER`), which emits one SER token over SEP's atom set and then slots those atoms against SER's reference atoms. Verified on the upstream smoke set: token counts come out at OF3's documented values (7fb8 → 53, 7ohe → 24, 7vus → 87).
+- **Unresolved atoms carry `NaN` coordinates.** OF3 materialises every polymer residue's full reference atom set whether or not it was observed. DeepFold3's convention is coordinates `0` + `is_present=False`, so the NaNs are zeroed at conversion — a NaN reaching the cropper poisons every distance it takes part in and surfaces only as a NaN loss with no offending atom named.
+- **`chain_id` is OF3's chain *key*, a string of an integer (`"1"`, `"3"`) — not a chain letter.** It is the join key into the dataset cache's per-structure `chains` dict; `label_asym_id` carries the letter and becomes DeepFold3's `chain_name`. `convert_of3_atom_array` returns the keys in `asym_id` order as its third element.
 
 Supported OF3 directory layouts:
 
 - Nested: `{pdb_id}/{pdb_id}.npz`
 - RODA monomer: `{id}/structure.npz`
 - Flat: `{pdb_id}.npz`
+
+### Training on OpenFold 3's `pdb_training_set` in place (`format: of3pdb`)
+
+`import-of3` bulk-converts structures; `format: of3pdb` instead reads an `aws s3 sync s3://openfold3-data/pdb_training_set/` mirror **as-is** and is the AF3 weighted-PDB training set. Nothing is re-preprocessed — structures, MSAs and templates are read from the upstream tree at `__getitem__` time and fed through DeepFold3's own tokenize → crop → featurize pipeline.
+
+The one offline step is the **dataset cache**. Upstream ships it as a ~1.7 GB JSON and reads it either whole (tens of GB resident) or through an LMDB store; neither is acceptable per DDP rank × dataloader worker, and LMDB is not a dependency we want in the data path. `deepfold3 build-of3-cache` streams that JSON once (`data/prepare/of3_pdb_cache.py`, bounded memory — the reader is verified byte-exact against `json.load`) into a directory of plain `.npy` **columns** that `OF3PdbCache` opens with `mmap_mode="r"`: startup is a handful of `open()` calls, resident cost is only the pages touched, and forked workers share them through the page cache. ~50 MB of columns for the full set; the validation cache converts in 0.1 s.
+
+```bash
+deepfold3 build-of3-cache \
+    --cache-file /data/pdb_training_set/dataset_caches/training_cache_with_templates.json \
+    --output     /data/pdb_training_set/df3_cache
+```
+
+```yaml
+datasets:
+  - name: of3_pdb
+    data_dir: /data/pdb_training_set          # the set's ROOT
+    of3_cache_dir: /data/pdb_training_set/df3_cache   # default: {data_dir}/df3_cache
+    weight: 1.0
+    strategy: weighted
+    format: of3pdb
+    cutoff_date: "2021-09-30"
+```
+
+What the dataset reads, and from where:
+
+| Artefact | Path under `data_dir` | Notes |
+| --- | --- | --- |
+| Structure | `preprocessed_pdb_data/standard/structure_files/{id}/{id}.npz` | biotite `AtomArray`, converted per sample |
+| MSA | `alignment_arrays/{alignment_representative_id}.npz` | one block per search database; the representative is a *sequence-identical* chain, often in another entry |
+| Template hits | `templates/train_template_cache/{rep}.npz` | falls back to `val_template_cache` when the training one is absent |
+| Template geometry | `templates/template_structure_arrays/{pdb}/{pdb}_{chain}.npz` | see below |
+
+Points that differ from `format: df3`:
+
+- **Sampling is AF3 §2.5.1 computed on the cache's columns** (`of3_anchor_weights`), not on `Record` objects: the sampler draws a structure by the cluster marginal and the dataset draws that structure's chain / interface crop anchor at load time — the same two-stage decomposition `data/sample/weighted.py` applies, and a unit test asserts the two agree anchor for anchor. `N_clust` is recounted over the structures that survive `cutoff_date` rather than read from upstream's frozen `cluster_size`. The per-item distribution reaches `MultiDatasetSampler` through its `weights` key.
+- **Templates need no mmCIF mirror and no realignment.** OF3 renders each template chain over its full SEQRES with `res_id` as the SEQRES index, so a hit's `idx_map` (1-based query position, template `res_id`) addresses it directly. `mmcif_dir` is not consulted and `template_struct_space` does not apply. Frame verified by re-deriving hit identity: 99.3% on a close homolog (`5enn_A` ← `3ls8_A`), and 0.45 pooled over remote validation hits versus 0.07–0.11 for every off-by-one alternative.
+- **MSA blocks each repeat the query as row 0**, so they cannot simply be stacked; `build_chain_msa` concatenates in OF3's `aln_order`, deduplicates, and keeps the query exactly once. `uniprot_hits` is held out for **species pairing** (`pair_uniprot_msas`, AF2-Multimer style: rank *r* of species *s* pairs across chains, species seen by one chain only are dropped, rows covering more chains sort first). Chains sharing a representative decode the file once, and the UniProt block is skipped entirely when the crop has fewer than two distinct representatives (that alone took a monomer sample from 454 ms to 278 ms). **DNA chains have no `alignment_representative_id` at all** — OF3 searches proteins and RNA only — so, as in the df3 path, any polymer chain without an alignment falls back to a single-sequence MSA read off its own tokens; without it the featurizer would leave the whole chain at `MSA_GAP` and the model would never see its query sequence.
+- **Crop-then-load ordering** as in `TrainingDataset`: tokenization never reads MSA content, so alignments and templates are only read for the chains that survive the crop.
+- **Date filtering is fail-closed on both ends.** `cutoff_date` drops structures with no release date in either direction, and the template cap is `min(max_template_date, query_release − template_cutoff_days)` — when neither can be established, every template is dropped rather than used unfiltered.
 
 The featurizer produces these training-specific features:
 

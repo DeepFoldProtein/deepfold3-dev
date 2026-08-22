@@ -24,6 +24,11 @@ class MultiDatasetSampler(Sampler[int]):
       - ``dataset_len``: number of items in the dataset
       - ``weight``: relative sampling probability for this dataset
       - ``strategy``: ``"weighted"`` (cluster-balanced) or ``"uniform"``
+      - ``weights`` (optional): a precomputed per-item draw distribution, used
+        verbatim instead of running :func:`compute_cluster_weights` over
+        ``records``. ``format: of3pdb`` supplies this — its AF3 §2.5.1 weights
+        come vectorised off a columnar cache, and it never materialises the
+        ``Record`` objects ``compute_cluster_weights`` would need.
 
     Args:
         dataset_configs: List of dicts, each with keys:
@@ -82,7 +87,10 @@ class MultiDatasetSampler(Sampler[int]):
         # Pre-build per-dataset sampling weights
         self._weighted_weights: list[np.ndarray | None] = []
         for cfg in dataset_configs:
-            if cfg["strategy"] == "weighted":
+            precomputed = cfg.get("weights")
+            if precomputed is not None:
+                self._weighted_weights.append(np.asarray(precomputed, dtype=np.float64))
+            elif cfg["strategy"] == "weighted":
                 self._weighted_weights.append(compute_cluster_weights(cfg["records"], **weighted_kwargs))
             else:
                 self._weighted_weights.append(None)

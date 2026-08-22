@@ -42,6 +42,7 @@ deepfold3 msa       --sequence MKTII --output msa_out/ --link-templates --pdb-mm
 deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensors
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --pdb-mmcif-dir /data/pdb/mmcif/
+deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --msa-crop-size 4096
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 export    --checkpoint runs/exp1/checkpoint_final.pt --output weights.safetensors --snapshot average
 deepfold3 plot      --input out_confidences.json --output confidences.png
@@ -65,6 +66,7 @@ deepfold3 import-msa --data-dir /data/training --msa-dir /data/afdb/a3ms --worke
 deepfold3 import-paired-msa --data-dir /data/training --paired-dir /data/msa/paired --workers 32
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training
 deepfold3 import-of3 --of3-dir /data/of3/structures --output /data/training --cache /data/of3/dataset_cache.json
+deepfold3 build-of3-cache --cache-file /data/pdb_training_set/dataset_caches/training_cache_with_templates.json --output /data/pdb_training_set/df3_cache
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8
 deepfold3 prepare-templates --data-dir /data/training --m8-dir /data/msa/pdb/merged/m8 --max-templates 4 --workers 16
 deepfold3 build-pdb-cache --data-dir /data/training --mmcif-dir /data/pdb/divided --output /data/pdb/cache --workers 64
@@ -86,6 +88,15 @@ deepfold3 train     --data-dir /data/training --output runs/exp1 --override alph
 deepfold3 train     --data-dir /data/training --output runs/exp1 --wandb deepfold3
 deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.25:uniform:true
 deepfold3 train     --data-dir /data/pdb --output runs/exp1 --dataset afdb:/data/afdb:0.5:uniform:true --dataset pdb2:/data/pdb2:1.0:weighted
+# OpenFold 3 `pdb_training_set` as the weighted PDB set (`format: of3pdb`) — configured
+# via a `datasets:` entry, not a flag; see configs/initial.yaml and docs/training.md.
+# Complex language model (separate model — see docs/complex-lm.md)
+deepfold3 plm-prepare structure --data-dir /data/distillation/afdb_nvda --output /data/plm/store/afdb --source afdb --workers 64
+deepfold3 plm-prepare pairs     --fasta /data/plm/raw/STRING_seqs.fasta --pairs /data/plm/raw/trainset.STRING.txt --output /data/plm/store/string --source string
+deepfold3 plm-prepare cluster   --store /data/plm/store/pdb --store /data/plm/store/afdb --work-dir /data/plm/clust
+deepfold3 plm-prepare stats     --store /data/plm/store/pdb
+deepfold3 plm-train --config configs/plm-base.yaml --output runs/plm-r1
+torchrun --nproc_per_node=8 -m deepfold3.scripts.plm_train --config configs/plm-base.yaml --output runs/plm-r1
 # Multi-GPU training via torchrun
 torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training --output runs/exp1
 # Pre-warm the persistent Triton autotune cache (run once per GPU model on a single rank
@@ -104,6 +115,7 @@ When modifying source code, update the corresponding developer documentation in 
 - **Architecture changes** (new modules, changed forward pass, new heads) → update `docs/architecture.md`
 - **Data pipeline changes** (new features, changed shapes, new parsing formats) → update `docs/data-pipeline.md`
 - **New patterns or conventions** (testing, code style, extension points) → update `docs/contributing.md`
+- **Complex-LM changes** (architecture, store format, masking, sampling) → update `docs/complex-lm.md`, and record measurements in `export/complex-lm/README.md`
 - **Feature table** in `docs/data-pipeline.md` must stay in sync with `data/feature/featurizer.py` output
 
 Keep the docs concise — update existing sections rather than appending.
@@ -173,8 +185,22 @@ src/deepfold3/
 │   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
 │   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   ├── prepare/          # structure.py (mmCIF→NPZ + AF3-aligned metadata extract), filters.py, manifest.py (atomic save), clustering.py, template_search.py, materialize.py (parallel A3M→NPZ runner), entries_idx.py (wwPDB TSV parser)
-│   └── module/           # dataset.py (TrainingDataset, InferenceInput), collate.py (batch)
+│   ├── prepare/          # structure.py (mmCIF→NPZ + AF3-aligned metadata extract), filters.py, manifest.py (atomic save), clustering.py, template_search.py, materialize.py (parallel A3M→NPZ runner), entries_idx.py (wwPDB TSV parser), openfold3.py (OF3 AtomArray NPZ → Structure), of3_pdb_cache.py (OF3 dataset-cache JSON → mmap'd columnar cache; no LMDB)
+│   └── module/           # dataset.py (TrainingDataset, InferenceInput), of3_dataset.py (format: of3), of3_pdb_dataset.py (format: of3pdb — OF3 pdb_training_set in place), collate.py (batch)
+├── complexlm/       # Complex language model (MLM over multi-chain complexes)
+│   ├── config.py         # ComplexLMConfig (layer_pattern = the architecture ablation), Data/Train/Source/Masking
+│   ├── vocab.py          # ESM2-compatible alphabet
+│   ├── store.py          # ComplexStore / ComplexStoreWriter (mmap'd flat-npy complex store)
+│   ├── prepare.py        # structures + paired FASTA -> store; Cβ 8 Å interface flags
+│   ├── cluster.py        # mmseqs linclust over all stores + source-overlap report
+│   ├── sampler.py        # hierarchical p(D) -> p(T|D) -> cluster -> member
+│   ├── crop.py           # interface-biased crop, entity-consistent windows
+│   ├── masking.py        # uniform / interface-biased / homomer-paired MLM
+│   ├── batch.py          # PackedBatch (one token axis, chain_cu + complex_cu)
+│   ├── dataset.py        # packing stream, evaluation plan
+│   ├── model.py          # ComplexLM (chain-RoPE / complex-NoPE varlen attention)
+│   ├── diagnostics.py    # partner utilisation, permutation sensitivity, attention sink
+│   └── trainer.py        # DDP MLM training loop
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
 ├── io/              # Output serialization
@@ -195,8 +221,10 @@ src/deepfold3/
 │   ├── inspect_example.py # `deepfold3 inspect-example`
 │   ├── msa_batch.py      # `deepfold3 msa-batch`
 │   ├── msa_search.py     # `deepfold3 msa`
+│   ├── plm_prepare.py    # `deepfold3 plm-prepare {structure,pairs,cluster,stats}`
+│   ├── plm_train.py      # `deepfold3 plm-train`
 │   ├── plot_confidences.py # `deepfold3 plot`
-│   ├── prepare.py        # `deepfold3 prepare`, `apply-clusters`, `cluster`, `fetch-ccd`, `build-ccd-cache`, `export-complexes`, `import-msa`, `import-paired-msa`, `import-of3`, `enrich-manifest`, `drop-obsolete`
+│   ├── prepare.py        # `deepfold3 prepare`, `apply-clusters`, `cluster`, `fetch-ccd`, `build-ccd-cache`, `export-complexes`, `import-msa`, `import-paired-msa`, `import-of3`, `build-of3-cache`, `enrich-manifest`, `drop-obsolete`
 │   ├── prepare_templates.py # `deepfold3 prepare-templates`
 │   ├── refilter.py       # `deepfold3 refilter`
 │   ├── scan_mmcif.py     # `deepfold3 scan-mmcif` (parallel mmCIF metadata cache)
@@ -267,7 +295,7 @@ Per-token mask channels stored in `data_dir/masks/{pdb_id}.npz`, loaded automati
 | Channel    | Dtype         | Effect                                                                                                                         |
 | ---------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `"fixed"`  | float32 `[N]` | 1.0 = experimental, 0.0 = model-generated. Scales `exp_resolved` loss target (soft CE). For PATCHR ATLAS distillation.         |
-| `"region"` | int16 `[N]`   | Region label (0=unset, 1+=CDR-H1/H2/H3 etc.). Applies per-token weight via `region_loss_weights` config to diffusion MSE loss. |
+| `"region"` | int16 `[N]`   | Region label (0=unset, 1+=CDR-H1/H2/H3 etc.). Consumed by `atomize_source="region"` only — it drives **no** loss weighting (the `region_loss_weights` path was removed as unreachable). |
 
 Generate PATCHR ATLAS masks from inpainting metadata JSON:
 
@@ -355,7 +383,7 @@ Training-time template support uses pre-computed per-chain m8 files (MMseqs2 hit
 4. **Template augmentation**: each sample randomly uses `k = min(Uniform[0, n_avail], max_templates)` of the available hits, so **`k = 0` is drawn with probability `1/(n_avail+1)`** — template-free inference is in-distribution, not a train/serve mismatch. Per-chain dropout additionally drops chain alignments from multimer templates (50% per chain, always keeping ≥1), so a query chain may be templated or bare.
 5. **Template pair mask is intra-chain only** (`34326d5`): the template pair features are masked by `pb_mask[i] × pb_mask[j] × multichain_mask`, so only the block-diagonal (same-`asym_id`) signal reaches the trunk. Template features are extracted **per chain, each in its own coordinate frame**, so their cross-chain pseudo-beta distances and backbone-frame orientations are not real interface geometry — feeding them unmasked injects noise. Verified: with the mask the template output is invariant to a rigid translation of one chain; without it the output shifts by 2.9. **Consequence: a multimer template index is consumed as a bundle of per-chain templates** — the chain pairing that produced it does not change what the model sees.
 6. **Date cutoff filtering**: `dataset.py:_effective_template_cutoff` computes `min(max_template_date, record.released - cutoff_days)` per record and is applied on **both** the monomer and multimer load paths (`ba646ba` re-enabled multimer templates behind this runtime cutoff after they were found leaking ~50% future hits). **Fail-closed**: when no cutoff can be established — the query has no release date and no `default_template_cutoff_date` is configured — templates are dropped rather than used unfiltered. AF3 §2.4: template release ≥ 60 days before example release; distillation max 2018-04-30.
-7. **Template index frame**: hit files store template positions either in SEQRES space or in **structure space** (0-based resolved-residue). The two differ by the template's unresolved N-terminal count, which varies per template, so reading one as the other misaligns every hit and raises nothing — templates just become noise. `prepare-templates` therefore **stamps `"index_space"` into each hit**, and the loader uses that; the per-dataset `template_struct_space` flag is only a fallback for index files written before the field existed, and taking it logs a one-shot warning per dataset. Verify a new source by re-deriving each hit's sequence identity and comparing it to the identity the search recorded: under the correct frame the medians agree to ~1 pt. Frames in use — df3 sets (`patchr`, `afdb_nvda`, `teddymer`) are **structure**-space; of3 sets (`long_monomers`, `short_monomers`) carry `template.npz` `idx_map` in 1-based **SEQRES** and `OF3Dataset` handles them, ignoring `template_struct_space`. `monomer_template_struct_space` is the deprecated spelling of the flag.
+7. **Template index frame**: hit files store template positions either in SEQRES space or in **structure space** (0-based resolved-residue). The two differ by the template's unresolved N-terminal count, which varies per template, so reading one as the other misaligns every hit and raises nothing — templates just become noise. `prepare-templates` therefore **stamps `"index_space"` into each hit**, and the loader uses that; the per-dataset `template_struct_space` flag is only a fallback for index files written before the field existed, and taking it logs a one-shot warning per dataset. Verify a new source by re-deriving each hit's sequence identity and comparing it to the identity the search recorded: under the correct frame the medians agree to ~1 pt. Frames in use — df3 sets (`patchr`, `afdb_nvda`, `teddymer`) are **structure**-space; of3 sets (`long_monomers`, `short_monomers`) carry `template.npz` `idx_map` in 1-based **SEQRES** and `OF3Dataset` handles them, ignoring `template_struct_space`. `format: of3pdb` needs no frame flag at all: OF3's `template_structure_arrays` render each template chain over its full SEQRES with `res_id` **as** the SEQRES index, so a hit's `idx_map` (1-based query, template `res_id`) addresses it directly with no mmCIF mirror and no realignment (verified: 99.3% identity on a close homolog, 0.45 pooled on remote validation hits vs 0.07–0.11 for every off-by-one reading). `monomer_template_struct_space` is the deprecated spelling of the flag.
 8. **Per-chain cache (`PdbChainCache`)**: training extracts each template chain's query-independent intermediate (`seqres`, `struct_seq`, residue→atom `lookup`) at most once via a two-tier cache — per-worker memory LRU + hierarchical sharded disk (`{cache}/{shard}/{pdb}/{chain}.npz` + `_done` sentinel) — instead of re-parsing the full template mmCIF with gemmi per hit (the dominant, query-size-independent dataloader-stall cost). Pre-build with `deepfold3 build-pdb-cache --output /data/pdb/cache`; enable at train time via `training.pdb_chain_cache_dir`. `mmcif_dir` is the cold-parse fallback for chains absent from the cache.
 
 **Crop-then-load ordering** (`dataset.py:_load_sample`): tokenization reads only the structure (MSA content is never needed to build `msa_col_idx`), so MSA files and templates are loaded **after** cropping, restricted to the chains that survive the crop. A 228-chain assembly cropped to `max_tokens` loads MSA/templates for the few surviving chains, not all 228 — turning O(all chains) I/O into O(cropped chains). `data/crop/cropper.py:compute_chain_msa_cols` derives the per-chain MSA columns to load from the cropped `msa_col_idx`. Tier-4 diagnostics: per-`__getitem__` phase timing (`slow_sample_log_threshold_s`) + per-step `data_wait_s` (dataloader-wait) logged by the trainer / WandB.

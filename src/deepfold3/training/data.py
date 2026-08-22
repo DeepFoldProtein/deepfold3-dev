@@ -250,6 +250,17 @@ def build_dataloaders(
     }
     of3_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3_kwarg_names}
 
+    # Keys accepted by OF3PdbDataset (``format: of3pdb``). A superset of the
+    # of3 monomer set: this path carries real chain/interface metadata, so the
+    # large-assembly chain pre-crop and the per-query template date tightening
+    # both apply. ``mmcif_dir`` is deliberately absent — OF3 ships the template
+    # geometry as SEQRES-indexed arrays, so no local PDB mirror is consulted.
+    of3pdb_kwarg_names = (of3_kwarg_names - {"mmcif_dir"}) | {
+        "max_chains",
+        "template_cutoff_days",
+    }
+    of3pdb_kwargs = {k: v for k, v in ds_kwargs.items() if k in of3pdb_kwarg_names}
+
     # By default eval mirrors deployment, so the stochastic-atomization
     # regularizer is off there — inference never atomizes standard residues, and
     # a per-sample random expansion would add noise to the eval metric on top of
@@ -258,10 +269,11 @@ def build_dataloaders(
     # Everything else (crop, random rotation, training-time features) stays on
     # either way: eval scores training losses.
     if model_cfg.data.atomize_eval:
-        eval_ds_kwargs, eval_of3_kwargs = ds_kwargs, of3_kwargs
+        eval_ds_kwargs, eval_of3_kwargs, eval_of3pdb_kwargs = ds_kwargs, of3_kwargs, of3pdb_kwargs
     else:
         eval_ds_kwargs = {**ds_kwargs, "atomize_prob": 0.0}
         eval_of3_kwargs = {**of3_kwargs, "atomize_prob": 0.0}
+        eval_of3pdb_kwargs = {**of3pdb_kwargs, "atomize_prob": 0.0}
 
     # Cache discovered records by (data_dir, format) to avoid re-scanning.
     record_cache: dict[tuple[str, str], list] = {}
@@ -316,7 +328,46 @@ def build_dataloaders(
             out = {**out, "max_template_date": spec.max_template_date}
         return out
 
+    def load_of3pdb(spec, *, keep_after: bool, for_eval: bool):
+        """``format: of3pdb`` — OpenFold 3's ``pdb_training_set``, read in place.
+
+        Metadata comes from the memory-mapped columnar cache, so there are no
+        ``Record`` objects: the release-date cutoff is a mask over the cache's
+        ``struct_release`` column and the sampler gets the dataset's own
+        ``sampling_weights`` instead of ``compute_cluster_weights``.
+        """
+        from deepfold3.data.module.of3_pdb_dataset import OF3PdbDataset
+        from deepfold3.data.prepare.of3_pdb_cache import OF3PdbCache
+
+        root = Path(spec.data_dir)
+        cache = OF3PdbCache(Path(spec.of3_cache_dir) if spec.of3_cache_dir else root / "df3_cache")
+
+        indices = None
+        if spec.cutoff_date:
+            released = cache.release_dates()
+            cutoff = spec.cutoff_date.encode("ascii")
+            # Fail-closed on both sides, as ``_apply_cutoff`` does: a structure
+            # with no release date can never be proven pre-cutoff.
+            dated = released != b""
+            indices = np.flatnonzero(dated & ((released > cutoff) if keep_after else (released <= cutoff)))
+            if indices.size == 0:
+                return None, []
+
+        ds = OF3PdbDataset(
+            cache=cache,
+            root=root,
+            indices=indices,
+            is_distillation=spec.is_distillation,
+            name=spec.name,
+            exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
+            anchor_sampling=(spec.strategy == "weighted"),
+            **_spec_kwargs(eval_of3pdb_kwargs if for_eval else of3pdb_kwargs, spec),
+        )
+        return ds, []
+
     def load_from_spec(spec, *, keep_after: bool, preloaded_records=None, for_eval: bool = False):
+        if spec.format == "of3pdb":
+            return load_of3pdb(spec, keep_after=keep_after, for_eval=for_eval)
         recs = preloaded_records if preloaded_records is not None else discover(spec.data_dir, spec.format)
         if spec.cutoff_date:
             recs = _apply_cutoff(recs, spec.cutoff_date, keep_after=keep_after)
@@ -409,14 +460,18 @@ def build_dataloaders(
                     "dataset_len": len(ds),
                     "weight": spec.weight,
                     "strategy": spec.strategy,
+                    # ``format: of3pdb`` computes its own AF3 §2.5.1 marginal off
+                    # the columnar cache; None everywhere else.
+                    "weights": getattr(ds, "sampling_weights", None) if spec.strategy == "weighted" else None,
                 }
             )
             logger.info(
-                "Extra dataset %r: %d records, weight=%.2f, strategy=%s, distillation=%s",
+                "Extra dataset %r: %d items, weight=%.2f, strategy=%s, format=%s, distillation=%s",
                 spec.name,
-                len(recs),
+                len(ds),
                 spec.weight,
                 spec.strategy,
+                spec.format,
                 spec.is_distillation,
             )
 

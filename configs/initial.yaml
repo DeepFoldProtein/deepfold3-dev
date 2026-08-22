@@ -56,10 +56,10 @@ training:
   diffusion_chunk_size: 8
   mini_rollout_steps: 20
   mini_rollout_samples: 1
-  permute_gt_before_noise: true # Permute-then-noise ordering fix
+  permute_gt_before_noise: true # Permute-then-noise
   diffusion_mse_per_sample_symmetry: false
-  chain_perm_stability_gate: true
-  chain_perm_gate_k: 3
+  chain_perm_stability_gate: false
+  chain_perm_gate_k: 1 # 3
 
   alpha_diffusion: 4.0
   alpha_smooth_lddt: 1.0
@@ -75,7 +75,6 @@ training:
   alpha_masked_msa: 0.0
   nucleotide_loss_weight: 5.0
   ligand_loss_weight: 10.0
-  region_loss_weights: {}
 
   # Magnitude regularizers on trunk outputs (mean per-token Σ_c |x|^p / C).
   # Pair reg bounds DistogramHead logit magnitude; alpha=0 = observation-only.
@@ -182,20 +181,20 @@ training:
   wandb_run_name: null
 
 datasets:
-  - name: patchr
-    data_dir: /data/distillation/patchr_training
-    weight: 0.50
-    strategy: weighted
-    is_distillation: false
-    format: df3
-    cutoff_date: "2021-09-30"
-    exclude_loss_mol_types: []
-    # templates/*.json indices are structure-space (verified: re-deriving each
-    # hit's identity matches the recorded value to 0.5 pt this way, and misses
-    # by 74 pt read as SEQRES).
-    template_struct_space: true
-    # Multi-chain PDB assemblies: keep all three AF3 §2.7 crop strategies.
-    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+  # - name: patchr
+  #   data_dir: /data/distillation/patchr_training
+  #   weight: 0.50
+  #   strategy: weighted
+  #   is_distillation: false
+  #   format: df3
+  #   cutoff_date: "2021-09-30"
+  #   exclude_loss_mol_types: []
+  #   # templates/*.json indices are structure-space (verified: re-deriving each
+  #   # hit's identity matches the recorded value to 0.5 pt this way, and misses
+  #   # by 74 pt read as SEQRES).
+  #   template_struct_space: true
+  #   # Multi-chain PDB assemblies: keep all three AF3 §2.7 crop strategies.
+  #   crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
 
   # of3-format sets below: their template.npz idx_map is 1-based SEQRES, which
   # is what OF3Dataset assumes. `template_struct_space` is a df3-only knob and
@@ -245,6 +244,51 @@ datasets:
     # identity, 16 pt off if read as SEQRES). Was missing -> templates were noise.
     template_struct_space: true
     crop_weights: { contiguous: 0.1, spatial: 0.5, interface: 0.4 }
+
+  # ---------------------------------------------------------------------
+  # OpenFold 3 weighted-PDB set (`format: of3pdb`), read in place from an
+  # `aws s3 sync s3://openfold3-data/pdb_training_set/` mirror. Uncomment to
+  # train on the real PDB alongside (or instead of) the patchr set above.
+  #
+  # One-time setup — convert OF3's ~1.7 GB dataset-cache JSON into the
+  # memory-mapped columnar cache this format reads (no LMDB, no re-preprocessing
+  # of structures/MSAs/templates):
+  #
+  #   deepfold3 build-of3-cache \
+  #     --cache-file /data/pdb_training_set/dataset_caches/training_cache_with_templates.json \
+  #     --output    /data/pdb_training_set/df3_cache
+  #
+  # `data_dir` is the pdb_training_set ROOT; structure_files/, alignment_arrays/
+  # and templates/ are located under it. Templates come from OF3's own SEQRES-
+  # indexed template_structure_arrays, so `mmcif_dir` is NOT consulted and
+  # `template_struct_space` does not apply.
+  #
+  - name: of3_pdb
+    data_dir: /data/pdb_training_set
+    of3_cache_dir: /data/pdb_training_set/df3_cache # default: {data_dir}/df3_cache
+    weight: 0.50
+    strategy: weighted
+    is_distillation: false
+    format: of3pdb
+    cutoff_date: "2021-09-30"
+    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+    # Templates additionally get the per-query `released - 60d` tightening
+    # (data.template_cutoff_days); "" inherits data.max_template_date.
+    # max_template_date: ""
+
+  # Held-out eval on the same tree — everything released AFTER cutoff_date.
+  # Point of3_cache_dir at the validation cache's conversion if you would rather
+  # use OF3's own validation split:
+  #   deepfold3 build-of3-cache \
+  #     --cache-file /data/pdb_training_set/dataset_caches/validation_cache_with_templates.json \
+  #     --output    /data/pdb_training_set/df3_cache_val
+  #
+  # (add under eval_datasets:)
+  # - name: of3_pdb_eval
+  #   data_dir: /data/pdb_training_set
+  #   of3_cache_dir: /data/pdb_training_set/df3_cache
+  #   format: of3pdb
+  #   cutoff_date: "2021-09-30"
 
 eval_datasets:
   - name: patchr_eval

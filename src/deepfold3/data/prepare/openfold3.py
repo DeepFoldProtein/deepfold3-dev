@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -40,264 +40,310 @@ logger = logging.getLogger(__name__)
 # DF3: PROTEIN=0, DNA=1, RNA=2, NONPOLYMER=3
 _OF3_MOL_TO_DF3 = {0: const.MOL_PROTEIN, 1: const.MOL_RNA, 2: const.MOL_DNA, 3: const.MOL_NONPOLYMER}
 
-# Reverse maps for sequence reconstruction (module-level to avoid per-call rebuild)
-_RNA_RES_TO_LETTER: dict[str, str] = (
-    {v: k for k, v in const.RNA_LETTER_TO_RES.items()} if hasattr(const, "RNA_LETTER_TO_RES") else {}
-)
-_DNA_RES_TO_LETTER: dict[str, str] = (
-    {v: k for k, v in const.DNA_LETTER_TO_RES.items()} if hasattr(const, "DNA_LETTER_TO_RES") else {}
-)
+
+# Residue-type index -> 1-letter code, used to rebuild a chain sequence from the
+# already-resolved ``res_type`` rather than from raw residue names. Going through
+# ``res_type`` is what makes modified residues (SEP -> S), unknown protein (UNK ->
+# X) and unknown nucleic (N / DN -> N) come out as single characters; the previous
+# name-keyed maps emitted the raw 2-character "DN" and inflated the sequence.
+_RES_TYPE_TO_LETTER: dict[int, str] = {}
+for _n, _i in const.RES_TYPE_ORDER.items():
+    if _i <= 20:
+        _RES_TYPE_TO_LETTER.setdefault(_i, const.THREE_LETTER_TO_ONE.get(_n, "X"))
+    elif _i == 21:
+        _RES_TYPE_TO_LETTER[_i] = "-"
+    elif _i <= 25:
+        _RES_TYPE_TO_LETTER.setdefault(_i, _n)  # RNA A/G/C/U
+    elif _i <= 29:
+        _RES_TYPE_TO_LETTER.setdefault(_i, _n[1:])  # DNA DA/DG/DC/DT -> A/G/C/T
+    else:
+        _RES_TYPE_TO_LETTER[_i] = "N"  # unknown nucleic
 
 
-def _chain_sequence(res_names: list[str], mol_type: int) -> str:
-    """Reconstruct a 1-letter sequence from a list of 3-letter residue names."""
-    if mol_type == const.MOL_PROTEIN:
-        return "".join(const.THREE_LETTER_TO_ONE.get(n, "X") for n in res_names)
-    elif mol_type == const.MOL_RNA:
-        return "".join(_RNA_RES_TO_LETTER.get(n, n) for n in res_names)
-    elif mol_type == const.MOL_DNA:
-        return "".join(_DNA_RES_TO_LETTER.get(n, n) for n in res_names)
-    return ""
+def _chain_sequence(res_types: np.ndarray, mol_type: int) -> str:
+    """Reconstruct a 1-letter sequence from a chain's ``res_type`` indices."""
+    if mol_type == const.MOL_NONPOLYMER:
+        return ""
+    default = "X" if mol_type == const.MOL_PROTEIN else "N"
+    return "".join(_RES_TYPE_TO_LETTER.get(int(t), default) for t in res_types)
 
 
-def convert_of3_structure(npz_path: Path, pdb_id: str | None = None) -> tuple[Structure, Record]:
+def _decode(arr: np.ndarray) -> np.ndarray:
+    """Decode a biotite annotation array to stripped ``<U`` strings."""
+    return np.char.strip(arr.astype(str))
+
+
+def _segment_starts(*keys: np.ndarray) -> np.ndarray:
+    """Indices where any of ``keys`` changes value (segment boundaries)."""
+    n = len(keys[0])
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    boundary = np.zeros(n, dtype=bool)
+    boundary[0] = True
+    for k in keys:
+        boundary[1:] |= k[1:] != k[:-1]
+    return np.flatnonzero(boundary).astype(np.int64)
+
+
+def convert_of3_atom_array(
+    npz_path: Path,
+    pdb_id: str | None = None,
+) -> tuple[Structure, Record, list[str]]:
     """Convert an OpenFold 3 biotite-NPZ file to DeepFold3 Structure + Record.
 
-    The OpenFold 3 NPZ contains flat per-atom arrays:
-    - coord [N, 3]: atomic coordinates
-    - chain_id [N]: integer chain identifiers
-    - res_id [N]: residue sequence numbers
-    - res_name [N]: 3-letter residue names (Unicode strings)
-    - atom_name [N]: atom names (Unicode strings)
-    - element [N]: element symbols (Unicode strings)
-    - molecule_type_id [N]: 0=protein, 1=RNA, 2=DNA, 3=ligand
-    - occupancy [N]: occupancy (optional)
-    - charge [N]: formal charge (optional)
-    - bonds: BondList array (optional) [B, 3] (atom1, atom2, bond_type)
+    The OpenFold 3 NPZ is a serialised biotite ``AtomArray``: ``coord`` plus one
+    flat per-atom annotation array per category. The ones consumed here:
+
+    - ``coord`` [N, 3] float32 — **NaN on unresolved atoms** (OF3 materialises the
+      full reference atom set of every polymer residue, resolved or not).
+    - ``chain_id`` [N] ``<U`` — OF3's chain key. Note this is a *string of an
+      integer* (``"1"``, ``"3"``), and it is the key the dataset cache indexes
+      chains by — not a chain letter. ``label_asym_id`` carries the letter.
+    - ``res_id`` [N] int — residue sequence number within the chain.
+    - ``res_name`` / ``atom_name`` / ``element`` [N] ``<U``.
+    - ``molecule_type_id`` [N] int — OF3 ``MoleculeType`` (0 protein, 1 RNA,
+      2 DNA, 3 ligand).
+    - ``is_atomized`` [N] bool — OF3's own tokenization decision: True for every
+      atom of a residue that is tokenized **per atom** (ligands *and* modified /
+      non-standard polymer residues). This is the authoritative source for
+      DeepFold3's ``is_standard``; re-deriving it from the residue name maps
+      modified residues onto their standard parent (SEP -> SER) and would emit a
+      single SER token over SEP's atom set, which the featurizer then slots
+      against SER's reference atoms.
+    - ``occupancy`` [N] float, ``charge`` [N] int, ``entity_id`` [N] int,
+      ``label_asym_id`` / ``auth_asym_id`` [N] ``<U``.
+    - ``bonds`` [B, 3] uint32 — biotite ``BondList`` (atom_1, atom_2, bond_type).
 
     Args:
         npz_path: Path to an OpenFold 3 structure NPZ file.
         pdb_id: Override PDB ID (defaults to filename stem).
 
     Returns:
-        (Structure, Record) tuple in DeepFold3 format.
+        ``(Structure, Record, chain_keys)`` where ``chain_keys[asym_id]`` is the
+        OF3 ``chain_id`` string of that chain — the join key into the OF3 dataset
+        cache's per-structure ``chains`` dict.
     """
     if pdb_id is None:
         pdb_id = npz_path.stem.split(".")[0].lower()
 
     data = read_npz(npz_path)
 
-    coord = data["coord"]  # [N, 3]
+    coord = np.asarray(data["coord"], dtype=np.float32)
     n_atoms = coord.shape[0]
 
-    chain_ids = data["chain_id"]
-    res_ids = data["res_id"]
-    res_names = np.array([s.strip() for s in data["res_name"].astype(str)])
-    atom_names = np.array([s.strip() for s in data["atom_name"].astype(str)])
-    elements = np.array([s.strip().upper() for s in data["element"].astype(str)])
+    chain_key = _decode(data["chain_id"])
+    res_ids = np.asarray(data["res_id"]).astype(np.int64)
+    res_names = _decode(data["res_name"])
+    atom_names = _decode(data["atom_name"])
+    elements = np.char.upper(_decode(data["element"]))
+    ins_codes = _decode(data["ins_code"]) if "ins_code" in data else np.zeros(n_atoms, dtype="<U1")
 
-    mol_type_ids = data["molecule_type_id"].astype(int) if "molecule_type_id" in data else np.zeros(n_atoms, dtype=int)
-    occupancy = data["occupancy"].astype(float) if "occupancy" in data else np.ones(n_atoms, dtype=float)
-    charges = data["charge"].astype(float) if "charge" in data else np.zeros(n_atoms, dtype=float)
+    of3_mol = np.asarray(data["molecule_type_id"]).astype(np.int64) if "molecule_type_id" in data else None
+    occupancy = np.asarray(data["occupancy"], dtype=np.float64) if "occupancy" in data else np.ones(n_atoms)
+    charges = np.asarray(data["charge"], dtype=np.float64) if "charge" in data else np.zeros(n_atoms)
+    is_atomized = np.asarray(data["is_atomized"], dtype=bool) if "is_atomized" in data else None
 
     if "entity_id" in data:
-        entity_ids_arr = data["entity_id"].astype(int)
+        entity_ids = np.asarray(data["entity_id"]).astype(np.int64)
     elif "label_entity_id" in data:
-        entity_ids_arr = data["label_entity_id"].astype(int)
+        entity_ids = np.asarray(data["label_entity_id"]).astype(np.int64)
     else:
-        entity_ids_arr = chain_ids.copy()
+        entity_ids = np.zeros(n_atoms, dtype=np.int64)
 
-    # Bond list: OF3 stores BondList as [B, 3] array (atom1, atom2, bond_type)
-    if "bonds" in data:
-        raw_bonds = data["bonds"]
-        if raw_bonds.ndim == 2 and raw_bonds.shape[1] >= 2:
-            bond_count = raw_bonds.shape[0]
-        else:
-            bond_count = 0
-    else:
-        raw_bonds = None
-        bond_count = 0
+    label_ids = _decode(data["label_asym_id"]) if "label_asym_id" in data else None
+    auth_ids = _decode(data["auth_asym_id"]) if "auth_asym_id" in data else None
 
-    # Decode chain name arrays once (outside per-chain loop)
-    label_ids = data["label_asym_id"].astype(str) if "label_asym_id" in data else None
-    auth_ids = data["auth_asym_id"].astype(str) if "auth_asym_id" in data else None
-
-    # Identify unique chains preserving order of first occurrence
-    seen_chains: dict[int, int] = {}
-    chain_order: list[int] = []
-    for cid in chain_ids:
-        cid = int(cid)
-        if cid not in seen_chains:
-            seen_chains[cid] = len(chain_order)
-            chain_order.append(cid)
-
-    # Group atom indices by (chain_id, res_id)
-    chain_to_residue_atoms: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
-    for i in range(n_atoms):
-        chain_to_residue_atoms[int(chain_ids[i])][int(res_ids[i])].append(i)
-
-    atoms_list: list[tuple] = []
-    residues_list: list[tuple] = []
-    chains_list: list[tuple] = []
-    old_to_new = np.empty(n_atoms, dtype=np.int32)
-
-    atom_offset = 0
-    res_offset = 0
-    entity_sym_counter: Counter = Counter()  # entity_id → next sym_id
-
-    for asym_id, cid in enumerate(chain_order):
-        residue_map = chain_to_residue_atoms[cid]
-        sorted_res_ids = sorted(residue_map.keys())
-
-        chain_atom_start = atom_offset
-        chain_res_start = res_offset
-        chain_mol_type = None
-        chain_entity_id = None
-        chain_res_names: list[str] = []
-
-        for rid in sorted_res_ids:
-            atom_indices = residue_map[rid]
-            n_res_atoms = len(atom_indices)
-
-            first = atom_indices[0]
-            rname = str(res_names[first])
-            of3_mol = int(mol_type_ids[first])
-            df3_mol = _OF3_MOL_TO_DF3.get(of3_mol, const.MOL_NONPOLYMER)
-            eid = int(entity_ids_arr[first])
-
-            if chain_mol_type is None:
-                chain_mol_type = df3_mol
-            if chain_entity_id is None:
-                chain_entity_id = eid
-
-            rtype = const.get_res_type(rname, df3_mol)
-            is_standard = rtype != 20 or df3_mol == const.MOL_NONPOLYMER
-            chain_res_names.append(rname)
-
-            any_present = any(occupancy[j] > 0.0 for j in atom_indices)
-
-            for j in atom_indices:
-                elem_int = const.element_name_to_int(str(elements[j]))
-                aname = str(atom_names[j])[:4]
-                atoms_list.append(
-                    (
-                        float(coord[j, 0]),
-                        float(coord[j, 1]),
-                        float(coord[j, 2]),
-                        np.int8(elem_int),
-                        np.float16(charges[j]),
-                        aname.encode("ascii"),
-                        bool(occupancy[j] > 0.0),
-                        np.float32(0.0),
-                    )
-                )
-                old_to_new[j] = atom_offset
-                atom_offset += 1
-
-            residues_list.append(
-                (
-                    rname[:5].encode("ascii"),
-                    np.int16(rtype),
-                    np.int8(df3_mol),
-                    np.int32(rid),
-                    np.int32(chain_atom_start + (atom_offset - chain_atom_start - n_res_atoms)),
-                    np.int16(n_res_atoms),
-                    bool(is_standard),
-                    bool(any_present),
-                )
-            )
-            res_offset += 1
-
-        chain_atom_count = atom_offset - chain_atom_start
-        chain_res_count = res_offset - chain_res_start
-
-        if chain_mol_type is None:
-            chain_mol_type = const.MOL_PROTEIN
-        if chain_entity_id is None:
-            chain_entity_id = asym_id
-
-        sym_id = entity_sym_counter[chain_entity_id]
-        entity_sym_counter[chain_entity_id] += 1
-
-        # Chain name from labels
+    # DeepFold3's Structure requires each chain's atoms (and residues) to be
+    # contiguous. OF3 files already are, but a stable sort by first-occurrence
+    # rank of the chain key guarantees it without reordering within a chain.
+    uniq_keys, first_idx = np.unique(chain_key, return_index=True)
+    chain_order = uniq_keys[np.argsort(first_idx)]
+    rank = {k: i for i, k in enumerate(chain_order)}
+    chain_rank = np.array([rank[k] for k in chain_key], dtype=np.int64)
+    if np.any(np.diff(chain_rank) < 0):
+        perm = np.argsort(chain_rank, kind="stable")
+        inv_perm = np.empty(n_atoms, dtype=np.int64)
+        inv_perm[perm] = np.arange(n_atoms, dtype=np.int64)
+        coord, res_ids, res_names, atom_names = coord[perm], res_ids[perm], res_names[perm], atom_names[perm]
+        elements, ins_codes, occupancy, charges = elements[perm], ins_codes[perm], occupancy[perm], charges[perm]
+        entity_ids, chain_rank, chain_key = entity_ids[perm], chain_rank[perm], chain_key[perm]
+        if of3_mol is not None:
+            of3_mol = of3_mol[perm]
+        if is_atomized is not None:
+            is_atomized = is_atomized[perm]
         if label_ids is not None:
-            first_chain_atom = residue_map[sorted_res_ids[0]][0]
-            cname = str(label_ids[first_chain_atom]).strip()[:4]
-        elif auth_ids is not None:
-            first_chain_atom = residue_map[sorted_res_ids[0]][0]
-            cname = str(auth_ids[first_chain_atom]).strip()[:4]
-        else:
-            cname = chr(ord("A") + asym_id) if asym_id < 26 else str(asym_id)
+            label_ids = label_ids[perm]
+        if auth_ids is not None:
+            auth_ids = auth_ids[perm]
+    else:
+        inv_perm = None
 
-        chains_list.append(
-            (
-                cname.encode("ascii"),
-                np.int8(chain_mol_type),
-                np.int32(chain_entity_id),
-                np.int32(sym_id),
-                np.int32(asym_id),
-                np.int32(chain_res_start),
-                np.int32(chain_res_count),
-                np.int32(chain_atom_start),
-                np.int32(chain_atom_count),
-            )
-        )
+    # --- per-atom arrays -------------------------------------------------
+    # Unresolved atoms carry NaN coordinates in OF3; DeepFold3's convention is
+    # zeros + ``is_present=False`` (the featurizer masks them out of the GT
+    # losses). Leaving the NaNs in poisons the crop's distance computation and
+    # every downstream loss.
+    finite = np.isfinite(coord).all(axis=1)
+    coord = np.where(finite[:, None], coord, 0.0).astype(np.float32)
+    is_present = (occupancy > 0.0) & finite
 
-    atoms_arr = np.array(atoms_list, dtype=ATOM_DTYPE) if atoms_list else np.empty(0, dtype=ATOM_DTYPE)
-    residues_arr = np.array(residues_list, dtype=RESIDUE_DTYPE) if residues_list else np.empty(0, dtype=RESIDUE_DTYPE)
-    chains_arr = np.array(chains_list, dtype=CHAIN_DTYPE) if chains_list else np.empty(0, dtype=CHAIN_DTYPE)
+    elem_lut = {e: const.element_name_to_int(e) for e in np.unique(elements)}
+    elem_int = np.array([elem_lut[e] for e in elements], dtype=np.int8)
 
-    # Convert bonds (remap indices)
-    if bond_count > 0:
-        bonds_out = []
-        for b in range(bond_count):
-            a1 = int(raw_bonds[b, 0])
-            a2 = int(raw_bonds[b, 1])
-            btype = int(raw_bonds[b, 2]) if raw_bonds.shape[1] > 2 else 1
-            if a1 < n_atoms and a2 < n_atoms:
-                bonds_out.append((old_to_new[a1], old_to_new[a2], np.int8(btype)))
-        bonds_arr = np.array(bonds_out, dtype=BOND_DTYPE) if bonds_out else np.empty(0, dtype=BOND_DTYPE)
+    atoms_arr = np.zeros(n_atoms, dtype=ATOM_DTYPE)
+    atoms_arr["x"], atoms_arr["y"], atoms_arr["z"] = coord[:, 0], coord[:, 1], coord[:, 2]
+    atoms_arr["element"] = elem_int
+    atoms_arr["charge"] = charges.astype(np.float16)
+    atoms_arr["name"] = np.char.encode(np.char.ljust(atom_names, 4).astype("<U4"), "ascii")
+    atoms_arr["is_present"] = is_present
+    atoms_arr["b_factor"] = 0.0
+
+    # --- residues --------------------------------------------------------
+    # A residue is a maximal run of atoms sharing (chain, res_id, ins_code,
+    # res_name). Segmenting on runs (rather than grouping by res_id) preserves
+    # the file's atom order, which multi-residue ligands and the bond indices
+    # both depend on.
+    res_starts = _segment_starts(chain_rank, res_ids, ins_codes, res_names)
+    res_counts = np.diff(np.append(res_starts, n_atoms)).astype(np.int64)
+    n_res = len(res_starts)
+
+    mol_lut = np.full(4, const.MOL_NONPOLYMER, dtype=np.int8)
+    for _k, _v in _OF3_MOL_TO_DF3.items():
+        mol_lut[_k] = _v
+    if of3_mol is not None:
+        res_mol = mol_lut[np.clip(of3_mol[res_starts], 0, 3)]
+    else:
+        res_mol = np.full(n_res, const.MOL_PROTEIN, dtype=np.int8)
+
+    res_name_first = res_names[res_starts]
+    type_lut = {
+        (nm, int(mt)): const.get_res_type(nm, int(mt))
+        for nm, mt in {(a, b) for a, b in zip(res_name_first, res_mol, strict=True)}
+    }
+    res_type = np.array(
+        [type_lut[(nm, int(mt))] for nm, mt in zip(res_name_first, res_mol, strict=True)], dtype=np.int16
+    )
+
+    if is_atomized is not None:
+        # OF3's own decision, taken verbatim (see docstring).
+        res_standard = ~is_atomized[res_starts]
+    else:
+        res_standard = (res_mol != const.MOL_NONPOLYMER) & (res_type != 20)
+    res_standard &= res_mol != const.MOL_NONPOLYMER
+
+    res_present = np.add.reduceat(is_present.astype(np.int64), res_starts) > 0 if n_res else np.zeros(0, dtype=bool)
+
+    residues_arr = np.zeros(n_res, dtype=RESIDUE_DTYPE)
+    residues_arr["name"] = np.char.encode(res_name_first.astype("<U5"), "ascii")
+    residues_arr["res_type"] = res_type
+    residues_arr["mol_type"] = res_mol
+    residues_arr["res_id"] = res_ids[res_starts].astype(np.int32)
+    residues_arr["atom_idx"] = res_starts.astype(np.int32)
+    residues_arr["atom_num"] = res_counts.astype(np.int16)
+    residues_arr["is_standard"] = res_standard
+    residues_arr["is_present"] = res_present
+
+    # --- chains ----------------------------------------------------------
+    res_chain_rank = chain_rank[res_starts]
+    ch_res_starts = _segment_starts(res_chain_rank)
+    ch_res_counts = np.diff(np.append(ch_res_starts, n_res)).astype(np.int64)
+    n_chains = len(ch_res_starts)
+
+    ch_atom_starts = res_starts[ch_res_starts] if n_chains else np.zeros(0, dtype=np.int64)
+    ch_atom_counts = np.diff(np.append(ch_atom_starts, n_atoms)).astype(np.int64)
+
+    chain_keys = [str(chain_key[int(a)]) for a in ch_atom_starts]
+    ch_entity = entity_ids[ch_atom_starts].astype(np.int32) if n_chains else np.zeros(0, dtype=np.int32)
+    ch_mol = res_mol[ch_res_starts] if n_chains else np.zeros(0, dtype=np.int8)
+
+    if label_ids is not None:
+        ch_names = [str(label_ids[int(a)])[:4] for a in ch_atom_starts]
+    elif auth_ids is not None:
+        ch_names = [str(auth_ids[int(a)])[:4] for a in ch_atom_starts]
+    else:
+        ch_names = [chr(ord("A") + i) if i < 26 else str(i) for i in range(n_chains)]
+    ch_auth = [str(auth_ids[int(a)])[:4] for a in ch_atom_starts] if auth_ids is not None else ch_names
+
+    sym_counter: Counter = Counter()
+    sym_ids = np.empty(n_chains, dtype=np.int32)
+    for i, eid in enumerate(ch_entity):
+        sym_ids[i] = sym_counter[int(eid)]
+        sym_counter[int(eid)] += 1
+
+    chains_arr = np.zeros(n_chains, dtype=CHAIN_DTYPE)
+    chains_arr["name"] = np.array([n.encode("ascii", "replace") for n in ch_names], dtype="S4")
+    chains_arr["mol_type"] = ch_mol
+    chains_arr["entity_id"] = ch_entity
+    chains_arr["sym_id"] = sym_ids
+    chains_arr["asym_id"] = np.arange(n_chains, dtype=np.int32)
+    chains_arr["res_idx"] = ch_res_starts.astype(np.int32)
+    chains_arr["res_num"] = ch_res_counts.astype(np.int32)
+    chains_arr["atom_idx"] = ch_atom_starts.astype(np.int32)
+    chains_arr["atom_num"] = ch_atom_counts.astype(np.int32)
+
+    # --- bonds -----------------------------------------------------------
+    raw_bonds = data["bonds"] if "bonds" in data else None
+    if raw_bonds is not None and raw_bonds.ndim == 2 and raw_bonds.shape[0] > 0 and raw_bonds.shape[1] >= 2:
+        b = np.asarray(raw_bonds).astype(np.int64)
+        a1, a2 = b[:, 0], b[:, 1]
+        btype = b[:, 2] if b.shape[1] > 2 else np.ones(len(b), dtype=np.int64)
+        keep = (a1 >= 0) & (a1 < n_atoms) & (a2 >= 0) & (a2 < n_atoms)
+        a1, a2, btype = a1[keep], a2[keep], btype[keep]
+        if inv_perm is not None:
+            a1, a2 = inv_perm[a1], inv_perm[a2]
+        bonds_arr = np.zeros(len(a1), dtype=BOND_DTYPE)
+        bonds_arr["atom_1"], bonds_arr["atom_2"] = a1.astype(np.int32), a2.astype(np.int32)
+        bonds_arr["type"] = np.clip(btype, 0, 127).astype(np.int8)
     else:
         bonds_arr = np.empty(0, dtype=BOND_DTYPE)
 
     structure = Structure(atoms=atoms_arr, bonds=bonds_arr, residues=residues_arr, chains=chains_arr, name=pdb_id)
 
-    # Build Record
+    # --- record ----------------------------------------------------------
     chain_infos: list[ChainInfo] = []
-    for ci, chain_row in enumerate(chains_arr):
-        mol_type = int(chain_row["mol_type"])
-        chain_name = chain_row["name"].decode("ascii").strip()
-        n_res = int(chain_row["res_num"])
-        entity_id = int(chain_row["entity_id"])
-
-        res_start = int(chain_row["res_idx"])
-        res_slice = residues_arr[res_start : res_start + n_res]
-        res_name_list = [r["name"].decode("ascii").strip() for r in res_slice]
-        seq = _chain_sequence(res_name_list, mol_type)
-        msa_id = _hash_sequence(seq) if seq else f"{pdb_id}_{chain_name}"
-
+    for ci in range(n_chains):
+        mol_type = int(ch_mol[ci])
+        rs, rn = int(ch_res_starts[ci]), int(ch_res_counts[ci])
+        seq = _chain_sequence(res_type[rs : rs + rn], mol_type)
+        msa_id = _hash_sequence(seq) if seq else f"{pdb_id}_{ch_names[ci]}"
         chain_infos.append(
             ChainInfo(
                 chain_id=ci,
-                chain_name=chain_name,
+                chain_name=ch_names[ci],
                 mol_type=mol_type,
                 cluster_id=msa_id,
                 msa_id=msa_id,
-                num_residues=n_res,
-                entity_id=entity_id,
+                num_residues=rn,
+                entity_id=int(ch_entity[ci]),
+                auth_chain_name=ch_auth[ci],
+                res_name=str(res_name_first[rs]) if mol_type == const.MOL_NONPOLYMER and rn else None,
             )
         )
 
-    # Detect interfaces using shared KDTree-based implementation
-    def _get_chain_coords(chain_row: np.void) -> np.ndarray:
-        start = int(chain_row["atom_idx"])
-        end = start + int(chain_row["atom_num"])
-        return np.stack([atoms_arr["x"][start:end], atoms_arr["y"][start:end], atoms_arr["z"][start:end]], axis=1)
-
-    chain_atoms = {i: _get_chain_coords(chains_arr[i]) for i in range(len(chains_arr))}
+    chain_atoms = {
+        i: np.stack(
+            [
+                atoms_arr["x"][int(ch_atom_starts[i]) : int(ch_atom_starts[i]) + int(ch_atom_counts[i])],
+                atoms_arr["y"][int(ch_atom_starts[i]) : int(ch_atom_starts[i]) + int(ch_atom_counts[i])],
+                atoms_arr["z"][int(ch_atom_starts[i]) : int(ch_atom_starts[i]) + int(ch_atom_counts[i])],
+            ],
+            axis=1,
+        )
+        for i in range(n_chains)
+    }
     interfaces = _compute_interfaces(chain_atoms)
 
     record = Record(id=pdb_id, chains=chain_infos, interfaces=interfaces)
+    return structure, record, chain_keys
+
+
+def convert_of3_structure(npz_path: Path, pdb_id: str | None = None) -> tuple[Structure, Record]:
+    """``convert_of3_atom_array`` without the OF3 chain-key list.
+
+    Kept as the entry point for callers that address chains by DeepFold3
+    ``asym_id`` (the monomer ``format: of3`` path and ``deepfold3 import-of3``).
+    """
+    structure, record, _ = convert_of3_atom_array(npz_path, pdb_id=pdb_id)
     return structure, record
 
 
