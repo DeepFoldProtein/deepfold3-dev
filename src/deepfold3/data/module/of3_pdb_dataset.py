@@ -41,7 +41,7 @@ from deepfold3.data import const
 from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols, remap_msa_col_idx_to_slice
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.io_cache import read_npz
-from deepfold3.data.module.dataset import _per_sample_rng, _retry_getitem
+from deepfold3.data.module.dataset import _count_drop, _per_sample_rng, _retry_getitem
 from deepfold3.data.prepare.of3_pdb_cache import OF3PdbCache
 from deepfold3.data.prepare.openfold3 import convert_of3_atom_array
 from deepfold3.data.tokenize.atomize import maybe_atomize
@@ -883,11 +883,12 @@ class OF3PdbDataset(torch.utils.data.Dataset):
             allowed = set(self.cache.template_ids(chain_row_of_asym[aid])) if self.cache.has_templates else None
             path = self.template_cache_dir / f"{meta.aln_rep_id}.npz"
             if not path.exists():
+                _count_drop("OF3 template hit list missing", f"{pdb_id} chain {aid}: {path}")
                 continue
             try:
                 hits = load_of3_template_hits(path)
             except Exception:
-                logger.debug("OF3 template cache unreadable: %s", path, exc_info=True)
+                _count_drop("OF3 template hit list unreadable", f"{pdb_id} chain {aid}: {path}", exc_info=True)
                 continue
 
             usable = [
@@ -914,11 +915,18 @@ class OF3PdbDataset(torch.utils.data.Dataset):
             for tid, hit in chosen:
                 arr_path = self.template_array_dir / tid.split("_")[0] / f"{tid}.npz"
                 if not arr_path.exists():
+                    # A *partially* synced geometry tree passes the directory
+                    # check in __init__ and then loses templates one file at a
+                    # time. The k draw above already happened, so each miss
+                    # silently shrinks this sample's template count — count it,
+                    # or the run just trains with thinner templates than the
+                    # config asked for and nothing ever says so.
+                    _count_drop("OF3 template geometry missing", f"{pdb_id} chain {aid}: {arr_path}")
                     continue
                 try:
                     lookup = template_residue_lookup(arr_path)
                 except Exception:
-                    logger.debug("OF3 template array unreadable: %s", arr_path, exc_info=True)
+                    _count_drop("OF3 template geometry unreadable", f"{pdb_id} chain {aid}: {arr_path}", exc_info=True)
                     continue
                 idx_map = np.asarray(hit["idx_map"])
                 # idx_map[:, 0] is 1-based within the query chain; idx_map[:, 1]
