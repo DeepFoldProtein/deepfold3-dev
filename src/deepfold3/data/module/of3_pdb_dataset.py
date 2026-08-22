@@ -573,7 +573,32 @@ class OF3PdbDataset(torch.utils.data.Dataset):
             n_msa_crops=n_msa_crops,
             pad_templates=pad_templates,
         )
+        # Templates need BOTH halves: the per-query hit lists and the template
+        # chain geometry they point at. Checking only the hit lists made a
+        # half-synced mirror (a very live failure mode — the tree is ~TB and
+        # `aws s3 sync` lands directories in whatever order) look exactly like a
+        # deliberately template-free run: every hit resolved to a missing array
+        # file, got skipped at debug level, and training quietly proceeded at
+        # T=0 with nothing in the log to say so. Fail loud once, up front.
         self._has_templates = cache.has_templates and self.template_cache_dir.is_dir()
+        if self._has_templates and not self.template_array_dir.is_dir():
+            logger.warning(
+                "%s: template hits are present (%s) but the template geometry directory "
+                "%s does not exist — TEMPLATES ARE DISABLED for this dataset. Sync "
+                "templates/template_structure_arrays/ (or pass template_array_dir) to "
+                "enable them.",
+                name or "of3pdb",
+                self.template_cache_dir,
+                self.template_array_dir,
+            )
+            self._has_templates = False
+        elif not self._has_templates and cache.has_templates:
+            logger.warning(
+                "%s: dataset cache lists template hits but %s does not exist — "
+                "templates are disabled for this dataset.",
+                name or "of3pdb",
+                self.template_cache_dir,
+            )
 
     # -- indexing -----------------------------------------------------------
 

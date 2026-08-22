@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -1498,6 +1499,115 @@ def build_of3_cache(cache_file: str, output: str, no_templates: bool) -> None:
         f"{meta['n_interfaces']} interfaces, {meta['n_templates']} template hits, "
         f"{meta['n_clusters']} clusters"
     )
+
+
+def _stamp_index_space_shard(args: tuple[str, str, bool]) -> tuple[int, int, int, int]:
+    """Stamp one shard directory. Returns (scanned, stamped, already, failed)."""
+    shard_dir, space, dry_run = args
+    scanned = stamped = already = failed = 0
+    for path in Path(shard_dir).glob("*.json"):
+        scanned += 1
+        try:
+            with open(path) as f:
+                hits = json.load(f)
+            if not isinstance(hits, list):
+                failed += 1
+                continue
+            if all(h.get("index_space") == space for h in hits):
+                already += 1
+                continue
+            for h in hits:
+                h["index_space"] = space
+            if not dry_run:
+                # Same-directory temp + rename: POSIX rename(2) is atomic, so a
+                # training run reading this index concurrently sees either the
+                # old or the new file, never a truncated one.
+                tmp = path.with_suffix(f".json.tmp.{os.getpid()}")
+                with open(tmp, "w") as f:
+                    json.dump(hits, f, separators=(",", ":"))
+                os.replace(tmp, path)
+            stamped += 1
+        except Exception:
+            failed += 1
+    return scanned, stamped, already, failed
+
+
+@cli.command("stamp-template-index-space")
+@click.option("--data-dir", required=True, type=click.Path(exists=True), help="Training data directory.")
+@click.option(
+    "--space",
+    type=click.Choice(["struct", "seqres"]),
+    default="struct",
+    show_default=True,
+    help="Frame the template-side alignment positions in this dataset are in.",
+)
+@click.option("--workers", default=16, show_default=True, type=int, help="Parallel worker processes.")
+@click.option("--dry-run", is_flag=True, help="Report what would change without writing.")
+def stamp_template_index_space(data_dir: str, space: str, workers: int, dry_run: bool) -> None:
+    """Record the template index frame into an existing template index.
+
+    Template index files written before ``index_space`` existed carry no frame,
+    so the loader falls back to the per-dataset ``template_struct_space`` config
+    flag. That fallback is the one setting whose being wrong is *invisible*: the
+    two frames differ by each template's unresolved N-terminal count, so a wrong
+    guess shifts every hit by a different amount and templates silently become
+    noise. Stamping the frame into the data removes the config from the loop.
+
+    Verify the frame BEFORE stamping — re-derive each hit's sequence identity
+    under both readings and compare against the identity the search recorded;
+    the correct frame agrees to ~1 pt. The shipped df3 sets (patchr, afdb_nvda,
+    teddymer) were measured this way and are all ``struct``.
+
+    Idempotent and safe to run against a directory a training job is reading:
+    each file is rewritten through a same-directory temp + atomic rename, and
+    files already carrying the frame are skipped.
+
+    Examples::
+
+        deepfold3 stamp-template-index-space --data-dir /data/distillation/patchr_training --dry-run
+        deepfold3 stamp-template-index-space --data-dir /data/distillation/afdb_nvda --workers 32
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    log = logging.getLogger(__name__)
+
+    root = Path(data_dir)
+    shard_dirs: list[str] = []
+    for sub in ("templates", "monomer_templates"):
+        base = root / sub
+        if not base.is_dir():
+            continue
+        found = [str(d) for d in sorted(base.iterdir()) if d.is_dir()]
+        # Flat (unsharded) layouts keep their JSONs directly under `base`.
+        shard_dirs.extend(found or [str(base)])
+
+    if not shard_dirs:
+        click.echo(f"No templates/ or monomer_templates/ directory under {root}.", err=True)
+        sys.exit(1)
+
+    log.info("Stamping index_space=%r across %d shard dirs%s", space, len(shard_dirs), " (dry run)" if dry_run else "")
+
+    totals = [0, 0, 0, 0]
+    tasks = [(d, space, dry_run) for d in shard_dirs]
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for i, counts in enumerate(ex.map(_stamp_index_space_shard, tasks), start=1):
+            totals = [t + c for t, c in zip(totals, counts, strict=True)]
+            if i % 32 == 0 or i == len(tasks):
+                log.info(
+                    "  %d/%d shards — scanned %d, stamped %d, already %d, failed %d",
+                    i,
+                    len(tasks),
+                    *totals,
+                )
+
+    scanned, stamped, already, failed = totals
+    verb = "would stamp" if dry_run else "stamped"
+    click.echo(f"{root}: scanned {scanned}, {verb} {stamped}, already {space} {already}, failed {failed}")
+    if failed:
+        click.echo(f"WARNING: {failed} file(s) could not be read or rewritten.", err=True)
 
 
 # Allow running as module
