@@ -489,6 +489,95 @@ def test_converter_regroups_interleaved_chains(tmp_path):
     assert got == bonded_names
 
 
+def test_msa_columns_follow_res_id_at_alternate_sites(tmp_path):
+    """Two residues modelled at one res_id share ONE alignment column.
+
+    Crystal structures sometimes model alternates at a single SEQRES position —
+    3l4j has PTR and TYR both at res_id 362, 6gpv has two such sites. The
+    tokenizer's running per-chain counter advances once per *residue*, so it
+    walks one past the end of the alignment and throws
+    ``index 757 is out of bounds for axis 1 with size 757`` from inside a
+    dataloader worker. OF3 indexes by ``res_id - 1`` instead, which maps both
+    residues onto the shared column.
+    """
+    from deepfold3.data.module.of3_pdb_dataset import _msa_cols_from_res_id
+    from deepfold3.data.prepare.openfold3 import convert_of3_atom_array
+    from deepfold3.data.tokenize.tokenizer import Tokenizer
+    from deepfold3.data.types import Input
+
+    # ALA(1) — [SEP(2) / THR(2) alternates] — GLY(3): three SEQRES positions.
+    res = [
+        ("ALA", 1, ["N", "CA", "C", "O", "CB"]),
+        ("SEP", 2, ["N", "CA", "C", "O", "CB", "OG", "P"]),
+        ("THR", 2, ["N", "CA", "C", "O", "CB"]),
+        ("GLY", 3, ["N", "CA", "C", "O"]),
+    ]
+    coord, chain_id, res_id, res_name, atom_name, element, atomized = [], [], [], [], [], [], []
+    for k, (name, rid, atoms) in enumerate(res):
+        for j, a in enumerate(atoms):
+            coord.append([float(k), float(j), 0.0])
+            chain_id.append("1")
+            res_id.append(rid)
+            res_name.append(name)
+            atom_name.append(a)
+            element.append(a[0])
+            atomized.append(name == "SEP")
+    n = len(coord)
+    np.savez(
+        tmp_path / "alt.npz",
+        coord=np.array(coord, dtype=np.float32),
+        chain_id=np.array(chain_id, dtype="<U21"),
+        res_id=np.array(res_id, dtype=np.int64),
+        ins_code=np.array([""] * n, dtype="<U1"),
+        res_name=np.array(res_name, dtype="<U5"),
+        atom_name=np.array(atom_name, dtype="<U6"),
+        element=np.array(element, dtype="<U2"),
+        occupancy=np.ones(n),
+        charge=np.zeros(n, dtype=np.int64),
+        molecule_type_id=np.zeros(n, dtype=np.int64),
+        is_atomized=np.array(atomized, dtype=bool),
+        entity_id=np.ones(n, dtype=np.int64),
+        label_asym_id=np.array(["A"] * n, dtype="<U4"),
+        auth_asym_id=np.array(["A"] * n, dtype="<U4"),
+        bonds=np.zeros((0, 3), dtype=np.uint32),
+    )
+
+    structure, _, _ = convert_of3_atom_array(tmp_path / "alt.npz", pdb_id="alt", build_record=False)
+    tokenized = Tokenizer().tokenize(Input(structure=structure, paired_msa={}, unpaired_msa={}))
+
+    # Four residues over three SEQRES positions.
+    assert len(structure.residues) == 4
+    counter_cols = np.asarray(tokenized.msa_col_idx)
+    assert counter_cols.max() == 3, "the running counter reaches a 4th column..."
+
+    rebased = np.asarray(_msa_cols_from_res_id(tokenized).msa_col_idx)
+    # ...but only three alignment columns exist, and the alternates share one.
+    assert rebased.max() == 2
+    assert set(rebased.tolist()) == {0, 1, 2}
+
+    # Both alternates land on the same column, and every other token is unmoved.
+    res_of_token = tokenized.tokens["residue_index"]
+    assert set(rebased[res_of_token == 2].tolist()) == {1}
+
+
+def test_msa_columns_unchanged_without_alternates(tmp_path):
+    """The res_id rule is a no-op wherever res_id runs 1..N without duplicates.
+
+    That is what makes it safe to apply unconditionally: measured over 304 live
+    structures, only the four carrying an alternate site changed at all.
+    """
+    from deepfold3.data.module.of3_pdb_dataset import _msa_cols_from_res_id
+    from deepfold3.data.prepare.openfold3 import convert_of3_atom_array
+    from deepfold3.data.tokenize.tokenizer import Tokenizer
+    from deepfold3.data.types import Input
+
+    structure, _, _ = convert_of3_atom_array(_write_atom_array(tmp_path / "s.npz"), pdb_id="t")
+    tokenized = Tokenizer().tokenize(Input(structure=structure, paired_msa={}, unpaired_msa={}))
+    before = np.asarray(tokenized.msa_col_idx).copy()
+    after = np.asarray(_msa_cols_from_res_id(tokenized).msa_col_idx)
+    np.testing.assert_array_equal(before, after)
+
+
 def test_unknown_dna_residue_type(tmp_path):
     """``DN`` is unknown-nucleic (30), not protein UNK (20).
 

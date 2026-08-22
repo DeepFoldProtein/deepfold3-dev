@@ -449,6 +449,43 @@ def template_residue_lookup(npz_path: Path, max_atoms: int = const.MAX_ATOMS_PER
     return lookup
 
 
+def _msa_cols_from_res_id(tokenized):
+    """Index each token's MSA column by ``res_id - 1``, as OpenFold 3 does::
+
+        msa_column_positions = msa_token_mapper.res_id - 1
+        msa_array = msa_array_vstack.msa[:, msa_column_positions]
+
+    The tokenizer's own ``msa_col_idx`` is a running per-chain counter. That is
+    correct for ``format: df3`` (residue order defines the columns) and, for an
+    OF3 chain whose ``res_id`` runs 1..N without duplicates, produces *exactly
+    the same* indices — so this is a no-op on 991 of 996 chains sampled.
+
+    It differs at **microheterogeneity**: two residues modelled at one SEQRES
+    position. 3l4j res_id 362 carries PTR and TYR, 4gfh res_id 782 the same,
+    6gpv has two such sites in one chain. Those are one alignment column, and
+    OF3 treats them so (it emits PTR atomized plus TYR standard, all sharing the
+    res_id). The running counter instead advances twice and walks off the end of
+    the alignment — ``index 757 is out of bounds for axis 1 with size 757`` — which
+    escaped a dataloader worker and killed a 112-rank job.
+
+    Measured over 996 chains: ``max(res_id) <= width`` holds 100% of the time,
+    ``n_residues <= width`` only 99.50%.
+
+    Applied straight after tokenization so the crop's ``query_col_idx`` — which
+    places template features, and which OF3's template ``idx_map`` also indexes
+    by SEQRES position — inherits the same convention.
+    """
+    from dataclasses import replace
+
+    col = tokenized.msa_col_idx
+    if col is None:
+        return tokenized
+    # Ligand / column-less tokens keep -1; polymer tokens take their SEQRES
+    # position. res_id is 1-based in OF3's preprocessed structures.
+    rebased = np.where(col >= 0, tokenized.tokens["residue_index"].astype(np.int64) - 1, -1)
+    return replace(tokenized, msa_col_idx=rebased.astype(col.dtype))
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -708,6 +745,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         # content, so a 40-chain assembly cropped to max_tokens reads the few
         # surviving chains' alignments instead of all of them.
         tokenized = self.tokenizer.tokenize(Input(structure=structure, paired_msa={}, unpaired_msa={}))
+        tokenized = _msa_cols_from_res_id(tokenized)
         if self.exclude_loss_mol_types:
             from deepfold3.data.masking import MASK_LOSS_WEIGHT, TokenMask
 
