@@ -392,7 +392,13 @@ def main() -> int:
     p.add_argument("--clip", type=float, default=None, help="clip threshold (annotates >clip column)")
     p.add_argument("--tail", type=int, default=10, help="max rows to show per table (default: 10)")
     p.add_argument("--full", action="store_true", help="show all rows (overrides --tail)")
-    p.add_argument("-ws", "--window-size", type=int, default=250, help="window size in steps for grad_norm/loss tables (default: 250)")
+    p.add_argument(
+        "-ws",
+        "--window-size",
+        type=int,
+        default=250,
+        help="window size in steps for grad_norm/loss tables (default: 250)",
+    )
     args = p.parse_args()
     tail = None if args.full else args.tail
 

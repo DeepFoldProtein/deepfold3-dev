@@ -32,6 +32,7 @@ Usage:
         --out-prefix tmp/bench/ss_analysis_full/fapeK5 \\
         --out-csv tmp/bench/ss_analysis_full/fapeK5_struct.csv
 """
+
 from __future__ import annotations
 
 import argparse
@@ -72,8 +73,7 @@ def _read_value(sample_dir: Path, fname: str, key: str) -> float | None:
     return v if v == v else None  # drop NaN
 
 
-def _process_step(step: int, targets: list, n_samples: int, seed: int,
-                  pattern: str) -> tuple:
+def _process_step(step: int, targets: list, n_samples: int, seed: int, pattern: str) -> tuple:
     """Collect per-sample values for one ``step``.
 
     Picklable (module-level) so it can run in a process-pool worker.
@@ -89,24 +89,22 @@ def _process_step(step: int, targets: list, n_samples: int, seed: int,
             if not sd.exists():
                 continue
             for name, sources in METRICS:
-                v = next((x for fname, key in sources
-                          if (x := _read_value(sd, fname, key)) is not None), None)
+                v = next((x for fname, key in sources if (x := _read_value(sd, fname, key)) is not None), None)
                 if v is not None:
                     out[name].append(v)
     return step, out
 
 
-def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
-               prefix: Path, recent_box: int) -> None:
+def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]], prefix: Path, recent_box: int) -> None:
     import matplotlib  # noqa: PLC0415
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
     names = [n for n, _ in METRICS]
     fig = plt.figure(figsize=(15, 16))
-    gs = fig.add_gridspec(len(names) + 1, len(names),
-                          height_ratios=[1] * len(names) + [1.1])
+    gs = fig.add_gridspec(len(names) + 1, len(names), height_ratios=[1] * len(names) + [1.1])
 
     # --- trend rows: per-sample mean + median + IQR band over all steps.
     top = None
@@ -119,8 +117,7 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
         med = np.array([np.median(v) if v else np.nan for v in vals])
         q25 = np.array([np.percentile(v, 25) if v else np.nan for v in vals])
         q75 = np.array([np.percentile(v, 75) if v else np.nan for v in vals])
-        ax.fill_between(steps, q25, q75, color=color, alpha=0.18,
-                        label="IQR (25–75 %, per-sample)")
+        ax.fill_between(steps, q25, q75, color=color, alpha=0.18, label="IQR (25–75 %, per-sample)")
         ax.plot(steps, mean, color=color, lw=2, marker="o", ms=3, label="mean")
         ax.plot(steps, med, color=color, lw=1, ls="--", alpha=0.85, label="median")
         n_per = next((len(v) for v in vals if v), 0)
@@ -148,14 +145,17 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
         pairs = [(lbl, d) for lbl, d in pairs if d]
         ax.set_title(f"{name} — recent {len(pairs)} ckpts")
         if not pairs:
-            ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, color="gray")
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes, color="gray")
             continue
         labels, data = zip(*pairs, strict=True)
-        bp = ax.boxplot(list(data), tick_labels=list(labels),
-                        showfliers=True, patch_artist=True,
-                        flierprops={"marker": ".", "ms": 2, "alpha": 0.3},
-                        medianprops={"color": "black"})
+        bp = ax.boxplot(
+            list(data),
+            tick_labels=list(labels),
+            showfliers=True,
+            patch_artist=True,
+            flierprops={"marker": ".", "ms": 2, "alpha": 0.3},
+            medianprops={"color": "black"},
+        )
         for patch in bp["boxes"]:
             patch.set(facecolor=color, alpha=0.35)
         ax.tick_params(axis="x", labelrotation=90, labelsize=7)
@@ -168,8 +168,7 @@ def _make_plot(steps: list[int], per_step: dict[int, dict[str, list[float]]],
     print(f"wrote {prefix}_struct.png / .pdf")
 
 
-def _write_csv(steps: list[int], per_step: dict[int, dict[str, list[float]]],
-               out_csv: Path) -> None:
+def _write_csv(steps: list[int], per_step: dict[int, dict[str, list[float]]], out_csv: Path) -> None:
     import numpy as np  # noqa: PLC0415
 
     cols = ["step", "metric", "n", "mean", "median", "q25", "q75", "min", "max"]
@@ -182,44 +181,47 @@ def _write_csv(steps: list[int], per_step: dict[int, dict[str, list[float]]],
                 if not v:
                     continue
                 a = np.array(v)
-                w.writerow({
-                    "step": s, "metric": name, "n": len(a),
-                    "mean": round(float(a.mean()), 5),
-                    "median": round(float(np.median(a)), 5),
-                    "q25": round(float(np.percentile(a, 25)), 5),
-                    "q75": round(float(np.percentile(a, 75)), 5),
-                    "min": round(float(a.min()), 5),
-                    "max": round(float(a.max()), 5),
-                })
+                w.writerow(
+                    {
+                        "step": s,
+                        "metric": name,
+                        "n": len(a),
+                        "mean": round(float(a.mean()), 5),
+                        "median": round(float(np.median(a)), 5),
+                        "q25": round(float(np.percentile(a, 25)), 5),
+                        "q75": round(float(np.percentile(a, 75)), 5),
+                        "min": round(float(a.min()), 5),
+                        "max": round(float(a.max()), 5),
+                    }
+                )
     print(f"wrote {out_csv}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--targets-file", type=Path,
-                    help="CSV with header including 'pdb' column.")
-    ap.add_argument("--bench-root", type=Path,
-                    help="Root containing one {pdb}/_ref.cif.gz per target.")
-    ap.add_argument("--arm-dir", type=str, default="df3-fapeK5-25e5-c10-g35",
-                    help="Arm subdirectory name under each target.")
-    ap.add_argument("--target-spec", action="append", default=[],
-                    help="PDB:REF_PATH:INFERENCE_DIR (repeatable).")
+    ap.add_argument("--targets-file", type=Path, help="CSV with header including 'pdb' column.")
+    ap.add_argument("--bench-root", type=Path, help="Root containing one {pdb}/_ref.cif.gz per target.")
+    ap.add_argument(
+        "--arm-dir", type=str, default="df3-fapeK5-25e5-c10-g35", help="Arm subdirectory name under each target."
+    )
+    ap.add_argument("--target-spec", action="append", default=[], help="PDB:REF_PATH:INFERENCE_DIR (repeatable).")
     # {n} expands to --n-samples so the per-sample suffix tracks the driver
     # (analysis.sh uses n5); a hardcoded _n30 silently matched nothing under n5.
     ap.add_argument("--pattern", default="step_{step}_n{n}")
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--workers", type=int, default=1,
-                    help="Process-pool size for the per-step cache reads "
-                         "(steps independent). High values speed up full-history "
-                         "rebuilds; default 1 (sequential).")
-    ap.add_argument("--recent-box", type=int, default=12,
-                    help="Number of most-recent checkpoints to box-plot.")
-    ap.add_argument("--out-prefix", type=Path, default=None,
-                    help="Write {prefix}_struct.{png,pdf}.")
-    ap.add_argument("--out-csv", type=Path, default=None,
-                    help="Per-step / per-metric distribution-stats CSV.")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Process-pool size for the per-step cache reads "
+        "(steps independent). High values speed up full-history "
+        "rebuilds; default 1 (sequential).",
+    )
+    ap.add_argument("--recent-box", type=int, default=12, help="Number of most-recent checkpoints to box-plot.")
+    ap.add_argument("--out-prefix", type=Path, default=None, help="Write {prefix}_struct.{png,pdf}.")
+    ap.add_argument("--out-csv", type=Path, default=None, help="Per-step / per-metric distribution-stats CSV.")
     args = ap.parse_args()
 
     targets = []  # [(pdb, ref_path, inference_dir)]
@@ -240,9 +242,9 @@ def main() -> None:
     print(f"Steps: {len(args.steps)} ({args.steps[0]}..{args.steps[-1]})")
 
     workers = min(max(1, args.workers), len(args.steps))
-    step_fn = functools.partial(_process_step, targets=targets,
-                                n_samples=args.n_samples, seed=args.seed,
-                                pattern=args.pattern)
+    step_fn = functools.partial(
+        _process_step, targets=targets, n_samples=args.n_samples, seed=args.seed, pattern=args.pattern
+    )
     if workers > 1:
         from concurrent.futures import ProcessPoolExecutor
 
@@ -254,10 +256,10 @@ def main() -> None:
     per_step = {s: d for s, d in results}
 
     for name, _ in METRICS:
-        last = next((per_step[s][name] for s in reversed(args.steps)
-                     if per_step.get(s, {}).get(name)), [])
+        last = next((per_step[s][name] for s in reversed(args.steps) if per_step.get(s, {}).get(name)), [])
         if last:
             import statistics
+
             print(f"  {name:7s} latest step mean={statistics.mean(last):.4f}  n={len(last)}")
 
     if args.out_csv:

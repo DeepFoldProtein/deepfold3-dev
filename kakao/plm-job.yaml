@@ -1,0 +1,262 @@
+# Complex language model training — one node, as a plain Kubernetes Job.
+#
+# Why not a TrainJob: with `numNodes: 1` the deepspeed-llm runtime still
+# materialises a launcher pod *and* a worker pod, each requesting 8 GPUs, so a
+# single-node run asks the scheduler for 16 and one half sits Pending behind
+# the other. The mpirun layer those two pods exist for is also pure overhead
+# when torchrun fans out 8 local ranks by itself. Multi-node keeps the TrainJob
+# path (kakao/plm-trainjob-multinode.yaml).
+#
+# The launch script and the env block are copied verbatim from
+# kakao/plm-trainjob.yaml by hand; keep them in step.
+#
+# Placeholders (replaced by kakao/plm-submit.sh at apply time):
+#   __JOB_NAME__ __RUN_NAME__ __WANDB_PROJECT__ __WANDB_ENTITY__
+#   __PLM_CONFIG__ __EXTRA_ARGS__ __NCCL_DEBUG__ __NCCL_DEBUG_SUBSYS__
+#   __NCCL_DEBUG_FILE__ __TORCH_NCCL_ENABLE_TIMING__
+#
+# Submit:  bash kakao/plm-submit.sh <run-name> [extra args]
+# Logs:    kubectl -n kbm-g-np-kias logs -f job/__JOB_NAME__
+# Cancel:  kubectl -n kbm-g-np-kias delete job __JOB_NAME__
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: kbm-g-np-kias
+spec:
+  backoffLimit: 0          # a crash is something to read, not to retry into
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+        # 8 NIC attachments, one per mlnxnic (see trainjob-multinode.yaml).
+        k8s.v1.cni.cncf.io/networks: |-
+          kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      # Confirmed bad; see kakao/trainjob-multinode.yaml.
+                      - host-10-0-0-232
+      containers:
+        - name: trainer
+          image: mlops.kr-central-2.kcr.dev/kc-kubeflow-registry/deepspeed-runtime:v2.1.0.kbm.1d
+          command:
+            - bash
+            - "-lc"
+            - |
+              set -euo pipefail
+
+              # Kill leftovers from a previous attempt: the pod is restarted in place
+              # on failure, and an orphaned python still holding a GPU makes the next
+              # set_device fail with cudaErrorDevicesUnavailable.
+              pkill -9 -f '\.venv/bin/python[0-9]' || true
+              sleep 5
+
+              {
+                echo "POD=$(hostname) K8S_NODE=${NODE_NAME:-unknown}"
+                nvidia-smi --query-gpu=index,uuid,pci.bus_id,compute_mode --format=csv || true
+              } 2>&1 | sed "s/^/[plm] /"
+
+              REPO=/home/jovyan/work/deepfold3-dev
+              VENV=${REPO}/.venv
+              RUN_DIR=${REPO}/runs/${RUN_NAME}
+              LOG_DIR=${RUN_DIR}/logs
+
+              # Sentinel keyed on the uv.lock hash, on the shared PVC — auto-invalidates
+              # when dependencies change, reused otherwise.
+              LOCK_HASH=$(sha256sum ${REPO}/uv.lock | cut -c1-16)
+              SENTINEL="${VENV}/.sync-done.${LOCK_HASH}"
+              if [ ! -f "${SENTINEL}" ]; then
+                echo "[plm] rebuilding ${VENV} via uv sync --frozen (lock=${LOCK_HASH})"
+                rm -rf ${VENV}
+                pip install --no-cache-dir uv
+                (cd ${REPO} && uv sync --frozen --python 3.11)
+                touch ${SENTINEL}
+              else
+                echo "[plm] reusing ${VENV} (lock=${LOCK_HASH} matches)"
+              fi
+              export PATH=${VENV}/bin:${PATH}
+
+              mkdir -p ${LOG_DIR}
+              cd ${REPO}
+              echo "[plm] HOST=$(hostname) PYTHON=$(readlink -f $(which python)) CONFIG=${PLM_CONFIG}"
+
+              exec torchrun \
+                --standalone \
+                --nnodes=1 \
+                --nproc-per-node=8 \
+                --redirects 3 --tee 3 \
+                --log-dir=${LOG_DIR} \
+                -m deepfold3.scripts.plm_train \
+                --config ${PLM_CONFIG} \
+                --output ${RUN_DIR} \
+                --wandb ${WANDB_PROJECT} \
+                --wandb-entity ${WANDB_ENTITY} \
+                --override train.wandb_run_name=${RUN_NAME} \
+                ${EXTRA_ARGS}
+          env:
+            - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_IB_HCA
+              # The 8 Multus-attached 400 Gb/sec NDR HCAs on this cluster. All 22
+              # mlx5 devices are visible in /sys/class/infiniband (host leak), but
+              # only these 8 are bound to the pod's net-attach-defs. Without this,
+              # NCCL auto-probe picks unreachable HCAs and falls back to TCP over
+              # eth0 (Calico), cutting throughput ~2×. Regenerate from the Multus
+              # network-status annotation if the cluster PCI layout ever changes.
+              value: "=mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
+            # NCCL_NVLS_ENABLE removed 2026-08-03 — NVLink SHARP is now left to NCCL's
+            # own auto-detect (default on B200/NVSwitch). It had been pinned to "1"
+            # since 2026-04-19 purely to sidestep auto-detect quirks, not to turn the
+            # feature on. Removing the pin is behaviour-neutral on this hardware.
+            # - name: NCCL_P2P_LEVEL
+            #   value: "NVL"
+            - name: NCCL_DEBUG
+              # WARN by default; `NCCL_LOG=1 bash kakao/submit.sh …` flips to INFO for
+              # verbose per-collective + net/proxy timing to a NODE-LOCAL file (below),
+              # to diagnose the ~80-min periodic collective stall
+              # (export/burst-periodic-stall/). Transport already confirmed 2026-06-13:
+              # all NET/IB (mlx5_14..21), zero Socket fallback.
+              value: "__NCCL_DEBUG__"
+            - name: NCCL_DEBUG_SUBSYS
+              # Default INIT,TUNING (setup + per-size algo choice; no per-collective
+              # spam). NCCL_LOG=1 → INIT,NET,COLL,PROFILE (per-AllReduce + proxy/net
+              # op timing = the closest in-pod proxy for switch PortXmitWait).
+              value: "__NCCL_DEBUG_SUBSYS__"
+            - name: NCCL_DEBUG_FILE
+              # Empty by default (WARN → stdout, stays in the per-rank stdout.log).
+              # NCCL_LOG=1 → /tmp/nccl.%h.%p.log: NODE-LOCAL (not the shared PVC) so the
+              # verbose logging doesn't add fabric/PVC I/O and confound the very
+              # congestion we measure; %h/%p give one clean file per rank. Collect
+              # after a burst with monitor/collect_nccl_logs.sh.
+              value: "__NCCL_DEBUG_FILE__"
+            - name: NCCL_RAS_ENABLE
+              # RAS straggler/hang detector — background thread, ~zero overhead, always
+              # on. Query LIVE during a burst:  kubectl exec <pod> -- ncclras
+              # → per-rank collective progress; lagging ranks name the straggler.
+              value: "1"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_FR_BUFFER_SIZE
+              value: "20000"
+            - name: TORCH_NCCL_ENABLE_TIMING
+              # Record per-collective durations in the flight-recorder ring buffer.
+              # Small per-collective CUDA-event cost → only on when NCCL_LOG=1. Dump on
+              # demand via torch._C._distributed_c10d._dump_nccl_trace(), or auto on a
+              # watchdog timeout (below). During a burst the all-reduce durations spike.
+              value: "__TORCH_NCCL_ENABLE_TIMING__"
+            - name: TORCH_NCCL_DUMP_ON_TIMEOUT
+              value: "1"
+            - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
+              # On-demand flight-recorder dump trigger. PGNCCL's monitor thread creates
+              # a per-rank FIFO at <path><rank>; writing one byte to it serializes the
+              # FR ring buffer (recent collectives + per-op durations when
+              # TORCH_NCCL_ENABLE_TIMING=1) to <TORCH_FR_DUMP_TEMP_FILE><rank>.
+              # Node-local; ~free when idle. Trigger+collect during a burst with
+              # monitor/dump_fr.sh; read dumps with torch...flight_recorder.fr_trace.
+              # This is the only tool that sees the gradient AllReduces (NCCL COLL log
+              # + RAS opCount are blind to them — registered-buffer/coalesced path).
+              value: "/tmp/nccl_fr_pipe"
+            - name: TORCH_FR_DUMP_TEMP_FILE
+              # Node-local base path for FR dumps (pipe-triggered or watchdog-timeout);
+              # PGNCCL appends the global rank. Pickle format. (torch 2.11 name; the
+              # old TORCH_NCCL_DEBUG_INFO_TEMP_FILE is deprecated → warning.)
+              value: "/tmp/nccl_fr_dump_"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              # expandable_segments: grow CUDA allocations in-place instead of the
+              # default fixed-size segment pool, so caching-allocator fragmentation
+              # doesn't accumulate over a long run. Targets the dt-spike SAWTOOTH:
+              # spike rate climbs 5%→20% over each ~8-day process lifetime then
+              # resets on restart, with GPU peak mem FLAT — the signature of
+              # allocator fragmentation raising cudaMalloc/Free device-sync frequency
+              # without raising peak reserved (see memory
+              # project_fapek5_dt_spike_collective). Compare the next run's
+              # %steps>30s-vs-uptime curve against the sawtooth to confirm.
+              value: "expandable_segments:True"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: UV_CACHE_DIR
+              value: "/home/jovyan/.cache/uv"
+            - name: UV_PYTHON_INSTALL_DIR
+              # uv-managed python MUST live on the shared PVC — otherwise
+              # .venv/bin/python symlinks to the launcher-only ephemeral FS
+              # and the other 56 ranks break with ModuleNotFoundError.
+              value: "/home/jovyan/.cache/uv/python"
+            - name: TRITON_CACHE_DIR
+              value: "/home/jovyan/.triton/autotune"
+            - name: DEEPFOLD3_TRITON_CACHE_DIR
+              # deepfold3's autotune-CONFIG cache (block sizes/warps) — a SEPARATE
+              # mechanism from TRITON_CACHE_DIR's compiled-binary cache. Without this
+              # it resolves to Path.home()/.cache = /home/mpiuser/.cache (ephemeral,
+              # per-pod), so all 64 ranks re-autotune and race-write. Pin to the PVC.
+              value: "/home/jovyan/.cache/deepfold3-triton"
+            - name: PYTORCH_KERNEL_CACHE_PATH
+              # Torch's JIT kernel cache. Default ($HOME/.cache/torch/kernels)
+              # resolves to /home/mpiuser/.cache on the ephemeral container FS.
+              value: "/home/jovyan/.cache/torch/kernels"
+            - name: XDG_CACHE_HOME
+              # Catch-all: any XDG-compliant tool that isn't already overridden
+              # lands on the PVC instead of /home/mpiuser/.cache.
+              value: "/home/jovyan/.cache"
+            - name: HF_HOME
+              value: "/home/jovyan/.cache/huggingface"
+            - name: RUN_NAME
+              value: "__RUN_NAME__"
+            - name: WANDB_PROJECT
+              value: "__WANDB_PROJECT__"
+            - name: WANDB_ENTITY
+              value: "__WANDB_ENTITY__"
+            - name: EXTRA_ARGS
+              value: "__EXTRA_ARGS__"
+            - name: PLM_CONFIG
+              value: "__PLM_CONFIG__"
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-api-key
+                  key: api-key
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "96"
+              memory: 1Ti
+              nvidia.com/gpu: "8"
+              nvidia.com/mlnxnics: "8"
+            limits:
+              cpu: "96"
+              memory: 1Ti
+              nvidia.com/gpu: "8"
+              nvidia.com/mlnxnics: "8"
+          volumeMounts:
+            - mountPath: /home/jovyan
+              name: home
+            - mountPath: /data
+              name: data
+            - mountPath: /dev/shm
+              name: dshm
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: vv137-workspace
+        - name: data
+          persistentVolumeClaim:
+            claimName: deepfold3-sync
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi

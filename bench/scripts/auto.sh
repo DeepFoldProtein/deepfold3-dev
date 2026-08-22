@@ -16,7 +16,7 @@
 #         > bench/runs/df3v1/logs/auto.log 2>&1 &
 #
 # Env overrides:
-#   SERIES        series name              (default df3v1)
+#   SERIES        series name              (REQUIRED — no default, see below)
 #   CATEGORIES    space list of categories (default: the 8 below)
 #   SEEDS         comma list of seeds      (default 42,43 — lighter than FoldBench's 4)
 #   SEEDS_<CAT>   per-category seed override, CAT upper-cased with '-'/' ' -> '_'
@@ -24,14 +24,24 @@
 #                 below give antibody-antigen FoldBench's full 4 seeds.
 #   NUM_SAMPLES   diffusion samples / seed (default 5)
 #   MAX_TEMPLATES structural templates per protein chain (default 4; 0 = off)
-#   REF_SERIES    measured baseline overlay (default: none — see note below)
+#   REF_SERIES    measured baseline overlay (default: af3_ref — see note below)
 #   MAX_TOKENS    FoldBench-small cap      (default 1024)
 #   SNAPSHOT      .pt weight snapshot      (default auto: shadow if present else average)
 #   STEP_OFFSET   series-global step shift (default 0)
+#   STEP_GRID     (default 1000)
 set -u
 cd "$(dirname "$0")/../.."
-SERIES="${SERIES:-df3v4r14}"
-TRAIN_DIR="${1:-runs/df3-stage0-r14}"
+# SERIES and TRAIN_DIR are deliberately un-defaulted. Both used to carry the
+# then-current arm as a default, which is a silent failure waiting to happen:
+# the pair is what routes folds to disk, and a launch that passes TRAIN_DIR
+# positionally but forgets `SERIES=` writes the new arm's checkpoints into the
+# previous arm's series under the previous arm's step numbers. Nothing errors —
+# the trajectory CSVs simply grow rows that belong to a different network.
+# That happened: `bench/runs/df3v5r15` carries r17 folds at steps 16000-18000,
+# dated after r15's last checkpoint (15000), because the default here was still
+# `df3v5r15`. A stale default is not a convenience; it is the failure mode.
+: "${SERIES:?set SERIES=<series name> (e.g. df3v5r18) — no default, see comment above}"
+TRAIN_DIR="${1:?pass TRAIN_DIR as \$1 (e.g. runs/df3-stage0-r18) — no default}"
 POLL="${2:-3600}"            # ~1 h
 # STEP_OFFSET shifts the benchmarked step number (raw checkpoint step N is
 # logged as N+OFFSET) so a fork that restarts the step counter (e.g. stage1
@@ -39,6 +49,7 @@ POLL="${2:-3600}"            # ~1 h
 # of colliding with the earlier phase's points. e.g. STEP_OFFSET=110000:
 # stage1 checkpoint_5000 -> df3v1 step_115000 (continues after stage0's 110k).
 OFFSET="${STEP_OFFSET:-0}"
+GRID="${STEP_GRID:-1000}"
 SEEDS="${SEEDS:-42,43}"
 # Per-category seed count. Sample count is a real axis of the comparison, not a
 # free knob: `oracle` is monotone in N, so an N mismatch biases the model with
@@ -77,7 +88,8 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 # is its weakest supported mode, and it made `af3_ref` a handicapped AlphaFold3:
 # on identical targets our template-free fold trails the published AF3 by 3.8
 # points on protein-protein and 9.9 on antibody-antigen — which is why af3_ref is
-# no longer drawn as a baseline (see REF_SERIES).
+# drawn with a "template-free" caveat rather than as a bare AF3 baseline
+# (see REF_SERIES).
 #
 # CAUTION: turning this on changes the bench inputs, so numbers before and after
 # are not comparable. Do not flip it in the same window as a training-side
@@ -88,13 +100,33 @@ MAX_TEMPLATES="${MAX_TEMPLATES:-4}"
 # figures fall back to the published AF3 numbers (FoldBench Supp. Table 3, drawn
 # dotted and labelled "paper, full set" — a target marker, not like-for-like).
 #
-# `af3_ref` used to be the default and is now RETIRED: it was folded before the
-# bench attached templates, so it is a handicapped AlphaFold3 (3.8 points below
-# the published AF3 on protein-protein, 9.9 on antibody-antigen, same targets).
-# summarize.py / plot_lddt_grid.py refuse it by name, so setting it here has no
-# effect until af3_ref is re-folded WITH templates and dropped from their
-# RETIRED_REF_SERIES.
-REF_SERIES="${REF_SERIES:-}"
+# `af3_ref` is the default: 4 seeds x 5 samples of AlphaFold3 through THIS bench
+# (same num-token-capped manifest, same OST scoring), so it is the only AF3
+# number we own that is like-for-like. It is also the only reference the iLDDT
+# row can have at all — the paper publishes no inter-chain lDDT.
+#
+# It is HANDICAPPED and labelled as such everywhere it is drawn: folded 2026-07-24,
+# before MAX_TEMPLATES landed, so it is template-free while every current df3
+# series folds with templates (3.8 points below the published AF3 on
+# protein-protein, 9.9 on antibody-antigen, same targets). A df3-minus-af3_ref
+# delta is therefore biased toward df3 by an unquantified amount — read it as a
+# floor on AF3, never as parity. summarize.py's REF_SERIES_CAVEAT stamps
+# "(template-free)" into every label, and the published paper means stay on the
+# figures alongside it. Re-fold af3_ref WITH templates and drop that entry to
+# make the comparison clean.
+#
+# Two categories are NOT comparable against af3_ref at all and are dropped
+# automatically (REF_SERIES_EXCLUDE_CATEGORIES): monomer_dna / monomer_rna.
+# af3_ref folded them before the water bug fix (2026-08-12), so its inputs carry
+# 24-47% water-derived DN padding (8d78: 46 residues vs 22 after the fix). The
+# six protein-containing categories were verified to have identical folded
+# inputs on both sides, so those overlays are exact on the target axis.
+#
+# Sample budget: af3_ref is 4 seeds x 5 = 20 everywhere. df3 series run 4 seeds
+# only on protein-protein and antibody-antigen (see SEEDS_* above), 2 elsewhere.
+# Mean lDDT is unbiased in N so every lDDT overlay is fair; ORACLE is monotone in
+# N, so the success-rate panel is only N-matched for those two categories.
+REF_SERIES="${REF_SERIES:-af3_ref}"
 # GPUs for run_sweep sharding — default to every visible GPU (auto-adapts to the
 # node: 8-GPU box -> 0..7, 4-GPU box -> 0..3). Override with GPUS=0,1 to reserve.
 GPUS="${GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)}"
@@ -162,6 +194,45 @@ sweep_active() {
     || pgrep -f "inference-batch" >/dev/null
 }
 
+# --- source guards -----------------------------------------------------------
+# A sweep folds with whatever is in the working tree *at the moment the python
+# process starts*. Training does not: the trainer imported its modules when it
+# launched and holds them for the life of the run. So the two can silently
+# disagree, and on 2026-08-15 they did -- a commit that redefined what
+# `trimul_head_norm="channel"` means left training healthy and made every
+# prediction collapse to random coil (see export/mhr-trimul/README.md s12).
+#
+# PAUSE is the manual brake: `touch bench/PAUSE` and no new unit starts. Use it
+# while editing anything the forward pass imports.
+#
+# The dirty check is the automatic one, scoped to the modules inference actually
+# loads -- model/, data/, io/, params.py. Deliberately NOT src/deepfold3 whole:
+# unrelated WIP under training/ or complexlm/ cannot change a fold, and blocking
+# on it would just train everyone to set ALLOW_DIRTY=1 out of habit. Untracked
+# files are ignored for the same reason -- a new file changes nothing until
+# something imports it.
+#
+# Neither guard would have caught 2026-08-15 on its own: that change was
+# committed and the tree was clean. What catches *that* class is the stamp
+# below plus a self-describing checkpoint. Guards narrow the window; provenance
+# is what lets you find the damage afterwards.
+INFER_SURFACE="src/deepfold3/model src/deepfold3/data src/deepfold3/io src/deepfold3/params.py"
+
+paused() { [ -e bench/PAUSE ]; }
+
+surface_dirty() {
+  [ -n "$(git status --porcelain --untracked-files=no -- $INFER_SURFACE 2>/dev/null)" ]
+}
+
+stamp_source() {                                        # stamp_source <step> <category>
+  local out="bench/runs/$SERIES/source_provenance.tsv"
+  mkdir -p "$(dirname "$out")"
+  [ -s "$out" ] || printf 'utc\tstep\tcategory\tcommit\tsurface_dirty\n' > "$out"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$2" \
+      "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+      "$(surface_dirty && echo yes || echo no)" >> "$out"
+}
+
 # Build inputs once at startup (idempotent; rebuilds JSONs + manifest at the
 # current cap). New categories / a raised cap slot in without re-benchmarking
 # existing predictions (sweep is skip-existing).
@@ -195,7 +266,7 @@ while true; do
   for ckpt in $(ls "$TRAIN_DIR"/checkpoint_*.pt 2>/dev/null | sort -t_ -k2 -nr); do
     N=$(basename "$ckpt" | sed 's/checkpoint_//;s/\.pt//')
     case "$N" in (*[!0-9]*) continue ;; esac          # skip _checkpoint_* etc.
-    (( N % 1000 == 0 )) || continue                    # 1k grid only (raw step)
+    (( N % $GRID == 0 )) || continue                    # 1k grid only (raw step)
     G=$(( N + OFFSET ))                                 # series-global step
     for CAT in $CATEGORIES; do
       if [ ! -e "bench/runs/$SERIES/eval/$CAT/step_$G/summary.csv" ]; then
@@ -211,6 +282,15 @@ while true; do
   if sweep_active; then
     echo "[auto] $(date '+%m-%d %H:%M') external sweep active -- defer"; sleep 60; continue
   fi
+  if paused; then
+    echo "[auto] $(date '+%m-%d %H:%M') bench/PAUSE present -- defer"; sleep 60; continue
+  fi
+  if surface_dirty && [ -z "${ALLOW_DIRTY:-}" ]; then
+    echo "[auto] $(date '+%m-%d %H:%M') uncommitted changes in the inference surface -- defer:"
+    git status --porcelain --untracked-files=no -- $INFER_SURFACE | sed 's/^/[auto]   /'
+    echo "[auto]   commit them, or set ALLOW_DIRTY=1 if they cannot affect a fold"
+    sleep 60; continue
+  fi
 
   G="$sel_step"; CAT="$sel_cat"
   echo "[auto] $(date '+%m-%d %H:%M') === $CAT step $G (newest-pending) ==="
@@ -221,6 +301,7 @@ while true; do
   # runs, e.g. df3v4/r12 — the deployment target), else ckpt['model'] (SF's x /
   # live AdamW). Matches `deepfold3 export`/`inference`/eval; average would score
   # the raw live params (NOT deployed) for an AdamW+EMA run. Env-overridable.
+  stamp_source "$G" "$CAT"
   CAT_SEEDS="$(cat_seeds "$CAT")"
   [ "$CAT_SEEDS" != "$SEEDS" ] && echo "[auto] $CAT uses seeds=$CAT_SEEDS (global $SEEDS)"
   $PY bench/scripts/run_sweep.py --series "$SERIES" --steps "$G" --category "$CAT" \
@@ -234,17 +315,17 @@ while true; do
   # cross-category lDDT overview (mean + median per step, all categories)
   $PY bench/scripts/plot_lddt_grid.py --series "$SERIES" --ref "$REF_SERIES" || \
     echo "[auto] WARN plot_lddt_grid failed"
-  # Refresh the whole af3-vs-r14 FoldBench report after an interface eval:
-  # overview, confidence calibration, multimer decomposition, the 8-model
-  # mean->oracle comparison and its post-cutoff control, and the rank-1||oracle
-  # twin-bar figure. External model rows are cached; only r14 is recomputed, and
-  # every script auto-detects the latest benched step per category, so running
-  # this after either interface category is safe and cheap.
+  # Refresh the FoldBench comparison report for THIS series after an interface eval:
+  # confidence calibration, the 8-model mean->oracle comparison and its post-cutoff
+  # control, and the rank-1||oracle twin-bar figure. External model rows are cached;
+  # only $SERIES is recomputed, and every script auto-detects the latest benched step
+  # per category, so running this after either interface category is safe and cheap.
+  # Figures land in export/foldbench-compare/out/<short>/, keyed off $SERIES.
   case "$CAT" in
     interface_protein_protein|interface_antibody_antigen)
-      if [ -f export/af3-vs-r14-foldbench/foldbench_ext_cache.json ]; then
-        export/af3-vs-r14-foldbench/update_foldbench.sh \
-          && echo "[auto] foldbench report refreshed" \
+      if [ -f export/foldbench-compare/data/foldbench_ext_cache.json ]; then
+        export/foldbench-compare/update_foldbench.sh --run "$SERIES" \
+          && echo "[auto] foldbench report refreshed ($SERIES)" \
           || echo "[auto] WARN foldbench report update failed"
       fi ;;
   esac

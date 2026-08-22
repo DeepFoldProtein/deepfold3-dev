@@ -1,0 +1,33 @@
+base: lr2e4-c70-rsf-c200-ema.yaml
+
+# Continuation of df3-2e4-c70-rsf-c200-ema with bumped distogram loss weight.
+# Resumes from its checkpoint_16000.pt to probe whether boosting distogram
+# gradient compensates for the residual_branch_rmsnorm suppression observed
+# in stage 1:
+#
+#   - branch RMSNorm divides distogram backward gradient by ~10× (RMSNorm
+#     Jacobian / branch_RMS) — see memory/feedback_rmsn_distogram_cascade.md.
+#   - Net effective lr on PF internal weights was ~85× weaker than s035
+#     (uniros 1/√L × RMSN Jacobian × lr_diff).
+#   - Distogram CE plateaued 0.04 above s035 at matched step. Pair
+#     representation refinement gradient-starved.
+#
+# alpha_distogram 0.03 → 3.0 (×100) targets restoration of the distogram→PF
+# gradient signal to s035-equivalent magnitude (matches the ~85× suppression
+# factor quantified in memory/feedback_rmsn_distogram_cascade.md). Net loss
+# contribution moves from 0.015% to ~1.5% of total (diffusion drops 99.86%
+# → 98.5%). Effect on:
+#
+#   * PF weight update rate ↑ proportionally
+#   * Distogram CE descent rate expected 2-3× (per gradient amplitude argument)
+#   * Trunk stability: monitor — distogram backprop also routes through pair,
+#     where small_rms / pair_rms could drift. Reset to 0.03 if abort triggers.
+#
+# Other knobs unchanged (refined SF C=200, EMA(0.999), lr=2e-4, clip=70).
+# EMA decay stays 0.999 even though feedback_sf_ema_redundancy.md suggested
+# dropping — keep this arm minimal A/B (only alpha_distogram differs from
+# the predecessor) so we can attribute outcome to the loss-weight change
+# alone. Future arm will ablate EMA separately.
+
+training:
+  alpha_distogram: 3.0

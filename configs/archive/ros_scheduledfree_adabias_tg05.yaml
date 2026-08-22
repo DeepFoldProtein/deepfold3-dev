@@ -1,0 +1,23 @@
+base: ros_scheduledfree_adabias.yaml
+
+# Per-layer ROS + AdaLN cond_bias wake-up + ``transition_residual_gain = 0.5``
+# on BOTH single and pair transition branches of the trunk PairFormer.
+# Per-layer ROS is inherited so ``s_ros = 1/√(ℓ+1)``; the gain composes:
+#
+#   s_single_ffn = 0.5 · s_ros = 0.5/√(ℓ+1)
+#   s_pair_ffn   = 0.5 · s_ros = 0.5/√(ℓ+1)
+#
+# Other branches (single_attn / tri_mul / pair_attn) keep ``s_ros`` unchanged.
+#
+# Motivation: the sts ablation
+# (``docs/single-track-stability-experiments.md`` §11) showed that
+# ``single_transition_residual_gain ∈ {0.35, 0.5}`` bounds RMS(s) at
+# matched overfit speed. 0.5 is the less invasive setting and is now
+# also extended to the pair_transition branch as a paired brake. The
+# confidence-head PairFormer is left at the inherited per-layer ROS
+# (its trunk inputs are detached so a confidence-side gain wouldn't
+# affect the trunk we're stabilizing).
+model:
+  pairformer:
+    single_transition_residual_gain: 0.5
+    pair_transition_residual_gain: 0.5

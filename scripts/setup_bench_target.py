@@ -20,6 +20,7 @@ Usage:
         uv run python scripts/setup_bench_target.py --pdb-id $ID --out-dir tmp/bench
     done
 """
+
 from __future__ import annotations
 
 import argparse
@@ -76,9 +77,10 @@ def run_msa(target_dir: Path, sequence: str, pdb_id: str) -> Path:
     msa_dir.mkdir(exist_ok=True, parents=True)
     print(f"[{pdb_id}] running ColabFold-server MSA (≈3-5 min)...")
     proc = subprocess.run(
-        ["deepfold3", "msa", "--sequence", sequence, "--output", str(msa_dir),
-         "--mode", "server"],
-        capture_output=True, text=True, check=False,
+        ["deepfold3", "msa", "--sequence", sequence, "--output", str(msa_dir), "--mode", "server"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout)
@@ -116,8 +118,12 @@ def write_query_json(target_dir: Path, sequence: str, pdb_id: str) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pdb-id", required=True, help="4-character PDB ID (case insensitive)")
-    ap.add_argument("--out-dir", type=Path, default=Path("tmp/bench"),
-                    help="Benchmark root (one subdir per target). Default: tmp/bench")
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("tmp/bench"),
+        help="Benchmark root (one subdir per target). Default: tmp/bench",
+    )
     ap.add_argument("--chain", default="A")
     args = ap.parse_args()
 

@@ -1,0 +1,13 @@
+# ESM2-150M's shape, for ablations that do not need the full model.
+#
+# Note for muP: this ladder varies depth *and* width, exactly as ESM2's does,
+# so it is not a valid muP proxy ladder — muP transfers a learning rate across
+# width at fixed depth. For an LR sweep, hold n_layers at the target's 33 and
+# vary d_model instead:
+#   --override model.mup=true --override model.d_model=320 --override model.n_layers=33
+base: plm-base.yaml
+
+model:
+  d_model: 640
+  n_heads: 20
+  n_layers: 30

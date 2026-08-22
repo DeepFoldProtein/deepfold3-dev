@@ -1,0 +1,44 @@
+base: ../af3_rsf.yaml
+
+# `df3-rsf-18e3-w1k-s035` — single-knob ablation on top of `af3_rsf`
+# (= v2-equivalent: AF3 default + refined SF, warmup 1000, wd 0, clip 10).
+#
+# **Single knob changed**: `pairformer.single_transition_residual_gain: 0.35`.
+#
+# Diagnostic basis (from `df3-rsf-18e3-w1k` act_meter data @ step 163):
+#   * `b_single_ffn` is the sole runaway branch — ρ breach 5/48,
+#     L0=0.580, L1=0.396, L2=0.293 (ceiling c/√(L·2) = 0.102)
+#   * pair track entirely within budget (max 0.073 vs ceiling 0.0645)
+#   * Branch RMS roughly uniform across layers (1.7-2.1) → aligned
+#     dynamics not Karras-orthogonal
+#   * Stream RMS linear in depth: 3.47 → 98.94 (52× total amp)
+#   * ρ_l fits 1/(c+l), c≈1.69; Σρ ≈ ln(amp) ≈ 3.96 (aligned regime)
+#
+# Target amplification 4× (ln 4 / Σρ ≈ 0.35 — sts_B historical winner):
+#   * uniform η=0.35 over-brakes deep layers, under-brakes L0-L1 (still
+#     barely above ceiling); per-layer linear schedule would be cleaner
+#     but requires new knob. 0.35 chosen for fast verification with
+#     existing infrastructure.
+#
+# Expected outcome (vs `df3-rsf-18e3-w1k`):
+#   * ρ_l × 0.35: all single layers below ceiling 0.102 except L0
+#     (0.580 × 0.35 = 0.203 — 2× over, but bounded)
+#   * Σρ × 0.35 = 1.39 → total amp ≈ exp(1.39) ≈ 4× (vs current 52×)
+#   * single_l2 plateau ~10-50× lower (was rms 81 at step 142 in w1k)
+#   * smooth_lddt: should match or slightly underperform w1k (35-45% LDDT)
+#     until step 500-1000 when stable trunk allows continued descent
+#   * Eval CE breakthrough: w1k stuck at distogram ~2.05; this arm
+#     could push below 2.0 if trunk capacity isn't artifically squeezed
+#
+# Abort criteria:
+#   * single_l2 trajectory matches w1k (no improvement) → 0.35 too weak
+#   * smooth_lddt > 0.65 sustained past step 300 → 0.35 too strong
+#
+# pair_transition is NOT scaled — pair track was already healthy.
+#
+# act_rms_log_interval=10 (from initial.yaml) so this run logs one ρ
+# snapshot per 10 steps instead of every step.
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.35

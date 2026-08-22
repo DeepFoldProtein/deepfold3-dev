@@ -1,0 +1,31 @@
+# Warm start from ESMC-600M, then complex MLM.
+#
+#   PLM_CONFIG=configs/plm-esmc600m.yaml bash kakao/plm-submit.sh plm-esmc
+#
+# The shape is ESMC-600M's exactly (36 x 1152, 18 heads) because the weights
+# are copied tensor for tensor; `esmc_compat` reproduces its mixture of norm
+# biases, without which the load is not exhaustive.
+#
+# `cg` over 36 layers is 18 chain-scoped and 18 complex-scoped. The 18 that
+# become complex-scoped keep ESMC's projections and FFN but lose rotary
+# entirely, so their attention is effectively re-learned — the early loss will
+# show it. That is the deliberate trade: the alternative is what plm-r2 did,
+# training the whole trunk from scratch, which after 90k steps still trails
+# frozen ESM2 on both membership (0.59 vs 0.70) and pairing (Result 9).
+base: plm-base.yaml
+
+model:
+  d_model: 1152
+  n_heads: 18
+  n_layers: 36
+  layer_pattern: cg
+  norm: layernorm
+  esmc_compat: true
+  # muP off: its scale factors are defined against a *from-scratch* proxy, and
+  # the transferred learning rate assumed that. A warm start needs its own,
+  # smaller rate — PPLM fine-tuned ESM2 at 1e-6 to 5e-7.
+  mup: false
+
+train:
+  lr: 1.0e-4
+  warmup_steps: 2000

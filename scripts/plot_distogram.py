@@ -570,9 +570,7 @@ def main() -> None:
                 mae = float(np.nanmean(R))
                 rmax = float(np.nanmax(R))
                 if args.residual_heatmap:
-                    title = (
-                        f"|{label} − {ref_label}|\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
-                    )
+                    title = f"|{label} − {ref_label}|\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
                     panels.append((title, R, chains, True))
                 else:
                     # Mask trimmed head/tail with NaN so the heatmap visibly
@@ -581,9 +579,7 @@ def main() -> None:
                     # full D for the pred-vs-struct MAE computation.
                     D_disp = np.full_like(D, np.nan)
                     D_disp[si : si + L, si : si + L] = D[si : si + L, si : si + L]
-                    title = (
-                        f"{label}\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
-                    )
+                    title = f"{label}\naligned L={L}/{S}  trim h/t={src_drop[0]}/{src_drop[1]}  MAE={mae:.2f} Å"
                     panels.append((title, D_disp, chains, False))
                 panel_meta.append((src_path, 0, mae))
                 panel_raw[len(panels) - 1] = D
@@ -684,7 +680,9 @@ def main() -> None:
                 mae = float(np.nanmean(R))
                 rmax = float(np.nanmax(R))
                 if args.residual_heatmap:
-                    title = f"|{label} pred − {ref_label}|\naligned L={L}/{S}  trim h/t={si}/{S - si - L}  MAE={mae:.2f} Å"
+                    title = (
+                        f"|{label} pred − {ref_label}|\naligned L={L}/{S}  trim h/t={si}/{S - si - L}  MAE={mae:.2f} Å"
+                    )
                     panels.append((title, R, chains, True))
                 else:
                     # Mask trimmed edges so the heatmap shows the aligned
@@ -695,9 +693,7 @@ def main() -> None:
                     panels.append((title, E_disp, chains, False))
                 panel_meta.append((path, 1, mae))
                 panel_raw[len(panels) - 1] = E
-                print(
-                    f"[plot_distogram] {label} (pred): MAE={mae:.2f} Å, max={rmax:.2f} Å (cif-borrowed alignment)"
-                )
+                print(f"[plot_distogram] {label} (pred): MAE={mae:.2f} Å, max={rmax:.2f} Å (cif-borrowed alignment)")
             else:
                 print(
                     f"[plot_distogram] {label} (pred): shape {E.shape} vs ref {ref_D_full.shape}; "
@@ -754,12 +750,28 @@ def main() -> None:
             cx, cy = _sorted(cif_xs, cif_ys)
             ax.plot(cx, cy, marker="o", color="tab:blue", label="cif (structure-derived |D − D_ref|)")
             for x, y in zip(cx, cy, strict=True):
-                ax.annotate(f"{y:.2f}", (x, y), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=7, color="tab:blue")
+                ax.annotate(
+                    f"{y:.2f}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, 6),
+                    ha="center",
+                    fontsize=7,
+                    color="tab:blue",
+                )
         if pred_xs:
             px, py = _sorted(pred_xs, pred_ys)
             ax.plot(px, py, marker="s", color="tab:orange", label="pred E[d]  |E[d] − D_ref|")
             for x, y in zip(px, py, strict=True):
-                ax.annotate(f"{y:.2f}", (x, y), textcoords="offset points", xytext=(0, -12), ha="center", fontsize=7, color="tab:orange")
+                ax.annotate(
+                    f"{y:.2f}",
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, -12),
+                    ha="center",
+                    fontsize=7,
+                    color="tab:orange",
+                )
         ax.set_xlabel("training step" if has_step else "source index")
         ax.set_ylabel("MAE  (Å)")
         ax.set_title(f"Distogram MAE vs {ref_label}")

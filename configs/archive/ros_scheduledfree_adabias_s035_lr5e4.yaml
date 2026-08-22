@@ -1,0 +1,25 @@
+base: ros_scheduledfree_adabias_s035.yaml
+
+# Same as ros_scheduledfree_adabias_s035 (single_transition_residual_gain=0.35,
+# pair untouched) but with the peak learning rate halved from 1e-3 → 5e-4.
+#
+# Motivation: in df3-12n-s035-0504-032348, the η=0.35 brake bounded
+# per-block residual update magnitude but couldn't keep up with the
+# lr-driven growth of the underlying ``single_transition.linear2``
+# weights themselves — single_l2 climbed from 36.8 (step 200, lr=2e-4)
+# to 851 (step 800, lr=8e-4), roughly 1.5–2× per +1e-4 of lr. The brake
+# is forward-pass invariant; weights still grow linearly with the
+# update step ∝ lr.
+#
+# Halving lr cuts the per-step weight update magnitude in half, which
+# (a) slows ``single_transition.linear2`` Frobenius growth and
+# (b) reduces the effective ``α`` (radial gain coefficient) the model
+# converges to. Combined with the η=0.35 schedule this should bound
+# single_l2 plateau to a safe regime (target ~50–100 by post-warmup).
+#
+# Tradeoff: smaller lr → slower convergence. With Schedule-Free AdamW
+# the iterate-averaging is mostly insensitive to lr scale (the averaged
+# x sequence is what's reported), so this should mainly affect the
+# point-estimate y trajectory's noise, not the final iterate quality.
+training:
+  lr: 5.0e-4

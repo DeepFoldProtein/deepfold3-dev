@@ -1,0 +1,15 @@
+base: sts_A.yaml
+
+# Single-track stability experiment, run C — single_transition gets an
+# extra ``1/√(ℓ+1)`` factor on top of the inherited per-layer ROS:
+#   s_single_ffn = (1/√(ℓ+1)) · s_ros = 1/√(ℓ+1) · 1/√(ℓ+1) = 1/(ℓ+1)
+# for the trunk PairFormer single FFN only.
+#
+# Hypothesis: a steeper-than-sqrt depth schedule is needed when the single
+# update has a positive-aligned-gain component — the budget for growth is
+# Σ γ_k α_k, not Σ γ_k², so the conventional 1/sqrt(L) safety margin is
+# under-scaled.
+
+model:
+  pairformer:
+    single_transition_residual_per_layer_extra: true

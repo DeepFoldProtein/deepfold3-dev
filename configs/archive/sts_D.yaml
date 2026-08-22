@@ -1,0 +1,16 @@
+base: sts_A.yaml
+
+# Single-track stability experiment, run D — single_transition × 0.5.
+# Per-layer ROS is inherited so ``s_ros = 1/√(ℓ+1)``. This config adds a
+# constant 0.5× factor on the single FFN branch only:
+#   s_single_ffn = 0.5 · s_ros = 0.5/√(ℓ+1)
+# Same recipe as run B but with a less aggressive damp — the next bracket
+# on the η-sweep started by B(0.35) and C(extra 1/√(ℓ+1)).
+#
+# Hypothesis: identifies the loosest brake that still bounds RMS(s) at
+# matched fit speed. If D plateaus similarly to B (bounded RMS, equal
+# loss), production can adopt η=0.5 — a less invasive change.
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.5

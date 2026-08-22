@@ -212,11 +212,13 @@ def write_sbatch(
     save_distogram: bool,
     snapshot: str,
     tag: str = "",
+    msa_crop_size: int | None = None,
 ) -> Path:
     gres = f"gpu:{gpu_type}:1" if gpu_type and gpu_type != "any" else "gpu:1"
     array = f"0-{n_shards - 1}" + (f"%{max_concurrent}" if max_concurrent else "")
     seed_flags = " ".join(f"--seed {s}" for s in seeds)
     disto = "--save-distogram" if save_distogram else "--no-save-distogram"
+    msa_flag = f"--msa-crop-size {msa_crop_size}" if msa_crop_size else ""
     suffix = f"_{tag}" if tag else ""
     sbatch = shard_dir / "sweep.sbatch"
     sbatch.write_text(
@@ -259,6 +261,7 @@ for attempt in 1 2 3 4 5; do
         --optim inference \\
         --num-samples {num_samples} \\
         --num-recycles {num_recycles} \\
+        {msa_flag} \\
         {seed_flags} \\
         --skip-existing \\
         {disto}; then
@@ -323,6 +326,7 @@ def submit_step(args, step: int, categories: list[str], tag: str = "") -> str | 
         not args.no_distogram,
         args.snapshot,
         tag,
+        args.msa_crop_size,
     )
     order = " > ".join(c for c, _ in by_cat)
     print(
@@ -374,6 +378,17 @@ def main() -> None:
     ap.add_argument("--partition", default="normal")
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--num-recycles", type=int, default=10)
+    ap.add_argument(
+        "--msa-crop-size",
+        type=int,
+        default=None,
+        help=(
+            "Override the checkpoint's per-recycle MSA crop. Training uses a "
+            "deliberately small crop (r14: 1024) and randomises the effective row "
+            "count, so bench should serve the full pool: pass 16384. Omitted = "
+            "whatever the checkpoint was trained with."
+        ),
+    )
     ap.add_argument("--seed", default="42,43,44,45", help="Comma list of model seeds (FoldBench uses 4).")
     ap.add_argument(
         "--max-concurrent",

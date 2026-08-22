@@ -1,0 +1,38 @@
+base: af3_refined_sf.yaml
+
+# `df3-af3r-s035` — s035-derived stable point + refined SF + lighter clip.
+#
+# Combines the s035 stability envelope (lr 2.5e-4, wd 0.1, AF3 baseline arch)
+# with our refined SF + lighter clip preferences:
+#
+#   * lr 1.8e-3 → 2.5e-4         (s035; tested-stable with wd 0.1)
+#   * weight_decay 0.0 → 0.1     (s035; bounds scale-invariant directions)
+#   * grad_clip_norm 10.0 → 100.0 (s035 used 10 → 82% clip rate, too heavy;
+#                                  100 → 19% r_clip, lr×clip = 0.025 safe)
+#   * keep refined SF (decoupling_parameter=200) from af3_refined_sf
+#   * keep AF3 baseline arch (no RMSN, no uniros) from af3_refined_sf
+#
+# Empirical context (s035 grad_norm distribution, 11k steps):
+#   p50=28, p90=279, p95=1401, p99=7540
+#   clip=10 → r_clip 82% (s035 default, heavy normalized-gradient mode)
+#   clip=100 → r_clip 19% (rare-spike limiter, framework "good regime")
+#
+# Rationale: s035's heavy clip dominance probably suppressed learning
+# signal that's actually productive. With clip=100, ~80% of steps pass
+# without clip → real gradient magnitudes inform the update direction.
+# Catapult events (grad > 100) still get capped.
+#
+# lr × clip = 2.5e-4 × 100 = 0.025
+# Within empirical pre-RMSN abort envelope (0.036).
+# With refined SF averaging smoothing trajectory, additional safety margin.
+#
+# Predictions vs af3_refined_sf (v2: lr 1.8e-3 wd 0 clip 10):
+#   * Slower per-step learning (lr ~14% of v2)
+#   * BUT more productive directional signal per step (less clip noise)
+#   * single explosion bounded (wd 0.1 brake — like predecessor 12.04 plateau)
+#   * Plateau (if any) may be deeper than 2.14 — wd brake raises capacity ceiling
+
+training:
+  lr: 2.5e-4
+  weight_decay: 0.1
+  grad_clip_norm: 100.0

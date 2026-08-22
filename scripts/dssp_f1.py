@@ -36,6 +36,7 @@ Usage:
         --steps 5000 7000 9000 10000 \\
         --n-samples 30
 """
+
 from __future__ import annotations
 
 import argparse
@@ -67,8 +68,12 @@ def _resolve_mkdssp() -> str:
     (zero-residue output → blank SS-F1). analysis.sh Phase 2 auto-installs the
     conda-forge ``dssp`` package and exports ``$MKDSSP`` when it is missing.
     """
-    for cand in (os.environ.get("MKDSSP"), shutil.which("mkdssp"),
-                 os.path.expanduser("~/.local/bin/mkdssp"), "/usr/bin/mkdssp"):
+    for cand in (
+        os.environ.get("MKDSSP"),
+        shutil.which("mkdssp"),
+        os.path.expanduser("~/.local/bin/mkdssp"),
+        "/usr/bin/mkdssp",
+    ):
         if cand and os.path.exists(cand):
             return cand
     return "mkdssp"
@@ -81,9 +86,15 @@ DSSP_8 = ("H", "E", "G", "I", "T", "S", "B", "P", "-")
 
 # Collapse to a 3-state SS code (the classical benchmark scale).
 THREE_STATE = {
-    "H": "α", "G": "α", "I": "α", "P": "α",  # all helix-like
-    "E": "β", "B": "β",                       # all strand-like
-    "T": "c", "S": "c", "-": "c",             # turn / bend / coil
+    "H": "α",
+    "G": "α",
+    "I": "α",
+    "P": "α",  # all helix-like
+    "E": "β",
+    "B": "β",  # all strand-like
+    "T": "c",
+    "S": "c",
+    "-": "c",  # turn / bend / coil
 }
 
 
@@ -121,6 +132,7 @@ def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
         lines = cache_path.read_text().splitlines()
     else:
         import gemmi  # noqa: PLC0415
+
         with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as tf:
             pdb_path = Path(tf.name)
         with tempfile.NamedTemporaryFile(suffix=".dssp", mode="w", delete=False) as tf:
@@ -130,12 +142,9 @@ def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
             st.write_pdb(str(pdb_path))
             body = pdb_path.read_text()
             keep_prefixes = ("ATOM", "HETATM", "TER", "END", "MODEL", "ENDMDL")
-            body_atoms = "\n".join(
-                line for line in body.splitlines() if line.startswith(keep_prefixes)
-            ) + "\n"
+            body_atoms = "\n".join(line for line in body.splitlines() if line.startswith(keep_prefixes)) + "\n"
             pdb_path.write_text(_PDB_STUB_HEADER + body_atoms)
-            subprocess.run([MKDSSP, str(pdb_path), str(out_path)],
-                           capture_output=True, text=True, check=False)
+            subprocess.run([MKDSSP, str(pdb_path), str(out_path)], capture_output=True, text=True, check=False)
             dssp_text = out_path.read_text()
             lines = dssp_text.splitlines()
             if cache:
@@ -145,21 +154,19 @@ def run_dssp(cif: Path, cache: bool = True) -> list[tuple[str, str]]:
                 # a target ref).
                 import os  # noqa: PLC0415
                 import threading
-                tmp = cache_path.with_name(
-                    f"{cache_path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
-                )
+
+                tmp = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
                 tmp.write_text(dssp_text)
                 tmp.replace(cache_path)
         finally:
             pdb_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
     # Find header line "  #  RESIDUE AA STRUCTURE …"; data starts the next line.
-    start = next((i for i, line in enumerate(lines)
-                  if line.startswith("  #  RESIDUE")), -1)
+    start = next((i for i, line in enumerate(lines) if line.startswith("  #  RESIDUE")), -1)
     if start < 0:
         return []
     residues = []
-    for line in lines[start + 1:]:
+    for line in lines[start + 1 :]:
         if len(line) < 17:
             continue
         if line[13:14] == "!":
@@ -198,8 +205,7 @@ def per_class_metrics(pred: list[str], gt: list[str], classes: tuple[str, ...]):
     return prec_d, rec_d, f1_d, macro
 
 
-def confusion_matrix(pred: list[str], gt: list[str], classes: tuple[str, ...]
-                     ) -> dict[tuple[str, str], int]:
+def confusion_matrix(pred: list[str], gt: list[str], classes: tuple[str, ...]) -> dict[tuple[str, str], int]:
     """``{(gt_class, pred_class): count}`` over the aligned positions."""
     mat: dict[tuple[str, str], int] = {(g, p): 0 for g in classes for p in classes}
     for p, g in zip(pred, gt, strict=True):
@@ -209,8 +215,7 @@ def confusion_matrix(pred: list[str], gt: list[str], classes: tuple[str, ...]
 
 
 # Backward-compat shim — older callers expecting only (f1, macro).
-def per_class_f1(pred: list[str], gt: list[str], classes: tuple[str, ...]
-                 ) -> tuple[dict[str, float], float]:
+def per_class_f1(pred: list[str], gt: list[str], classes: tuple[str, ...]) -> tuple[dict[str, float], float]:
     _p, _r, f1_d, macro = per_class_metrics(pred, gt, classes)
     return f1_d, macro
 
@@ -281,10 +286,12 @@ def main() -> None:
     print(f"REF: {args.ref}")
     print(f"mkdssp: {MKDSSP}")
     print()
-    print(f"{'step':>6} | {'n':>3} | "
-          f"{'F1(8st) mean':>12} | {'med':>5} | "
-          f"{'F1(3st) mean':>12} | {'med':>5} | "
-          f"{'acc(8)':>6} | {'acc(3)':>6}")
+    print(
+        f"{'step':>6} | {'n':>3} | "
+        f"{'F1(8st) mean':>12} | {'med':>5} | "
+        f"{'F1(3st) mean':>12} | {'med':>5} | "
+        f"{'acc(8)':>6} | {'acc(3)':>6}"
+    )
     print("-" * 90)
     for step in args.steps:
         sub = args.inference_dir / args.pattern.format(step=step, n=args.n_samples)
@@ -295,10 +302,12 @@ def main() -> None:
         if r is None:
             print(f"{step:>6} | (no usable samples)")
             continue
-        print(f"{step:>6} | {r['n']:>3} | "
-              f"{r['f1_8_mean']:>12.4f} | {r['f1_8_med']:>5.3f} | "
-              f"{r['f1_3_mean']:>12.4f} | {r['f1_3_med']:>5.3f} | "
-              f"{r['acc_8_mean']:>6.3f} | {r['acc_3_mean']:>6.3f}")
+        print(
+            f"{step:>6} | {r['n']:>3} | "
+            f"{r['f1_8_mean']:>12.4f} | {r['f1_8_med']:>5.3f} | "
+            f"{r['f1_3_mean']:>12.4f} | {r['f1_3_med']:>5.3f} | "
+            f"{r['acc_8_mean']:>6.3f} | {r['acc_3_mean']:>6.3f}"
+        )
 
 
 if __name__ == "__main__":

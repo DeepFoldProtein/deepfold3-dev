@@ -27,6 +27,7 @@ Usage (standalone CLI, mirrors ``usalign_tm.py``)::
         --inference-dir tmp/bench/9SZN/df3-fapeK5-25e5-c10-g35 \\
         --steps 1000 1500 2000 --n-samples 30 --per-sample
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,10 +44,26 @@ from check_chirality import needleman_wunsch  # noqa: E402
 
 # Standard 20 amino acids — used to skip ligands / waters / non-standard residues.
 _AA_3TO1 = {
-    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
 }
 
 GDT_TS_CUTOFFS = (1.0, 2.0, 4.0, 8.0)
@@ -109,10 +126,15 @@ def kabsch_superimpose(pred: np.ndarray, ref: np.ndarray) -> np.ndarray:
     return pred @ R.T + t
 
 
-def _gdt_score_at_cutoff(pred: np.ndarray, ref: np.ndarray,
-                          cutoff: float, seed_len: int = 5,
-                          stride: int = 3, max_iter: int = 20,
-                          min_subset: int = 3) -> float:
+def _gdt_score_at_cutoff(
+    pred: np.ndarray,
+    ref: np.ndarray,
+    cutoff: float,
+    seed_len: int = 5,
+    stride: int = 3,
+    max_iter: int = 20,
+    min_subset: int = 3,
+) -> float:
     """LGA-style multi-seed best-fit subset score for one cutoff ``d``.
 
     For every length-``seed_len`` contiguous-residue seed (sliding with
@@ -135,7 +157,7 @@ def _gdt_score_at_cutoff(pred: np.ndarray, ref: np.ndarray,
     best = 0
     for start in range(0, n - seed_len + 1, stride):
         mask = np.zeros(n, dtype=bool)
-        mask[start:start + seed_len] = True
+        mask[start : start + seed_len] = True
         for _ in range(max_iter):
             if mask.sum() < min_subset:
                 break
@@ -152,8 +174,7 @@ def _gdt_score_at_cutoff(pred: np.ndarray, ref: np.ndarray,
     return float(best / n)
 
 
-def compute_gdt_ts(pred_ca: np.ndarray, ref_ca: np.ndarray,
-                   cutoffs: tuple[float, ...] = GDT_TS_CUTOFFS) -> float:
+def compute_gdt_ts(pred_ca: np.ndarray, ref_ca: np.ndarray, cutoffs: tuple[float, ...] = GDT_TS_CUTOFFS) -> float:
     """LGA-style GDT-TS on already-paired Cα arrays. Both ``[N, 3]``.
 
     GDT-TS = mean over the four cutoffs ``{1, 2, 4, 8} Å`` of the
@@ -166,8 +187,7 @@ def compute_gdt_ts(pred_ca: np.ndarray, ref_ca: np.ndarray,
     return float(np.mean(scores))
 
 
-def gdt_ts_for_pair(pred_cif: Path, ref_cif: Path,
-                    chain_id: str = "A") -> float | None:
+def gdt_ts_for_pair(pred_cif: Path, ref_cif: Path, chain_id: str = "A") -> float | None:
     """End-to-end: load both, NW-align by sequence, superimpose, GDT-TS.
 
     Returns ``None`` if either file is unusable or no aligned residues.
@@ -184,8 +204,7 @@ def gdt_ts_for_pair(pred_cif: Path, ref_cif: Path,
     return compute_gdt_ts(pred_aligned, ref_aligned)
 
 
-def measure_step(step_dir: Path, ref: Path, n_samples: int,
-                 seed: int = 42, chain_id: str = "A"):
+def measure_step(step_dir: Path, ref: Path, n_samples: int, seed: int = 42, chain_id: str = "A"):
     rs: list[float] = []
     for i in range(n_samples):
         cif = step_dir / f"seed-{seed}_sample-{i}" / "model.cif"
@@ -220,8 +239,7 @@ def main() -> None:
 
     print(f"REF: {args.ref}")
     print()
-    print(f"  {'step':>5} | {'n':>3} | {'mean GDT-TS':>11} | {'median':>6} | "
-          f"{'max':>5} | {'min':>5}")
+    print(f"  {'step':>5} | {'n':>3} | {'mean GDT-TS':>11} | {'median':>6} | {'max':>5} | {'min':>5}")
     print("-" * 70)
     for step in args.steps:
         sub = args.inference_dir / args.pattern.format(step=step)
@@ -232,8 +250,10 @@ def main() -> None:
         if r is None:
             print(f"  {step:>5} | (no usable samples)")
             continue
-        print(f"  {step:>5} | {r['n']:>3} | {r['mean']:>11.4f} | "
-              f"{r['median']:>6.4f} | {r['max']:>5.3f} | {r['min']:>5.3f}")
+        print(
+            f"  {step:>5} | {r['n']:>3} | {r['mean']:>11.4f} | "
+            f"{r['median']:>6.4f} | {r['max']:>5.3f} | {r['min']:>5.3f}"
+        )
         if args.per_sample:
             samples_str = " ".join(f"{v:.3f}" for v in r["samples"])
             print(f"           samples: {samples_str}")

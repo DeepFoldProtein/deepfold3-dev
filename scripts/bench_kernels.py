@@ -163,10 +163,7 @@ def main():
                 base_mem = r["peak_gb"]
             spd = base / r["ms_median"]
             dmem = r["peak_gb"] - base_mem
-            print(
-                f"  {name:32s} {r['ms_median']:7.2f} ms  ({spd:4.2f}x)   "
-                f"peak {r['peak_gb']:6.2f} GB ({dmem:+.2f})"
-            )
+            print(f"  {name:32s} {r['ms_median']:7.2f} ms  ({spd:4.2f}x)   peak {r['peak_gb']:6.2f} GB ({dmem:+.2f})")
             del blocks
             torch.cuda.empty_cache()
         print()

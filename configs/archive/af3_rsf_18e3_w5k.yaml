@@ -1,0 +1,39 @@
+base: ../initial.yaml
+
+# `df3-rsf-18e3-w5k` — v2 (`df3-af3r`)와 warmup만 다른 single-knob ablation.
+#
+# 목적: v2가 capacity ceiling 2.14에서 시작해 single_l2 4.6M 폭주로
+# degrade한 패턴이, warmup을 5× 늘려 lr ramp를 천천히 하면 회피되는가?
+# 가설: sub-peak lr 시간이 5× 늘면 weight가 productive direction을
+# 누적할 시간이 충분해져 full lr 도달 시 EoS-unstable subspace 진입을
+# 피할 수 있음.
+#
+# Inherits from initial.yaml:
+#   - lr 1.8e-3 (AF3 default)
+#   - wd 0.0 (AF3 default)
+#   - grad_clip_norm 10 (AF3 default)
+#   - betas (0.9, 0.95)
+#   - AF3 baseline arch (no RMSN, no uniros)
+#   - EMA 0.999
+#
+# Overrides:
+#   - optimizer_type: schedule_free          (default adamw)
+#   - decoupling_parameter: 200             (refined SF)
+#   - batch_size_per_rank: 3, accumulate: 1  → eff. batch 288
+#   - warmup_steps: 1000 → 5000              (single-knob change vs v2)
+#
+# lr × clip = 1.8e-3 × 10 = 0.018 (= v2, = AF3 default).
+#
+# Decision logic:
+#   * single_l2 폭주 회피 + CE 2.14 ceiling 돌파 → warmup이 v2 폭주 막음
+#   * single_l2 여전히 폭주 → warmup으론 부족, wd 필요 (다음 arm에서)
+#   * 2.14 ceiling 안 깨짐 → ceiling은 arch-bound, AF3 baseline 재검토
+
+training:
+  optimizer_type: schedule_free
+  decoupling_parameter: 200.0
+
+  batch_size_per_rank: 3
+  accumulate_grad_batches: 1
+
+  warmup_steps: 5000

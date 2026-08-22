@@ -1,0 +1,44 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Sibling A/B arm to df3-12n-uniros-rmsn-lr2e4-clip70-cont (= df3-2e4-c70
+# in registry).  Resumes from its checkpoint_5000.pt with two simultaneous
+# knobs versus the vanilla arm:
+#
+#   1. Refined SF averaging (arxiv 2507.09846 "Through the River"):
+#      decoupling_parameter = 200, β₁ = 0.9 → α = (1−β₁)·C = 20 →
+#      narrow window on x (≈ recent T/20 step weighted average) instead
+#      of vanilla's uniform-ish-over-all-past. Tests whether decoupling
+#      β₁ from x's averaging width unlocks additional fit-rate at the
+#      same lr × clip = 0.014 budget that the vanilla arm has been
+#      plateauing on (see memory/project_uniros_rmsn_lr_clip_landing.md).
+#
+#   2. EMA(x) on top:
+#      ema_decay = 0.999. Compensates for the narrower SF window by
+#      adding ~1000-step external smoothing. EMACallback wraps
+#      ema.update() in optimizer_eval_mode() so the shadow tracks x
+#      (the SF inference target), not y (the gradient point). Per-step
+#      cost: 2 extra param-sized lerps (~3-5ms at 620M params on B200).
+#      Through the River §6 found EMA-on-vanilla-SF yields little gain
+#      (vanilla x is already wide-averaged); refined SF narrows x so
+#      external EMA can add complementary smoothing.
+#
+# Vanilla arm continues unaltered alongside this one for matched-step
+# A/B comparison.
+#
+# Watch points (200-500 step post-resume):
+#   * single_rms ≤ 11    (trunk safety; refined averaging shouldn't
+#                         change trunk dynamics, but verify)
+#   * tm_true ≥ vanilla at matched steps (refined should not regress)
+#   * mean/median grad ≈ vanilla's ~5 (Adam preconditioning unchanged)
+#   * Eval-time smooth_lddt: EMA(x) shadow should be at least as low
+#     as vanilla's x; ideally lower (the whole point of the ablation)
+
+training:
+  lr: 2.0e-4
+  grad_clip_norm: 70.0
+  checkpoint_interval: 100
+  checkpoint_every_hours: 0
+  num_workers: 16
+  prefetch_factor: 16
+  decoupling_parameter: 200.0
+  ema_decay: 0.999

@@ -1,0 +1,25 @@
+base: schedule_free.yaml
+
+# Refined Schedule-Free averaging (arxiv 2507.09846 "Through the River:
+# Understanding the Benefit of Schedule-Free Methods for Language Model
+# Training", 2025).
+#
+# Vanilla SF (Defazio 2024, arxiv 2405.15682) uses
+#     c_t = γ_t² / Σ γ_i²    (asymptotically 1/t)
+# which couples β₁'s momentum role to x's averaging window. Refined SF
+# replaces this with
+#     c_t = (1 − β₁) · C / t
+# where C = decoupling_parameter. β₁ then governs only the y-interpolation
+# (momentum); C governs only the averaging window width.
+#
+# C choices (with β₁ = 0.9, so α = (1−β₁)·C = 0.1·C):
+#   C = 10  → α = 1   ≈ vanilla equivalent (uniform-ish over all past z)
+#   C = 100 → α = 10  → moderate concentration on recent z
+#   C = 200 → α = 20  → narrow window, x ≈ recent ~T/20 weighted average
+#   C → ∞  → x → most-recent z (no averaging)
+#
+# This is a base mixin — every inheriting config should set the actual C
+# value. Use this when you want to compose refined-SF with arbitrary lr /
+# clip overrides without re-stating the SF base setup.
+training:
+  decoupling_parameter: 1.0   # placeholder — override per arm

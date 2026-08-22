@@ -1,0 +1,40 @@
+base: af3_rsf_s035.yaml
+
+# `df3-rsf-18e3-w1k-s035-wd05` — combined intervention on top of `af3_rsf_s035`.
+#
+# Single knob added vs `af3_rsf_s035.yaml`: `weight_decay 0 → 0.05`.
+#
+# Rationale (from `df3-rsf-18e3-w1k-s035` eval @ step 500-700):
+#   * `gain=0.35` alone reduces single_l2 6× vs w1k baseline at every
+#     matched step (verified step 21-410). Brake is real.
+#   * BUT single_l2 still grows monotonically (training-time weight
+#     drift). 6× slower v2 trajectory but still v2-shaped. wd=0 leaves
+#     scale-invariant subspaces unbounded.
+#   * step 500-700 distogram CE regressed 2.17 → 2.18 → … (early step
+#     500 was 2.17 best, then climbing); distogram_entropy dropping
+#     while CE climbing = confidently-wrong predictions = classic
+#     capacity-collapse signal. Single_l2 hit 1.67M @ step 700 = past
+#     v2's 4.6M ballpark.
+#
+# `weight_decay = 0.05` chosen:
+#   * Conservative — between `initial.yaml`'s 0.0 default and `s035`-era
+#     0.10. Pairs naturally with `gain=0.35` to give a two-mechanism
+#     brake: forward (gain) reduces per-layer ρ; decay (wd) bounds the
+#     stationary norm |w|²* ~ η/(2λ_w) · E|Pg|².
+#   * Under AdamW the effective decay is `lr × wd × steps`. At
+#     `lr_peak = 1.8e-3, wd = 0.05` → effective per-step shrinkage
+#     `9e-5`, accumulating to a measurable counterterm over 1000+ step.
+#
+# Expected outcome:
+#   * Single_l2 plateau at finite value (vs s035's monotonic growth)
+#   * Distogram CE descent resumes (no more 2.06 → 2.45 regression)
+#   * smooth_lddt continues slow descent (no quality cost from wd at
+#     this level — sub-stable per the AdamW phase diagram)
+#
+# Abort criteria:
+#   * smooth_lddt > 0.65 sustained → wd over-applied, drop to 0.025
+#   * single_l2 still climbing monotonically past step 1500 → gain too
+#     weak even with wd; need 0.17
+
+training:
+  weight_decay: 0.05

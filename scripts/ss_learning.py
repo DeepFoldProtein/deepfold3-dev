@@ -31,6 +31,7 @@ Usage:
 For ad-hoc targets outside the bench layout (e.g., 11CF, 9SZN), pass
 ``--target-spec PDB:REF_PATH:INFERENCE_DIR`` (repeatable).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -104,7 +105,7 @@ def helix_recovery_fractions(ref_ss: list[str], pred_ss: list[str]) -> list[tupl
     """
     out = []
     for start, length in find_contiguous_runs(ref_ss, "H"):
-        window = pred_ss[start:start + length]
+        window = pred_ss[start : start + length]
         # Longest H run inside the window
         best = 0
         cur = 0
@@ -132,9 +133,13 @@ def _serialize_metrics(r: dict) -> dict:
         "pred_ss": "".join(r["pred_ss"]),
         "ref_ss": "".join(r["ref_ss"]),
         "n_aligned": r["n_aligned"],
-        "prec_8": r["prec_8"], "rec_8": r["rec_8"], "f1_8": r["f1_8"],
+        "prec_8": r["prec_8"],
+        "rec_8": r["rec_8"],
+        "f1_8": r["f1_8"],
         "macro_8": r["macro_8"],
-        "prec_3": r["prec_3"], "rec_3": r["rec_3"], "f1_3": r["f1_3"],
+        "prec_3": r["prec_3"],
+        "rec_3": r["rec_3"],
+        "f1_3": r["f1_3"],
         "macro_3": r["macro_3"],
         "confusion_3": {f"{g}|{p}": v for (g, p), v in r["confusion_3"].items()},
         "helix_fractions": [list(t) for t in r["helix_fractions"]],
@@ -148,13 +153,15 @@ def _deserialize_metrics(d: dict) -> dict:
         "pred_ss": list(d["pred_ss"]),
         "ref_ss": list(d["ref_ss"]),
         "n_aligned": d["n_aligned"],
-        "prec_8": d["prec_8"], "rec_8": d["rec_8"], "f1_8": d["f1_8"],
+        "prec_8": d["prec_8"],
+        "rec_8": d["rec_8"],
+        "f1_8": d["f1_8"],
         "macro_8": d["macro_8"],
-        "prec_3": d["prec_3"], "rec_3": d["rec_3"], "f1_3": d["f1_3"],
+        "prec_3": d["prec_3"],
+        "rec_3": d["rec_3"],
+        "f1_3": d["f1_3"],
         "macro_3": d["macro_3"],
-        "confusion_3": {
-            tuple(k.split("|")): v for k, v in d["confusion_3"].items()
-        },
+        "confusion_3": {tuple(k.split("|")): v for k, v in d["confusion_3"].items()},
         "helix_fractions": [tuple(t) for t in d["helix_fractions"]],
         "gdt_ts": d["gdt_ts"],
     }
@@ -184,9 +191,7 @@ def _write_metric_cache(cif: Path, r: dict) -> None:
     under concurrent writers (e.g. two ss_learning runs sharing a sample
     dir, or our own ThreadPool firing on the same sample twice)."""
     path = cif.parent / _SS_METRICS_FILENAME
-    tmp = path.with_name(
-        f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
-    )
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     try:
         with open(tmp, "w") as fh:
             json.dump(_serialize_metrics(r), fh)
@@ -225,8 +230,14 @@ def _per_sample(cif: Path, ref_res, ref_cif: Path):
         "pred_ss": pred_ss,
         "ref_ss": ref_ss,
         "n_aligned": len(pred_ss),
-        "prec_8": p_8, "rec_8": r_8, "f1_8": f1_8, "macro_8": m8,
-        "prec_3": p_3, "rec_3": r_3, "f1_3": f1_3, "macro_3": m3,
+        "prec_8": p_8,
+        "rec_8": r_8,
+        "f1_8": f1_8,
+        "macro_8": m8,
+        "prec_3": p_3,
+        "rec_3": r_3,
+        "f1_3": f1_3,
+        "macro_3": m3,
         "confusion_3": conf_3,
         "helix_fractions": helix_recovery_fractions(ref_ss, pred_ss),
         "gdt_ts": gdt_ts_v if (gdt_ts_v is not None) else float("nan"),
@@ -235,8 +246,9 @@ def _per_sample(cif: Path, ref_res, ref_cif: Path):
     return r
 
 
-def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
-                max_workers: int | None = None, ref_cif: Path | None = None):
+def measure_one(
+    step_dir: Path, ref_res, n_samples: int, seed: int = 42, max_workers: int | None = None, ref_cif: Path | None = None
+):
     """Aggregate per-class F1 + helix recovery for one ckpt.
 
     Parallelises DSSP + alignment across samples via a thread pool —
@@ -295,19 +307,21 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
             gdt_vals.append(gt)
     if not macro_8:
         return None
+
     def mean_or_nan(v):
         return statistics.mean(v) if v else float("nan")
+
     return {
         "n_samples": len(macro_8),
         "n_aligned": n_aligned,
         "macro_f1_8": statistics.mean(macro_8),
         "macro_f1_3": statistics.mean(macro_3),
-        "f1_8":   {c: mean_or_nan(v) for c, v in f1_8.items()},
+        "f1_8": {c: mean_or_nan(v) for c, v in f1_8.items()},
         "prec_8": {c: mean_or_nan(v) for c, v in p_8.items()},
-        "rec_8":  {c: mean_or_nan(v) for c, v in r_8.items()},
-        "f1_3":   {c: mean_or_nan(v) for c, v in f1_3.items()},
+        "rec_8": {c: mean_or_nan(v) for c, v in r_8.items()},
+        "f1_3": {c: mean_or_nan(v) for c, v in f1_3.items()},
         "prec_3": {c: mean_or_nan(v) for c, v in p_3.items()},
-        "rec_3":  {c: mean_or_nan(v) for c, v in r_3.items()},
+        "rec_3": {c: mean_or_nan(v) for c, v in r_3.items()},
         "confusion_3": conf_3_total,
         "counts_pred": counts_pred,
         "counts_ref": counts_ref,
@@ -316,8 +330,7 @@ def measure_one(step_dir: Path, ref_res, n_samples: int, seed: int = 42,
     }
 
 
-def _process_step(step: int, targets: list, ref_dssp: dict,
-                  n_samples: int, seed: int, pattern: str) -> tuple:
+def _process_step(step: int, targets: list, ref_dssp: dict, n_samples: int, seed: int, pattern: str) -> tuple:
     """Measure every target at one training ``step``.
 
     Pure / picklable so it can run in a ``ProcessPoolExecutor`` worker:
@@ -348,7 +361,9 @@ def _process_step(step: int, targets: list, ref_dssp: dict,
             if v == v:
                 agg_f1_3[c].append(v)
         row = {
-            "step": step, "target": pdb, "macro_f1_8": r["macro_f1_8"],
+            "step": step,
+            "target": pdb,
+            "macro_f1_8": r["macro_f1_8"],
             "macro_f1_3": r["macro_f1_3"],
             "gdt_ts": r.get("gdt_ts", float("nan")),
         }
@@ -365,8 +380,7 @@ def _process_step(step: int, targets: list, ref_dssp: dict,
             row[f"conf_gt{gt}_pred{pred}"] = cnt
         rows.append(row)
         for gt_len, frac in r["helix_fractions"]:
-            helix_rows.append({"step": step, "target": pdb,
-                               "helix_len": gt_len, "recovery": frac})
+            helix_rows.append({"step": step, "target": pdb, "helix_len": gt_len, "recovery": frac})
 
     lines = [f"=== step {step} ==="]
     if agg_macro:
@@ -388,14 +402,20 @@ def _process_step(step: int, targets: list, ref_dssp: dict,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     src = ap.add_argument_group("target source (mutually exclusive)")
-    src.add_argument("--targets-file", type=Path,
-                     help="CSV with header including 'pdb' column.")
-    src.add_argument("--bench-root", type=Path,
-                     help="Root containing one {pdb}/_ref.cif.gz per target.")
-    src.add_argument("--arm-dir", type=str, default="df3-fapeS3-25e5-c10-g35",
-                     help="Arm subdirectory name under each target (default: df3-fapeS3-25e5-c10-g35)")
-    src.add_argument("--target-spec", action="append", default=[],
-                     help="PDB:REF_PATH:INFERENCE_DIR  (repeatable, overrides bench-root path heuristic for that PDB)")
+    src.add_argument("--targets-file", type=Path, help="CSV with header including 'pdb' column.")
+    src.add_argument("--bench-root", type=Path, help="Root containing one {pdb}/_ref.cif.gz per target.")
+    src.add_argument(
+        "--arm-dir",
+        type=str,
+        default="df3-fapeS3-25e5-c10-g35",
+        help="Arm subdirectory name under each target (default: df3-fapeS3-25e5-c10-g35)",
+    )
+    src.add_argument(
+        "--target-spec",
+        action="append",
+        default=[],
+        help="PDB:REF_PATH:INFERENCE_DIR  (repeatable, overrides bench-root path heuristic for that PDB)",
+    )
     # {n} expands to --n-samples so the per-sample suffix tracks the driver
     # (analysis.sh uses n5); a hardcoded _n30 silently matched nothing under n5,
     # so the F1 CSV came out 0-row → EXISTING_STEPS empty → one-point trends.
@@ -403,23 +423,34 @@ def main() -> None:
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--workers", type=int, default=1,
-                    help="Process-pool size for the per-step loop. Steps are "
-                         "independent, so >1 parallelises the whole step list "
-                         "across cores. Best for multi-step / full-history "
-                         "rebuilds (per-sample work is cached → I/O-latency "
-                         "bound; parallel readers overlap the waits). Each "
-                         "worker still runs its own per-sample thread pool, so "
-                         "avoid huge values on fresh (uncached) DSSP runs. "
-                         "Default 1 (sequential, unchanged behaviour).")
-    ap.add_argument("--out-csv", type=Path, default=None,
-                    help="Per-step / per-class F1 CSV.")
-    ap.add_argument("--helix-recovery-csv", type=Path, default=None,
-                    help="Per-helix recovery fractions CSV (every helix × every sample).")
-    ap.add_argument("--out-prefix", type=Path, default=None,
-                    help="If set, also write {prefix}_f1.{png,pdf,npz} and "
-                         "{prefix}_helix.{png,pdf,npz} with the same aggregated "
-                         "data shown in the F1 / helix-recovery CSV.")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Process-pool size for the per-step loop. Steps are "
+        "independent, so >1 parallelises the whole step list "
+        "across cores. Best for multi-step / full-history "
+        "rebuilds (per-sample work is cached → I/O-latency "
+        "bound; parallel readers overlap the waits). Each "
+        "worker still runs its own per-sample thread pool, so "
+        "avoid huge values on fresh (uncached) DSSP runs. "
+        "Default 1 (sequential, unchanged behaviour).",
+    )
+    ap.add_argument("--out-csv", type=Path, default=None, help="Per-step / per-class F1 CSV.")
+    ap.add_argument(
+        "--helix-recovery-csv",
+        type=Path,
+        default=None,
+        help="Per-helix recovery fractions CSV (every helix × every sample).",
+    )
+    ap.add_argument(
+        "--out-prefix",
+        type=Path,
+        default=None,
+        help="If set, also write {prefix}_f1.{png,pdf,npz} and "
+        "{prefix}_helix.{png,pdf,npz} with the same aggregated "
+        "data shown in the F1 / helix-recovery CSV.",
+    )
     args = ap.parse_args()
 
     # Resolve target list
@@ -450,10 +481,12 @@ def main() -> None:
     for pdb, dssp_res in ref_dssp.items():
         if dssp_res:
             cnt = Counter(c for _, c in dssp_res)
-            print(f"REF {pdb}: {len(dssp_res)} residues, "
-                  f"H={cnt.get('H',0)} E={cnt.get('E',0)} G={cnt.get('G',0)} "
-                  f"I={cnt.get('I',0)} T={cnt.get('T',0)} S={cnt.get('S',0)} "
-                  f"B={cnt.get('B',0)} P={cnt.get('P',0)} -={cnt.get('-',0)}")
+            print(
+                f"REF {pdb}: {len(dssp_res)} residues, "
+                f"H={cnt.get('H', 0)} E={cnt.get('E', 0)} G={cnt.get('G', 0)} "
+                f"I={cnt.get('I', 0)} T={cnt.get('T', 0)} S={cnt.get('S', 0)} "
+                f"B={cnt.get('B', 0)} P={cnt.get('P', 0)} -={cnt.get('-', 0)}"
+            )
     print()
 
     # Per-step work is independent → optionally fan out across processes.
@@ -463,8 +496,13 @@ def main() -> None:
     helix_rows = []
     workers = min(max(1, args.workers), len(args.steps))
     step_fn = functools.partial(
-        _process_step, targets=targets, ref_dssp=ref_dssp,
-        n_samples=args.n_samples, seed=args.seed, pattern=args.pattern)
+        _process_step,
+        targets=targets,
+        ref_dssp=ref_dssp,
+        n_samples=args.n_samples,
+        seed=args.seed,
+        pattern=args.pattern,
+    )
     if workers > 1:
         from concurrent.futures import ProcessPoolExecutor
 
@@ -507,10 +545,10 @@ def main() -> None:
         _make_plots(rows, helix_rows, args.steps, args.out_prefix)
 
 
-def _make_plots(rows: list[dict], helix_rows: list[dict],
-                steps: list[int], prefix: Path) -> None:
+def _make_plots(rows: list[dict], helix_rows: list[dict], steps: list[int], prefix: Path) -> None:
     """Write {prefix}_f1.{png,pdf,npz} + {prefix}_helix.{png,pdf,npz}."""
     import matplotlib  # noqa: PLC0415
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
@@ -560,9 +598,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
     # per-sample distribution (mean/median/IQR/box). This panel is pure SS-F1.
     gdt_means = []
     for step in steps:
-        per_step = [r["gdt_ts"] for r in rows
-                    if r["step"] == step and "gdt_ts" in r
-                    and r["gdt_ts"] == r["gdt_ts"]]
+        per_step = [r["gdt_ts"] for r in rows if r["step"] == step and "gdt_ts" in r and r["gdt_ts"] == r["gdt_ts"]]
         gdt_means.append(np.mean(per_step) if per_step else float("nan"))
     ax3.set_xlabel("training step")
     ax3.set_ylabel("F1")
@@ -677,12 +713,15 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
             else:
                 pmf = counts / total
             # Build polygon for this step's filled histogram in (x=bin, z=pmf) plane.
-            verts.append([(0.0, 0.0)]
-                         + list(zip(bin_centers, pmf, strict=True))
-                         + [(1.0, 0.0)])
+            verts.append([(0.0, 0.0)] + list(zip(bin_centers, pmf, strict=True)) + [(1.0, 0.0)])
             zs.append(step)
-        poly = PolyCollection(verts, facecolors=plt.cm.viridis(
-            np.linspace(0, 1, len(steps))), edgecolors="black", linewidths=0.4, alpha=0.85)
+        poly = PolyCollection(
+            verts,
+            facecolors=plt.cm.viridis(np.linspace(0, 1, len(steps))),
+            edgecolors="black",
+            linewidths=0.4,
+            alpha=0.85,
+        )
         ax3d.add_collection3d(poly, zs=zs, zdir="y")
         ax3d.set_xlabel("recovery fraction")
         ax3d.set_ylabel("training step")
@@ -690,8 +729,11 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
         ax3d.set_xlim(0, 1)
         ax3d.set_ylim(min(zs), max(zs))
         # Auto-scale z based on observed max pmf so all curves fit.
-        max_pmf = max((per_step_counts[s].astype(float) / max(per_step_counts[s].sum(), 1)).max()
-                      for s in steps if per_step_counts[s].sum() > 0)
+        max_pmf = max(
+            (per_step_counts[s].astype(float) / max(per_step_counts[s].sum(), 1)).max()
+            for s in steps
+            if per_step_counts[s].sum() > 0
+        )
         ax3d.set_zlim(0, max_pmf * 1.05)
         ax3d.view_init(elev=25, azim=-65)
         fig3d.tight_layout()
@@ -707,8 +749,7 @@ def _make_plots(rows: list[dict], helix_rows: list[dict],
             total = counts.sum()
             if total == 0:
                 continue
-            ax.plot(bin_centers, counts / total, marker="o",
-                    label=f"step {step}  (n={total})")
+            ax.plot(bin_centers, counts / total, marker="o", label=f"step {step}  (n={total})")
         ax.set_xlabel("recovery fraction (longest pred-H run / GT helix length)")
         ax.set_ylabel("probability mass")
         ax.legend(fontsize=8, loc="center left", bbox_to_anchor=(1.02, 0.5))

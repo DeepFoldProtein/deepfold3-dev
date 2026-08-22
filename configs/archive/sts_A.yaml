@@ -1,0 +1,54 @@
+base: ros_scheduledfree_adabias.yaml
+
+# Single-track stability experiment, run A — control.
+# Inherits the per-layer ROS (1/sqrt(ℓ+1) on every branch) + AdaLN cond_bias
+# wake-up of ros_scheduledfree_adabias.yaml. Single-transition residual
+# scaling unchanged from the inherited ROS schedule (gain=None).
+#
+# Goal: track loss vs single-track RMS dynamics on a 32-record overfit set.
+# See ``docs/single-track-stability-experiments.md``.
+
+training:
+  # Sqrt scaling from baseline lr=1.8e-3 at effective batch ≈ 256
+  # (≈ 1.8e-3 · sqrt(2/256) ≈ 1.6e-4). Run A/B/C share the same lr so
+  # only the single-track residual scaling differs.
+  lr: 1.6e-4
+  warmup_steps: 200
+  max_steps: 5000
+
+  batch_size_per_rank: 2
+  accumulate_grad_batches: 1
+  max_tokens: 256
+  max_atoms: 2048
+
+  log_interval: 50
+  log_microsteps: false
+  single_track_probe: true
+  single_track_probe_interval: 5
+
+  # No eval split for the overfit set.
+  eval_before: false
+  eval_interval: 1_000_000
+  eval_samples: 0
+  epoch_size: 32
+
+  # 3 arms running concurrently on one host — keep per-rank dataloader
+  # workers low so we don't oversubscribe the CPU. 32-record overfit set
+  # is tiny enough that 2 workers + prefetch=2 is plenty.
+  num_workers: 2
+  eval_num_workers: 0
+  prefetch_factor: 2
+
+  # Long-keep checkpoints — small overfit run, want full trajectory.
+  checkpoint_interval: 1000
+  checkpoint_every_hours: 0.0
+  max_checkpoints: 0
+
+  # WandB off — file logging only.
+  wandb_enabled: false
+
+# Replace inherited dataset list (initial.yaml configures patchr +
+# long_monomers + short_monomers + eval split) — the overfit set is the
+# only data this run should see.
+datasets: []
+eval_datasets: []

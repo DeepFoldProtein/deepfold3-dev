@@ -1,0 +1,23 @@
+base: schedule_free.yaml
+
+# Depth-uniform Residual Output Scaling.
+#
+# x ← x + s · F(x)   with   s = 1 / sqrt(num_layer)   for every layer
+#
+# Same per-stack depth L as the per-layer ROS variant (ros_scheduledfree.yaml),
+# but the same scalar 1/sqrt(L) is applied to every layer instead of the
+# layer-index-dependent 1/sqrt(ℓ).
+model:
+  evoformer:
+    uniform_residual_scale: true
+  pairformer:
+    uniform_residual_scale: true
+  confidence:
+    uniform_residual_scale: true
+  template:
+    pairformer:
+      uniform_residual_scale: true
+  # DistogramHead.half_logits init: small-normal W ~ trunc_normal(0,
+  # (α/√fan_in)²). See ros_scheduledfree.yaml for rationale.
+  distogram:
+    half_logits_init_alpha: 0.05

@@ -1,0 +1,55 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Resume of df3-12n-uniros-rmsn-lr2e4-clip70 with lr × clip rebalance.
+# Adam-invariance hypothesis under 1/√L · RMSNorm(F(LayerNorm(x))).
+#
+# Theory:
+#   AdamW normalises by √v, so first-order gradient-scale changes from
+#   the architectural 1/√L scaling cancel between m and v. Optimal lr
+#   is therefore architecture-invariant; AF3 baseline lr=1.8e-3 / clip=10
+#   should still apply under uniros + RMSNorm. We are climbing back to
+#   that ceiling in stages, holding lr × clip = 0.018 (the AF3 max
+#   per-step Δθ ceiling) constant.
+#
+# Step ceiling history:
+#   AF3 baseline    lr=1.8e-3 clip=10  → lr·clip = 0.0180
+#   s035 (drift)    lr=2.5e-4 clip=10  → 0.0025  (ceiling too tight)
+#   prev (clip70)   lr=2.0e-4 clip=70  → 0.0140  (78% of AF3)
+#   THIS arm        lr=5.0e-4 clip=36  → 0.0180  (AF3 ceiling restored)
+#
+# Levers:
+#   * lr 2.0e-4 → 5.0e-4 (2.5× bump) — primary fit-rate lever; tests
+#     whether the trunk (uniros + RMSNorm bounded single_rms~10.2 stable
+#     over 200 step) tolerates AF3-like step magnitude with Adam-invariant
+#     update geometry.
+#   * grad_clip_norm 70 → 36 — keep lr × clip = 0.018. Clip rate at the
+#     current grad-norm distribution (p99 ≈ 4.4k) will rise to ~25-30%;
+#     this is by design for the same step-ceiling-preserving budget.
+#
+# Abort triggers (monitor first 200-500 steps post-resume):
+#   1. single_rms > 12.0           → trunk drift returning   → revert lr 2.5e-4
+#   2. clip rate (>36) > 50%       → spike-driven Adam noise → clip 50
+#   3. smooth_lddt static or up    → lr / arch interaction   → revert lr 2.0e-4
+#   4. mean/median grad ratio > 4  → distribution wider      → diagnose
+#
+# Resume: from runs/df3-12n-uniros-rmsn-lr2e4-clip70/checkpoint_3700.pt
+# (preserves SF state + sampler progress; trainer's [resume] LR override
+# hook bumps lr automatically; sampler state-dict restores within-epoch
+# position exactly).
+
+training:
+  lr: 5.0e-4
+  grad_clip_norm: 36.0
+
+  # Save burst absorption — at interval=100 each save event burns ~10
+  # step of training (~200s) on the boundary. Empirical confirmed it's
+  # NOT GPFS read starvation (vmstat bi=0 across all 11 nodes during
+  # the burst, GPU util=100% but power 680W → NCCL busy-wait while rank0
+  # blocks on the 4.3GB GPFS write). interval 500 → ~3.3% overhead vs
+  # 10%; async save is the proper fix and will be a separate change.
+  checkpoint_interval: 500
+
+  # Per-rank DataLoader; kept higher than upstream defaults to absorb
+  # any residual GPFS read jitter (token-reclaim / quota-refresh cycles).
+  num_workers: 16
+  prefetch_factor: 16

@@ -1,0 +1,50 @@
+base: lr2e4-c70-rsf-c200-ema.yaml
+
+# `df3-eos` arm: probe whether the "proper EoS" regime (r_clip ≈ 5%) gives
+# better dynamics than our current clip-dominated (r_clip 30-50%) regime.
+#
+# Resumes from `df3-2e4-c70-rsf-c200-ema/checkpoint_16000.pt` (predecessor
+# end, alpha_distogram=0.03 default).  Single-knob ablation vs predecessor:
+# only `lr` and `grad_clip_norm` change.  alpha_distogram stays at the
+# default 0.03 so the comparison isolates clip-regime effect from the
+# alpha-boost experiment (`df3-dist3`).
+#
+# Phase-diagram framing (memory/reference_sf_adamw_phase_diagram.md):
+#   - predecessor + df3-dist3 ran at r_clip 33-47% → optimizer dynamics
+#     effectively a norm-constrained mode, NOT proper EoS. The
+#     ponderomotive flatness-seeking force F_pond = −½A²∇λ is suppressed
+#     because clip caps catapult amplitude A.
+#   - Target: r_clip ≈ 5% so clip becomes a rare-spike safety rail only,
+#     not the dominant update-shaping mechanism.
+#   - p95(grad_norm) in predecessor ≈ 370. G=400 lands clip just above the
+#     bulk → ~5% clip rate predicted.
+#
+# Why lr 2e-4 → 1e-4:
+#   - Empirical envelope (memory/project_uniros_rmsn_lr_clip_landing.md):
+#     lr × clip ≤ 0.036 was the abort boundary tested with RMSNorm.
+#   - 1e-4 × 400 = 0.040 → marginally above the *tested* envelope, but
+#     RMSNorm + uniros stabilization gives expected headroom.  Acceptable
+#     risk for one ablation arm.
+#   - Going to 5e-5 (lr×clip=0.020) would be the maximally-conservative
+#     point; chosen 1e-4 trades safety margin for 2× faster fit rate.
+#
+# Predictions to verify:
+#   * r_clip drops from ~40% to ~5% (direct, immediate)
+#   * grad_norm distribution exposes natural tail — p95 ~370, p99 ~5000+
+#     observable post-clip-relaxation
+#   * single_rms safety: predecessor was at 12.24, df3-dist3 drifted to
+#     12.13.  Watch ≤ 12.3 (drift sign).  Abort > 13.
+#   * fit rate ~2× slower than predecessor (lr halved)
+#   * PF single_attn/single_transition eff_rank collapse rate slowed
+#     (ponderomotive flatness-seeking restored, opposes wd drag)
+#   * Distogram CE descent rate vs predecessor: lr-bounded baseline.
+#
+# Watch points (first 100-500 step):
+#   * grad_norm distribution actually shifts (clip not silently active)
+#   * single_rms stays bounded (< 12.3)
+#   * No NaN, no loss spike beyond clip
+#   * fit rate non-trivial (CE moving)
+
+training:
+  lr: 1.0e-4
+  grad_clip_norm: 400.0

@@ -1,90 +1,19 @@
 base: initial.yaml
 
-# ---------------------------------------------------------------------------
-# Stage-1 (df3v2 lineage): continue from the stage-0 (df3-stage0-r6) step-10k
-# checkpoint and fold in the afdb_nvda distillation set. Crop stays 384 — this
-# is NOT the AF3 crop-640 ramp (cf. finetune1_structure_640.yaml / stage1_crop640.yaml).
-#
-# Everything except the dataset mix is inherited from initial.yaml: crop
-# (max_tokens=384 / max_atoms=4096 NOT overridden), losses, Schedule-Free
-# optimizer, LR/warmup, recycles, template date logic.
-#
-# NOTE: `datasets:` is a top-level LIST, and deep_merge REPLACES lists (does
-# not append), so all four datasets are restated below. The only change vs
-# initial.yaml is afdb_nvda enabled at 0.10, taken out of long_monomers
-# (0.45 -> 0.35). Weights still sum to 1.00.
-#
-# afdb_nvda template geometry is served entirely from the prebuilt
-# /data/pdb/cache (assembly-form ids like `1yj8-assembly1`); the cold-parse
-# fallback under --mmcif-dir /data/pdb/divided cannot resolve assembly ids, so
-# any cache miss is silently dropped (audited ~99.85% cache hit, negligible).
-#
-# Launch — CONTINUATION (recommended: only the dataset mix changes, so carry the
-# SF optimizer state + step forward from 10k; datasets are (re)built from THIS
-# --config, so afdb_nvda is included even on --resume — the checkpoint's pickled
-# cfg is not used for the dataset list; the sampler state_dict is just
-# {epoch, sample_idx, seed}, robust to the 3→4 dataset change):
-#   deepfold3 train --config configs/stage1_afdb.yaml \
-#       --resume runs/df3-stage0-r6/checkpoint_10000.pt \
-#       --output runs/df3-stage1-r7 \
-#       --ccd /data/components.cif.gz --ccd-cache /data/ccd_cache.json \
-#       --mmcif-dir /data/pdb/divided \
-#       --wandb deepfold3-stage1 --wandb-entity DeepFoldProtein \
-#       --override wandb_run_name=df3-stage1-r7
-#
-# Alt — HARD stage boundary (fresh SF k=0, step 0, re-warmup): swap --resume for
-#   --params runs/df3-stage0-r6/checkpoint_10000.pt --override skip_load_optimizer=true
-# ---------------------------------------------------------------------------
-
 training:
   wandb_project: deepfold3-stage1
 
-  alpha_bond: 0.0
-  bond_include_symmetric: false # was true
-  permute_gt_before_noise: true # Permute-then-noise ordering fix
-  chain_perm_gate_k: 3 # was 1
+  alpha_bond: 1.0
+  alpha_smooth_lddt: 1.0
 
-  # alpha_fape: 1.0            # off by default (0.0); tune against alpha_diffusion=4.0
-  # fape_atom_set: ALL         # all-atom points
-  # fape_clip_distance: 10.0   # AF2 d_clamp (Å)
-  # fape_normalize: true       # divide by clamp -> dimensionless [0, 1]
-  # # fape_chunk_size: 64      # ALL is O(N^2 * M=24 slots); chunk the frame axis if OOM at large crops
+  chain_perm_stability_gate: true
+  chain_perm_gate_k: 3
 
-datasets:
-  - name: patchr
-    data_dir: /data/distillation/patchr_training
-    weight: 0.50
-    strategy: weighted
-    is_distillation: false
-    format: df3
-    cutoff_date: "2021-09-30"
-    exclude_loss_mol_types: []
-    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+  accumulate_grad_batches: 2
+  batch_size_per_rank: 1
 
-  - name: long_monomers
-    data_dir: /data/distillation/long_monomers/preprocessed
-    weight: 0.35 # 0.45 -> 0.35: the freed 0.10 goes to afdb_nvda
-    strategy: uniform
-    is_distillation: true
-    format: of3
-    max_template_date: "2018-04-30" # AF2 distillation cutoff (AF3 §2.4)
-    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
-
-  - name: short_monomers
-    data_dir: /data/distillation/short_monomers/preprocessed
-    weight: 0.05
-    strategy: uniform
-    is_distillation: true
-    format: of3
-    max_template_date: "2018-04-30"
-    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
-
-  - name: afdb_nvda
-    data_dir: /data/distillation/afdb_nvda
-    weight: 0.10
-    strategy: weighted
-    is_distillation: true
-    format: df3
-    monomer_template_struct_space: true # Foldseek struct-space monomer templates
-    max_template_date: "2018-04-30" # AFDB = AF2 predictions; AF2 template cutoff (AF3 §2.4)
-    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+  max_tokens: 512
+  max_atoms: 6912
+  diffusion_batch_size: 32
+  diffusion_chunk_size: 8
+ 

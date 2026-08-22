@@ -1,0 +1,42 @@
+base: af3_rsf_s017_wd10.yaml
+
+# `df3-rsf-18e3-w1k-s017-wd10-ros` — adds per-layer ROS (residual output
+# scaling) on top of `af3_rsf_s017_wd10.yaml`.
+#
+# Single knob added: `pairformer.residual_output_scaling: true`.
+#
+# This is the missing brake from the original s035-era recipe. Per memory
+# `project_layer0_dominance_confirmed` and `reference_clip_before_adam`:
+# the historical `df3-12n-s035-lr2-5e4-wd10` arm reached step 10.5k with
+# only single_l2 411 (rms 20) and monotonic distogram descent to 1.80.
+# Our s017-wd10 (no ROS) hit single_l2 173k by step 600 with distogram
+# already regressing 2.12 → 2.28.
+#
+# Configurations producing the s035 stability:
+#   * lr 2.5e-4 (7× lower than ours) → ruled out — AF3 default target
+#   * wd 0.10 ✓ (already)
+#   * gain 0.35 → we tightened to 0.17 (acceptable for stronger brake)
+#   * **per-layer ROS** ← missing
+#   * heavy clip regime (92.7%) → side-effect of high grad_norm at low lr;
+#     not directly configurable
+#
+# ROS schedule:  s_ros[ℓ] = 1/√(ℓ + 1) for layer ℓ ∈ {0..L-1}
+#   * L0:  s_ros = 1.000  →  s_single_ffn = 0.170 (unchanged vs s017-wd10)
+#   * L10: s_ros = 0.302  →  s_single_ffn = 0.051 (3.3× stronger brake)
+#   * L47: s_ros = 0.144  →  s_single_ffn = 0.024 (7.1× stronger brake)
+#
+# This matches the Karras 1/√L budget: deeper layers naturally need
+# smaller ρ. ROS applies to ALL branches (not just single_ffn), so pair
+# branches also get scaled. Pair was already self-stabilizing; mild
+# over-brake here should be benign (pair branches were all < 0.07 ρ).
+#
+# Expected outcome vs s017-wd10:
+#   * Single_l2 plateau much lower — L47 single_ffn now 7× weaker
+#   * Distogram regression averted
+#   * Possible slight slowdown of smooth_lddt descent
+#   * eff_rank on PF may compress (original s035 had PF eff_rank 25-29
+#     vs 60+ for non-RMSN AF3-class)
+
+model:
+  pairformer:
+    residual_output_scaling: true

@@ -98,6 +98,7 @@ def run_step(
     num_recycles: int,
     seeds: list[int],
     snapshot: str,
+    msa_crop_size: int | None = None,
 ) -> None:
     params = resolve_ckpt(series, step)
     if params is None:
@@ -154,6 +155,7 @@ def run_step(
             str(num_samples),
             "--num-recycles",
             str(num_recycles),
+            *(["--msa-crop-size", str(msa_crop_size)] if msa_crop_size else []),
             "--skip-existing",
             "--save-distogram",  # per-seed trunk distogram for interface/contact post-analysis
         ]
@@ -181,6 +183,17 @@ def main() -> None:
     ap.add_argument("--num-samples", type=int, default=5)
     ap.add_argument("--num-recycles", type=int, default=10)
     ap.add_argument(
+        "--msa-crop-size",
+        type=int,
+        default=None,
+        help=(
+            "Override the checkpoint's per-recycle MSA crop. Training uses a "
+            "deliberately small crop (r14: 1024) and randomises the effective row "
+            "count, so bench should serve the full pool: pass 16384. Omitted = "
+            "whatever the checkpoint was trained with."
+        ),
+    )
+    ap.add_argument(
         "--seed",
         default="42",
         help="Comma list of model seeds, e.g. 42,43,44,45. Each target is folded "
@@ -199,10 +212,14 @@ def main() -> None:
     print(
         f"[sweep] series={args.series} steps={steps} gpus={gpus} "
         f"samples={args.num_samples} recycles={args.num_recycles} "
+        f"msa_crop={args.msa_crop_size or 'ckpt'} "
         f"seeds={seeds} snapshot={args.snapshot}"
     )
     for step in steps:
-        run_step(args.series, step, args.category, gpus, args.num_samples, args.num_recycles, seeds, args.snapshot)
+        run_step(
+            args.series, step, args.category, gpus, args.num_samples, args.num_recycles,
+            seeds, args.snapshot, args.msa_crop_size,
+        )
 
 
 if __name__ == "__main__":

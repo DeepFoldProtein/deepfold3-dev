@@ -1,0 +1,34 @@
+base: af3_refined_sf.yaml
+
+# `df3-af3r-wd01` — single-variable ablation vs `df3-af3r`: add small wd.
+#
+# Framework recap (memory/reference_sf_adamw_phase_diagram.md):
+# Scale-invariant weight directions settle at
+#     |w|²* ~ η / (2·λ_w) · E|Pg|²
+# With λ_w = 0 (df3-af3r v2), there is no stationary point → single-track
+# norm drift / explosion (observed: single_l2 grew from 65 to 1M over
+# 500 steps, log-linear). λ_w = 0.10 (predecessor) bounded the trunk
+# but caused PF single-track eff_rank collapse (-9 over 8k step).
+# This arm probes the sweet spot at λ_w = 0.01.
+#
+# Predicted effects vs df3-af3r:
+#   * Stationary single-track weight magnitude ~10× smaller than wd=0
+#     (which has no stationary point at all), but ~10× larger than wd=0.10.
+#   * Single explosion should saturate rather than diverge.
+#   * PF eff_rank trajectory: less collapse than wd=0.10, more growth
+#     than wd=0 (whose collapse pattern is *opposite* — single-track too
+#     high-rank, didn't specialize).
+#   * χ = η(1-β)(μ_max+λ_w)/2 essentially unchanged (λ_w=0.01 << μ_max).
+#     So EoS regime stays the same, only adds contraction.
+#
+# Watch points (vs df3-af3r v2 at matched step):
+#   * single_l2 trajectory — saturation vs continued growth
+#   * eval/distogram — does the model train MORE stably?
+#   * PF per-submod eff_rank evolution — track via plot_vs_af3.py
+#   * Compare with AF3 official (resources/alphafold3.safetensors):
+#       AF3 PF eff_rank 62, single-track specialized (single_attn 57,
+#       single_transition 69 — *lower* than our wd=0.10 predecessor).
+#       wd=0.01 may or may not let single-track collapse toward AF3 pattern.
+
+training:
+  weight_decay: 0.01

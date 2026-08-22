@@ -25,6 +25,7 @@ Usage:
 Each ``step_N`` directory must contain ``seed-42_sample-{i}/model.cif``
 files (the layout produced by ``deepfold3 inference``).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,15 +36,49 @@ import gemmi
 import numpy as np
 
 STD_AA = {
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
 }
 
 THREE_TO_ONE = {
-    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
 }
 
 
@@ -137,11 +172,13 @@ def get_ca_with_label(path: Path, chain_id: str = "A") -> list[tuple[int, str, n
                 ca = r.find_atom("CA", "*")
                 if ca is None:
                     continue
-                out.append((
-                    r.label_seq,
-                    THREE_TO_ONE[rn],
-                    np.array([ca.pos.x, ca.pos.y, ca.pos.z]),
-                ))
+                out.append(
+                    (
+                        r.label_seq,
+                        THREE_TO_ONE[rn],
+                        np.array([ca.pos.x, ca.pos.y, ca.pos.z]),
+                    )
+                )
         break
     return out
 
@@ -238,9 +275,7 @@ def compute_helix_signs(coord_map: dict[int, np.ndarray], helices: list[tuple[in
         wins = []
         for i in range(start, end - 2):
             if all(j in coord_map for j in (i, i + 1, i + 2, i + 3)):
-                d = ca_pseudo_dihedral(
-                    coord_map[i], coord_map[i + 1], coord_map[i + 2], coord_map[i + 3]
-                )
+                d = ca_pseudo_dihedral(coord_map[i], coord_map[i + 1], coord_map[i + 2], coord_map[i + 3])
                 wins.append((i, d))
         out[(start, end)] = wins
     return out
@@ -297,8 +332,10 @@ def measure_step(
                 if any(p_ls[k + 1] - p_ls[k] != 1 for k in range(3)):
                     continue
                 pd = ca_pseudo_dihedral(
-                    pred_map[p_ls[0]], pred_map[p_ls[1]],
-                    pred_map[p_ls[2]], pred_map[p_ls[3]],
+                    pred_map[p_ls[0]],
+                    pred_map[p_ls[1]],
+                    pred_map[p_ls[2]],
+                    pred_map[p_ls[3]],
                 )
                 sample_match.append(np.sign(pd) == np.sign(ref_d))
             if sample_match:
@@ -329,25 +366,34 @@ def measure_step(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ref", required=True, type=Path,
-                    help="Reference structure (mmCIF or PDB).")
-    ap.add_argument("--inference-dir", required=True, type=Path,
-                    help="Directory containing step_N subdirs.")
-    ap.add_argument("--pattern", default="step_{step}_n30",
-                    help="Subdir name template; {step} is substituted. Default: step_{step}_n30")
-    ap.add_argument("--steps", type=int, nargs="+", required=True,
-                    help="List of training steps to analyse.")
-    ap.add_argument("--n-samples", type=int, default=30,
-                    help="Samples per ckpt (must match --num-samples used at inference time).")
+    ap.add_argument("--ref", required=True, type=Path, help="Reference structure (mmCIF or PDB).")
+    ap.add_argument("--inference-dir", required=True, type=Path, help="Directory containing step_N subdirs.")
+    ap.add_argument(
+        "--pattern",
+        default="step_{step}_n30",
+        help="Subdir name template; {step} is substituted. Default: step_{step}_n30",
+    )
+    ap.add_argument("--steps", type=int, nargs="+", required=True, help="List of training steps to analyse.")
+    ap.add_argument(
+        "--n-samples", type=int, default=30, help="Samples per ckpt (must match --num-samples used at inference time)."
+    )
     ap.add_argument("--chain", default="A", help="Chain to compare. Default: A")
-    ap.add_argument("--align", choices=("label_seq", "sequence"), default="sequence",
-                    help="Residue-correspondence method. 'sequence' runs "
-                         "Needleman-Wunsch on the CA one-letter sequences "
-                         "(robust to renumbering / truncation); 'label_seq' "
-                         "intersects label_seq_id sets (fast, requires "
-                         "consistent numbering). Default: sequence.")
-    ap.add_argument("--helix-min-match", type=float, default=0.8,
-                    help="Per-helix sign-match threshold for the 'fully consistent' tally.")
+    ap.add_argument(
+        "--align",
+        choices=("label_seq", "sequence"),
+        default="sequence",
+        help="Residue-correspondence method. 'sequence' runs "
+        "Needleman-Wunsch on the CA one-letter sequences "
+        "(robust to renumbering / truncation); 'label_seq' "
+        "intersects label_seq_id sets (fast, requires "
+        "consistent numbering). Default: sequence.",
+    )
+    ap.add_argument(
+        "--helix-min-match",
+        type=float,
+        default=0.8,
+        help="Per-helix sign-match threshold for the 'fully consistent' tally.",
+    )
     args = ap.parse_args()
 
     ref_cas = get_ca_with_label(args.ref, args.chain)
@@ -361,25 +407,28 @@ def main() -> None:
         print(f"  helix {s:>3}-{e:>3} (n={len(wins):d}): {sig}")
     print()
 
-    print(f"{'step':>6} | {'global':>10} | {'95% CI':>17} | {'mean':>5} | "
-          f"{'proper_RMSD':>11} | {'mirror_RMSD':>11} | {'helix_match':>11} | "
-          f"{'consistent (≥' + str(args.helix_min_match) + ')':>20}")
+    print(
+        f"{'step':>6} | {'global':>10} | {'95% CI':>17} | {'mean':>5} | "
+        f"{'proper_RMSD':>11} | {'mirror_RMSD':>11} | {'helix_match':>11} | "
+        f"{'consistent (≥' + str(args.helix_min_match) + ')':>20}"
+    )
     print("-" * 120)
     for step in args.steps:
         sub = args.inference_dir / args.pattern.format(step=step)
         if not sub.exists():
             print(f"{step:>6} | (missing: {sub})")
             continue
-        r = measure_step(sub, ref_cas, ref_map, ref_helix_signs,
-                         args.helix_min_match, args.n_samples, args.align)
+        r = measure_step(sub, ref_cas, ref_map, ref_helix_signs, args.helix_min_match, args.n_samples, args.align)
         if r is None:
             print(f"{step:>6} | (no samples found)")
             continue
-        print(f"{step:>6} | {r['n_proper']:>2}/{r['n']:<2}      | "
-              f"[{r['ci_lo']*100:>4.1f}%, {r['ci_hi']*100:>4.1f}%]  | "
-              f"{r['mean_rmsd']:>5.2f} | {r['proper_rmsd']:>11.2f} | "
-              f"{r['mirror_rmsd']:>11.2f} | {r['helix_mean_match']*100:>10.1f}% | "
-              f"{r['consistent']:>3}/{r['n']:<3}")
+        print(
+            f"{step:>6} | {r['n_proper']:>2}/{r['n']:<2}      | "
+            f"[{r['ci_lo'] * 100:>4.1f}%, {r['ci_hi'] * 100:>4.1f}%]  | "
+            f"{r['mean_rmsd']:>5.2f} | {r['proper_rmsd']:>11.2f} | "
+            f"{r['mirror_rmsd']:>11.2f} | {r['helix_mean_match'] * 100:>10.1f}% | "
+            f"{r['consistent']:>3}/{r['n']:<3}"
+        )
 
 
 if __name__ == "__main__":

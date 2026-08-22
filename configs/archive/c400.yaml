@@ -1,0 +1,48 @@
+base: lr2e4-c70-rsf-c200-ema.yaml
+
+# `df3-c400` arm: "X-bold" probe — proper EoS regime at full lr.
+#
+# Resumes from `df3-2e4-c70-rsf-c200-ema/checkpoint_16000.pt` (predecessor
+# end, alpha_distogram=0.03 default).  Single-knob change vs predecessor:
+# only `grad_clip_norm` (70 → 400).  lr stays at predecessor's 2e-4.
+#
+# Rationale (memory/reference_sf_adamw_phase_diagram.md, gradient-clipping
+# section): predecessor + df3-dist3 operated at r_clip 28-47% — *clip-
+# dominated* regime, NOT proper EoS.  df3-eos halved lr to stay within the
+# `lr × clip ≤ 0.036` empirical envelope; result: smooth_lddt regressed
+# toward predecessor plateau (0.468 → 0.471 over 300 step), distogram CE
+# stalled at 1.82.  The lr cost of "safe EoS" exceeded the ponderomotive
+# benefit.
+#
+# `df3-c400` tests the alternative: keep lr=2e-4 (full predecessor drive),
+# relax clip to 400.  Result: lr × clip = 0.080, **2.2× above the abort
+# threshold** observed in lr1e3-clip36 (0.036).  RMSNorm + uniros
+# stabilization is the hedge — those weren't present when the 0.036 abort
+# boundary was discovered (s035 era / pre-RMSN earlier runs).
+#
+# Predictions to verify:
+#   * r_clip ≈ 3-5% (G=400 above p95 grad_norm ≈ 370)
+#   * Full-lr descent on distogram CE and smooth_lddt (vs df3-eos's stall)
+#   * Pondermotive force unleashed by clip relaxation may unlock further
+#     descent below predecessor plateau
+#   * MAIN RISK: trunk drift (single_rms > 13 → abort)
+#     - watch single_rms in first 100 step closely
+#     - df3-eos showed single_rms 12.05 stable → suggests RMSN really does
+#       hold trunk independent of clip regime
+#   * Secondary risk: NaN on extreme grad spikes (max was 8844 in
+#     predecessor; G=400 means optimizer state can absorb 22× clip, but
+#     AdamW v normalizes anyway)
+#
+# Abort criteria:
+#   * single_rms > 13.0 sustained (3 windows)
+#   * NaN in 100 step
+#   * loss spike > 5000 sustained
+#
+# Watch points (first 100-300 step):
+#   * r_clip stabilizes around 5% (G=400 above p95 ≈ 370)
+#   * single_rms ≤ 12.5 (trunk safety)
+#   * distogram CE descent restarts (predecessor plateau was 1.825)
+#   * smooth_lddt below predecessor plateau (0.472)
+
+training:
+  grad_clip_norm: 400.0

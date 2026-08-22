@@ -75,7 +75,6 @@ training:
   alpha_masked_msa: 0.0
   nucleotide_loss_weight: 5.0
   ligand_loss_weight: 10.0
-  region_loss_weights: {}
 
   # Magnitude regularizers on trunk outputs (mean per-token Σ_c |x|^p / C).
   # Pair reg bounds DistogramHead logit magnitude; alpha=0 = observation-only.

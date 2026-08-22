@@ -1,0 +1,37 @@
+base: af3_refined_sf_wd01.yaml
+
+# `df3-af3r-wd01-w40` — follow-up to `df3-af3r-wd01`: shorter warmup.
+#
+# Rationale: schedule_free.py composes two lr ramps —
+#   sched = min(1, (k+1)/warmup_steps)              # external
+#   bias_correction2 = 1 - β₂^(k+1)                  # intrinsic
+#   effective_lr = lr · sched · sqrt(bias_correction2)
+#
+# With β₂ = 0.95, the intrinsic v calibration is essentially complete
+# at step 2/(1-β₂) = 40 (sqrt(bias_correction2) ≈ 0.93). The remaining
+# 960 steps of external warmup are pure throttle, not v safety.
+#
+# Empirical justification (df3-af3r v1 plain AdamW eval trajectory):
+# dist_H descent rate peaked at step 400-600 (lr ~half-peak) then
+# decelerated as lr approached full magnitude (step 700+). Plateau set
+# in around step 1000 (warmup end). Same pattern emerging in df3-af3r v2
+# (refined SF) by step 400. Implication: full lr 1.8e-3 is destructive
+# under AF3 baseline + no stabilizer; warmup just delayed the inevitable.
+#
+# With wd=0.01 (from base) providing scale-invariant brake, longer
+# productive time at full lr may translate to deeper descent. Trade-off:
+# faster productive learning AND faster destructive direction exploration.
+#
+# Predictions to verify (vs df3-af3r-wd01):
+#   * lr reaches 1.8e-3 by step 40 (vs step 1000)
+#   * If wd brake holds: deeper CE descent (since productive time at
+#     full lr is much longer)
+#   * If wd brake insufficient: faster single_l2 explosion
+#   * Plateau (if any) shifts earlier (step ~100 vs ~1000)
+#
+# Caveat: this is TWO variables changed vs df3-af3r v2 (wd 0→0.01,
+# warmup 1000→40). Run df3-af3r-wd01 first to isolate wd effect, then
+# this arm to test the additional warmup shortening.
+
+training:
+  warmup_steps: 40

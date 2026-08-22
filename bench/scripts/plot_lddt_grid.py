@@ -17,8 +17,11 @@ category (``--ref``, off by default) — computed the SAME way as the trajectory
 like-for-like comparison on the same num-token-capped manifest. A baseline is
 drawn only for categories that have BOTH a trajectory in ``--series`` and an eval
 in the ref series (categories the ref never benched simply get no baseline).
-Series in ``summarize.RETIRED_REF_SERIES`` — currently the template-free
-``af3_ref`` fold — are refused; see the note there.
+Series in ``summarize.REF_SERIES_CAVEAT`` — currently the template-free
+``af3_ref`` fold — are drawn with the caveat stamped into the legend and the
+title, never as a bare "AF3" baseline; see the note there. The published paper
+means stay on rows 1-2 alongside a measured baseline (dash-dot), so the figure
+shows both the full-strength AF3 target and the handicapped measured fold.
 
 Usage:
     python bench/scripts/plot_lddt_grid.py --series df3v2
@@ -39,7 +42,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Single source of truth for the retirement list and the published AF3 numbers.
-from summarize import AF3_INTERFACE_LDDT, AF3_MONOMER, RETIRED_REF_SERIES  # noqa: E402
+from summarize import (  # noqa: E402
+    AF3_INTERFACE_LDDT,
+    AF3_MONOMER,
+    REF_SERIES_CAVEAT,
+    REF_SERIES_EXCLUDE_CATEGORIES,
+)
 
 BENCH = Path(__file__).resolve().parents[1]
 
@@ -185,9 +193,11 @@ def _panel(
     trajectory itself shows, so the comparison is line-to-line.
 
     ``paper`` is the published AF3 mean per category (FoldBench Supp. Table 3),
-    drawn dash-dot ONLY where no measured baseline exists. It is a mean over the
-    paper's FULL set, not our num-token-capped subset — a target marker, not a
-    like-for-like value.
+    drawn dash-dot. It is a mean over the paper's FULL set, not our
+    num-token-capped subset — a target marker, not a like-for-like value. It is
+    kept even when ``ref`` is present: a caveated measured baseline (template-free
+    af3_ref) sits BELOW the published number, and showing only one of the two
+    invites reading the gap that remains as either larger or smaller than it is.
     """
     for cat, pts in data.items():
         steps = [p["step"] for p in pts]
@@ -206,7 +216,7 @@ def _panel(
         if drawn:  # grey proxies so the legend explains the faint baseline styling
             ax.plot([], [], color="0.5", ls="-", lw=1.1, alpha=0.6, label=f"{ref_label} mean")
             ax.plot([], [], color="0.5", ls=":", lw=1.1, alpha=0.6, label=f"{ref_label} median")
-    if paper and not ref:
+    if paper:
         drawn = False
         for cat, v in paper.items():
             if cat not in data:
@@ -229,8 +239,15 @@ def ref_values(ref_series: str, categories: list[str], col: str) -> dict[str, di
     Computed via the same ``collect`` path as the trajectory (like-for-like), then
     reduced to the ref series' latest benched step per category (``af3_ref`` writes
     a single ``step_0``; latest-step is robust to a ref benched elsewhere).
+
+    Categories the ref series cannot be compared on at all (``af3_ref``'s
+    pre-water-fix nucleic monomers) are dropped rather than drawn.
     """
-    return {cat: pts[-1] for cat, pts in collect(ref_series, categories, col).items() if pts}
+    skip = REF_SERIES_EXCLUDE_CATEGORIES.get(ref_series, set())
+    for cat in sorted(skip & set(categories)):
+        print(f"[lddt-grid] {ref_series}/{cat}: fold not comparable — baseline dropped")
+    usable = [c for c in categories if c not in skip]
+    return {cat: pts[-1] for cat, pts in collect(ref_series, usable, col).items() if pts}
 
 
 def plot(mono_lddt, iface_lddt, iface_ilddt, series: str, out_png: Path, refs=None, ref_label: str = "") -> None:
@@ -263,7 +280,10 @@ def plot(mono_lddt, iface_lddt, iface_ilddt, series: str, out_png: Path, refs=No
     ax2.set_xlabel("training step")
     base = f"{series}: per-category lDDT vs step   (solid = mean, dashed = median)"
     if ref_label:
-        base += f"   —   faint = {ref_label} baseline (solid mean, dotted median)"
+        base += (
+            f"   —   faint = {ref_label} measured on THIS subset (solid mean, dotted median)"
+            "; dash-dot = AF3 paper mean (full set)"
+        )
     else:
         base += "   —   dash-dot = AF3 paper mean (FoldBench full set, not this subset)"
     fig.suptitle(base, fontsize=13)
@@ -280,8 +300,9 @@ def main() -> None:
         "--ref",
         default="",
         help="fixed reference series overlaid as a faint per-category baseline "
-        "(mean solid, median dotted). Off by default; series in RETIRED_REF_SERIES "
-        f"({', '.join(sorted(RETIRED_REF_SERIES))}) are refused.",
+        "(mean solid, median dotted). Off by default; series in REF_SERIES_CAVEAT "
+        f"({', '.join(f'{k}: {v}' for k, v in sorted(REF_SERIES_CAVEAT.items()))}) are "
+        "drawn with that caveat in the legend.",
     )
     args = ap.parse_args()
 
@@ -295,19 +316,21 @@ def main() -> None:
         print(f"[lddt-grid] no eval raw dumps found for series {args.series}")
         return
 
-    # Reference baseline overlay (skip when empty, retired, or the series itself).
-    ref_label = args.ref.strip()
-    if ref_label in RETIRED_REF_SERIES:
-        print(f"[lddt-grid] ref series '{ref_label}' is retired — baseline skipped")
-        ref_label = ""
+    # Reference baseline overlay (skip when empty or the series itself). A
+    # caveated series is drawn, with the caveat carried in the legend label.
+    ref_series = args.ref.strip()
+    caveat = REF_SERIES_CAVEAT.get(ref_series, "")
+    if caveat:
+        print(f"[lddt-grid] ref series '{ref_series}' is {caveat} — labelled as such, not a parity baseline")
+    ref_label = f"{ref_series} ({caveat})" if caveat else ref_series
     refs = None
-    if ref_label and ref_label != args.series:
-        ref_mono = ref_values(ref_label, mono, "lddt")
-        ref_iface = ref_values(ref_label, iface, "lddt")
-        ref_iface_i = ref_values(ref_label, iface, "ilddt")
+    if ref_series and ref_series != args.series:
+        ref_mono = ref_values(ref_series, mono, "lddt")
+        ref_iface = ref_values(ref_series, iface, "lddt")
+        ref_iface_i = ref_values(ref_series, iface, "ilddt")
         refs = (ref_mono, ref_iface, ref_iface_i)
         if not (ref_mono or ref_iface or ref_iface_i):
-            print(f"[lddt-grid] ref series '{ref_label}' has no eval dumps — baseline skipped")
+            print(f"[lddt-grid] ref series '{ref_series}' has no eval dumps — baseline skipped")
             ref_label, refs = "", None
     else:
         ref_label = ""

@@ -1,0 +1,62 @@
+base: ../initial.yaml
+
+# `df3-rsf-25e4-w5k` — AF3 baseline arch + refined SF + long warmup + lighter clip.
+#
+# AF3 baseline (no RMSN, no uniros, no single_transition_residual_gain) +
+# refined Schedule-Free (C=200) is the architectural baseline; this arm
+# tunes the optimizer hyperparameters to reach a stable, high-capacity
+# regime without using wd as a brake.
+#
+# Inherits from initial.yaml:
+#   - wd = 0  (AF3 paper default — kept; ablation hinges on it)
+#   - betas = (0.9, 0.95)
+#   - AF3 trunk arch (no RMSN, no uniros)
+#   - eval_snapshot: average
+#
+# Overrides:
+#   - optimizer_type: schedule_free        (initial.yaml default is adamw)
+#   - decoupling_parameter: 200           (refined SF — arxiv 2507.09846)
+#   - batch_size_per_rank: 3, accumulate: 1 → eff. batch 288
+#   - lr: 1.8e-3 → 2.5e-4                  (v2 reached EoS at 1.8e-3)
+#   - grad_clip_norm: 10 → 100             (v2 r_clip ~80%; aim ~20%)
+#   - warmup_steps: 1000 → 5000            (longer sub-peak equilibration)
+#
+# Hyperparameter envelope:
+#   lr × clip = 2.5e-4 × 100 = 0.025  (≤ pre-RMSN empirical ceiling 0.036)
+#
+# Hypothesis: v2 (wd=0, lr=1.8e-3, w1000, clip=10) plateau at CE 2.14 was
+# a *capacity* ceiling driven by EoS-region dynamics, not lack of wd. With
+# lr 14% of v2 and 5× warmup, the model has time to find productive
+# directions before full lr activates EoS-unstable modes. If single_l2
+# still explodes geometrically, that's clean evidence wd is required even
+# at lower lr.
+#
+# Decision logic post-launch:
+#   * single_l2 bounded + CE descent past 2.14 → AF3 baseline is viable,
+#     wd not needed
+#   * single_l2 geometric explosion → relaunch with wd=0.1 (clean knob test)
+#   * CE plateau at ~2.14 → capacity ceiling is arch-bound, need to revisit
+#     AF3 baseline assumption
+#
+# Watch points (first 5k step):
+#   * single_rms / single_l2 trajectory
+#   * PF eff_rank (AF3 baseline historical: > 60)
+#   * Distogram CE descent rate vs s035 reference
+#   * Clip rate (target ~20% post-warmup)
+#
+# Abort criteria:
+#   * single_rms > 13 sustained
+#   * NaN / loss spike beyond clip+grad_skip
+#   * CE > 4.16 (= ln 64) past warmup 90%
+
+training:
+  optimizer_type: schedule_free
+  decoupling_parameter: 200.0
+
+  batch_size_per_rank: 3
+  accumulate_grad_batches: 1
+
+  lr: 2.5e-4
+  weight_decay: 0.0
+  grad_clip_norm: 100.0
+  warmup_steps: 5000

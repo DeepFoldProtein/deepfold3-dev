@@ -1,0 +1,47 @@
+base: ../af3_rsf.yaml
+
+# `df3-rsf-18e3-w1k-s017-wd10` — stronger brake combo.
+#
+# Two knobs vs `af3_rsf.yaml`:
+#   * `pairformer.single_transition_residual_gain: 0.17` (2× stronger
+#     than s035's 0.35 — targets aligned-branch budget Σρ ≤ ln 2)
+#   * `weight_decay: 0 → 0.10` (2× stronger than wd05 to accelerate
+#     stationary-norm onset)
+#
+# Rationale (s035-wd05 result @ step 190):
+#   * gain=0.35 + wd=0.05 trajectory **indistinguishable** from gain=0.35
+#     alone (single_l2 within 5%, slope identical).
+#   * wd=0.05 effective decay = lr × wd × step ≈ 1e-4 × 0.05 × 190 ≈
+#     1e-3 — too small to bound weight scale at this stage.
+#   * AdamW stationary norm |w|²* ~ η/(2λ_w) · E|Pg|². With wd=0.10
+#     instead of 0.05, |w|²* drops 2×; convergence to stationary norm
+#     halved.
+#
+# Aligned-branch budget (from `reference_aligned_branch_budget.md`):
+#   * gain = 0.17 corresponds to A=2× total amp target (Σρ ≤ ln 2)
+#   * gain = 0.35 was A=4× (sts_B winner historically, but absorbed)
+#   * Stronger gain bites at all step counts (forward), not just at
+#     stationary norm. Complements wd.
+#
+# Expected outcome:
+#   * single_l2 ~ 3× lower than s035 at matched step (gain 0.17 vs 0.35
+#     gives ρ × 0.486 in forward; cumulative effect over training time
+#     ~3× under same drift dynamics)
+#   * Weight scale bounded by step 1000-1500 (wd=0.10 stationary onset)
+#   * distogram CE: should descend continuously (no 2.06 → 2.45 reversal)
+#   * smooth_lddt: may underperform s035 by 0.01-0.02 at early steps due
+#     to stronger forward brake on FFN; should match by step 500
+#
+# Abort criteria:
+#   * smooth_lddt > 0.65 sustained past step 300 → gain too strong, halt
+#   * single_l2 still growing > 5× per 100 step past step 500 → need
+#     even stronger intervention (uniros + wd, or learnable scaler)
+#
+# Pair untouched (already self-stabilizing).
+
+training:
+  weight_decay: 0.10
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.17

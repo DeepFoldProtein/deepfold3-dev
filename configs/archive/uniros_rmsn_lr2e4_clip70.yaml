@@ -1,0 +1,67 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Resume of df3-12n-uniros-rmsn-lr1e4-clip50 with partial lr recovery now
+# that uniros + RMSNorm has been verified to bound the trunk
+# (single_rms ~10.5 stable through step 3400+).
+#
+# Motivation:
+#   Initial post-resume measurement at lr=1e-4 / clip=50 showed:
+#     * trunk safely bounded (single_rms 10.5 across 850 steps)
+#     * spike events attenuated (mean/median ratio 1.7 → 1.4)
+#     * BUT smooth_lddt descent rate ~31% of s035's matched-step rate
+#       (-3.25e-6/step vs -1.05e-5/step at step 2600-3400)
+#     * gap vs s035 widening at ~+7.75e-6/step
+#
+#   Trunk safety is the result of uniros + RMSNorm — *not* of lr=1e-4 alone.
+#   With trunk normalisation in place, lr can be partially restored toward
+#   s035's 2.5e-4 without re-triggering trunk drift.
+#
+# Levers:
+#   * lr 1.0e-4 → 2.0e-4 (80% of s035 baseline) — primary fit-rate lever
+#   * grad_clip_norm 50 → 70 — keep clip rate near 10-15% under the higher
+#     lr; otherwise the proportional rise in raw grads would push clip rate
+#     to 25-30% and re-collapse Adam preconditioning.
+#
+# Abort triggers (monitor first 200-500 steps post-resume):
+#   1. single_rms > 12.0          → trunk drift returning   → revert lr 1.5e-4
+#   2. clip rate (>70) > 30%      → Adam preconditioning at risk → clip 90
+#   3. smooth_lddt static or up   → lr is not the proximate issue → diagnose
+#   4. mean/median ratio > 2.5    → spike-driven distribution → clip ↑
+#
+# Resume: from latest in-progress ckpt (preserves SF state + sampler progress;
+# trainer's [resume] LR override hook bumps lr automatically, sampler now
+# state-dict-aware so within-epoch position is exact).
+
+training:
+  lr: 2.0e-4
+  grad_clip_norm: 70.0
+
+  # Checkpoint every 100 step (back to initial.yaml default). The 500-step
+  # spacing was an interim measure during lr exploration; once trajectory is
+  # stable we want abort-recovery cost capped at ~100 step. Each save event
+  # blocks rank 0 on a 4.3GB GPFS write for ~55s (rest of cluster waits in
+  # NCCL all-reduce), with ~5-10 step recovery as prefetch refills — total
+  # ~200s burst, ~9% throughput overhead. Empirically the per-event cost
+  # did NOT scale down with prefetch_factor (slowdown is NOT GPFS read
+  # starvation — vmstat bi=0 on all 11 nodes during the burst, GPU util=100%
+  # everywhere but power 680W = NCCL busy-wait, not real compute). Real fix
+  # is async save (separate task).
+  checkpoint_interval: 100
+
+  # Disable the time-based safety net. checkpoint_every_hours=1.0 (initial.yaml
+  # default) was added as a fallback when checkpoint_interval was very large;
+  # at interval=100 (= ~37 min wall-clock) the step-based trigger fires more
+  # often than the hourly anyway, so the time-based variant is redundant and
+  # only adds drift between save points across resumes.
+  checkpoint_every_hours: 0
+
+  # Per-rank DataLoader; kept higher than upstream defaults to absorb
+  # any residual GPFS read jitter (token-reclaim / quota-refresh cycles).
+  #   prefetch_factor 4 → 16   : 96 → 384 records/rank buffered
+  #   num_workers     8 → 16   : 64 → 128 worker procs/pod (CPU budget 96
+  #                              cores × per-pod 8 ranks; 96.9% idle now,
+  #                              well within capacity)
+  #   persistent_workers       : auto-True via num_workers > 0
+  #                              (data.py:356 — no override needed)
+  num_workers: 16
+  prefetch_factor: 16

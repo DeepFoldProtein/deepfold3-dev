@@ -196,26 +196,56 @@ AF3_INTERFACE_LDDT = {
 # its measured value; otherwise we fall back to the paper dict (labelled "paper"
 # so the two are never confused). ``--ref-series ""`` disables the overlay.
 #
-# RETIRED: `af3_ref`. It was folded template-free (the bench attached no
-# `templates` field until MAX_TEMPLATES landed), which is AlphaFold3's weakest
-# supported mode — on identical targets it trails the published AF3 by 3.8 points
-# on protein-protein and 9.9 on antibody-antigen. Overlaying it understates AF3
-# and invites the reading "we are close to AF3" when the gap is to a handicapped
-# fold. Retiring it here (not just flipping the default) means an already-running
-# auto.sh, or any stale command line that still passes `--ref-series af3_ref`,
-# stops drawing it too; the raw sweep stays on disk under runs/af3_ref. Drop the
-# entry once af3_ref has been re-folded WITH templates.
-RETIRED_REF_SERIES = {"af3_ref"}
+# A series listed here is HANDICAPPED: drawable, but every label it produces
+# carries the caveat so the figure cannot be read as parity with a full-strength
+# AlphaFold3. This replaces an earlier blanket refusal of `af3_ref`, which kept
+# the only like-for-like AF3 sweep we own off every figure — including the iLDDT
+# row, where there is no published number to fall back to at all.
+#
+# `af3_ref` was folded template-free (the bench attached no `templates` field
+# until MAX_TEMPLATES landed in 949e5de), which is AlphaFold3's weakest supported
+# mode: on identical targets it trails the published AF3 by 3.8 points on
+# protein-protein and 9.9 on antibody-antigen. Every current df3 series folds
+# WITH templates, so a df3-minus-af3_ref delta is biased toward df3 by that
+# unquantified amount. Drop the entry once af3_ref is re-folded with templates.
+REF_SERIES_CAVEAT = {"af3_ref": "template-free"}
+
+# Categories where a ref series' fold is not comparable at all, so no line is
+# better than a wrong one. af3_ref folded the nucleic monomers on 2026-07-24,
+# before the build_inputs water fix (2026-08-12): its inputs padded chains with
+# water-derived DN tokens (8d78: 46 residues against 22 after the fix), so its
+# monomer_dna/monomer_rna scores are on different sequences than any current
+# series. Verified by folded-length comparison that the six protein-containing
+# categories are unaffected — identical inputs on both sides.
+REF_SERIES_EXCLUDE_CATEGORIES = {"af3_ref": {"monomer_dna", "monomer_rna"}}
+
+# Set by ``resolve_ref_series``; suffixes every measured-AF3 label drawn below.
+# Safe as module state: this is a single-shot CLI (one ``summarize()`` per run).
+_REF_CAVEAT_TAG = ""
+
 _REF_ROW_CACHE: dict[tuple[str, str], dict | None] = {}
 
 
+def af3_tag() -> str:
+    """``"AF3"``, or ``"AF3 (template-free)"`` when the ref series is handicapped."""
+    return f"AF3{_REF_CAVEAT_TAG}"
+
+
 def resolve_ref_series(ref_series: str, series: str) -> str:
-    """``ref_series`` with self-reference and retired series stripped (loudly)."""
+    """``ref_series`` with self-reference stripped; stamps the handicap caveat.
+
+    A caveated series is drawn (not refused) and ``af3_tag()`` starts returning
+    the annotated name, so the caveat rides along on every label rather than
+    living only in a comment.
+    """
+    global _REF_CAVEAT_TAG
+    _REF_CAVEAT_TAG = ""
     if ref_series == series:  # don't draw a series' reference line against itself
         return ""
-    if ref_series in RETIRED_REF_SERIES:
-        print(f"[summary] reference series '{ref_series}' is retired — overlay dropped, using paper AF3 numbers")
-        return ""
+    caveat = REF_SERIES_CAVEAT.get(ref_series)
+    if caveat:
+        _REF_CAVEAT_TAG = f" ({caveat})"
+        print(f"[summary] reference series '{ref_series}' is {caveat} — labelled as such, not a parity baseline")
     return ref_series
 
 
@@ -242,17 +272,49 @@ def _ref_row(ref_series: str, category: str) -> dict | None:
     return _REF_ROW_CACHE[key]
 
 
+def ref_count(ref_series: str, category: str) -> int:
+    """Targets/interfaces behind the ref series' summary row (0 if unknown)."""
+    row = _ref_row(ref_series, category)
+    if not row:
+        return 0
+    for k in ("n_interfaces", "n_scored"):
+        try:
+            return int(row[k])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return 0
+
+
 def ref_value(
-    ref_series: str, category: str, column: str, fallback: float | None
+    ref_series: str, category: str, column: str, fallback: float | None, min_n: int = 0
 ) -> tuple[float | None, bool]:
     """``(value, measured)`` for a reference line.
 
     Measured mean ``column`` from the reference series when present, else
     ``fallback`` (the paper dict). ``measured`` tells the caller which source
     won so a paper fallback can be labelled distinctly.
+
+    ``min_n`` rejects a summary row built from far fewer comparisons than the
+    series it baselines — a ref swept on a partial manifest would otherwise be
+    drawn as authoritative. af3_ref does NOT trip it: its DockQ coverage matches
+    df3v5r16's exactly (240 / 138 / 35 / 20 / 6 interfaces for pp / agab /
+    peptide / dna / rna).
+
+    Note what that last pair means. The nucleic-interface success panels rest on
+    20 and 6 scored interfaces on BOTH sides — small in absolute terms, but
+    like-for-like, which is why the guard is relative and not an absolute floor.
+    Whole-model lDDT is unaffected: those panels re-aggregate from raw/ and cover
+    all 170 / 36 benched targets.
     """
     row = _ref_row(ref_series, category)
     if row is not None and row.get(column) not in (None, ""):
+        n = ref_count(ref_series, category)
+        if min_n and n and n < min_n:
+            print(
+                f"[summary] {ref_series}/{category}: ref '{column}' covers {n} < {min_n} "
+                "comparisons — too thin to baseline, falling back to the paper number"
+            )
+            return fallback, False
         try:
             return float(row[column]), True
         except ValueError:
@@ -353,6 +415,12 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt", select:
 
 def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> None:
     ref_series = resolve_ref_series(ref_series, series)
+    if category in REF_SERIES_EXCLUDE_CATEGORIES.get(ref_series, ()):
+        print(
+            f"[summary] {ref_series}/{category}: fold not comparable "
+            "(see REF_SERIES_EXCLUDE_CATEGORIES) — overlay dropped, using paper AF3 numbers"
+        )
+        ref_series = ""
     summaries = load_step_summaries_for(series, category)
     if not summaries:
         print(f"[summary] no per-step summaries yet for {series}/{category}")
@@ -420,8 +488,8 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
         # hatched over: early DockQ "successes" there are collapsed-blob artefacts
         # (inflated fnat, no fnonnat penalty), so the bar height is not
         # trustworthy.
-        LDDT_FOLD_THRESH = 0.5
-        ld_by_step = {d["step"]: d["mean"] for d in ld}
+        TM_FOLD_THRESH = 0.5
+        tm_by_step = {d["step"]: d["mean"] for d in tm}
 
         # Bar width in step units = 72% of the smallest gap between benchmarked
         # steps, so bars never overlap even when the grid is irregular (1k/2k/5k).
@@ -448,7 +516,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
             unfolded = [
                 t["step"]
                 for t in tiers
-                if (ld_by_step.get(t["step"]) is not None and ld_by_step[t["step"]] < LDDT_FOLD_THRESH)
+                if (tm_by_step.get(t["step"]) is not None and tm_by_step[t["step"]] < TM_FOLD_THRESH)
             ]
             for j, s in enumerate(unfolded):
                 axd.axvspan(
@@ -459,12 +527,15 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     hatch="////",
                     linewidth=0.0,
                     zorder=9,
-                    label="TM < 0.5 (unreliable)" if j == 0 else None,
+                    label=f"mean TM < {TM_FOLD_THRESH:.2f} (unreliable)" if j == 0 else None,
                 )
             # Success panel uses ORACLE (matches the oracle DockQ-tier stack top);
             # every other panel uses the mean aggregate. Measured af3_ref value is a
             # percentage (÷100 to the fraction axis); the paper fallback is a fraction.
-            af3_pct, af3_measured = ref_value(ref_series, category, "success_rate_oracle", None)
+            # Half this series' own interface count is the floor for trusting the
+            # measured ref (see ref_value's min_n) — below that, use the paper number.
+            _own_n = max((int(s.get("n_interfaces") or 0) for s in summaries), default=0)
+            af3_pct, af3_measured = ref_value(ref_series, category, "success_rate_oracle", None, min_n=_own_n // 2)
             af3 = (af3_pct / 100.0) if af3_measured else AF3_SUCCESS_RATE.get(category)
             if af3 is not None:
                 # bar height (acceptable+medium+high) == success rate @0.23, so
@@ -472,11 +543,12 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 # The measured ref is an oracle like the stack; the paper fallback is a
                 # mean-over-samples rate on the full set — say which, on the line.
                 _sfx = "oracle" if af3_measured else "paper mean, full set"
+                _who = af3_tag() if af3_measured else "AF3 paper"
                 # Faint thin line in the SAME colour as the success score it references
                 # (the confidence top-1 success line, "#2166ac") — not a bold red dash.
                 axd.axhline(
                     af3, color="#2166ac", alpha=0.5, lw=1.1, zorder=3,
-                    label=f"AF3 success @0.23 ({af3:.0%}, {_sfx})",
+                    label=f"{_who} success @0.23 ({af3:.0%}, {_sfx})",
                 )
                 _spine_marker(axd, af3, "#2166ac")
             # Confidence top-1 success @0.23 (ranking_score-selected sample) — the
@@ -579,10 +651,10 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 ax.plot(sx, [d["mean"] for d in dist], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
                 if af3ref_median is not None:
                     ax.axhline(af3ref_median, color="k", alpha=0.5, lw=1.1, zorder=3,
-                               label=f"AF3 median ({af3ref_median:.2f})")
+                               label=f"{af3_tag()} median ({af3ref_median:.2f})")
                     _spine_marker(ax, af3ref_median, "k")
                 if af3ref_mean is not None:
-                    _spine_marker(ax, af3ref_mean, "0.45", label=f"AF3 mean ({af3ref_mean:.2f})")
+                    _spine_marker(ax, af3ref_mean, "0.45", label=f"{af3_tag()} mean ({af3ref_mean:.2f})")
                 if af3ref_median is None and paper_ref is not None:
                     ax.axhline(paper_ref, color="k", alpha=0.35, lw=1.1, ls=":", zorder=3,
                                label=f"AF3 paper mean, full set ({paper_ref:.2f})")
@@ -730,7 +802,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 _spine_marker(ax, _med, "k")
                 _spine_marker(ax, _mean, "0.45")
                 ax.text(
-                    0.005, _med, f"AF3 median {_med:.2f}", transform=ax.get_yaxis_transform(),
+                    0.005, _med, f"{af3_tag()} median {_med:.2f}", transform=ax.get_yaxis_transform(),
                     ha="left", va="bottom", fontsize=8, color="k", alpha=0.7, clip_on=False,
                 )
                 ax.text(
@@ -785,8 +857,9 @@ def main() -> None:
         default="",
         help="Series whose measured mean (oracle for the success panel) is drawn as a "
         "reference line; falls back to the built-in paper AF3 dicts when its eval is "
-        "absent or no series is given (the default). Series listed in "
-        f"RETIRED_REF_SERIES ({', '.join(sorted(RETIRED_REF_SERIES))}) are refused.",
+        "absent or no series is given. Series listed in REF_SERIES_CAVEAT "
+        f"({', '.join(f'{k}: {v}' for k, v in sorted(REF_SERIES_CAVEAT.items()))}) are "
+        "drawn with that caveat stamped into every label.",
     )
     args = ap.parse_args()
     summarize(args.series, args.category, plot=not args.no_plot, ref_series=args.ref_series)

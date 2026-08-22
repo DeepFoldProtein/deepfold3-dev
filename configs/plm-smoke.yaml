@@ -1,0 +1,39 @@
+# Smoke config: everything wired, nothing large. A few minutes on one GPU.
+base: plm-base.yaml
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 6
+
+data:
+  token_budget: 4096
+  num_workers: 2
+  sources:
+    - name: pdb
+      weight: 0.5
+      date_max: 20210930
+      interface_masking: true
+    - name: teddymer
+      weight: 0.5
+      holdout_every: 200
+      interface_masking: true
+
+eval_sources:
+  - name: pdb
+    date_min: 20210930
+    interface_masking: true
+    max_complexes: 500
+  - name: teddymer
+    holdout_every: 200
+    holdout_side: eval
+    interface_masking: true
+    max_complexes: 500
+
+train:
+  max_steps: 30
+  warmup_steps: 5
+  log_every: 10
+  eval_every: 15
+  eval_batches: 3
+  save_every: 0

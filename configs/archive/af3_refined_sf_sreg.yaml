@@ -1,0 +1,39 @@
+base: af3_refined_sf.yaml
+
+# `df3-af3r-sreg` — single representation magnitude regularization.
+#
+# Rationale: spectral analysis shows our AF3-baseline single track
+# (single_attn eff_rank 142, single_transition 189) is *higher* rank
+# than AF3 official (single_attn 57, single_transition 69). AF3 has
+# *more concentrated* single representations. Adding a magnitude
+# penalty on single may push our model toward AF3's specialized
+# subspace without hurting capacity.
+#
+# Mechanism: log_rms regularizer adds
+#     L_reg = α · log( sqrt(mean(s²)) + ε )
+# to total loss. log form keeps penalty moderate even when RMS is large
+# (~16k like our explosion zone) — unlike L2 form which would dominate
+# the loss when RMS is millions. Gradient through log is 1/(RMS+ε) so
+# the penalty is *scale-aware*: shrinks as RMS does.
+#
+# Predicted effects vs `af3_refined_sf` (wd=0, no reg):
+#   * single explosion slowed by direct counter-gradient on |s|
+#   * pair representation untouched
+#   * distogram CE: TBD — single not directly read by distogram head
+#     (pair-only), so should not hurt CE descent
+#   * smooth_lddt / diffusion: TBD — diffusion reads pair too, but
+#     conditioning may benefit from cleaner single
+#
+# Conservative α start: 1e-4 with log_rms gives gradient magnitude
+# ~α/RMS ≈ 1e-4 / 100 = 1e-6, negligible vs primary loss but compounds
+# over steps to constrain single magnitude.
+#
+# Holds constant from `af3_refined_sf.yaml`:
+#   - AF3 baseline arch (no RMSN, no uniros)
+#   - lr 1.8e-3, weight_decay 0.0
+#   - warmup_steps 1000, grad_clip_norm 10.0
+#   - refined SF C=200, EMA 0.999, eval_snapshot=average
+
+training:
+  alpha_single_reg: 1.0e-4
+  reg_form: log_rms

@@ -112,7 +112,12 @@ def seq_from_gt_cif(pdb_id: str, chain_id: str) -> str:
     model = st[0]
     for chain in model:
         if chain.name == chain_id:
-            return gemmi.one_letter_code([r.name for r in chain])
+            # Polymer residues only. Iterating the raw chain also yields waters,
+            # ions and ligands, which one_letter_code renders as 'X' — that fed
+            # 42% unknown-nucleotide padding into the monomer_dna inputs (8g2n:
+            # a 25-mer G-quadruplex plus 69 waters). Matches the fallback below
+            # and nucleic_groups_from_cif.
+            return gemmi.one_letter_code(chain.get_polymer().extract_sequence())
     # FoldBench's monomer target CSVs sometimes name the chain in a different
     # namespace than the GT assembly CIF (e.g. row says 'A' but the CIF labels
     # the single RNA chain 'B'). A monomer target is one polymer chain, so fall

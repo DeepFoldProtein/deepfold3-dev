@@ -276,9 +276,7 @@ def _print_distribution(name: str, values_by_layer: dict[int, float], ceiling: f
     print(" ".join(parts))
 
 
-def _collect_values_per_layer(
-    series: dict, predicate, num_layers: int = 48
-) -> list[list[float]]:
+def _collect_values_per_layer(series: dict, predicate, num_layers: int = 48) -> list[list[float]]:
     """Build ``[layer_0_values, layer_1_values, ..., layer_{L-1}_values]``.
 
     For every series matching ``predicate``, append all values (across the
@@ -422,18 +420,26 @@ def _render_boxplots(
         # Total residual-stream amplification (single track block panel).
         if title.endswith("single") and "block" in title and amp_single:
             ax.text(
-                0.5, 0.96,
+                0.5,
+                0.96,
                 rf"$\mathrm{{amp}}_\mathrm{{single}}={amp_single[-1][1]:.2f}\times$"
                 rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
-                transform=ax.transAxes, fontsize=9, va="top", ha="center",
+                transform=ax.transAxes,
+                fontsize=9,
+                va="top",
+                ha="center",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
             )
         elif title.endswith("pair") and "block" in title and amp_pair:
             ax.text(
-                0.5, 0.96,
+                0.5,
+                0.96,
                 rf"$\mathrm{{amp}}_\mathrm{{pair}}={amp_pair[-1][1]:.2f}\times$"
                 rf"  (= $\mathrm{{RMS}}(h_{{47}})/\mathrm{{RMS}}(h_\mathrm{{in}})$)",
-                transform=ax.transAxes, fontsize=9, va="top", ha="center",
+                transform=ax.transAxes,
+                fontsize=9,
+                va="top",
+                ha="center",
                 bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#888", alpha=0.85),
             )
     for ax in axes[-1, :]:
@@ -557,9 +563,13 @@ def _render_timeseries(
                 ax2.set_ylabel("amp ×", fontsize=8, color="#222222")
                 ax2.tick_params(axis="y", labelsize=8, colors="#222222")
                 ax2.text(
-                    0.04, 0.96,
+                    0.04,
+                    0.96,
                     rf"$\mathrm{{amp}}_\mathrm{{latest}}={ys[-1]:.2f}\times$",
-                    transform=ax2.transAxes, fontsize=9, va="top", ha="left",
+                    transform=ax2.transAxes,
+                    fontsize=9,
+                    va="top",
+                    ha="left",
                     bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#444", alpha=0.85),
                 )
     # Last ρ row gets the "step" label on the x-axis (above the input-stream
@@ -755,9 +765,7 @@ def _run_one(args, series, ceiling, latest_step):
     # ============================================================
     print(f"=== Stream RMS @ step {latest_step} ===")
     for track in ("single", "pair"):
-        vals_by_layer = _per_layer_at_latest(
-            series, lambda pk, t=track: pk.kind == "stream" and pk.track == t
-        )
+        vals_by_layer = _per_layer_at_latest(series, lambda pk, t=track: pk.kind == "stream" and pk.track == t)
         _print_distribution(f"stream {track} RMS", vals_by_layer, ceiling=None)
 
     # ============================================================
@@ -766,9 +774,7 @@ def _run_one(args, series, ceiling, latest_step):
     ceil_hdr = f" (ρ ≲ {ceiling:.3f})" if ceiling is not None else ""
     print(f"\n=== Block-level ρ @ step {latest_step}{ceil_hdr} ===")
     for track in ("single", "pair"):
-        vals_by_layer = _per_layer_at_latest(
-            series, lambda pk, t=track: pk.kind == "block_rho" and pk.track == t
-        )
+        vals_by_layer = _per_layer_at_latest(series, lambda pk, t=track: pk.kind == "block_rho" and pk.track == t)
         _print_distribution(f"block ρ {track}", vals_by_layer, ceiling=ceiling)
         _print_top_outliers(f"block ρ {track}", vals_by_layer, top_k=args.top)
 
@@ -777,9 +783,7 @@ def _run_one(args, series, ceiling, latest_step):
     # ============================================================
     print(f"\n=== Per-branch ρ @ step {latest_step}{ceil_hdr} ===")
     for branch in _BRANCH_NAMES:
-        vals_by_layer = _per_layer_at_latest(
-            series, lambda pk, b=branch: pk.kind == f"branch_{b}_rho"
-        )
+        vals_by_layer = _per_layer_at_latest(series, lambda pk, b=branch: pk.kind == f"branch_{b}_rho")
         _print_distribution(f"ρ {branch:<14}", vals_by_layer, ceiling=ceiling)
         _print_top_outliers(f"ρ {branch}", vals_by_layer, top_k=args.top)
 
@@ -820,10 +824,7 @@ def _run_one(args, series, ceiling, latest_step):
         )
         items = sorted(slopes_by_layer.items(), key=lambda p: -p[1])
         head = items[: args.top]
-        print(
-            "    top fastest-growing layers: "
-            + ", ".join(f"L{li:02d}={_fmt(s, 7, 5)}" for li, s in head)
-        )
+        print("    top fastest-growing layers: " + ", ".join(f"L{li:02d}={_fmt(s, 7, 5)}" for li, s in head))
 
     # ============================================================
     # Optional CSV dump

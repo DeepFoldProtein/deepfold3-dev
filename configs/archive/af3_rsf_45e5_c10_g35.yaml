@@ -1,0 +1,40 @@
+base: ../af3_rsf.yaml
+
+# `df3-rsf-45e5-c10-g35` — C2 → 원본 s035 영역으로 한 발 더.
+#
+# Hypothesis: distogram CE 회귀의 본질은 trunk drift 속도. 원본
+# `df3-12n-s035-lr2-5e4-wd10-0504-181609`은 distogram 1.80까지 단조
+# descent (10k+ step). 우리의 모든 lr=1.8e-3 / 9e-4 arms이 회귀하는 건
+# trunk drift > distogram head catch-up rate 때문.
+#
+# 원본 s035 effective per-step update ≈ lr × clip/grad_norm
+#   = 2.5e-4 × (10/43) = 5.8e-5  (heavy clip 92.7%)
+#
+# 이 arm 효과적 update:
+#   = 4.5e-4 × (10/20) = 2.25e-4 (clip 발동 시)
+#   원본 s035의 4× — 여전히 빠르지만 C2의 1/4
+#
+# Changes vs `af3_rsf.yaml` (AF3 default + refined SF):
+#   * lr: 1.8e-3 → 4.5e-4 (4×)
+#   * grad_clip_norm: 10 → 10 (keep, heavy clip regime)
+#   * weight_decay: 0 → 0.10 (s035 era)
+#   * single_transition_residual_gain: None → 0.35 (원본 s035)
+#
+# 원본 s035와 차이:
+#   * lr 1.8× higher (2.5e-4 → 4.5e-4)
+#   * ROS off (deep layer capacity 복원)
+#   * Refined SF + EMA (our default)
+#
+# Expected:
+#   * Distogram CE 단조 descent (regression 부재)
+#   * single_l2 plateau forming
+#   * smooth_lddt continued descent
+
+training:
+  lr: 4.5e-4
+  weight_decay: 0.10
+  grad_clip_norm: 10.0
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.35

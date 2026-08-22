@@ -1,0 +1,30 @@
+base: ros_scheduledfree_adabias_s035.yaml
+
+# Same as ros_scheduledfree_adabias_s035 (single_transition_residual_gain=0.35)
+# but with peak lr halved AGAIN (1e-3 → 5e-4 → 2.5e-4) AND weight_decay
+# doubled (0.05 → 0.10).
+#
+# Motivation: in df3-12n-s035-lr5e4-0504-075248 (lr=5e-4), the η=0.35
+# brake bounded forward-pass per-block contribution but couldn't keep
+# up with lr-driven weight-magnitude growth on the underlying
+# ``single_transition.linear2``. single_l2 climbed from 184 (step
+# 800-1000) to 388 (step 1600-1800) at +23% per 300-step window with
+# no plateau forming, while distogram / smooth_lddt stagnated.
+# grad_norm spikes escalated to 3477 (clipped to 10 → near-random
+# direction).
+#
+# This config attacks the root cause directly:
+#   * lr halved → per-step weight update magnitude halved
+#   * wd doubled → matmul-weight Frobenius growth bounded twice as hard
+#
+# Combined effect on ``single_transition.linear2`` Frobenius growth is
+# roughly multiplicative (lr × wd_complement), so the brake on weight
+# magnitude is ~4× stronger than the lr=5e-4 / wd=0.05 baseline.
+#
+# Tradeoff: smaller lr × stronger wd → slower convergence. With
+# Schedule-Free AdamW the iterate-averaging is mostly insensitive to lr
+# scale in steady state, so this should mainly affect the early
+# trajectory's noise, not the final iterate quality.
+training:
+  lr: 2.5e-4
+  weight_decay: 0.10

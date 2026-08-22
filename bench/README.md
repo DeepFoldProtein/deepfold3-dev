@@ -65,6 +65,9 @@ $PY bench/scripts/build_inputs.py  --category monomer_protein
 $PY bench/scripts/dssp_classify.py --category monomer_protein
 # 3. inference — 4 GPUs, 4 seeds, latest first ('all' = full grid)
 $PY bench/scripts/run_sweep.py --series df3v1 --steps 90000 --category monomer_protein --seed 42,43,44,45
+
+# serve fewer MSA rows than the pool (reproduce a training-crop run, or bound memory)
+$PY bench/scripts/run_sweep.py --series df3v1 --steps 90000 --category monomer_protein --msa-crop-size 1024
 # 4. score with OST (per step)
 $PY bench/scripts/eval_ost.py  --series df3v1 --step 90000 --category monomer_protein
 # 5. trajectory table + plot (after several steps scored)
@@ -88,6 +91,14 @@ nohup bash bench/scripts/auto.sh runs/df3-stage0-r5 3600 \
 | `build_inputs.py`  | targets CSV + MSA → per-target deepfold3 JSON + token-count manifest |
 | `dssp_classify.py` | mkdssp on GT CIF → `fold_class` ∈ {alpha, beta, alpha_beta, coil} |
 | `run_sweep.py`     | length-balanced target shards × N GPUs, one `inference-batch` per GPU (loads weights once, `--snapshot average`); resumable |
+
+> **MSA rows.** `inference` / `inference-batch` default `msa_crop_size` to the pool cap
+> (`const.MAX_MSA_ROWS` = 16384), **not** the checkpoint's trained crop — training uses a small crop
+> (r14: 1024) plus AF3 §2.3's random-`k` mask precisely so serving can use everything. `run_sweep.py`
+> and `slurm_sweep.py` take `--msa-crop-size N` and pass it through. Predictions made before this
+> default landed were served at the training crop; **do not mix them with new ones inside a step** —
+> `--skip-existing` will happily leave the old ones in place, so purge the step first (see the
+> per-step purge note) if you change the setting mid-sweep.
 | `make_pred_ref.py` | prediction tree → FoldBench `prediction_reference.csv` |
 | `eval_ost.py`      | `ost compare-structures` per sample (FoldBench-faithful flags) → mean/oracle LDDT, TM, GDT-TS |
 | `summarize.py`     | per-step + per-fold-class trajectory CSVs and plot |
@@ -153,4 +164,26 @@ see `memory/project_stage1_crop640`.)
 - **Resumable**: inference skips targets that already have `seed-*` dirs;
   OST skips comparisons whose detail JSON exists. Re-run to fill gaps.
 - **Sources are read-only** (`/data/...`); everything written stays under `bench/`.
+- **5 targets never score** — `8c5h`, `8dtn`, `8ts0` (antibody_antigen) and
+  `8ows`, `8q00` (protein_protein) return OST `status=FAILURE` with
+  `IndexError: arrays used as indices must be of integer (or boolean) type`
+  (a numpy-2 incompatibility inside OST, not a model or structure problem).
+  Verified 0 successes in 5,970 comparisons across r14/r15/r16 × 79 steps ×
+  every seed/sample, so it is independent of prediction quality. Effective
+  denominators are therefore **209/211 for protein_protein and 92/95 for
+  antibody_antigen**, constant across every step and series — cross-arm
+  comparisons are unaffected, but the target set differs from FoldBench's
+  official rows by these 5 when comparing against published numbers.
+- **`n_ost_failed` counts comparisons, not targets** — one target contributes
+  `seeds x samples` failures (20 for the default 2x5 x2 grid). A 3.2% failure
+  rate in `summary.csv` is 3 targets, not 3% of targets.
+- **Partial steps get a completion marker.** `auto.sh` treats
+  `eval/<cat>/step_<N>/summary.csv` as "done", and it is written even when the
+  sweep lost shards (e.g. a CUDA OOM killed 3 of 8 GPUs at step 14000, leaving
+  134/211 protein_protein targets). `plot_lddt_grid.py` then averages whatever
+  exists, silently. **Always check `n_targets` in `lddt_by_category.csv`
+  against the previous step before reading the newest column**; if it dropped,
+  the step is partial. To force a redo, delete the `summary.csv` marker (and
+  the `pred/` dirs too if the inputs themselves changed — the sweep is
+  `--skip-existing`).
 ```

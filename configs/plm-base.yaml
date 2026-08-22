@@ -1,0 +1,161 @@
+# Complex language model — main model (C): chain-wise RoPE + complex-wise NoPE.
+#
+#   torchrun --nproc-per-node=8 -m deepfold3.scripts.plm_train \
+#       --config configs/plm-base.yaml --output runs/plm-r1
+#
+# The positional-architecture ablation is one key: model.layer_pattern.
+#   cg   1 chain-RoPE : 1 global-NoPE   (this file, main model C)
+#   ccg  2:1                            (layer-ratio arm)
+#   r    global RoPE everywhere         (baseline A)
+#   cr   chain-RoPE + global RoPE       (baseline B)
+#   cx   chain-RoPE + cross-chain NoPE  (arm D; needs model.attn_impl=sdpa)
+
+# Model shape is ESM2-650M's (33 layers x 1280, 20 heads) so that parameter
+# count, depth and width line up with ESM2-650M and with PPLM, which is
+# ESM2-650M's shape too. SwiGLU at 8/3 lands at 672M against ESM2's 650M.
+# Smaller members of the ladder: configs/plm-{8m,35m,150m}.yaml.
+model:
+  d_model: 1280
+  n_heads: 20
+  n_layers: 33
+  layer_pattern: cg
+  norm: rmsnorm
+  qk_layernorm: true
+  bias: false
+  scale_residue: true
+  max_position: 2048
+  attn_impl: varlen
+  chain_signal: none
+  # Maximal-update parameterisation, so the learning rate below is a measured
+  # value rather than an inherited one. Verified two ways in
+  # export/complex-lm/README.md: a coordinate check (activation scale flat in
+  # width, 0.83x across 128->1024, against 284x under SP) and a transfer sweep
+  # (muP's optimum unmoved across 320->1280, SP's drifting as ~1/width).
+  mup: true
+  mup_base_width: 320
+
+data:
+  data_root: /data/plm/store
+  # Measured, not guessed (export/complex-lm/crop_cost.csv): on PDB the chain
+  # budget is nearly free and the complex budget is what costs interface.
+  #   (1024, 2048) keeps 94.3% of interface residues
+  #   (1024, 4096) keeps 99.2%   <- this
+  #   (2048, 4096) keeps 99.3%   (+0.14 pt for 2x the rotary range)
+  # So the interesting context ablation is the complex budget, not the chain
+  # budget that the design note expected.
+  max_chain_len: 1024
+  max_complex_len: 4096
+  max_chains: 16
+  min_chains: 2
+  # 32768 x 8 ranks = 262k tokens per optimiser step (~42k scored positions).
+  # Still 8x below ESM2's 2M-token batch, but 16384 was 16x below and the wider
+  # batch is also slightly *faster* per token on B200 (162k vs 154k tok/s) at
+  # 96 GiB of 183. Note lr=4e-4 is ESM2-650M's value at its own 2M batch, so it
+  # is not calibrated for this one — that is what the muP sweep is for.
+  token_budget: 32768
+  permute_chains: true
+  num_workers: 6
+  prefetch_factor: 4
+  seed: 0
+
+  masking:
+    rate: 0.15 # PPLM / ESM2 baseline
+    interface_rate: 0.30 # PPLM's PDB policy, structural sources only
+    mask_token_frac: 0.8
+    random_token_frac: 0.1
+    homomer_paired: true
+
+  # p(D) over sources, then p(T | D) within one. The AFDB weights are the
+  # interesting knob: its natural composition is ~96:4 homo:hetero, and under
+  # this architecture an *exact* homomer is provably indistinguishable from its
+  # monomer, so leaving it natural spends 96% of the AFDB budget on examples
+  # that teach the global layers nothing.
+  # Weights follow measured *sequence* diversity, not example counts. Each
+  # source's share of the distinct chain clusters (a cluster shared by k
+  # sources counted 1/k to each) is:
+  #
+  #     teddymer 0.626   afdb 0.255   string 0.103   pdb 0.016
+  #
+  # STRING has the most complexes (2.83M) and the fewest chain clusters
+  # (134,662) of any source: its pairings are diverse, its sequences are not.
+  # At weight 0.30 that was ~106 draws per chain cluster over a 100k-step run,
+  # and it showed — eval loss on `string_valid` fell to 0.73 nats (perplexity
+  # 2.07) while the clean PDB holdout flattened, i.e. the model was memorising
+  # sequences it had already seen. Combinatorial diversity in the *pairings*
+  # does not prevent that, because the pairs are built from the same sequences.
+  #
+  # Two deliberate departures from the measured shares. PDB is raised far above
+  # its 0.016 because it is the target domain and the only source with real
+  # experimental multimers; STRING is kept at 0.10 rather than dropped, because
+  # it is the only large supply of *heteromeric* pairings — AFDB is 97%
+  # homomeric and an exact homomer gives the complex-scoped layers no signal at
+  # all (Result 1).
+  sources:
+    - name: pdb
+      weight: 0.25
+      date_max: 20210930 # the split that matters; everything later is eval
+      cluster_balanced: true
+      interface_masking: true
+    - name: afdb
+      weight: 0.25
+      homo_weight: 0.70
+      hetero_weight: 0.30
+      interface_masking: true
+    - name: string
+      weight: 0.10 # was 0.30; ~106 -> ~35 draws per chain cluster
+      cluster_balanced: true # PPLM ships this set already clustered
+      interface_masking: false
+    - name: teddymer
+      weight: 0.40 # the actual supply of sequence diversity
+      interface_masking: true
+
+# Evaluation is PDB-first on purpose: AFDB and Teddymer are training fuel, and
+# the thing this model has to get right is real complexes. The PDB entry is the
+# temporal holdout — the same store, the other side of the cutoff — which is
+# the only split that does not leak for PDB.
+#
+# PPLM's own PDB validation set was dropped rather than filtered harder: 58.5%
+# of its entries are also in our PDB training split, and 30.8% still are after
+# the cluster filter, because a two-chain pair taken from a larger assembly has
+# a different complex-cluster key than the assembly it came from. `string_valid`
+# stays as an in-distribution monitor for the 30% of the mixture that is
+# STRING, not as a holdout: 90.8% of its chain sequences appear verbatim in the
+# STRING training split, since PPLM splits pairings rather than sequences.
+#
+# (Neither AFDB nor Teddymer is evaluated, so neither reserves a holdout. If
+# AFDB heterodimer memorisation ever needs checking — ~64k complexes seen ~20
+# times over a 100k-step run — put `holdout_every: 200` back on both sides.)
+eval_sources:
+  - name: pdb
+    date_min: 20210930
+    interface_masking: true
+    max_complexes: 2000
+  - name: string_valid
+    interface_masking: false
+    max_complexes: 2000
+
+train:
+  max_steps: 100000
+  # Swept at w=320 with this exact batch (262,144 tokens/step): a clean interior
+  # minimum at 9.8e-4, spread 0.044 against a measured run-to-run noise floor of
+  # ~0.002. Transferred to d_model=1280 by muP, i.e. an effective hidden-matrix
+  # rate of 9.8e-4 / (1280/320) = 2.4e-4 with embeddings and norms at 9.8e-4.
+  # The previous value, 4e-4, was ESM2-650M's at its own 2M-token batch.
+  lr: 9.77e-4
+  min_lr_frac: 0.1
+  warmup_steps: 2000
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.98
+  grad_clip: 1.0
+  accum_steps: 1
+  dtype: bf16
+  log_every: 100         # also the window train metrics are averaged over
+  # save_every must be a multiple of eval_every, so that every checkpoint lands
+  # on a step that was also evaluated and no metric is orphaned from a
+  # restorable state. The trainer refuses a config where it is not.
+  eval_every: 1000
+  eval_batches: 20
+  save_every: 5000
+  keep_last: 10 # ~8 GB each (fp32 params + AdamW state)
+  seed: 0

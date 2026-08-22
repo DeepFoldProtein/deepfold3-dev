@@ -1,0 +1,51 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Resume of df3-12n-uniros-rmsn-lr5e4-clip36 with base-lr ascent.
+# Tests whether lr itself (not the lr × clip ceiling) is the proximate
+# lever for fit-rate.
+#
+# Background — what lr5e4-clip36 showed (78 step at lr=5e-4):
+#   * trunk: single_rms 10.12 (vs 10.22 at lr=2e-4), even safer
+#   * spike distribution: max grad 705 vs 5886 prev (8× smaller)
+#   * Adam v reconverged: mean/median grad 2.14 vs prev 10.4
+#   * BUT smooth_lddt and tm_true essentially flat vs lr=2e-4 window:
+#         smooth_lddt 0.523 (vs 0.513), tm_true 0.1617 (vs 0.1614)
+#   → Adam-invariance hypothesis confirmed (lr-ratio change at fixed
+#     lr × clip preserves dynamics) but does NOT unlock faster descent.
+#   → Implication: the 0.018 step-magnitude ceiling itself is the bind,
+#     OR lr scaling at constant ceiling is genuinely null. Both call for
+#     climbing INTO base_lr territory.
+#
+# Levers:
+#   * lr 5e-4 → 1.0e-3 (2.0× bump) — moves lr to schedule_free.yaml's
+#     base_lr value (1e-3). At this scale every lr-related lever is
+#     directly comparable to the original SF baseline.
+#   * grad_clip_norm 36 → 18 — preserves lr × clip = 0.018 (AF3 ceiling).
+#     Keeps step-magnitude budget constant so the experiment isolates
+#     "lr at fixed ceiling" rather than confounding lr and ceiling.
+#
+# Theoretical justification:
+#   1/√L · RMSNorm(F(LayerNorm(x))) closes the forward-side weight-drift
+#   mode that constrained vanilla AF3 lr to 1.8e-3 with warmup.
+#   Architecturally, lr=1e-3 is strictly safer in this run than it was
+#   in vanilla pre-LN. Trunk drift at lr=5e-4 has not appeared
+#   (single_rms 10.12 < 12.0 abort), and lr=1e-3 is a 2× step.
+#
+# Abort triggers (200-500 step post-resume):
+#   1. single_rms > 12.0           → trunk drift returning   → revert lr 5e-4
+#   2. clip rate (>18) > 60%       → Adam preconditioning at risk → clip 25
+#   3. smooth_lddt static or up    → ceiling, not lr, is the bind → climb to lr1e3-clip36
+#   4. mean/median grad ratio > 4  → spike-driven distribution → clip ↑
+#   5. tm_true regression > -0.005 → going backwards → revert
+#
+# Resume: from runs/df3-12n-uniros-rmsn-lr5e4-clip36/checkpoint_4000.pt
+# (preserves SF state at the lr=5e-4-equilibrated v buffer; the lr
+# override hook bumps lr automatically).
+
+training:
+  lr: 1.0e-3
+  grad_clip_norm: 18.0
+  checkpoint_interval: 500
+
+  num_workers: 16
+  prefetch_factor: 16

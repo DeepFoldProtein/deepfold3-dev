@@ -55,10 +55,22 @@ base: stage1.yaml
 
 training:
   wandb_project: deepfold3-stage2
+  eval_before: false
+  alpha_smooth_lddt: 0.0
 
-model:
-  data:
-    atomize_prob: 0.01
-    atomize_source: interface
-    atomize_max_residues: 8
-    atomize_eval: false
+  # FAPE. fape_mode: pooled (AF2, all pairs) | both (AF-M 10/30) | intra | inter.
+  # inter is the only term with gradient on a far-off pose; intra is the control.
+  # fape_mode: both
+  # alpha_fape: 0.0 # intra-chain
+  # alpha_fape_inter: 0.1 # inter-chain
+  # fape_clip_distance: 10.0
+  # fape_clip_distance_inter: 30.0
+  # fape_atom_set: ALL
+  # fape_normalize: true
+  # fape_chunk_size: 0 # 64
+# model:
+#   data:
+#     atomize_prob: 0.01
+#     atomize_source: interface
+#     atomize_max_residues: 8
+#     atomize_eval: false

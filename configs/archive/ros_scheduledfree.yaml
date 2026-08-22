@@ -1,0 +1,45 @@
+base: schedule_free.yaml
+
+# Per-layer Residual Output Scaling (ROS).
+#
+# x ← x + s · F(x)   with   s = 1 / sqrt(layer_idx + 1)   per layer
+#
+# Applied to every "PairFormer-like" residual stack:
+#   * Evoformer MSA stack         (L=4)
+#   * PairFormer trunk            (L=48)
+#   * Confidence-head PairFormer  (L=4)
+#   * Template-embedding PairFormer (L=2)
+model:
+  evoformer:
+    residual_output_scaling: true
+  pairformer:
+    residual_output_scaling: true
+    # Per-head learnable PairBias gate inside SingleAttention. Calibrates
+    # PairBias-vs-QK contribution to the attention softmax per head.
+    # Independent of ROS — a free per-head re-balancer.
+    # Init τ₀ = 0.25 (small) so PairBias starts mildly suppressed and grows
+    # only where helpful.
+    pair_bias_gate: true
+    pair_bias_gate_init_tau: 0.25
+    # SingleTransition.linear_out (= linear2) init: replace the AF3 zeros
+    # init with a scaled row-orthogonal init (W = gain · Q). Targets the
+    # zero-wake-up dynamic that drives single_transition output to align
+    # with the residual stream and accumulate ‖single‖ across layers.
+    # gain = 0.01 keeps initial residual updates tiny (output stddev ≈ 0.01).
+    single_transition_linear_out_init_gain: 0.01
+  confidence:
+    residual_output_scaling: true
+    pair_bias_gate: true
+    pair_bias_gate_init_tau: 0.25
+    single_transition_linear_out_init_gain: 0.01
+  template:
+    pairformer:
+      residual_output_scaling: true
+  # DistogramHead.half_logits init: small-normal W ~ trunc_normal(0,
+  # (α/√fan_in)²). α=0.05 keeps the initial distogram softmax close to
+  # uniform (CE ≈ log(num_bins)) while delivering non-zero gradient to
+  # ``pair`` from step 0 — avoids the "stuck near log(64)" pattern that
+  # AF3's α=0 (zeros init) produces during early training. Setting α=0
+  # restores the AF3 default.
+  distogram:
+    half_logits_init_alpha: 0.05

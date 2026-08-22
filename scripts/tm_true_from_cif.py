@@ -29,6 +29,7 @@ Usage:
         --steps 8500 9500 9800 \\
         --n-samples 30
 """
+
 from __future__ import annotations
 
 import argparse
@@ -39,8 +40,26 @@ import gemmi
 import numpy as np
 
 STD_AA = {
-    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
 }
 
 
@@ -95,8 +114,9 @@ def frame_basis(n: np.ndarray, ca: np.ndarray, c: np.ndarray):
     return R_t, ca
 
 
-def _frame_angle_ok(n: np.ndarray, ca: np.ndarray, c: np.ndarray,
-                    angle_threshold_deg: float = 25.0, eps: float = 1e-8) -> bool:
+def _frame_angle_ok(
+    n: np.ndarray, ca: np.ndarray, c: np.ndarray, angle_threshold_deg: float = 25.0, eps: float = 1e-8
+) -> bool:
     u = n - ca
     v = c - ca
     cos_a = float(np.dot(u, v) / max(np.linalg.norm(u) * np.linalg.norm(v), eps))
@@ -117,12 +137,8 @@ def compute_tm_true(pred_bb: dict, ref_bb: dict) -> tuple[float, int]:
     pred_ca = np.array([pred_bb[k][1] for k in keys])
     gt_ca = np.array([ref_bb[k][1] for k in keys])
 
-    pred_angle_ok = np.array([
-        _frame_angle_ok(*pred_bb[k]) for k in keys
-    ])
-    gt_angle_ok = np.array([
-        _frame_angle_ok(*ref_bb[k]) for k in keys
-    ])
+    pred_angle_ok = np.array([_frame_angle_ok(*pred_bb[k]) for k in keys])
+    gt_angle_ok = np.array([_frame_angle_ok(*ref_bb[k]) for k in keys])
 
     # error[i, j] = || R_i_pred^T (CA_j_pred - CA_i_pred) - R_i_gt^T (CA_j_gt - CA_i_gt) ||
     error = np.zeros((N, N))
@@ -162,8 +178,7 @@ def main() -> None:
     args = ap.parse_args()
 
     ref_bb = get_backbone_with_label(args.ref, args.chain)
-    print(f"REF: {len(ref_bb)} residues with complete N/CA/C, label_seq "
-          f"{min(ref_bb):d}-{max(ref_bb):d}")
+    print(f"REF: {len(ref_bb)} residues with complete N/CA/C, label_seq {min(ref_bb):d}-{max(ref_bb):d}")
     print()
 
     print(f"{'step':>6} | {'n':>3} | {'mean tm_true':>12} | {'median':>7} | {'max':>5} | {'min':>5}")
@@ -185,8 +200,10 @@ def main() -> None:
         if not tms:
             print(f"{step:>6} | (no usable samples)")
             continue
-        print(f"{step:>6} | {len(tms):>3} | {statistics.mean(tms):>12.4f} | "
-              f"{statistics.median(tms):>7.4f} | {max(tms):>5.3f} | {min(tms):>5.3f}")
+        print(
+            f"{step:>6} | {len(tms):>3} | {statistics.mean(tms):>12.4f} | "
+            f"{statistics.median(tms):>7.4f} | {max(tms):>5.3f} | {min(tms):>5.3f}"
+        )
         if args.per_sample:
             print("           samples: " + " ".join(f"{t:.2f}" for t in tms))
 

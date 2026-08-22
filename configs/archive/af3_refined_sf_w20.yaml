@@ -1,0 +1,48 @@
+base: af3_refined_sf.yaml
+
+# `df3-af3r-w20` — adiabatic warmup (β₁ time scale). wd=0 baseline preserved.
+#
+# Single-variable change vs `df3-af3r`: warmup_steps 1000 → 40.
+# Stays on AF3-baseline wd=0 path (no deviation from paper).
+#
+# Rationale: linear warmup should be an *adiabatic ramp* (just long
+# enough for the optimizer's intrinsic state to settle), not a sustained
+# energy pump.
+#
+# Schedule_free.py composes two lr ramps:
+#   sched        = (k+1) / warmup_steps           # external
+#   √bias_corr2  = √(1 − β₂^(k+1))                 # intrinsic
+#   effective_lr = lr · sched · √bias_corr2
+#
+# Relevant time scales:
+#   * β₁ = 0.9  → 2/(1−β₁) = 20 step (y = (1−β₁)z + β₁x interpolation)
+#   * β₂ = 0.95 → 2/(1−β₂) = 40 step (v bias correction)
+#
+# w40 = β₁ time scale: at step 40, √bias_corr2 ≈ 0.93 (v is 93% calibrated).
+# External `sched` reaching 1.0 right when intrinsic √bias_corr2 reaches
+# near-1.0 gives a *clean handoff* — no further ramping beyond step 40.
+#
+# Empirical motivation (df3-af3r v1/v2 trajectories under warmup=1000):
+#   * 1000-step warmup spent 95% of its time at sub-peak lr while
+#     activations grew under wd=0
+#   * Plateau / EoS crossing coincided with warmup end (step ~1000)
+#   * Long warmup acted as a "sustained energy pump" — delayed full lr
+#     until activations had drifted, biased early representation toward
+#     cold-start dynamics
+#
+# w40 predicts (vs v2):
+#   * Full lr by step 40 — model trains at peak lr from very early
+#   * Productive learning phase (when activations are small, EoS far)
+#     is the bulk of training
+#   * EoS crossing under wd=0 still eventually occurs but at lower total
+#     step count due to less time at sub-peak
+#   * Verdict signal in ~50-100 step
+#
+# Holds constant from `af3_refined_sf.yaml`:
+#   - AF3 baseline arch (no RMSN, no uniros)
+#   - lr 1.8e-3, weight_decay 0.0 (AF3 baseline)
+#   - grad_clip_norm 10.0
+#   - batch 288, refined SF C=200, EMA 0.999, eval_snapshot=average
+
+training:
+  warmup_steps: 20

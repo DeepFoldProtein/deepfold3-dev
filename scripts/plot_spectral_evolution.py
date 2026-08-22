@@ -17,9 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-_BUCKET_RE = re.compile(
-    r"\s+(\w+)\s+\d+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+\d+\s*$"
-)
+_BUCKET_RE = re.compile(r"\s+(\w+)\s+\d+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+\d+\s*$")
 
 
 def parse_spectral_txt(path: Path) -> dict[str, dict[str, float]]:
@@ -95,24 +93,39 @@ def main() -> None:
         if rsf_rows:
             ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in rsf_rows]
             ax.plot(
-                rsf_steps, ys, marker="s", color="tab:red",
+                rsf_steps,
+                ys,
+                marker="s",
+                color="tab:red",
                 label="rsf (previous run, df3-rsf-25e5-c10-g35; no spec fix)",
-                linewidth=0.8, markersize=2.5, markeredgewidth=0, alpha=0.7,
+                linewidth=0.8,
+                markersize=2.5,
+                markeredgewidth=0,
+                alpha=0.7,
             )
         if fapeS3_rows:
             ys = [r[1].get(b, {}).get("eff_rank_p50", float("nan")) for r in fapeS3_rows]
             ax.plot(
-                fapeS3_steps, ys, marker="o", color="tab:blue",
+                fapeS3_steps,
+                ys,
+                marker="o",
+                color="tab:blue",
                 label="fapeS3 (current; +AF3-spec MSA/tmpl fix + fapeS3ity hinge α=2)",
-                linewidth=1.0, markersize=2.5, markeredgewidth=0,
+                linewidth=1.0,
+                markersize=2.5,
+                markeredgewidth=0,
             )
         # Reference horizontal lines
         ref_colors = {"AF3": "red", "Protenix": "purple", "Boltz-1": "darkgreen", "Boltz-2": "brown"}
         for name, vals in ref.items():
             if b in vals:
                 ax.axhline(
-                    vals[b], color=ref_colors[name], linestyle="--",
-                    linewidth=1, alpha=0.6, label=name,
+                    vals[b],
+                    color=ref_colors[name],
+                    linestyle="--",
+                    linewidth=1,
+                    alpha=0.6,
+                    label=name,
                 )
         ax.set_xlabel("training step")
         ax.set_ylabel("eff_rank p50")

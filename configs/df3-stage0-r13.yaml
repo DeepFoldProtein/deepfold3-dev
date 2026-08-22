@@ -1,0 +1,358 @@
+training:
+  optimizer_type: adamw
+  lr: 1.8e-3
+  weight_decay: 0.0
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  # decoupling_parameter: 200.0
+
+  warmup_steps: 1000
+  start_decay_after: 50000
+  decay_every: 50000
+  decay_factor: 0.95
+  # finetune_scheduler: af3
+  # cosine_min_lr_ratio: 0.1
+  # cosine_max_steps: 20000
+
+  grad_clip_norm: 10.0
+  grad_norm_fp64: true
+  # Both gates disabled (2026-05-18): the previous AF3-spec-fix arm
+  # showed only one skip event in ~3900 steps post-warmup, and the
+  # >100 grad_norm warnings produced noisy log output without
+  # actionable signal. Re-enable only if a catastrophic grad outlier
+  # incident actually corrupts training.
+  grad_norm_log_threshold: 0.0
+  grad_norm_skip_threshold: 0.0
+  # Per-rank gradient clipping (OF3-style): clip each rank's LOCAL grad to
+  # grad_clip_norm, then manually all-reduce the clipped grads. Bounds any
+  # one rank's contribution before averaging (vs. global clip on the
+  # already-averaged grad). Forces the whole backward under no_sync, so the
+  # grad all-reduce no longer overlaps backward — measure the cost via the
+  # SLOW_STEP ``bwd`` phase before enabling on large runs. Default off.
+  per_rank_grad_clip: true
+  max_consecutive_nan_skips: 10
+  accumulate_grad_batches: 1
+  ema_decay: 0.999
+  # eval_snapshot: "average" (SF's x — fast response, default) or
+  # "shadow" (EMA over x — slow, 1/(1-ema_decay) step lag, matches
+  # `deepfold3 inference --snapshot ema/auto`). Training callbacks
+  # update shadow regardless; this flag only controls which snapshot
+  # is forward-passed during run_eval.
+  eval_snapshot: average
+
+  max_tokens: 384
+  max_atoms: 4096
+  max_msa_seqs: 16384
+  max_recycles: 3
+  # Emit a FIXED [(max_recycles+1)*msa_crop_size, N] MSA crop stack from the
+  # featurizer (one crop per recycle, CPU resample) so the GPU MSA shape is
+  # constant every step — removes the per-step variable MSA allocation that
+  # drives caching-allocator fragmentation (the dt-spike forward-straggler).
+  # profile/deletion_mean still use the full 16384 pool; inference is unchanged.
+  msa_precrop: true
+
+  batch_size_per_rank: 2
+  diffusion_batch_size: 48
+  diffusion_chunk_size: 8
+  mini_rollout_steps: 20
+  mini_rollout_samples: 1
+  permute_gt_before_noise: true # Permute-then-noise ordering fix
+  diffusion_mse_per_sample_symmetry: false
+  chain_perm_stability_gate: true
+  chain_perm_gate_k: 3
+
+  alpha_diffusion: 4.0
+  alpha_smooth_lddt: 1.0
+  alpha_distogram: 0.03
+  alpha_confidence: 1.0e-4
+  alpha_pae: 1.0
+  alpha_bond: 0.0
+  # Masked-MSA (BERT) auxiliary CE weight. Requires
+  # model.masked_msa.enabled. Kept small (~distogram scale) so it nudges the
+  # MSA stack / single track without competing with the structure losses.
+  # OFF in the canonical config (this is a base for the whole af3_rsf / finetune
+  # lineage); enable per-arm — see configs/maskmsa.yaml.
+  alpha_masked_msa: 0.0
+  nucleotide_loss_weight: 5.0
+  ligand_loss_weight: 10.0
+
+  # Magnitude regularizers on trunk outputs (mean per-token Σ_c |x|^p / C).
+  # Pair reg bounds DistogramHead logit magnitude; alpha=0 = observation-only.
+  single_reg_p: 2
+  alpha_single_reg: 0.0
+  pair_reg_p: 2
+  alpha_pair_reg: 0.0
+
+  lddt_cutoffs: [0.5, 1.0, 2.0, 4.0]
+  lddt_inclusion_radius: 15.0
+  lddt_nucleotide_inclusion_radius: 30.0
+  lddt_min_distance: 1.0e-3
+  min_resolution: 0.1
+  max_resolution: 4.0
+
+  use_fused_ce_loss: false
+  fused_ce_chunk_n: 32
+
+  dtype: bf16
+  num_workers: 4
+  eval_num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
+  drop_last: true
+  # Per-chain template cache (memory LRU + hierarchical sharded disk). Build
+  # once with `deepfold3 build-pdb-cache --output /data/pdb/cache`; training then
+  # serves each template chain from disk (or the per-worker LRU) instead of
+  # re-parsing the full template mmCIF per hit — the dominant, query-size-
+  # independent dataloader-stall cost. Empty = disabled (cold-parse from mmcif).
+  pdb_chain_cache_dir: /data/pdb/cache
+  pdb_chain_cache_mem: 512
+  # Tier-4 diagnostic: log a per-phase breakdown when a single __getitem__
+  # exceeds this wall-clock. ~16 s ≈ the prefetch-overlap window (workers ×
+  # prefetch_factor × per-step compute) — below it, stalls are hidden by
+  # prefetch, so only samples beyond it actually move the step clock. 0 = off.
+  slow_sample_log_threshold_s: 0.0
+  # Tier-4b: per-rank GPU-side slow-step warning (names the straggler's record).
+  # Floor ~19s, normal spread to ~22s → 25 catches real spikes with few false
+  # positives. Grep: grep SLOW_STEP runs/<run>/logs/*/attempt_*/*/stdout.log
+  slow_step_log_threshold_s: 0.0
+  find_unused_parameters: false
+  static_graph: true
+  bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+  # NCCL watchdog deadline (also used by ``collective_guard`` to attribute hangs).
+  collective_timeout_s: 600.0
+  train_confidence_only: false
+
+  max_steps: 200_000
+  seed: 101
+  checkpoint_interval: 500
+  checkpoint_every_hours: 0.0
+  eval_samples: 1024
+  eval_interval: 100
+  eval_before: true
+  # Cadence (in effective steps) of the metrics flush. meters.sync() — an
+  # all_gather_object (key union) + one all_reduce across all ranks — fires
+  # ONLY here, so raising this cuts the per-step collective count directly.
+  # No information is lost: losses accumulate locally every microstep and are
+  # reported as window means; dt / data_wait / tok_per_sec divide by the same
+  # window; grad_norm is logged as window mean + window max. 1 = every step.
+  log_interval: 10
+  log_microsteps: false
+  uniform_recycle: true
+  # 0 = keep every checkpoint. Deliberate: per-checkpoint spectral analysis and
+  # step-specific evals both need the history, and rotation is applied on the
+  # next save, so setting this deletes an existing run's older checkpoints.
+  # Sizing, if space ever forces the question: 5.9 GB each, one per 500 steps,
+  # ~135 GB per 60 h run.
+  max_checkpoints: 0
+  # See TrainingConfig.checkpoint_staging_dir. Deployment note: the trainjob
+  # mounts only PVCs plus a memory-backed /dev/shm, so the container overlay
+  # (e.g. /tmp) is the only node-local candidate — verify free space first.
+  checkpoint_staging_dir: ""
+  # Always-on per-PF-layer activation RMS sentinel. Logs
+  # ``act_rms/pf_in_{single,pair}`` + ``act_rms/pf_{00..47}_{single,pair}``
+  # to WandB every ``log_interval`` steps. Compute is two reductions per
+  # PF block per forward; one packed all_reduce per log boundary. See
+  # :class:`deepfold3.training.activation_meter.ActivationRMSMeter`.
+  log_activation_rms: false
+  # Multiplier on ``log_interval`` for the act_rms flush cadence. With
+  # ``log_interval=1`` and ``act_rms_log_interval=10`` the meter emits one
+  # ρ snapshot per 10 effective steps; the meter still accumulates every
+  # step locally so window-averaged values are reported (cleaner than
+  # per-step noise). Drops WandB cost ~10× without losing the slow-dynamic
+  # depth profile.
+  act_rms_log_interval: 10
+  # Diagnostic-only accuracy metrics (no_grad, not in total, O(N²) every step).
+  # tm_true is the expensive frame-expansion metric and pure overhead in stage 1
+  # (alpha_pae=0 → nothing to share with), so it's off here; it auto-enables in
+  # FT3 (alpha_pae>0) where the PAE loss already builds the same error tensor.
+  # distogram_entropy is the cheaper fused calibration readout — kept on.
+  log_tm_true: false
+  log_distogram_entropy: true
+
+  auto_resume: false
+  load_strict: true
+  skip_load_optimizer: false
+  skip_load_scheduler: false
+  skip_load_step: false
+
+  wandb_enabled: true
+  wandb_project: deepfold3-stage0
+  wandb_run_name: null
+
+datasets:
+  - name: patchr
+    data_dir: /data/distillation/patchr_training
+    weight: 0.50
+    strategy: weighted
+    is_distillation: false
+    format: df3
+    cutoff_date: "2021-09-30"
+    exclude_loss_mol_types: []
+    # Multi-chain PDB assemblies: keep all three AF3 §2.7 crop strategies.
+    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+
+  - name: long_monomers
+    data_dir: /data/distillation/long_monomers/preprocessed
+    weight: 0.30
+    strategy: uniform
+    is_distillation: true
+    format: of3
+    # AlphaFold-2 predictions of MGnify sequences: pin templates to AF3's
+    # distillation cutoff (§2.4). The pseudo-labels were generated by AF2
+    # (template cutoff 2018-04-30), so a later template would leak structural
+    # information the label generator never had. "" would inherit 2021-09-30.
+    max_template_date: "2018-04-30"
+    # Single-chain: interface crop always degrades to spatial, so route its
+    # mass to spatial instead of wasting crop attempts on a missing interface.
+    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
+
+  - name: short_monomers
+    data_dir: /data/distillation/short_monomers/preprocessed
+    weight: 0.05
+    strategy: uniform
+    is_distillation: true
+    format: of3
+    max_template_date: "2018-04-30" # AF2 distillation cutoff (see long_monomers)
+    crop_weights: { contiguous: 0.25, spatial: 0.75, interface: 0.0 }
+
+  - name: afdb_nvda
+    data_dir: /data/distillation/afdb_nvda
+    weight: 0.15
+    strategy: weighted
+    is_distillation: true
+    format: df3
+    monomer_template_struct_space: true # Foldseek struct-space monomer templates
+    max_template_date: "2018-04-30" # AFDB = AF2 predictions; AF2 template cutoff (AF3 §2.4)
+    crop_weights: { contiguous: 0.2, spatial: 0.4, interface: 0.4 }
+
+eval_datasets:
+  - name: patchr_eval
+    data_dir: /data/distillation/patchr_training
+    format: df3
+    cutoff_date: "2021-09-30"
+
+model:
+  num_recycles: 10
+  msa_crop_size: 1024
+  evoformer:
+    num_layer: 4
+    msa_channel: 64
+    seq_channel: 384
+    pair_channel: 128
+    msa_dropout: 0.15
+    pair_dropout: 0.25
+  pairformer:
+    num_layer: 48
+    pair_channel: 128
+    seq_channel: 384
+    pair_dropout: 0.25
+  diffusion:
+    steps: 200
+    num_samples: 5
+    sigma_data: 16.0
+    p_mean: -1.2
+    p_std: 1.5
+    sigma_mix_alpha: 0.08 # 4/48=0.0833
+    sigma_mix_kind: uniform # uniform (log-uniform over [smin,smax]) | lognormal (targeted bump)
+    sigma_mix_smin: 4.0e-4 # uniform-mix lower bound, s = σ/σ_data (raise to skip easy low-σ tail)
+    sigma_mix_smax: 160.0 # uniform-mix upper bound, s = σ/σ_data
+    clamp_train_sigma: true
+    train_sigma_min: 0.01
+    skip_amp_sample: true
+    skip_amp_sample_training: true
+    atom_cross_att:
+      ref_element_zero_index: false
+  confidence:
+    num_layer: 4
+    num_plddt_bins: 50
+    num_distogram_bins: 64
+    max_error_bin: 31.0
+  template:
+    num_channels: 64
+    pairformer:
+      num_layer: 2
+      pair_dropout: 0.25
+  # Masked-MSA (BERT) learning head + single-query
+  # MSA cross-attention. Corrupts a fraction of MSA entries on the gradient
+  # recycle pass; a head at the end of the MSA module predicts the original
+  # residue identity. Weights are randomly initialized — when warm-starting
+  # from a structure-only checkpoint, load with `--override load_strict=false`
+  # so these new params keep their init. Loss weight = training.alpha_masked_msa.
+  #
+  # OFF here: initial.yaml is the base of the af3_rsf / finetune lineage (deep
+  # base-merge), so enabling it would turn it on for every descendant. The
+  # tunables are documented here; enable it per-arm — see configs/maskmsa.yaml.
+  masked_msa:
+    enabled: false
+    replace_fraction: 0.15 # BERT mask rate
+    uniform_prob: 0.1 # random-aa / profile / same mixture (rest → MASK token)
+    profile_prob: 0.1
+    same_prob: 0.1
+    num_heads: 4
+    head_dim: 32
+    hidden_dim: 128
+    c_out: 32 # full DF3 MSA vocab (const.MSA_VOCAB_SIZE)
+  data:
+    max_templates: 4
+    # Fixed T == max_templates template axis (+ template_mask), so per-step
+    # template compute is constant across ranks instead of being set by
+    # whichever rank drew the most templates. Model output is unchanged.
+    pad_templates: true
+    max_neighborhood: 40
+    contiguous_crop_weight: 0.2
+    spatial_crop_weight: 0.4
+    interface_crop_weight: 0.4
+    interface_distance: 15.0
+    template_cutoff_days: 60
+    # Drop records with > this many total chains (polymer + non-polymer) before
+    # the dataset is built (never sampled/loaded) — bounds giant-assembly
+    # featurisation cost / periodic dataloader stalls. 0 = off. Last stage
+    # (finetune3) raises this to 50, mirroring AF3's chain-count schedule.
+    max_total_chains: 30
+    max_template_date: "2021-09-30"
+    prefer_monomer_templates: true
+  optim:
+    use_fused_evo_attention: true
+    # Disabled: the fused pair-bias backward interacts with the fused
+    # evo-attention backward in a bf16 path that amplifies gradients by
+    # ~1e11× on specific training samples (reproduced on patchr:7k6p +
+    # ckpt_19; see scripts/triage_window.py). Keep fused evo-attn on for
+    # memory; fall back to plain LN+Linear pair-bias until the fused
+    # backward can be rewritten with fp32-promoted intermediates.
+    use_fused_pair_bias: false
+    # Enabled: the training-safe pair-scale trio. B200 end-to-end (fwd+bwd,
+    # gradient checkpointing) measured 1.04x @N=384 / 1.09x @N=640 with a ~20%
+    # trunk-activation memory cut (-0.63 GB/8-block @384, -1.76 GB @640).
+    # Numerics validated (tests/triton/test_fused_modules_robustness.py 46/46;
+    # full-model e2e fwd+bwd: 0 non-finite grads). Benefit grows with crop size.
+    # See docs/optimizations.md and scripts/bench_kernels.py.
+    use_fused_swiglu: true
+    use_fused_triangle_mul: true
+    use_fused_transition_pair: true
+    use_fused_ln_transpose: false # inference-only (column-attn LN+transpose)
+    use_tiled_linear: false
+    tiled_linear_inference: true
+    tiled_opm_chunk: 0
+    use_torch_compile: false
+    use_gradient_checkpointing: true
+  # Mixed-precision policy. Two sets of knobs:
+  # - ``fp32_*`` region guards pin numerically sensitive projections to fp32
+  #   while the rest of the net runs under bf16 autocast. Flip
+  #   ``fp32_distogram_head`` on if the distogram loss shows bursts beyond
+  #   its theoretical max (ln(num_bins) ≈ 4.16).
+  # - ``{grad_acc,reduce,loss}_dtype`` govern downstream precision axes:
+  #   grad accumulation across microsteps, DDP allreduce, and loss computation.
+  #   Defaults match pre-refactor DF3 (all fp32). Set ``reduce_dtype: bf16``
+  #   to register DDP's bf16_compress hook and halve allreduce bandwidth.
+  precision:
+    fp32_loss: true
+    fp32_confidence_head: true
+    fp32_distogram_head: true
+    # Wrap EvoformerConditioningEncoder in fp32 autocast (matching OF3
+    # input_embedders.py:127). Default on; ref_pos/offset/distance projections
+    # are bf16-noisy.
+    fp32_evo_cond_encoder: true
+    grad_acc_dtype: fp32
+    reduce_dtype: fp32
+    loss_dtype: fp32

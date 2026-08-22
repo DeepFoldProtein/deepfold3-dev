@@ -7,7 +7,9 @@ base: initial.yaml
 # inherited unchanged. Not warm-startable from a c_z=128 checkpoint.
 
 training:
-  wandb_project: deepfold3-protenix-v2
+  wandb_project: deepfold3-v2
+
+  lr: 0.9e-3
 
   diffusion_batch_size: 64
   diffusion_chunk_size: 8

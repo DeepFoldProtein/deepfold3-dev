@@ -1,0 +1,16 @@
+base: sts_A.yaml
+
+# Single-track stability experiment, run B — single_transition × 0.35.
+# Per-layer ROS is inherited so ``s_ros = 1/√(ℓ+1)``. This config adds a
+# constant 0.35× factor on the single FFN branch only:
+#   s_single_ffn = 0.35 · s_ros = 0.35/√(ℓ+1)
+# Other branches (single_attn / tri_mul / pair_attn / pair_transition) keep
+# ``s_ros`` unchanged.
+#
+# Hypothesis: a constant 0.35 multiplier on the single FFN update reduces
+# the radial-gain branch's contribution at the same loss-fitting capacity,
+# bounding ‖single‖ growth without hurting overfit speed.
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.35

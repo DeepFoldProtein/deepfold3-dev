@@ -1,70 +1,111 @@
-base: df3-stage0-r17.yaml
+base: df3-stage0-r16.yaml
 
-# r18 — the second half of MHR-TriMul, warm-started from r17.
-# Design note: export/mhr-trimul/README.md §3-4
+# r18 — no triangle attention, plain AF3 TriangleMul. From scratch.
+# Design note + measurements: export/mhr-trimul/README.md
 #
-# r17 runs the router against *per-head LayerNorm* (see the note in
-# df3-stage0-r17.yaml: it was configured for AF3's LayerNorm over c_z but a
-# missing branch gave it per-head normalization from step 0). So the change here
-# is smaller than originally planned: head_ln -> head_rms, i.e. drop the mean
-# subtraction, keep the gain.
+# This is the baseline r17 should have had. r17 changed two things at once —
+# triangle attention deleted AND TriangleMul -> MHR-TriMul — so every r17-vs-r16
+# number is charged to the pair of them. §9 argued for splitting the arm; it was
+# combined anyway, and r18 is the cost of that.
 #
-# Why drop it: at d = 32 the LayerNorm mean is estimated from 32 samples, so it
-# carries sigma/sqrt(32) ~ 0.18 sigma of noise and subtracts that from the
-# signal, while the variance estimate has ~25% relative error. RMSNorm removes
-# the mean term outright. head_rms also has no shift at all -- norm_center is
-# built without a bias in that mode -- which is why load_strict has to be off.
+# One run, two answers:
 #
-# Both modes equalize head magnitudes, so the property r17 already has (logged g
-# equals the per-head contribution) is preserved.
-
-# Warm start (not from scratch):
+#   vs r16  →  what deleting triangle attention costs, on its own.
+#   vs r17  →  what MHR-TriMul is worth, on its own.
 #
-#   deepfold3 train --config configs/df3-stage0-r18.yaml \
-#       --params runs/r17/checkpoint_<step>.pt --output runs/r18
+# The first is the headline. r17 matches r16 across every scored category at
+# step 8000 (all inside 1 SE) while its trunk infers 1.58x faster at N>=768 and
+# carries 431M parameters against 465M. "Triangle attention is removable" is the
+# result worth having, and right now it rests on a confounded arm.
 #
-# The per-head gain reuses norm_center.weight viewed as [H, d], so shapes line
-# up — but head_rms is RMSNorm proper (gain, no shift), so norm_center.bias does
-# not exist here while r17's checkpoint has it. Hence load_strict: false; the
-# only key it forgives is that bias. And LN_c != RMSNorm_d is a function change,
-# so this needs re-equilibration rather than the ~2-3k an identity-initialized
-# change would read in. The optimizer state is reset: its second moments were
-# accumulated under a different post-contraction normalization and carrying them
-# over would fight the change.
+# ── Why this and not the MHR variants ────────────────────────────────────────
 #
-# ── Ablation grid ────────────────────────────────────────────────────────────
-# The remaining two cells need no config file — they are one-line overrides,
-# passed through EXTRA_ARGS so the trainjob YAML is never edited:
+# The original r18 (head_rms, warm-started from r17) is withdrawn. It carried
+# per-head normalization, which §14 shows is the wrong axis, and it warm-started
+# across a pair-track normalization change, which is what §12's incident was.
 #
-#   plain no-TriAttn baseline (no router, LN_c):
+# The evidence on the router has kept shrinking, and none of it is about speed —
+# the head axis is a channel partition, so MHR saves no FLOPs at all:
+#
+#   * It provably carries no pair information `out_gate` does not already have.
+#     Both read the same LN(z); W_og is 256x256 and invertible, so W_r is a
+#     linear function of it. The numerical escape is closed too: only 2-3% of
+#     W_r's energy sits in W_og's weakest 10% of directions, against 10% for a
+#     random W_r (§13).
+#   * Over half of what the top-layer routers condition on is distance the pair
+#     representation already encodes — 53-57% at L43-47 (§13).
+#   * Its strongest single factor, chain, is `asym_id`: an input feature. The
+#     intra/inter separation is identical on antibody-antigen targets r17 docks
+#     and targets it misses by 11-13 Å (§15).
+#   * Sharpening inflates the branch. `sum_h g = H` pins the mean of g, not its
+#     norm, so what reaches out_proj grew to 2.26x uniform in the deep trunk by
+#     step 8000 (§14).
+#
+# The router is not inert — specialization rises monotonically all through
+# training — but nothing yet shows it is worth its slot. The burden belongs on
+# MHR, and this run is the cheapest way to put it there.
+#
+# `head_norm: post_channel` (normalize after the gate, added in bb262b5) fixes
+# the inflation and would let `router_kind: sigmoid` work. It is deliberately
+# NOT r18: fixing a defect in a component whose value is unestablished is the
+# wrong order, and the defect has no demonstrated quality cost — out_gate has
+# been absorbing it and r17 still tracks r16. If r18 shows MHR earns something,
+# post_channel + sigmoid is r19. If r18 ties r17, MHR is dead weight and the
+# question closes.
+#
+# ── What this cell is ────────────────────────────────────────────────────────
+#
+# trimul_num_heads: 0 turns the MHR path off entirely (`is_mhr` is False), so
+# the module is AF3 TriangleMul exactly — and it gets the fused center-proj
+# kernel back, which the MHR path cannot use. So this is also the fastest cell
+# in the grid, and its step time is a real data point rather than a handicap.
+#
+# From scratch. Not warm-startable from r17 (the router weights do not exist
+# here and the normalization differs) and not from r16 (r16 has the triangle
+# attention blocks). Depth 48 and crop 384 held at r16's values, lr at r17's, so
+# the only difference from r17 is the pair-track composition.
+#
+# Read at both iso-step and iso-wall-clock. r18 should be faster per step than
+# both r16 (no triangle attention) and r17 (no MHR path, fusion restored), so
+# iso-step alone understates it.
+#
+# ── Remaining grid cells, no config file needed ──────────────────────────────
+# Pass through EXTRA_ARGS so the trainjob YAML is never edited:
+#
+#   router only, AF3 normalization (isolates the router against this baseline):
 #     --config configs/df3-stage0-r17.yaml \
-#     --override model.evoformer.trimul_router=false \
-#     --override model.pairformer.trimul_router=false
+#     --override model.evoformer.trimul_head_norm=channel \
+#     --override model.pairformer.trimul_head_norm=channel
 #
-#   cell B (per-head norm, no router) — the reference-class cell, predicted
-#   harmful; if it is NOT worse than the baseline, the coupling argument above
-#   is wrong and r18's premise fails:
-#     --config configs/df3-stage0-r18.yaml \
-#     --override model.evoformer.trimul_router=false \
-#     --override model.pairformer.trimul_router=false
+#   post-gate normalization + independent heads (r19 if r18 says MHR earns it):
+#     --config configs/df3-stage0-r17.yaml \
+#     --override model.evoformer.trimul_head_norm=post_channel \
+#     --override model.pairformer.trimul_head_norm=post_channel \
+#     --override model.evoformer.trimul_router_kind=sigmoid \
+#     --override model.pairformer.trimul_router_kind=sigmoid
 #
-# Read `router/entropy` on both r17 and r18. It is H(g)/log H averaged over
-# pairs and layers; 1.0 means the router never left uniform, i.e. it is inert
-# and the module is functionally AF3 TriMul. If r18's entropy drops well below
-# r17's, the per-head norm did what it was added to do — hand the router real
-# authority — regardless of which way the benchmark moves.
+# ── What to read ─────────────────────────────────────────────────────────────
+#
+# `eval/distogram` split against `eval/distogram_entropy`: r17's deficit against
+# r16 was 100% sharpness and 0% calibration (§11). If r18 shows the same split,
+# it belongs to deleting triangle attention — summing over every k instead of
+# selecting a few costs entropy, not correctness — and MHR had nothing to do
+# with it. If r18's distogram is clean and r17's is not, MHR is the cause.
+#
+# Do NOT re-run the strand/helix ratio as a discriminator. It converged at step
+# 4000 and now reads the same in r16 and r17; §10 records why it looked like an
+# architectural signature and was not.
 
 training:
   wandb_project: deepfold3-v2
-  # r17 (head_ln) carries norm_center.bias; head_rms does not define it.
-  load_strict: false
-  # Second moments were accumulated under head_ln; they do not describe the
-  # head_rms parameterization and would fight the change.
-  skip_load_optimizer: true
+  # r17's value, kept so the pair-track composition is the only difference.
+  lr: 0.9e-3
 
 model:
   evoformer:
-    trimul_head_norm: head_rms
+    use_triangle_attention: false
+    trimul_num_heads: 0 # 0 = MHR off = AF3 TriangleMul, fused path available
 
   pairformer:
-    trimul_head_norm: head_rms
+    use_triangle_attention: false
+    trimul_num_heads: 0

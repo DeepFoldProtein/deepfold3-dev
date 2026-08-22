@@ -60,8 +60,8 @@ spec:
       - NCCL_IB_HCA
       # - "-x"
       # - NCCL_SOCKET_IFNAME
-      - "-x"
-      - NCCL_NVLS_ENABLE
+      # - "-x"
+      # - NCCL_NVLS_ENABLE   # removed 2026-08-03 — let NCCL auto-detect
       - "-x"
       # - NCCL_P2P_LEVEL
       # - "-x"
@@ -217,12 +217,10 @@ spec:
         # eth0 (Calico), cutting throughput ~2×. Regenerate from the Multus
         # network-status annotation if the cluster PCI layout ever changes.
         value: "=mlx5_14,mlx5_15,mlx5_16,mlx5_17,mlx5_18,mlx5_19,mlx5_20,mlx5_21"
-      - name: NCCL_NVLS_ENABLE
-        # NVLink SHARP in-network reduction on B200 NVLink5. Moves intra-node
-        # allreduce accumulation into the NVSwitch so GPUs stream-and-receive
-        # instead of full ring. NCCL ≥ 2.19 auto-enables on supported HW but
-        # explicit avoids auto-detect quirks.
-        value: "1"
+      # NCCL_NVLS_ENABLE removed 2026-08-03 — NVLink SHARP is now left to NCCL's
+      # own auto-detect (default on B200/NVSwitch). It had been pinned to "1"
+      # since 2026-04-19 purely to sidestep auto-detect quirks, not to turn the
+      # feature on. Removing the pin is behaviour-neutral on this hardware.
       # - name: NCCL_P2P_LEVEL
       #   value: "NVL"
       - name: NCCL_DEBUG
@@ -362,6 +360,38 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
+        # --- Host exclusion list ------------------------------------------
+        # Keep this in sync with the `node` template below — the launcher pod
+        # runs 8 ranks too, so excluding a host from only one of the two still
+        # lets the job land on it.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        # 2026-08-03: CONFIRMED bad. Three consecutive r14
+                        # restarts wedged on the first training microstep; 111
+                        # of 112 ranks sat in a long NVIDIA-driver syscall
+                        # (~99% system time, zero voluntary context switches,
+                        # static VmRSS, GPU 0%) while exactly one rank ran
+                        # normally (100% user + spinning NCCL kernel, i.e.
+                        # waiting in the collective for the other 111). Excluding
+                        # this host fixed it immediately — the replacement node
+                        # set differs ONLY by 232 → host-10-0-0-63 and the run
+                        # resumed at its normal 20 s/step.
+                        #
+                        # The one "healthy" rank was local rank 6 in all three
+                        # hangs ⇒ the fault is almost certainly GPU6 on this
+                        # host (P2P / NVLink / driver state): every peer blocks
+                        # in driver-level setup against it, while GPU6's own
+                        # rank has nothing to set up with itself and sails
+                        # through. A single bad peer produces a GLOBAL symptom —
+                        # do not read "all hosts look stuck" as "not a node
+                        # problem".
+                        - host-10-0-0-232
         containers:
           - name: node
             volumeMounts:
@@ -392,6 +422,16 @@ spec:
           k8s.v1.cni.cncf.io/networks: |-
             kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias,kbm-g-np-kias
       spec:
+        # Host exclusion list — keep in sync with the `launcher` template above.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        - host-10-0-0-232
         containers:
           - name: node
             volumeMounts:

@@ -16,6 +16,7 @@ Usage:
         --steps 5000 5200 5400 5500 \\
         --n-samples 30
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,9 +28,7 @@ from pathlib import Path
 USALIGN = "/home/jovyan/.local/bin/USalign"
 # USalign prints both Structure_1 and Structure_2 normalized scores;
 # we want the one normalized by length of Structure_2 (= reference).
-_TM_PATTERN = re.compile(
-    r"TM-score=\s*([0-9.]+)\s*\(normalized by length of Structure_2"
-)
+_TM_PATTERN = re.compile(r"TM-score=\s*([0-9.]+)\s*\(normalized by length of Structure_2")
 
 
 def run_usalign(pred: Path, ref: Path) -> float | None:
@@ -39,7 +38,10 @@ def run_usalign(pred: Path, ref: Path) -> float | None:
     try:
         out = subprocess.run(
             [USALIGN, str(pred), str(ref)],
-            capture_output=True, text=True, timeout=120, check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
         ).stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
@@ -74,8 +76,7 @@ def main() -> None:
     ap.add_argument("--steps", type=int, nargs="+", required=True)
     ap.add_argument("--n-samples", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--per-sample", action="store_true",
-                    help="Print each sample's TM-score in addition to summary.")
+    ap.add_argument("--per-sample", action="store_true", help="Print each sample's TM-score in addition to summary.")
     args = ap.parse_args()
 
     print(f"REF: {args.ref}")
@@ -92,8 +93,9 @@ def main() -> None:
         if r is None:
             print(f"{step:>6} | (no usable samples)")
             continue
-        print(f"{step:>6} | {r['n']:>3} | {r['mean']:>7.4f} | {r['median']:>6.4f} | "
-              f"{r['max']:>5.3f} | {r['min']:>5.3f}")
+        print(
+            f"{step:>6} | {r['n']:>3} | {r['mean']:>7.4f} | {r['median']:>6.4f} | {r['max']:>5.3f} | {r['min']:>5.3f}"
+        )
         if args.per_sample:
             tms_str = " ".join(f"{t:.2f}" for t in r["tms"])
             print(f"           samples: {tms_str}")

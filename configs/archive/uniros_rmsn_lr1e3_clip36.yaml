@@ -1,0 +1,53 @@
+base: uniros_rmsn_lr2_5e4.yaml
+
+# Resume of df3-12n-uniros-rmsn-lr2e4-clip70 with base-lr ascent +
+# ceiling lift. Tests whether lr × clip = 0.018 (AF3 step ceiling) is
+# itself the proximate bind on fit-rate.
+#
+# Background:
+#   lr5e4-clip36 (lr×clip=0.018, 2.5× lr at constant ceiling) showed:
+#     * trunk: single_rms 10.12 (vs 10.22 prev), even safer
+#     * spike distribution lr-invariant: max gn 5372 ≈ prev's 5886
+#       (~1 spike >500 per 26 step regardless of lr — driven by data,
+#       not lr scaling)
+#     * Adam v reconverged: mean/median 2.14 vs prev 10.4
+#     * BUT smooth_lddt + tm_true essentially flat — Adam-invariance
+#       confirmed: lr-ratio at constant ceiling does not unlock fit
+#   → ceiling 0.018 itself appears to be the bind, not lr.
+#
+# Levers:
+#   * lr 2.0e-4 → 1.0e-3 (5× bump from resume baseline) — moves to
+#     schedule_free.yaml's base_lr; well-known SF territory.
+#   * grad_clip_norm 70 → 36 with lr × clip = 0.036 — DOUBLES the AF3
+#     step ceiling. Justified by:
+#       (1) 1/√L · RMSNorm(F(LayerNorm(x))) closes forward drift mode
+#           that constrained vanilla AF3 to 0.018; arch is strictly
+#           safer than AF3 baseline.
+#       (2) trunk has been bounded (single_rms ≤10.22) across all
+#           recent lr arms, demonstrating large headroom.
+#       (3) spike distribution is lr-invariant (data-origin), so
+#           absolute spike size is not amplified by lr.
+#   * checkpoint_interval 500 → 100 — exploration phase: more granular
+#     resume points so abort-recovery costs ~100 step worst-case rather
+#     than 500. Save burst overhead is ~10% but acceptable while we're
+#     iterating on lr/clip.
+#
+# Abort triggers (200-500 step post-resume):
+#   1. single_rms > 12.0           → trunk drift                 → revert lr 5e-4
+#   2. clip rate (>36) > 60%       → Adam preconditioning at risk → clip 50
+#   3. smooth_lddt static or up    → ceiling not the lever        → diagnose
+#   4. mean/median grad ratio > 4  → spike-driven distribution    → clip ↑
+#   5. tm_true regression > -0.005 → going backwards              → revert
+#
+# Resume: from runs/df3-12n-uniros-rmsn-lr2e4-clip70/checkpoint_3700.pt
+# (lr=2e-4 equilibrated SF state — cleaner than lr5e4 v which has
+# accumulated burst noise; 5× lr jump → transient ~50 step expected
+# before v re-fits the new gradient distribution).
+
+training:
+  lr: 1.0e-3
+  grad_clip_norm: 36.0
+  checkpoint_interval: 100
+
+  num_workers: 16
+  prefetch_factor: 16

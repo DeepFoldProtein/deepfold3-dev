@@ -1,0 +1,18 @@
+base: ros_scheduledfree.yaml
+
+# Layered on top of ros_scheduledfree.yaml: also break the zero-wake-up
+# bias on the AdaLN ``cond_bias`` (attn + ffn) projections inside the
+# DiffusionTransformer (24 blocks). Each block's ``attn_cond_bias`` and
+# ``ffn_cond_bias`` weight is re-initialised with a small trunc-normal
+# ``W ~ trunc_normal(0, (β/√fan_in)²)`` so the initial AdaLN bias output
+# has stddev ≈ β = 1e-3 instead of 0. Other AdaLN cond projections
+# (``attn_cond_scale``, ``ffn_cond_scale``, ``zero_cond``) keep their AF3
+# zeros init — only the bias path is opened.
+model:
+  diffusion:
+    transformer:
+      # β = 1e-2: matches the prev-run cond_bias magnitude at step ~100
+      # (out_std ≈ 0.01). β = 1e-3 (initial pick) ended up only ~10% above
+      # the natural wake-up by step 100, so essentially indistinguishable
+      # from zero-init.
+      cond_bias_init_beta: 1.0e-2

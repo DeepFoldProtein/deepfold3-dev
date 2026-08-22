@@ -1,0 +1,47 @@
+base: ../af3_rsf.yaml
+
+# `df3-rsf-9e4-c50` — C2 variant: lr 절반 + clip 풀고 + gain만 (ROS 제거).
+#
+# Changes vs `af3_rsf.yaml` (AF3 default + refined SF):
+#   * lr: 1.8e-3 → 9e-4 (절반)
+#   * grad_clip_norm: 10 → 50 (rare-spike only)
+#   * weight_decay: 0 → 0.10
+#   * single_transition_residual_gain: None → 0.17
+#
+# Rationale:
+#   * ROS arm (`df3-rsf-18e3-w1k-s017-wd10-ros`) showed single amp
+#     stabilizing at 125× but DEEP layers (L20+) over-braked
+#     (s_single_ffn[L47] = 0.024 — effectively zero). Distogram regressed
+#     2.06 → 2.37 — capacity bottleneck at deep layers.
+#   * Our actual problem: L0 single_ffn ρ=0.58 (heavy violator).
+#     L47 ρ=0.021 (healthy, doesn't need brake).
+#   * ROS schedule is WRONG direction (brakes L47 7×, L0 not at all).
+#   * Solution: drop ROS entirely. ``gain=0.17`` applied uniformly to
+#     ALL layers' single_ffn = same 6× brake at L0 and L47. Deep layers
+#     keep their full learning capacity.
+#
+# lr/clip envelope:
+#   lr × clip = 9e-4 × 50 = 0.045
+#   - uniros-rmsn era operating point lr × clip = 0.014-0.063 (memory
+#     `project_uniros_rmsn_lr_clip_landing`)
+#   - clip=50 → r_clip near 0% on grad_norm < 50 (current ROS grad_norm
+#     was 5-15, occasional 365 spike still gated)
+#   - Raw AdamW preconditioner regime — second moment reflects real
+#     gradient direction, not normalized direction
+#
+# Expected:
+#   * Single_l2: lr 절반 → drift 시간상 2× 늦춰짐. But ROS 제거로 deep
+#     layer 학습 가능 → distogram 회귀 부재 기대
+#   * Distogram CE: 부재 또는 약화 (deep layer capacity 복원)
+#   * smooth_lddt: improved (more representational power)
+#   * Abort if: single_l2 grows faster than ROS arm at matched step
+#     (ROS removed → some drift inflation expected, but bounded by wd)
+
+training:
+  lr: 9.0e-4
+  weight_decay: 0.10
+  grad_clip_norm: 50.0
+
+model:
+  pairformer:
+    single_transition_residual_gain: 0.17

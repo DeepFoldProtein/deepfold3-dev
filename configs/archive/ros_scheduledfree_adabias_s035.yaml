@@ -1,0 +1,24 @@
+base: ros_scheduledfree_adabias.yaml
+
+# Per-layer ROS + AdaLN cond_bias wake-up + ``single_transition`` residual
+# gain = 0.35 (single FFN brake only — pair_transition stays at default).
+# Per-layer ROS is inherited so ``s_ros = 1/√(ℓ+1)``; the gain composes:
+#
+#   s_single_ffn = 0.35 · s_ros = 0.35/√(ℓ+1)
+#   s_pair_ffn   =        s_ros = 1/√(ℓ+1)         (no extra brake)
+#
+# Other branches (single_attn / tri_mul / pair_attn) keep ``s_ros`` unchanged.
+#
+# Motivation: the sts ablation (``docs/single-track-stability-experiments.md``
+# §11) showed that single-brake at η=0.35 (sts_B) bounds **both** single_l2
+# (~30 plateau, σ≈5) AND pair_l2 (~45 plateau, declining late) tighter
+# than the η=0.5 dual-brake (sts_E hypothesis) or per-layer-extra schedule
+# (sts_C). A single dial is sufficient — pair stabilizes as a side effect of
+# bounding the radial gain on single. Distogram / smooth_lddt are arm-
+# invariant on the mini set, so this brake costs no fit quality.
+#
+# Replaces ``ros_scheduledfree_adabias_tg05.yaml`` as the recommended
+# production trunk-stabilization config.
+model:
+  pairformer:
+    single_transition_residual_gain: 0.35

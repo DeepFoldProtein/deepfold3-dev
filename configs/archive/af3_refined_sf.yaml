@@ -1,0 +1,53 @@
+base: ../initial.yaml
+
+# `df3-af3r` — AF3 baseline architecture + Refined SF-AdamW.
+#
+# Hypothesis: the AF3-baseline architecture (no `residual_branch_rmsnorm`,
+# no `uniform_residual_scale`) was solid; our uniros + RMSN + refined SF
+# stack was introducing pathologies (PF single-track collapse, clip-
+# dominated regime, activation regime instability under ablation).
+# Strip back to pure AF3 architecture; keep ONLY the refined SF-AdamW
+# optimizer change.  Fresh from random init — no contamination from
+# any prior modified-arch checkpoint.
+#
+# Inherits from `initial.yaml`:
+#   - lr 1.8e-3 (AF3 paper)
+#   - wd 0.0 (AF3 baseline — smallest possible start)
+#   - warmup_steps 1000 (AF3 default; needed for lr=1.8e-3 ramp)
+#   - grad_clip_norm 10 (AF3 default; lr × clip = 0.018, at empirical
+#     pre-RMSN envelope ≤ 0.036)
+#   - batch_size_per_rank 2, accumulate 2 → effective 384 (matches AF3
+#     paper batch size on 12 nodes × 8 GPU = 96 ranks)
+#   - residual_branch_rmsnorm: false (default)
+#   - uniform_residual_scale: false (default)
+#
+# Overrides (this file):
+#   - decoupling_parameter: 200 (refined SF — Through the River
+#     arxiv 2507.09846; decouples β₁ from x averaging width)
+#
+# Watch points (first 5k step):
+#   * Trunk stability (single_rms, no RMSN to enforce bounds — drift
+#     was the original motivation for adding RMSN; need to verify
+#     refined SF + low wd can hold)
+#   * PF eff_rank trajectory — does it climb past the 30.65 peak seen
+#     in our uniros+RMSN stack? AF3-baseline arms historically reach
+#     PF eff_rank > 60.
+#   * Distogram CE descent rate vs s035 baseline at matched step.
+#   * Clip rate — clip=10 with AF3 baseline architecture; lr × clip =
+#     0.018 (s035 ran at 0.0025 = 2.5e-4 × 10).
+#
+# Abort criteria:
+#   * single_rms > 13 sustained
+#   * NaN / loss spike beyond clip+grad_skip
+#   * PF eff_rank dropping below s035's plateau (~25)
+
+training:
+  # ⚠ optimizer_type MUST be set explicitly here because we inherit from
+  # `initial.yaml` (default `adamw`), not from `schedule_free.yaml`.
+  # Forgetting this caused df3-af3r v1 to silently run with plain fused
+  # AdamW for 6.8 hours of GPU time. `decoupling_parameter` is ignored
+  # unless optimizer_type=="schedule_free".
+  optimizer_type: schedule_free
+  decoupling_parameter: 200.0
+  batch_size_per_rank: 3
+  accumulate_grad_batches: 1
