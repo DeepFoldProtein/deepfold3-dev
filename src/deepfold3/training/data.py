@@ -361,6 +361,10 @@ def build_dataloaders(
             name=spec.name,
             exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),
             anchor_sampling=(spec.strategy == "weighted"),
+            # Model-aware curation rides on top of the cluster marginal; never
+            # applied to an eval split (the eval distribution has to stay fixed
+            # for arms to be comparable).
+            curator_weights=(spec.curator_weights or None) if not for_eval else None,
             **_spec_kwargs(eval_of3pdb_kwargs if for_eval else of3pdb_kwargs, spec),
         )
         return ds, []

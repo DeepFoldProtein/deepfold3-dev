@@ -547,6 +547,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         anchor_sampling: bool = False,
         pad_templates: bool = False,
         weights: tuple[np.ndarray, np.ndarray] | None = None,
+        curator_weights: Path | str | None = None,
     ):
         self.cache = cache
         self.root = Path(root)
@@ -588,6 +589,8 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         # ``MultiDatasetSampler`` via its ``weights`` key. Renormalised over the
         # kept subset so it sums to 1 after a cutoff filter drops structures.
         sel = w_struct if self.indices is None else w_struct[self.indices]
+        if curator_weights:
+            sel = sel * self._curator_multiplier(curator_weights, name)
         total = float(sel.sum())
         self.sampling_weights = sel / total if total > 0 else np.full(len(self), 1.0 / max(len(self), 1))
         if anchor_sampling:
@@ -636,6 +639,39 @@ class OF3PdbDataset(torch.utils.data.Dataset):
                 name or "of3pdb",
                 self.template_cache_dir,
             )
+
+    def _curator_multiplier(self, path: Path | str, name: str) -> np.ndarray:
+        """Per-item multiplier on the AF3 cluster marginal, keyed by ``pdb_id``.
+
+        The curated sampler is exactly ``w_i^AF3 · m_i``: the cluster balancing
+        AF3 §2.5.1 prescribes is left untouched and the model-aware term rides
+        on top, so the ``m ≡ 1`` arm IS the baseline (no separate code path to
+        drift). Entries the file does not mention keep ``m = 1`` — a partial
+        scoring pass degrades toward baseline rather than silently zeroing the
+        unscored majority.
+        """
+        z = np.load(Path(path), allow_pickle=False)
+        lut = dict(zip((str(x) for x in z["pdb_id"]), z["weight"].astype(np.float64), strict=True))
+        idx = self.indices if self.indices is not None else np.arange(len(self.cache))
+        mult = np.ones(len(idx), dtype=np.float64)
+        hit = 0
+        for j, si in enumerate(idx):
+            w = lut.get(self.cache.pdb_id(int(si)))
+            if w is not None:
+                mult[j] = w
+                hit += 1
+        logger.info(
+            "%s: curator weights from %s — %d/%d items covered (%.1f%%), multiplier range [%.3f, %.3f], mean %.3f",
+            name or "of3pdb",
+            path,
+            hit,
+            len(idx),
+            100.0 * hit / max(len(idx), 1),
+            mult.min(),
+            mult.max(),
+            mult.mean(),
+        )
+        return mult
 
     # -- indexing -----------------------------------------------------------
 

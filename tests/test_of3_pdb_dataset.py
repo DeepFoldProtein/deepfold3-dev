@@ -586,3 +586,73 @@ def test_unknown_dna_residue_type(tmp_path):
     """
     assert const.get_res_type("DN", const.MOL_DNA) == 30
     assert const.get_res_type("N", const.MOL_RNA) == 30
+
+
+# --------------------------------------------------------------------------
+# Curator weights (DatasetConfig.curator_weights)
+# --------------------------------------------------------------------------
+
+
+def _dataset(cache, tmp_path, **kw):
+    """An ``OF3PdbDataset`` over the synthetic cache — weights only, no I/O."""
+    from deepfold3.data.module.of3_pdb_dataset import OF3PdbDataset
+
+    return OF3PdbDataset(cache=cache, root=tmp_path, name="t", anchor_sampling=True, **kw)
+
+
+def _weight_file(path, cache, weights):
+    ids = np.array([cache.pdb_id(i) for i in range(len(cache))], dtype="<U8")
+    np.savez(path, pdb_id=ids[: len(weights)], weight=np.asarray(weights, dtype=np.float64))
+    return path
+
+
+def test_curator_weights_baseline_is_bit_identical(cache, tmp_path):
+    """``m ≡ 1`` must reproduce the untouched AF3 marginal exactly.
+
+    The A/B design relies on the baseline arm being the *same code path* as every
+    treatment arm — if ``m ≡ 1`` diverged at all, the control would be measuring
+    the plumbing rather than the curation.
+    """
+    base = _dataset(cache, tmp_path).sampling_weights
+    path = _weight_file(tmp_path / "one.npz", cache, np.ones(len(cache)))
+    curated = _dataset(cache, tmp_path, curator_weights=path).sampling_weights
+    np.testing.assert_array_equal(curated, base)
+
+
+def test_curator_weights_scale_sampling_mass(cache, tmp_path):
+    """A k× multiplier moves k× the relative sampling mass, and stays normalised."""
+    base = _dataset(cache, tmp_path).sampling_weights
+    mult = np.ones(len(cache))
+    mult[0] = 10.0
+    path = _weight_file(tmp_path / "w.npz", cache, mult)
+    curated = _dataset(cache, tmp_path, curator_weights=path).sampling_weights
+
+    assert curated.sum() == pytest.approx(1.0)
+    ratio = (curated[0] / base[0]) / (curated[1:].sum() / base[1:].sum())
+    assert ratio == pytest.approx(10.0)
+
+
+def test_curator_weights_partial_coverage_keeps_baseline(cache, tmp_path):
+    """Entries absent from the file keep ``m = 1``.
+
+    A scoring pass that has not finished must degrade toward the baseline, not
+    silently zero every entry it has not reached yet.
+    """
+    base = _dataset(cache, tmp_path).sampling_weights
+    path = _weight_file(tmp_path / "part.npz", cache, [4.0])  # only the first pdb_id
+    curated = _dataset(cache, tmp_path, curator_weights=path).sampling_weights
+
+    ratio = (curated[0] / base[0]) / (curated[1:].sum() / base[1:].sum())
+    assert ratio == pytest.approx(4.0)
+
+
+def test_curator_weights_survive_config_normalisation(tmp_path):
+    """``normalize_datasets`` rebuilds the entry dict field by field.
+
+    A new ``DatasetConfig`` field that is not emitted there is dropped in
+    silence — exactly how per-dataset ``crop_weights`` was lost before c0e5e55.
+    """
+    from deepfold3.config_loader import normalize_datasets
+
+    out = normalize_datasets([{"name": "pdb", "data_dir": "/x", "format": "of3pdb", "curator_weights": "/w.npz"}])
+    assert out[0]["curator_weights"] == "/w.npz"

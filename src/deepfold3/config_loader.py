@@ -149,6 +149,11 @@ def normalize_datasets(raw: list[dict]) -> list[dict]:
                 # ``format: of3pdb`` only: where `deepfold3 build-of3-cache` wrote
                 # the columnar dataset cache. Empty = ``{data_dir}/df3_cache``.
                 "of3_cache_dir": str(entry.get("of3_cache_dir", "")),
+                # ``format: of3pdb`` only: per-entry multiplier on the AF3 cluster
+                # marginal (see DatasetConfig.curator_weights). This dict is rebuilt
+                # field-by-field, so a key omitted here is silently dropped — the same
+                # failure mode ``crop_weights`` had (c0e5e55).
+                "curator_weights": str(entry.get("curator_weights", "")),
             }
         )
     return result
