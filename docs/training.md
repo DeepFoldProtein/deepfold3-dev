@@ -600,7 +600,7 @@ What the dataset reads, and from where:
 | --- | --- | --- |
 | Structure | `preprocessed_pdb_data/standard/structure_files/{id}/{id}.npz` | biotite `AtomArray`, converted per sample |
 | MSA | `alignment_arrays/{alignment_representative_id}.npz` | one block per search database; the representative is a *sequence-identical* chain, often in another entry |
-| Template hits | `templates/train_template_cache/{rep}.npz` | falls back to `val_template_cache` when the training one is absent |
+| Template hits | `templates/train_template_cache/{rep}.npz` | override with `template_cache_dir`; falls back to `val_template_cache` only when the training one is absent |
 | Template geometry | `templates/template_structure_arrays/{pdb}/{pdb}_{chain}.npz` | see below |
 
 Points that differ from `format: df3`:
@@ -611,6 +611,19 @@ Points that differ from `format: df3`:
 - **Crop-then-load ordering** as in `TrainingDataset`: tokenization never reads MSA content, so alignments and templates are only read for the chains that survive the crop.
 - **Templates need both halves, and say so.** The hit lists (`templates/*_template_cache/`) and the geometry (`templates/template_structure_arrays/`) are separate directory trees, and `aws s3 sync` lands them in whatever order. If the geometry is missing the dataset logs a warning **once at construction** and disables templates outright — previously every hit resolved to a missing file, got skipped at debug level, and a half-synced mirror was indistinguishable in the logs from a deliberately template-free run.
 - **Date filtering is fail-closed on both ends.** `cutoff_date` drops structures with no release date in either direction, and the template cap is `min(max_template_date, query_release − template_cutoff_days)` — when neither can be established, every template is dropped rather than used unfiltered.
+- **An eval split needs its own two pointers.** The same tree serves both splits, but the dataset cache and the template hit lists are per-subset:
+
+  ```yaml
+  eval_datasets:
+    - name: of3_pdb_eval
+      data_dir: /data/pdb_training_set
+      of3_cache_dir: /data/pdb_training_set/df3_cache_val
+      template_cache_dir: /data/pdb_training_set/templates/val_template_cache
+      format: of3pdb
+      cutoff_date: "2021-09-30"
+  ```
+
+  Eval specs keep records released **after** `cutoff_date`, and the training cache ends the day before it (180,975 entries, all ≤ 2021-09-29), so leaving `of3_cache_dir` on the training conversion yields zero records — the dataset is dropped with a `no records in …, skipping.` warning and, if it was the only eval dataset, `eval_dl` is `None` and eval stops happening at all. `template_cache_dir` matters for the same reason in a quieter way: both hit-list directories exist on a synced mirror, so the constructor's fallback never fires and the val split resolves hits for 155/833 of its chain representatives instead of 640/833.
 
 The featurizer produces these training-specific features:
 

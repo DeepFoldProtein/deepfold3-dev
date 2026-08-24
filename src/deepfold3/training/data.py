@@ -357,6 +357,10 @@ def build_dataloaders(
             cache=cache,
             root=root,
             indices=indices,
+            # Upstream splits the per-query template hit lists by subset; an eval
+            # split under the training root must be pointed at its own cache or
+            # it runs (nearly) template-free while training does not.
+            template_cache_dir=Path(spec.template_cache_dir) if spec.template_cache_dir else None,
             is_distillation=spec.is_distillation,
             name=spec.name,
             exclude_loss_mol_types=tuple(spec.exclude_loss_mol_types),

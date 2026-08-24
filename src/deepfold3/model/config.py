@@ -846,6 +846,17 @@ class DatasetConfig:
             conversion of OpenFold 3's ``dataset_caches/*.json``. Empty
             defaults to ``{data_dir}/df3_cache``. The raw 1.7 GB JSON is never
             read at train time; see ``data/prepare/of3_pdb_cache.py``.
+        template_cache_dir: ``format: of3pdb`` only — directory of per-query
+            template hit lists (``{aln_rep}.npz``). Upstream splits these by
+            subset (``templates/train_template_cache`` /
+            ``templates/val_template_cache``) while the structures, alignments
+            and template geometry stay shared, so a **validation** split under
+            the same ``data_dir`` needs this pointed at the val cache. Empty
+            defaults to the train cache, falling back to the val one only when
+            the train directory is absent — which for a full mirror means an
+            eval split would silently find hits for a small minority of its
+            chains (measured 155/833 vs 640/833) and be evaluated nearly
+            template-free while training is not.
     """
 
     name: str = ""
@@ -860,6 +871,7 @@ class DatasetConfig:
     template_struct_space: bool = False
     max_template_date: str = ""
     of3_cache_dir: str = ""
+    template_cache_dir: str = ""
     curator_weights: str = ""
 
 

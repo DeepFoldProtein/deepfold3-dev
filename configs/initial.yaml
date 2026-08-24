@@ -268,6 +268,11 @@ datasets:
   - name: of3_pdb
     data_dir: /data/pdb_training_set
     of3_cache_dir: /data/pdb_training_set/df3_cache # default: {data_dir}/df3_cache
+    # Stated rather than defaulted: the hit lists are the one per-subset artefact
+    # under a shared root (see of3_pdb_eval below), and the implicit resolution
+    # silently falls back to the OTHER split's cache when this directory is
+    # missing — a half-synced mirror would then train on validation hit lists.
+    template_cache_dir: /data/pdb_training_set/templates/train_template_cache
     weight: 0.50
     strategy: weighted
     is_distillation: false
@@ -278,24 +283,29 @@ datasets:
     # (data.template_cutoff_days); "" inherits data.max_template_date.
     # max_template_date: ""
 
-  # Held-out eval on the same tree — everything released AFTER cutoff_date.
-  # Point of3_cache_dir at the validation cache's conversion if you would rather
-  # use OF3's own validation split:
+eval_datasets:
+  # - name: patchr_eval
+  #   data_dir: /data/distillation/patchr_training
+  #   format: df3
+  #   cutoff_date: "2021-09-30"
+
+  # Held-out eval: OF3's own validation split, converted from its dataset cache
+  # (the training cache holds NOTHING past the cutoff, so pointing of3_cache_dir
+  # at it makes this spec resolve zero records and eval is skipped outright):
   #   deepfold3 build-of3-cache \
   #     --cache-file /data/pdb_training_set/dataset_caches/validation_cache_with_templates.json \
   #     --output    /data/pdb_training_set/df3_cache_val
   #
-  # (add under eval_datasets:)
-  # - name: of3_pdb_eval
-  #   data_dir: /data/pdb_training_set
-  #   of3_cache_dir: /data/pdb_training_set/df3_cache
-  #   format: of3pdb
-  #   cutoff_date: "2021-09-30"
-
-eval_datasets:
-  - name: patchr_eval
-    data_dir: /data/distillation/patchr_training
-    format: df3
+  - name: of3_pdb_eval
+    data_dir: /data/pdb_training_set
+    of3_cache_dir: /data/pdb_training_set/df3_cache_val
+    # Structures / alignments / template geometry are shared, but the per-query
+    # template HIT LISTS are split by subset, and the default resolves to the
+    # train cache whenever it exists (it does on a full mirror) — which covers
+    # only 155/833 of this split's chain representatives vs 640/833 here. Left
+    # unset, eval would run near template-free while training does not.
+    template_cache_dir: /data/pdb_training_set/templates/val_template_cache
+    format: of3pdb
     cutoff_date: "2021-09-30"
 
 model:

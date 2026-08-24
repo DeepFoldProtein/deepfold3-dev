@@ -656,3 +656,48 @@ def test_curator_weights_survive_config_normalisation(tmp_path):
 
     out = normalize_datasets([{"name": "pdb", "data_dir": "/x", "format": "of3pdb", "curator_weights": "/w.npz"}])
     assert out[0]["curator_weights"] == "/w.npz"
+
+
+# ---------------------------------------------------------------------------
+# Template hit-list directory (DatasetConfig.template_cache_dir)
+# ---------------------------------------------------------------------------
+
+
+def test_template_cache_dir_defaults_to_train_split(cache, tmp_path):
+    """With a full mirror, both caches exist and the train one wins."""
+    (tmp_path / "templates" / "train_template_cache").mkdir(parents=True)
+    (tmp_path / "templates" / "val_template_cache").mkdir(parents=True)
+    ds = _dataset(cache, tmp_path)
+    assert ds.template_cache_dir == tmp_path / "templates" / "train_template_cache"
+
+
+def test_template_cache_dir_override(cache, tmp_path):
+    """An eval split under the training root must be able to pick the val cache.
+
+    Both directories exist on a synced mirror, so the constructor's
+    train-then-val fallback never reaches the val one: without this override an
+    eval dataset resolves hits for only the minority of its chains that happen
+    to share an alignment representative with the training split.
+    """
+    (tmp_path / "templates" / "train_template_cache").mkdir(parents=True)
+    val = tmp_path / "templates" / "val_template_cache"
+    val.mkdir(parents=True)
+    ds = _dataset(cache, tmp_path, template_cache_dir=val)
+    assert ds.template_cache_dir == val
+
+
+def test_template_cache_dir_survives_config_normalisation(tmp_path):
+    """``normalize_datasets`` rebuilds the entry dict field by field."""
+    from deepfold3.config_loader import normalize_datasets
+
+    out = normalize_datasets(
+        [
+            {
+                "name": "pdb_eval",
+                "data_dir": "/x",
+                "format": "of3pdb",
+                "template_cache_dir": "/x/templates/val_template_cache",
+            }
+        ]
+    )
+    assert out[0]["template_cache_dir"] == "/x/templates/val_template_cache"

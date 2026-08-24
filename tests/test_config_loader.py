@@ -177,6 +177,7 @@ class TestNormalizeDatasets:
                 "template_struct_space": False,
                 "max_template_date": "",
                 "of3_cache_dir": "",
+                "template_cache_dir": "",
                 "curator_weights": "",
             }
         ]
@@ -251,6 +252,7 @@ class TestLoadConfig:
                 "template_struct_space": False,
                 "max_template_date": "",
                 "of3_cache_dir": "",
+                "template_cache_dir": "",
                 "curator_weights": "",
             }
         ]
