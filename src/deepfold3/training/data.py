@@ -535,7 +535,11 @@ def build_dataloaders(
             logger.warning("Eval dataset %r: no records in %s, skipping.", spec.name, spec.data_dir)
             continue
         eval_datasets.append(ds)
-        logger.info("Eval dataset %r: %d records from %s", spec.name, len(recs), spec.data_dir)
+        # Item count, not ``len(recs)``: ``format: of3pdb`` keeps its metadata in
+        # the columnar cache and returns no ``Record`` list at all, so the old
+        # line reported "0 records" for a perfectly healthy 1,719-item eval set —
+        # indistinguishable at a glance from the empty-split warning above it.
+        logger.info("Eval dataset %r: %d items from %s", spec.name, len(ds), spec.data_dir)
 
     if eval_datasets:
         eval_ds = ConcatDataset(eval_datasets) if len(eval_datasets) > 1 else eval_datasets[0]
