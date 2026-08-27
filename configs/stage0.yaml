@@ -32,10 +32,10 @@ training:
 
   # AF3LRScheduler floors the window count -- n_decays =
   # (step - start_decay_after) // decay_every -- so the first drop lands at
-  # start_decay_after + decay_every, NOT at start_decay_after. 0 + 50000 puts
-  # it at 50k and keeps the 50k cadence and the 0.95 factor:
-  # 50k -> 8.55e-4, 100k -> 8.12e-4, 150k -> 7.72e-4.
-  start_decay_after: 0
+  # start_decay_after + decay_every, NOT at start_decay_after. 1000 + 50000 puts
+  # it at 51k and keeps the 50k cadence and the 0.95 factor:
+  # 51k -> 8.55e-4, 101k -> 8.12e-4, 151k -> 7.72e-4.
+  start_decay_after: 1000
   decay_every: 50000
 
   diffusion_batch_size: 48
