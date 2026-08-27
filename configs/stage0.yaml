@@ -1,0 +1,100 @@
+base: initial.yaml
+
+# Stage 0 — the DF3 v2 baseline: initial training at crop 384.
+#
+# Promoted verbatim from the r19 arm (configs/df3-stage0-r19.yaml, itself
+# stacked on r16); this file is the canonical form and `configs/stage1.yaml`
+# bases on it. Two axes over `initial.yaml`:
+#
+#   1. Width (r16, from Protenix v2): a pure scale-up of the pair track,
+#      c_z 128 -> 256 and c_m 64 -> 128, with per-head dim held fixed so the
+#      head count follows the channel width. Depth, loss weights, optimizer and
+#      the dataset mix are inherited unchanged.
+#   2. Trunk composition (r19, arXiv:2510.18870): no triangle attention and no
+#      per-token track in the trunk — a block is TriMulOutgoing + TriMulIncoming
+#      + FFN. Much cheaper per step, so report at iso-wall-clock as well as
+#      iso-step. `single_l2` stops being a stability metric under this trunk: it
+#      reports the norm of s_init and nothing else.
+#
+# Scope of (2) is the trunk. The confidence-head and template PairFormers keep
+# AF3 triangle attention, AF3 TriangleMul, and their own single track. The
+# confidence head now starts from s_init rather than from a 48-layer per-token
+# summary, so pLDDT / PAE / PDE quality against clean structure metrics is the
+# signature to watch.
+#
+# Not warm-startable from a c_z=128 checkpoint, nor from any run with the
+# single track on.
+
+training:
+  wandb_project: deepfold3-stage0
+
+  lr: 0.9e-3
+
+  # AF3LRScheduler floors the window count -- n_decays =
+  # (step - start_decay_after) // decay_every -- so the first drop lands at
+  # start_decay_after + decay_every, NOT at start_decay_after. 10000 + 50000
+  # puts it at 60k and keeps the 50k cadence and the 0.95 factor:
+  # 60k -> 8.55e-4, 110k -> 8.12e-4, 160k -> 7.72e-4.
+  start_decay_after: 10000
+  decay_every: 50000
+
+  diffusion_batch_size: 48
+  diffusion_chunk_size: 8
+
+  # 2x1 rather than r16's 1x2 — same global batch, fewer optimizer-step
+  # boundaries per token.
+  batch_size_per_rank: 2
+  accumulate_grad_batches: 1
+
+model:
+  num_recycles: 10
+
+  evoformer:
+    msa_channel: 128
+    pair_channel: 256
+    pair_attention:
+      num_head: 8 # 256 // 8 = 32 per head (AF3 c=32, Nhead follows c_z)
+    msa_attention:
+      # AF3 Alg. 8 line 7 pins MSAPairWeightedAveraging to c = 8 per head. DF3
+      # ties total width to c_msa, so the head count has to absorb the
+      # c_m 64 -> 128 widening for c to stay at 8.
+      num_head: 16
+    use_triangle_attention: false
+    trimul_num_heads: 0 # 0 = MHR off = AF3 TriangleMul, fused path available
+
+  pairformer:
+    pair_channel: 256
+    pair_attention:
+      num_head: 8
+    use_triangle_attention: false
+    trimul_num_heads: 0
+    use_single_track: false
+
+  confidence:
+    pair_channel: 256
+    pair_attention_num_head: 8
+
+  template:
+    # DF3-only deviation: Protenix v2 leaves the template stack at c=64, where
+    # hidden_scale_up yields 2 heads x 32. Widening to 128 instead recovers the
+    # AF3 spec attention shape (c=32, Nhead=4), which DF3 cannot express at c=64
+    # because head_dim = num_channels // num_heads.
+    #
+    # BOTH num_channels must be set: template_embedding.py:281 builds the blocks
+    # from pairformer.num_channels, while the outer one sizes the feature
+    # projections and output LN. Setting only one crashes at the first forward.
+    num_channels: 128
+    pair_channel: 256
+    pairformer:
+      num_layer: 2
+      num_channels: 128
+      num_heads: 4
+
+  diffusion:
+    conditioning_pair_channel: 256
+    steps: 200
+    # With the trunk single track off, s_trunk is single_activations(target_feat)
+    # — a pointwise map — so AF3's cat([s_trunk, target_feat]) would carry a
+    # 384-wide duplicate and shift the statistics of the LayerNorm running over
+    # both halves. Leaving this True is legal (paper-literal) and warns.
+    conditioning_use_trunk_single: false
