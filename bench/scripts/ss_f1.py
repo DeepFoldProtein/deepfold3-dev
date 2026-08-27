@@ -197,7 +197,7 @@ def _plot(series, category, rows):
         ax.set_xlabel("training step")
         ax.set_ylim(-0.02, 1.02)
         ax.grid(alpha=0.3)
-        ax.legend(loc="upper left")
+        ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
     fig.suptitle(f"{series} -- FoldBench-small {category}  DSSP secondary-structure F1")
     png = BENCH / "runs" / series / "ss_analysis" / f"ss_f1_{category}.png"
     fig.tight_layout()

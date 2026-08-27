@@ -199,6 +199,9 @@ def _panel(
     af3_ref) sits BELOW the published number, and showing only one of the two
     invites reading the gap that remains as either larger or smaller than it is.
     """
+    if data:  # grey proxies: the mean/median styling lives in the legend, not the title
+        ax.plot([], [], color="0.4", ls="-", lw=1.6, label="mean (solid)")
+        ax.plot([], [], color="0.4", ls="--", lw=1.3, label="median (dashed)")
     for cat, pts in data.items():
         steps = [p["step"] for p in pts]
         color = CATEGORY_COLORS.get(cat, "tab:gray")
@@ -214,7 +217,7 @@ def _panel(
             ax.axhline(r["median"], color=color, ls=":", lw=1.1, alpha=0.35, zorder=1)
             drawn = True
         if drawn:  # grey proxies so the legend explains the faint baseline styling
-            ax.plot([], [], color="0.5", ls="-", lw=1.1, alpha=0.6, label=f"{ref_label} mean")
+            ax.plot([], [], color="0.5", ls="-", lw=1.1, alpha=0.6, label=f"{ref_label} mean (this subset)")
             ax.plot([], [], color="0.5", ls=":", lw=1.1, alpha=0.6, label=f"{ref_label} median")
     if paper:
         drawn = False
@@ -230,7 +233,15 @@ def _panel(
     ax.set_ylim(-0.02, 1.0)  # shared [0,1] across rows so the three metrics compare directly
     ax.grid(True, alpha=0.3)
     if data or ref:
-        ax.legend(fontsize=8, ncol=2, loc="upper left")
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+            framealpha=0.95,
+            handlelength=1.6,
+            labelspacing=0.35,
+        )
 
 
 def ref_values(ref_series: str, categories: list[str], col: str) -> dict[str, dict]:
@@ -278,16 +289,16 @@ def plot(mono_lddt, iface_lddt, iface_ilddt, series: str, out_png: Path, refs=No
         ref_label=ref_label,
     )
     ax2.set_xlabel("training step")
-    base = f"{series}: per-category lDDT vs step   (solid = mean, dashed = median)"
-    if ref_label:
-        base += (
-            f"   —   faint = {ref_label} measured on THIS subset (solid mean, dotted median)"
-            "; dash-dot = AF3 paper mean (full set)"
-        )
-    else:
-        base += "   —   dash-dot = AF3 paper mean (FoldBench full set, not this subset)"
-    fig.suptitle(base, fontsize=13)
+    # Keep the suptitle short: it is measured by bbox_inches="tight", so a
+    # line wider than the axes pads the saved PNG out to the title's width.
+    # What it used to spell out (solid=mean / dashed=median, the faint baseline
+    # styling) is carried by the legend proxies instead.
+    fig.suptitle(f"{series} — per-category lDDT vs training step", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.985))
+    # centre the title over the axes, not the canvas: the legends sit outside on
+    # the right, so the tight bbox is wider than the plot area on that side.
+    c = ax0.get_position()
+    fig._suptitle.set_x(0.5 * (c.x0 + c.x1))
     fig.savefig(out_png, dpi=130, bbox_inches="tight")
     plt.close(fig)
 

@@ -331,6 +331,34 @@ def _spine_marker(ax, y, color, marker="<", ms=8, alpha=0.95, label=None):
     )
 
 
+# Legends live OUTSIDE the axes, in a column on the right. These panels have no
+# reliably empty interior — the DockQ bars fill the bottom, every curve plateaus
+# at the top — so an inside legend always lands on data. ``x`` is in axes coords;
+# panel 1 needs a wider offset to clear its twinx ticks + label.
+_LEGEND_X = 1.10
+
+
+def _legend_outside(ax, handles=None, labels=None, *, title=None, x=_LEGEND_X, fontsize=7.5, ncol=1):
+    """``ax.legend`` parked at ``x`` axes-coords, i.e. right of the axes."""
+    args = () if handles is None else (handles, labels)
+    leg = ax.legend(
+        *args,
+        loc="upper left",
+        bbox_to_anchor=(x, 1.0),
+        borderaxespad=0.0,
+        fontsize=fontsize,
+        ncol=ncol,
+        title=title,
+        framealpha=0.95,
+        handlelength=1.5,
+        labelspacing=0.35,
+        borderpad=0.4,
+    )
+    if title:
+        leg.get_title().set_fontsize(fontsize)
+    return leg
+
+
 def dockq_tier_fractions(series: str, category: str, mode: str = "oracle") -> list[dict]:
     """Per step: fraction of interfaces in each DockQ CAPRI tier.
 
@@ -482,7 +510,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
         il = interface_metric_dist(series, category, "ilddt")
         ld_conf = interface_metric_dist(series, category, "lddt", select="conf")
         tm_conf = interface_metric_dist(series, category, "tm_score", select="conf")
-        fig, (axd, axl, axt) = plt.subplots(3, 1, figsize=(10, 13), sharex=True)
+        fig, (axd, axl, axt) = plt.subplots(3, 1, figsize=(9.5, 11.5), sharex=True)
 
         # Steps where the model hasn't folded get their success-rate column
         # hatched over: early DockQ "successes" there are collapsed-blob artefacts
@@ -527,7 +555,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     hatch="////",
                     linewidth=0.0,
                     zorder=9,
-                    label=f"mean TM < {TM_FOLD_THRESH:.2f} (unreliable)" if j == 0 else None,
+                    label=f"TM<{TM_FOLD_THRESH:.1f} (unreliable)" if j == 0 else None,
                 )
             # Success panel uses ORACLE (matches the oracle DockQ-tier stack top);
             # every other panel uses the mean aggregate. Measured af3_ref value is a
@@ -542,13 +570,13 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 # this line is directly comparable to the top of each stack.
                 # The measured ref is an oracle like the stack; the paper fallback is a
                 # mean-over-samples rate on the full set — say which, on the line.
-                _sfx = "oracle" if af3_measured else "paper mean, full set"
+                _sfx = "oracle" if af3_measured else "paper, full set"
                 _who = af3_tag() if af3_measured else "AF3 paper"
                 # Faint thin line in the SAME colour as the success score it references
                 # (the confidence top-1 success line, "#2166ac") — not a bold red dash.
                 axd.axhline(
                     af3, color="#2166ac", alpha=0.5, lw=1.1, zorder=3,
-                    label=f"{_who} success @0.23 ({af3:.0%}, {_sfx})",
+                    label=f"{_who} success {af3:.0%} ({_sfx})",
                 )
                 _spine_marker(axd, af3, "#2166ac")
             # Confidence top-1 success @0.23 (ranking_score-selected sample) — the
@@ -566,11 +594,11 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     lw=2,
                     ms=5,
                     zorder=11,
-                    label="confidence top-1 success @0.23",
+                    label="conf top-1 success",
                 )
             axd.set_ylim(0, 1.0)
             axd.set_ylabel("fraction of interfaces")
-            axd.set_title(f"DockQ CAPRI quality tiers — oracle (best-of-N per interface)  n={tiers[-1]['n']}")
+            axd.set_title(f"DockQ CAPRI tiers — oracle (best-of-N)  n={tiers[-1]['n']}")
             # Secondary axis: oracle QS-score (collapse-sensitive interface quality)
             # over the DockQ tiers — makes the decoupling visible (blob-inflated DockQ
             # success vs real interface quality). QS is present only from the step it
@@ -595,13 +623,12 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 axq.tick_params(axis="y", labelcolor="black")
             else:
                 axq.set_yticks([])
-            # Legend moved right of the QS axis so the two don't overlap.
             handles, labels = axd.get_legend_handles_labels()
             if qs_handle is not None:
                 handles.append(qs_handle)
                 labels.append("oracle QS-score")
             # opaque + above the hatched bars (zorder 9) so the hatch doesn't show through
-            _leg = axd.legend(handles, labels, loc="upper left", fontsize=8, title="tier / QS", framealpha=1.0)
+            _leg = _legend_outside(axd, handles, labels, title="tier / QS")
             _leg.set_zorder(20)
             axd.grid(axis="y", alpha=0.3)
 
@@ -645,19 +672,19 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     color="k",
                     alpha=0.12,
                     lw=0,
-                    label="IQR (q25–q75)",
+                    label="IQR q25–q75",
                 )
                 ax.plot(sx, [d["med"] for d in dist], "-o", color="k", lw=2.2, ms=4, label="median", zorder=6)
                 ax.plot(sx, [d["mean"] for d in dist], "--o", color="0.35", lw=1.5, ms=3, label="mean", zorder=5)
                 if af3ref_median is not None:
                     ax.axhline(af3ref_median, color="k", alpha=0.5, lw=1.1, zorder=3,
-                               label=f"{af3_tag()} median ({af3ref_median:.2f})")
+                               label=f"{af3_tag()} median {af3ref_median:.2f}")
                     _spine_marker(ax, af3ref_median, "k")
                 if af3ref_mean is not None:
-                    _spine_marker(ax, af3ref_mean, "0.45", label=f"{af3_tag()} mean ({af3ref_mean:.2f})")
+                    _spine_marker(ax, af3ref_mean, "0.45", label=f"{af3_tag()} mean {af3ref_mean:.2f}")
                 if af3ref_median is None and paper_ref is not None:
                     ax.axhline(paper_ref, color="k", alpha=0.35, lw=1.1, ls=":", zorder=3,
-                               label=f"AF3 paper mean, full set ({paper_ref:.2f})")
+                               label=f"AF3 paper mean {paper_ref:.2f} (full set)")
                     _spine_marker(ax, paper_ref, "k", alpha=0.55)
             if conf:
                 cx = [d["step"] for d in conf]
@@ -669,7 +696,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     lw=2,
                     ms=4,
                     zorder=8,
-                    label="confidence top-1 (median)",
+                    label="conf top-1 (median)",
                 )
             if overlay is not None and overlay[0]:
                 odist, olabel, ocol = overlay
@@ -681,11 +708,11 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                 if overlay_af3ref is not None:
                     ax.axhline(
                         overlay_af3ref, color=ocol, alpha=0.5, lw=1.1, zorder=3,
-                        label=f"AF3 {olabel} median ({overlay_af3ref:.2f})",
+                        label=f"AF3 {olabel} median {overlay_af3ref:.2f}",
                     )
                     _spine_marker(ax, overlay_af3ref, ocol)
             if dist or (overlay is not None and overlay[0]):
-                ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+                _legend_outside(ax)
             ax.set_ylim(-0.02, 1.02)
             ax.set_ylabel(ylabel)
             ax.grid(alpha=0.3)
@@ -705,9 +732,9 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
             axl,
             ld,
             "lDDT",
-            "whole-model lDDT (black) + inter-chain iLDDT (red) — median + IQR",
+            "lDDT — whole model (black) + inter-chain (red), median + IQR",
             af3ref_median=_ld_med,
-            overlay=(il, "inter-chain iLDDT", "tab:red"),
+            overlay=(il, "iLDDT", "tab:red"),
             conf=ld_conf,
             af3ref_mean=_ld_mean,
             overlay_af3ref=_il_med,
@@ -717,7 +744,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
             axt,
             tm,
             "TM-score (whole model)",
-            "whole-model TM-score (median + IQR across targets)",
+            "TM-score — whole model, median + IQR",
             af3ref_median=_tm_med,
             conf=tm_conf,
             af3ref_mean=_tm_mean,
@@ -730,7 +757,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
             if len(all_steps) <= 12:
                 axt.set_xticks(all_steps)
         axt.set_xlabel("training step")
-        fig.suptitle(f"{series} — FoldBench-small {category}")
+        fig.suptitle(f"{series} — {category} (FoldBench-small)")
     else:
         # monomer: one stacked panel per metric (LDDT / TM-score / GDT-TS).
         # Each panel folds in the tmp/bench-style filled band — here the IQR
@@ -738,7 +765,7 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
         # per-DSSP fold-class breakdown.
         classes, rows = fold_breakdown(series, category)
         panels = [("lddt", "LDDT (no-stereocheck)"), ("tm", "TM-score"), ("gdt", "GDT-TS")]
-        fig, axes = plt.subplots(3, 1, figsize=(8.5, 13), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(8.5, 10.5), sharex=True)
         for ax, (mk, label) in zip(axes, panels, strict=True):
             pts = [
                 (r["step"], r.get(f"{mk}_q25"), r.get(f"{mk}_q75"), r.get(f"{mk}_med"), r.get(f"{mk}_mean"))
@@ -810,12 +837,16 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     ha="left", va="top", fontsize=8, color="0.45", alpha=0.9, clip_on=False,
                 )
             ax.set_ylabel(label)
-            ax.set_title(label)
             ax.set_ylim(-0.02, 1.02)
             ax.grid(alpha=0.3)
         axes[-1].set_xlabel("training step")
-        axes[0].legend(fontsize=8, ncol=2)
-        fig.suptitle(f"{series} — FoldBench-small {category}  (median + IQR across targets)")
+        _h, _l = axes[0].get_legend_handles_labels()
+        if _h:
+            fig.legend(
+                _h, _l, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+                ncol=min(4, len(_h)), fontsize=8, frameon=False, columnspacing=1.6,
+            )
+        fig.suptitle(f"{series} — {category} (FoldBench-small)")
         if rows:
             bf = (
                 ["step"]
