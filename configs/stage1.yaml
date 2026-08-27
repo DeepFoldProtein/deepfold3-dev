@@ -1,13 +1,10 @@
-base: initial.yaml
+base: stage0.yaml
 
 training:
   wandb_project: deepfold3-stage1
 
   alpha_bond: 1.0
-  alpha_smooth_lddt: 1.0
-
-  chain_perm_stability_gate: true
-  chain_perm_gate_k: 3
+  alpha_smooth_lddt: null
 
   accumulate_grad_batches: 2
   batch_size_per_rank: 1
@@ -16,4 +13,3 @@ training:
   max_atoms: 6912
   diffusion_batch_size: 32
   diffusion_chunk_size: 8
- 
