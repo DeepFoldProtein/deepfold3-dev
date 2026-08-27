@@ -38,6 +38,15 @@ training:
   # r17's value, kept so the trunk composition is the only difference.
   lr: 0.9e-3
 
+  # First LR decay at step 60k. AF3LRScheduler floors the window count --
+  # n_decays = (step - start_decay_after) // decay_every -- so the first drop
+  # lands at start_decay_after + decay_every, not at start_decay_after. The
+  # inherited 50000 / 50000 therefore held lr flat at 9.0e-4 through 51.8k and
+  # would not have moved it until 100k. 10000 + 50000 keeps the 50k cadence and
+  # the 0.95 factor: 60k -> 8.55e-4, 110k -> 8.12e-4, 160k -> 7.72e-4.
+  start_decay_after: 10000
+  decay_every: 50000
+
   diffusion_batch_size: 48
   diffusion_chunk_size: 8
 

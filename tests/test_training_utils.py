@@ -1279,3 +1279,69 @@ def test_eval_atomization_follows_its_flag(atomize_eval, expected):
     # that selects the eval kwargs for them.
     src = inspect.getsource(inspect.getmodule(build_dataloaders))
     assert "keep_after=True, for_eval=True" in src, "eval specs no longer request the eval kwargs"
+
+
+# ---------------------------------------------------------------------------
+# Scheduler resume-override tests
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerResumeOverride:
+    """``LambdaLR.state_dict()`` is ``self.__dict__`` minus ``optimizer`` /
+    ``lr_lambdas``, so the schedule fields ride along into every checkpoint and
+    ``load_state_dict`` restores them verbatim — shadowing a ``--config``
+    change. ``Trainer._run_inner`` forces the yaml value back in on resume.
+    """
+
+    def _make(self, start_decay, decay_every, lr=1e-3, warmup=10, decay_factor=0.95):
+        model = _simple_model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        cfg = TrainingConfig(
+            lr=lr,
+            warmup_steps=warmup,
+            start_decay_after=start_decay,
+            decay_every=decay_every,
+            decay_factor=decay_factor,
+        )
+        return optimizer, AF3LRScheduler(optimizer, cfg), cfg
+
+    def test_state_dict_shadows_the_schedule(self):
+        _, saved_sched, _ = self._make(start_decay=50, decay_every=50)
+        _, new_sched, _ = self._make(start_decay=10, decay_every=50)
+        new_sched.load_state_dict(saved_sched.state_dict())
+        # The checkpoint wins — this is the shadowing the override exists for.
+        assert new_sched.start_decay_after == 50
+
+    def test_override_restores_yaml_and_keeps_the_step_counter(self):
+        from deepfold3.training.trainer import _SCHEDULER_CFG_FIELDS
+
+        saved_opt, saved_sched, _ = self._make(start_decay=50, decay_every=50)
+        for _ in range(60):
+            saved_opt.step()
+            saved_sched.step()
+        optimizer, sched, cfg = self._make(start_decay=10, decay_every=50)
+        sched.load_state_dict(saved_sched.state_dict())
+
+        for sched_attr, cfg_attr in _SCHEDULER_CFG_FIELDS:
+            if hasattr(sched, sched_attr) and hasattr(cfg, cfg_attr):
+                setattr(sched, sched_attr, getattr(cfg, cfg_attr))
+
+        assert sched.start_decay_after == 10
+        assert sched.last_epoch == 60  # step counter stays aligned with global_step
+        # 10 + 50 = 60 -> one decay window has elapsed.
+        assert sched.lr_lambdas[0](60) == pytest.approx(0.95)
+        assert sched.lr_lambdas[0](59) == pytest.approx(1.0)
+
+    def test_af3_schedule_fields_are_all_covered(self):
+        from deepfold3.training.trainer import _SCHEDULER_CFG_FIELDS
+
+        covered = {sched_attr for sched_attr, _ in _SCHEDULER_CFG_FIELDS}
+        assert {"warmup_steps", "start_decay_after", "decay_every", "decay_factor"} <= covered
+
+    def test_resume_path_applies_the_override(self):
+        import inspect
+
+        from deepfold3.training.trainer import Trainer
+
+        src = inspect.getsource(Trainer._run_inner)
+        assert "_SCHEDULER_CFG_FIELDS" in src, "resume path no longer forces the yaml schedule"

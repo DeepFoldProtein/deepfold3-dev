@@ -64,6 +64,22 @@ _collate_bucket_pad = partial(collate_fn, bucket_pad=True)
 
 logger = logging.getLogger(__name__)
 
+# yaml-controlled scheduler schedule fields: (scheduler attribute, TrainingConfig
+# field). ``LambdaLR.state_dict`` is ``self.__dict__`` minus ``optimizer`` /
+# ``lr_lambdas``, so each of these is baked into every checkpoint and restored
+# verbatim by ``load_state_dict`` — shadowing a --config change unless it is
+# forced back in on resume. Shared by the resume override and the resume audit
+# so the two lists cannot drift apart.
+_SCHEDULER_CFG_FIELDS: tuple[tuple[str, str], ...] = (
+    ("max_lr", "lr"),
+    ("warmup_steps", "warmup_steps"),
+    ("start_decay_after", "start_decay_after"),
+    ("decay_every", "decay_every"),
+    ("decay_factor", "decay_factor"),
+    ("max_steps", "cosine_max_steps"),
+    ("min_ratio", "cosine_min_lr_ratio"),
+)
+
 
 def _yaml_safe(value):
     """Recursively convert tuples to lists so the result is `yaml.safe_dump` clean."""
@@ -596,6 +612,35 @@ class Trainer:
                 for g in self.optimizer.param_groups:
                     g["decoupling_parameter"] = target_c
 
+        # Resume scheduler-schedule override: same "yaml wins" pattern as the
+        # LR override above. Every field in ``_SCHEDULER_CFG_FIELDS`` is stored
+        # on the scheduler instance, hence saved into ``scheduler.state_dict()``
+        # and restored by ``load_state_dict`` — so a --config change to
+        # ``start_decay_after`` / ``decay_every`` / ``decay_factor`` is silently
+        # ignored on resume without this. These are pure hyperparameters; no
+        # optimizer or scheduler accumulator is tied to their value, so the yaml
+        # wins and every override is reported to the log.
+        #
+        # ``last_epoch`` / ``_step_count`` / ``base_lrs`` are deliberately left
+        # alone: the step counter must stay aligned with global_step, and
+        # base_lrs is owned by the LR override above. ``wsds_decay_windows`` is
+        # also not forced — rebuilding the sorted/validated window list belongs
+        # in the constructor — so the audit below still reports it as shadowed.
+        if resumed and self.scheduler is not None:
+            sched_overrides: list[str] = []
+            for sched_attr, cfg_attr in _SCHEDULER_CFG_FIELDS:
+                if not hasattr(self.scheduler, sched_attr) or not hasattr(self.cfg, cfg_attr):
+                    continue
+                saved_val = getattr(self.scheduler, sched_attr)
+                target_val = getattr(self.cfg, cfg_attr)
+                if saved_val != target_val:
+                    setattr(self.scheduler, sched_attr, target_val)
+                    sched_overrides.append(f"{sched_attr}: {saved_val} → {target_val}")
+            if sched_overrides:
+                rank_zero_info(
+                    "[resume] scheduler schedule override (yaml wins over checkpoint): " + ", ".join(sched_overrides)
+                )
+
         # Resume EMA shadow re-seed: if the source checkpoint has no saved
         # EMA shadow (e.g. an EMA-on-x arm starting from a vanilla-SF
         # checkpoint), the freshly constructed shadow is at random init
@@ -651,20 +696,14 @@ class Trainer:
                 if abs(saved_ema - target_ema) > 1e-12:
                     mismatches.append(f"  ema_decay: saved={saved_ema} != cfg={target_ema}")
 
-            # Scheduler instance attributes. PyTorch's LambdaLR.state_dict
-            # currently filters these out, so they stay at the cfg-derived
-            # __init__ value after load — but if that ever changes, this
-            # audit catches a silent restore.
+            # Scheduler instance attributes. LambdaLR.state_dict carries these
+            # into the checkpoint and load_state_dict restores them verbatim,
+            # so they are force-overridden from the yaml above; anything still
+            # mismatched here (currently only the WSDS window list) genuinely
+            # kept the saved value.
             sched = self.scheduler
             sched_pairs: list[tuple[str, str]] = []
-            for sched_attr, cfg_attr in (
-                ("warmup_steps", "warmup_steps"),
-                ("start_decay_after", "start_decay_after"),
-                ("decay_every", "decay_every"),
-                ("decay_factor", "decay_factor"),
-                ("max_steps", "cosine_max_steps"),
-                ("min_ratio", "cosine_min_lr_ratio"),
-            ):
+            for sched_attr, cfg_attr in _SCHEDULER_CFG_FIELDS:
                 if hasattr(sched, sched_attr) and hasattr(self.cfg, cfg_attr):
                     sched_pairs.append((sched_attr, cfg_attr))
             for sched_attr, cfg_attr in sched_pairs:

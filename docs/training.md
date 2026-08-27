@@ -238,10 +238,12 @@ Two schedulers available, selected by `finetune_scheduler`:
 ```
 1. Warmup (0 → warmup_steps): linear 0 → lr
 2. Plateau (warmup_steps → start_decay_after): constant lr
-3. Step decay: lr × decay_factor^n every decay_every steps
+3. Step decay: lr × decay_factor^n, n = (step − start_decay_after) // decay_every
 ```
 
-Default: lr=0.0018, warmup=1000, decay starts at 50k, factor=0.95 every 50k.
+Default: lr=0.0018, warmup=1000, `start_decay_after`=50k, factor=0.95 every 50k.
+
+Note the floor in phase 3: `start_decay_after` is where the decay **windows start being counted**, not where the first drop happens. With `start_decay_after == decay_every == 50000` the multiplier is `0.95^0 = 1` for the whole of `[50k, 100k)` and the first drop lands at **100k**. To put the first drop at step `S`, set `start_decay_after = S − decay_every` (e.g. 10k + 50k → 60k, 110k, 160k) or shorten `decay_every`.
 
 **Cosine annealing** (`finetune_scheduler="cosine"`): warmup then cosine decay to `lr × cosine_min_lr_ratio` over `cosine_max_steps`. Useful for fine-tuning stages.
 
@@ -661,7 +663,9 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 **LR override on resume**: `optimizer.load_state_dict` and `LambdaLR.load_state_dict` both restore the saved `lr` / `initial_lr` / `base_lrs` verbatim, which silently shadows any `--config` change. The trainer's `[resume]` block detects this and force-overrides `param_groups['lr','initial_lr']` + `scheduler.base_lrs` to the configured value, so `--config new.yaml --resume ...` honors the new lr. Schedule-Free AdamW's accumulator state (`z` buffer, `lr_max`, `weight_sum`) is preserved across the override. A `[resume] LR override: <saved> → <target>` line is logged when this fires.
 
-**Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, scheduler instance attributes (`warmup_steps`, `start_decay_after`, `decay_every`, `decay_factor`, `cosine_max_steps`, `cosine_min_lr_ratio`, `wsds_decay_windows`) — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only; only `lr` is force-overridden. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
+**Schedule override on resume**: `LambdaLR.state_dict()` is `self.__dict__` minus `optimizer` / `lr_lambdas`, so every schedule field the scheduler stores as an attribute (`max_lr`, `warmup_steps`, `start_decay_after`, `decay_every`, `decay_factor`, `cosine_max_steps`, `cosine_min_lr_ratio`) is baked into the checkpoint and restored verbatim — a `--config` change to any of them used to be silently ignored on resume. The trainer now forces the yaml value back in (list: `_SCHEDULER_CFG_FIELDS` in `trainer.py`, shared with the audit below) and logs `[resume] scheduler schedule override (yaml wins over checkpoint): <field>: <saved> → <target>` for each one. `last_epoch` / `_step_count` are untouched (the counter must stay aligned with `global_step`) and `base_lrs` is owned by the LR override above. `wsds_decay_windows` is not forced — rebuilding the sorted/validated window list belongs in the constructor — so it still only warns.
+
+**Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, `wsds_decay_windows` — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
 
 **Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
 
