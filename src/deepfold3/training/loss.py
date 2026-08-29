@@ -16,9 +16,12 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from torch.utils.checkpoint import checkpoint
 
+from deepfold3.data import const
 from deepfold3.data.masking import MASK_FIXED, MASK_LOSS_WEIGHT
 from deepfold3.model.config import TrainingConfig
+from deepfold3.model.precision import fp32_scope
 
 # ---------------------------------------------------------------------------
 # Weighted rigid alignment (AF3 Algorithm 28 / §3.7.1 eq. 2)
@@ -379,6 +382,370 @@ def smooth_lddt_loss(
     lddt_per_sample = score_sum / (n_pairs * len(cutoffs))
 
     return (1.0 - lddt_per_sample).mean()
+
+
+# ---------------------------------------------------------------------------
+# Shape-complementarity loss (OpenDDE arXiv:2607.03787 §A.2.1)
+# ---------------------------------------------------------------------------
+
+
+def _shape_comp_normals(
+    centers: torch.Tensor,  # [..., N, 3]
+    token_asym: torch.Tensor,  # [N]
+    atom_pos: torch.Tensor,  # [..., A, 3]
+    atom_asym: torch.Tensor,  # [A]
+    density_sigma: float,
+    eps: float,
+    chunk_size: int,
+    use_checkpoint: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Outward surface normal of each token, from the same-chain atomic density.
+
+    ``g_u = Σ_{a ∈ C(u)} exp(-‖c_u - x_a‖² / 2σ²) · (c_u - x_a)/σ²`` is
+    ``-∇ρ_chain(c_u)`` for a Gaussian density ``ρ``, i.e. it points *away* from
+    the token's own chain. Its magnitude is a burial read-out: a buried token
+    sits in a locally isotropic density and the gradient cancels.
+
+    ``n_u = g_u / (‖g_u‖ + ε)`` — the paper's soft normalisation, deliberately
+    not the shipped code's ``clamp_min`` (which leaves a ``1/‖g‖`` derivative
+    alive for tokens that only just pass the strength gate).
+
+    Args:
+        centers: Token center coordinates ``[..., N, 3]``.
+        token_asym: Per-token chain id ``[N]``.
+        atom_pos: Density source atoms ``[..., A, 3]`` (resolved atoms only).
+        atom_asym: Per-atom chain id ``[A]``.
+        density_sigma: Gaussian width in Angstroms.
+        eps: Normalisation floor.
+        chunk_size: Token-axis chunk for the dense ``[..., C, A, 3]`` step.
+        use_checkpoint: Recompute each chunk in backward instead of storing it.
+
+    Returns:
+        ``(normal [..., N, 3], strength [..., N])``.
+    """
+    n_token = centers.shape[-2]
+    same_chain = token_asym[:, None] == atom_asym[None, :]  # [N, A]
+    inv_two_sigma_sq = 1.0 / (2.0 * density_sigma * density_sigma)
+    inv_sigma_sq = 1.0 / (density_sigma * density_sigma)
+
+    def _chunk(center_chunk: torch.Tensor, atoms: torch.Tensor, mask_chunk: torch.Tensor) -> torch.Tensor:
+        delta = center_chunk.unsqueeze(-2) - atoms.unsqueeze(-3)  # [..., C, A, 3]
+        weight = torch.exp(-(delta * delta).sum(-1) * inv_two_sigma_sq)  # [..., C, A]
+        weight = weight * mask_chunk.to(dtype=delta.dtype)
+        return (weight.unsqueeze(-1) * delta).sum(-2) * inv_sigma_sq  # [..., C, 3]
+
+    step = n_token if chunk_size <= 0 else min(chunk_size, n_token)
+    grads = []
+    for start in range(0, n_token, step):
+        end = min(start + step, n_token)
+        args = (centers[..., start:end, :], atom_pos, same_chain[start:end])
+        if use_checkpoint:
+            grads.append(checkpoint(_chunk, *args, use_reentrant=False))
+        else:
+            grads.append(_chunk(*args))
+    grad = torch.cat(grads, dim=-2)  # [..., N, 3]
+    strength = torch.linalg.vector_norm(grad, dim=-1)  # [..., N]
+    return grad / (strength + eps).unsqueeze(-1), strength
+
+
+def _shape_comp_field(
+    centers: torch.Tensor,  # [..., N, 3]
+    normals: torch.Tensor,  # [..., N, 3]
+    pair_mask: torch.Tensor,  # [N, N] bool — GT-derived, never re-derived here
+    token_mask: torch.Tensor,  # [N] bool — GT-derived
+    gap_mean: float,
+    gap_scale: float,
+    clash_distance: float,
+    clash_scale: float,
+    pool_temperature: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pair / token / global shape-complementarity scores (OpenDDE §A.2.1).
+
+    The masks are *arguments*, never derived here: the GT field determines which
+    ``(u, v)`` pairs are scored, and the predicted field is evaluated on exactly
+    that set. That is what makes the GT-only convention structural rather than a
+    flag — there is no second code path in which a predicted mask could be built.
+
+    Args:
+        centers: Token centers ``[..., N, 3]``.
+        normals: Unit outward normals ``[..., N, 3]``.
+        pair_mask: Scored cross-chain pairs ``[N, N]``.
+        token_mask: Tokens with at least one scored partner ``[N]``.
+        gap_mean: Preferred inter-surface separation (Å).
+        gap_scale: Width of the separation Gaussian (Å).
+        clash_distance: Distance below which the pair is a steric clash (Å).
+        clash_scale: Sharpness of the anti-clash sigmoid (Å).
+        pool_temperature: Softmax temperature (Å²) for the partner pooling.
+        eps: Division floor.
+
+    Returns:
+        ``(q_pair [..., N, N], q_token [..., N], q_global [...])``.
+    """
+    delta = centers.unsqueeze(-3) - centers.unsqueeze(-2)  # [..., N, N, 3], d_uv = c_v - c_u
+    dist = torch.linalg.vector_norm(delta, dim=-1)  # [..., N, N]
+    unit = delta / (dist + eps).unsqueeze(-1)
+
+    n_u = normals.unsqueeze(-2)
+    n_v = normals.unsqueeze(-3)
+    facing = torch.relu((n_u * unit).sum(-1)) * torch.relu((n_v * -unit).sum(-1))
+    opposite = 0.5 * (1.0 - (n_u * n_v).sum(-1))
+    gap = torch.exp(-(((dist - gap_mean) / gap_scale) ** 2))
+    anti_clash = 1.0 - torch.sigmoid((clash_distance - dist) / clash_scale)
+    q_pair = facing * opposite * gap * anti_clash
+    q_pair = torch.where(pair_mask, q_pair, torch.zeros_like(q_pair))
+
+    # Soft nearest-partner pooling: w_uv ∝ exp(-d²/T) over the scored partners.
+    logits = -(dist * dist) / pool_temperature
+    neg_inf = torch.finfo(logits.dtype).min
+    masked = torch.where(pair_mask, logits, torch.full_like(logits, neg_inf))
+    row_max = masked.amax(dim=-1, keepdim=True)
+    row_max = torch.where(token_mask.unsqueeze(-1), row_max, torch.zeros_like(row_max))
+    expo = torch.where(pair_mask, torch.exp(masked - row_max), torch.zeros_like(logits))
+    weight = torch.where(pair_mask, expo / expo.sum(dim=-1, keepdim=True).clamp_min(eps), torch.zeros_like(logits))
+
+    q_token = (weight * q_pair).sum(-1)  # [..., N]
+    q_token = torch.where(token_mask, q_token, torch.zeros_like(q_token))
+    denom = token_mask.sum().clamp_min(1).to(dtype=q_token.dtype)
+    q_global = q_token.sum(-1) / denom  # [...]
+    return q_pair, q_token, q_global
+
+
+def shape_complementarity_loss(
+    pred_pos: torch.Tensor,  # [S, N, M, 3]
+    gt_pos: torch.Tensor,  # [N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M]
+    token_to_rep_atom: torch.Tensor,  # [N]
+    asym_id: torch.Tensor,  # [N]
+    mol_type: torch.Tensor,  # [N]
+    seq_mask: torch.Tensor,  # [N]
+    *,
+    sample_weight: torch.Tensor | None = None,  # [S]
+    density_sigma: float = 1.5,
+    interface_cutoff: float = 16.0,
+    gap_mean: float = 6.0,
+    gap_scale: float = 3.0,
+    clash_distance: float = 2.0,
+    clash_scale: float = 0.5,
+    pool_temperature: float = 16.0,
+    normal_strength_min: float = 1e-4,
+    huber_delta: float = 0.01,
+    pair_weight: float = 0.4,
+    token_weight: float = 1.0,
+    global_weight: float = 0.4,
+    chunk_size: int = 128,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Shape-complementarity loss (OpenDDE ``arXiv:2607.03787`` §A.2.1).
+
+    A differentiable, token-level analogue of the Lawrence-Colman ``Sc``
+    statistic. Each protein token gets an outward surface normal from the
+    same-chain atomic density; every cross-chain pair inside the interface
+    cutoff is scored by whether the two surfaces *face* each other, carry
+    *opposed* normals, sit at a plausible *gap*, and avoid a *clash*::
+
+        q_uv = ReLU(n_u·d̂) ReLU(n_v·(-d̂)) · (1 - n_u·n_v)/2
+               · exp(-((d - μ_gap)/τ_gap)²) · (1 - sigmoid((d_clash - d)/τ_clash))
+
+    The same field is computed from the ground truth, and the loss is a Huber
+    regression of the predicted field onto it at pair / token / global
+    granularity::
+
+        L = λ_p Huber(q_uv, q*_uv) + λ_t Huber(q_u, q*_u) + λ_g Huber(q_g, q*_g)
+
+    The quantity is SE(3)-invariant, so no rigid alignment is needed — unlike
+    the diffusion MSE, this constrains inter-chain geometry without routing
+    through a superposition dominated by the larger chain. It is also
+    mirror-invariant (it carries no chirality signal) and, by construction,
+    protein-protein and cross-chain only.
+
+    **GT-only masking.** The ground-truth field fixes which pairs are scored;
+    the predicted field is evaluated on exactly that index set. The pair list is
+    therefore static across the ``S`` diffusion samples and is built once under
+    ``no_grad``. The cost is that an interface the prediction *invents* where the
+    ground truth has none is invisible here (``smooth_lddt`` and the distogram
+    already penalise it); the benefit is that there is no pred/GT mask
+    reconciliation and no cutoff discontinuity in the gradient.
+
+    **Range of action.** Measured on rigidly perturbed complexes, the loss is
+    monotone in interface error out to ~8 Å and saturated by ~12 Å; beyond the
+    interface cutoff it is a constant with exactly zero gradient. This is a
+    refinement objective, not a docking objective — see
+    ``export/shape-complementarity/``.
+
+    Args:
+        pred_pos: Denoised predicted positions ``[S, N, M, 3]``.
+        gt_pos: Ground-truth positions ``[N, M, 3]``, already chain-permuted and
+            atom-symmetry-resolved (the shared GT that smooth-lDDT scores).
+        atom_mask: Ground-truth atom presence ``[N, M]``.
+        token_to_rep_atom: Per-token representative atom slot ``[N]`` (CB for
+            protein residues, CA for glycine).
+        asym_id: Per-token chain id ``[N]``.
+        mol_type: Per-token molecule type ``[N]``.
+        seq_mask: Valid-token mask ``[N]``.
+        sample_weight: Optional per-diffusion-sample weight ``[S]`` (e.g. a
+            noise-level gate). ``None`` weights every sample equally. A weight
+            vector of all zeros yields 0 while keeping the autograd graph, so
+            gating cannot change the graph topology.
+        density_sigma: Gaussian width for the density normal (Å).
+        interface_cutoff: Maximum GT center distance for a scored pair (Å).
+        gap_mean: Preferred inter-surface separation (Å).
+        gap_scale: Width of the separation Gaussian (Å).
+        clash_distance: Steric-clash distance (Å).
+        clash_scale: Anti-clash sigmoid sharpness (Å).
+        pool_temperature: Partner-pooling softmax temperature (Å²).
+        normal_strength_min: Burial gate on ``‖g_u‖``.
+        huber_delta: ``smooth_l1`` beta. NOTE this is the *beta* of
+            ``F.smooth_l1_loss``, whose slope above the knee is 1 — NOT the
+            ``delta`` of ``F.huber_loss``, whose slope above the knee is
+            ``delta`` and which would weaken this term by ``1/delta``.
+        pair_weight: ``λ_p``.
+        token_weight: ``λ_t``.
+        global_weight: ``λ_g``.
+        chunk_size: Token-axis chunk for the density step (0 = no chunking).
+        eps: Division floor.
+
+    Returns:
+        ``(loss, components)``. ``loss`` is the *unweighted*
+        ``λ_p H_p + λ_t H_t + λ_g H_g`` — the caller applies
+        ``alpha_shape_comp``. ``components`` holds the three raw Huber terms,
+        the raw token L1 (the interpretable scale), the GT/pred global scores,
+        and ``shape_comp_coverage`` (1.0 when the example had a scorable
+        interface, else 0.0).
+    """
+    # OpenDDE wraps this computation in ``autocasting_disable_decorator(True)``:
+    # the field is built from ``exp(-d²/2σ²)``, its values live in [0, 1], and the
+    # residuals sit at the 1e-2 scale, so bf16 would spend most of its mantissa on
+    # the exponent. Upcast only genuinely low precision — float64 (the tests and
+    # the reference cross-check) must survive untouched.
+    if pred_pos.dtype in (torch.bfloat16, torch.float16):
+        pred_pos = pred_pos.float()
+    if gt_pos.dtype in (torch.bfloat16, torch.float16):
+        gt_pos = gt_pos.float()
+    with fp32_scope(pred_pos.is_cuda):
+        zero = pred_pos.sum() * 0.0  # keeps the autograd graph topology constant
+        components: dict[str, torch.Tensor] = {
+            "shape_comp_coverage": zero.detach(),
+            "shape_comp_pair": zero.detach(),
+            "shape_comp_token": zero.detach(),
+            "shape_comp_global": zero.detach(),
+            "shape_comp_l1_token": zero.detach(),
+            "shape_comp_glob_gt": zero.detach(),
+            "shape_comp_glob_pred": zero.detach(),
+        }
+
+        n_token, n_atom_slot = atom_mask.shape
+        atom_mask = atom_mask.bool()
+        token_index = torch.arange(n_token, device=pred_pos.device)
+
+        # Scorable tokens: protein, valid, and with a real side (>= 2 resolved
+        # atoms). The atom-count rule mirrors OpenDDE's residue-token mode and
+        # drops stochastically atomized single-atom tokens, whose "surface" is a
+        # single point.
+        valid_token = seq_mask.bool() & (mol_type == const.MOL_PROTEIN) & (atom_mask.sum(-1) >= 2)
+        if not bool(valid_token.any()):
+            return zero, components
+
+        # ---- static GT side -------------------------------------------------
+        with torch.no_grad():
+            gt_center = gt_pos[token_index, token_to_rep_atom]  # [N, 3]
+            atom_asym = asym_id.unsqueeze(-1).expand(n_token, n_atom_slot)[atom_mask]  # [A]
+            gt_atoms = gt_pos[atom_mask]  # [A, 3]
+            if atom_asym.numel() == 0:
+                return zero, components
+            gt_normal, gt_strength = _shape_comp_normals(
+                gt_center,
+                asym_id,
+                gt_atoms,
+                atom_asym,
+                density_sigma=density_sigma,
+                eps=eps,
+                chunk_size=chunk_size,
+                use_checkpoint=False,
+            )
+            gt_valid = valid_token & (gt_strength > normal_strength_min)
+            gt_dist = torch.cdist(gt_center, gt_center)
+            pair_mask = (
+                gt_valid.unsqueeze(-1)
+                & gt_valid.unsqueeze(-2)
+                & (asym_id.unsqueeze(-1) != asym_id.unsqueeze(-2))
+                & (gt_dist <= interface_cutoff)
+            )
+            token_mask = pair_mask.any(dim=-1)
+            if not bool(token_mask.any()):
+                return zero, components
+            gt_pair, gt_token, gt_global = _shape_comp_field(
+                gt_center,
+                gt_normal,
+                pair_mask,
+                token_mask,
+                gap_mean=gap_mean,
+                gap_scale=gap_scale,
+                clash_distance=clash_distance,
+                clash_scale=clash_scale,
+                pool_temperature=pool_temperature,
+                eps=eps,
+            )
+
+        # ---- differentiable predicted side ----------------------------------
+        pred_center = pred_pos[:, token_index, token_to_rep_atom]  # [S, N, 3]
+        pred_atoms = pred_pos[:, atom_mask]  # [S, A, 3]
+        pred_normal, _ = _shape_comp_normals(
+            pred_center,
+            asym_id,
+            pred_atoms,
+            atom_asym,
+            density_sigma=density_sigma,
+            eps=eps,
+            chunk_size=chunk_size,
+            use_checkpoint=pred_pos.requires_grad,
+        )
+        pred_pair, pred_token, pred_global = _shape_comp_field(
+            pred_center,
+            pred_normal,
+            pair_mask,
+            token_mask,
+            gap_mean=gap_mean,
+            gap_scale=gap_scale,
+            clash_distance=clash_distance,
+            clash_scale=clash_scale,
+            pool_temperature=pool_temperature,
+            eps=eps,
+        )
+
+        # ``smooth_l1`` (beta), NOT ``huber`` (delta): PyTorch defines
+        # huber(delta) = delta * smooth_l1(beta=delta), so the huber form would
+        # scale this whole term — and its gradient — by ``huber_delta``.
+        sel_pair = pred_pair[:, pair_mask]  # [S, P]
+        sel_token = pred_token[:, token_mask]  # [S, T]
+
+        def _reduce(pred_sel: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            # [S, K] -> scalar, weighted over the sample axis.
+            per_sample = F.smooth_l1_loss(
+                pred_sel, target.unsqueeze(0).expand_as(pred_sel), beta=huber_delta, reduction="none"
+            ).mean(dim=-1)
+            if sample_weight is None:
+                return per_sample.mean()
+            w = sample_weight.to(dtype=per_sample.dtype)
+            return (per_sample * w).sum() / w.sum().clamp_min(eps)
+
+        h_pair = _reduce(sel_pair, gt_pair[pair_mask])
+        h_token = _reduce(sel_token, gt_token[token_mask])
+        h_global = _reduce(pred_global.unsqueeze(-1), gt_global.reshape(1))
+
+        loss = pair_weight * h_pair + token_weight * h_token + global_weight * h_global
+        components.update(
+            {
+                "shape_comp_coverage": torch.ones_like(zero.detach()),
+                "shape_comp_pair": h_pair.detach(),
+                "shape_comp_token": h_token.detach(),
+                "shape_comp_global": h_global.detach(),
+                "shape_comp_l1_token": (sel_token - gt_token[token_mask].unsqueeze(0)).abs().mean().detach(),
+                "shape_comp_glob_gt": gt_global.detach(),
+                "shape_comp_glob_pred": pred_global.mean().detach(),
+            }
+        )
+        return loss, components
 
 
 # ---------------------------------------------------------------------------
@@ -2075,6 +2442,35 @@ def _compute_per_atom_lddt(
 # ---------------------------------------------------------------------------
 
 
+_SHAPE_COMP_FEATURES = ("mol_type", "asym_id", "token_to_rep_atom", "seq_mask")
+
+
+def _shape_comp_kwargs(cfg: TrainingConfig) -> dict[str, float | int]:
+    """Geometry / weighting kwargs for :func:`shape_complementarity_loss`."""
+    return dict(
+        density_sigma=cfg.shape_comp_density_sigma,
+        interface_cutoff=cfg.shape_comp_interface_cutoff,
+        gap_mean=cfg.shape_comp_gap_mean,
+        gap_scale=cfg.shape_comp_gap_scale,
+        clash_distance=cfg.shape_comp_clash_distance,
+        clash_scale=cfg.shape_comp_clash_scale,
+        pool_temperature=cfg.shape_comp_pool_temperature,
+        normal_strength_min=cfg.shape_comp_normal_strength_min,
+        huber_delta=cfg.shape_comp_huber_delta,
+        pair_weight=cfg.shape_comp_pair_weight,
+        token_weight=cfg.shape_comp_token_weight,
+        global_weight=cfg.shape_comp_global_weight,
+        chunk_size=cfg.shape_comp_chunk_size,
+    )
+
+
+def _shape_comp_sample_weight(cfg: TrainingConfig, noise_levels: torch.Tensor) -> torch.Tensor | None:
+    """Per-sample gate from ``shape_comp_sigma_max`` (None = no gate)."""
+    if cfg.shape_comp_sigma_max is None:
+        return None
+    return (noise_levels <= cfg.shape_comp_sigma_max).to(dtype=noise_levels.dtype)
+
+
 def diffusion_only_loss(
     pred: dict[str, torch.Tensor],
     features: dict[str, torch.Tensor],
@@ -2199,6 +2595,25 @@ def diffusion_only_loss(
         total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
     else:
         total = total + cfg.alpha_diffusion * l_mse
+
+    # Shape complementarity (OpenDDE arXiv:2607.03787 §A.2.1) — an
+    # SE(3)-invariant, orientation-aware penalty on cross-chain protein
+    # interfaces, scored against the same shared GT as smooth-lDDT. Weighted
+    # outside ``alpha_diffusion``, like FAPE and the chirality terms.
+    if cfg.alpha_shape_comp > 0 and all(k in features for k in _SHAPE_COMP_FEATURES):
+        l_shape, shape_comps = shape_complementarity_loss(
+            denoised,
+            gt_pos,
+            atom_mask,
+            features["token_to_rep_atom"],
+            features["asym_id"],
+            features["mol_type"],
+            seq_mask,
+            sample_weight=_shape_comp_sample_weight(cfg, noise_levels),
+            **_shape_comp_kwargs(cfg),
+        )
+        components.update(shape_comps)
+        total = total + cfg.alpha_shape_comp * l_shape
 
     if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):
         b_idx = features.get("bond_atom_indices")
@@ -2551,6 +2966,22 @@ def training_loss(
             total = total + cfg.alpha_diffusion * (l_mse + cfg.alpha_smooth_lddt * l_lddt)
         else:
             total = total + cfg.alpha_diffusion * l_mse
+
+        # Shape complementarity — see ``diffusion_only_loss`` for the rationale.
+        if cfg.alpha_shape_comp > 0 and all(k in features for k in _SHAPE_COMP_FEATURES):
+            l_shape, shape_comps = shape_complementarity_loss(
+                denoised,
+                gt_pos,
+                loss_atom_mask,
+                features["token_to_rep_atom"],
+                features["asym_id"],
+                features["mol_type"],
+                seq_mask,
+                sample_weight=_shape_comp_sample_weight(cfg, noise_levels),
+                **_shape_comp_kwargs(cfg),
+            )
+            losses.update(shape_comps)
+            total = total + cfg.alpha_shape_comp * l_shape
 
         # Bond violation loss (stage 2 fine-tuning)
         if cfg.alpha_bond > 0 and ("bond_atom_indices" in features or cfg.bond_include_symmetric):

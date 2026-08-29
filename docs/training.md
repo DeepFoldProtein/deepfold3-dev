@@ -182,6 +182,7 @@ separately, so the distogram loss is never affected (matching OF3's ordering).
 | Diffusion MSE   | `alpha_diffusion` (4.0)            | EDM-weighted MSE per AF3 §5.3 eq. 3: `(1/3) · Σ‖Δ‖²·w·mask / Σ mask` (per-coordinate average; denominator is atom count, not sum-of-weights). w(σ) = (σ²+σ_d²)/(σ·σ_d)²; mol-type reweight: DNA/RNA 5×, ligand 10×. |
 | Smooth LDDT     | `alpha_diffusion` (4.0)            | Distance-based accuracy (cutoffs: 0.5, 1.0, 2.0, 4.0 Å)                                                                                                                        |
 | Bond violation  | `alpha_diffusion × alpha_bond` (0) | MSE on bonded atom distances vs observed GT; enable for stage 2                                                                                                                |
+| Shape complementarity | `alpha_shape_comp` (0)             | SE(3)-invariant cross-chain protein interface loss (OpenDDE `arXiv:2607.03787` §A.2.1); Huber regression of the predicted surface-complementarity field onto the GT field. See below. |
 | Distogram       | `alpha_distogram` (0.03)           | Cross-entropy on 64-bin distance predictions                                                                                                                                   |
 | Masked MSA      | `alpha_masked_msa` (0)             | BERT-style MSA reconstruction CE over corrupted entries. Requires `ModelConfig.masked_msa.enabled`. Single-query MSA cross-attention head at the end of the MSA module; trains the MSA stack + single track. All samples incl. distillation. |
 | pLDDT           | `alpha_confidence` (1e-4)          | Per-atom confidence cross-entropy (50 bins); gated on resolution ∈ [0.1, 4.0] Å. AF3 §4.3.1: j-axis restricted to representative atoms (CA / C1') of standard polymer tokens, with inclusion radius 15 Å for protein-rep j and 30 Å for nucleic-rep j; ligand j atoms drop. |
@@ -190,6 +191,54 @@ separately, so the distogram loss is never affected (matching OF3's ordering).
 | PAE             | `alpha_confidence × alpha_pae` (0) | Frame-aligned predicted aligned error (AF3 §4.3.2, Algorithm 29 — disabled in stage 1). Frames whose ∠(a, b, c) lies within 25° of co-linearity are dropped per-sample on both pred and GT. |
 | Single-repr reg | `alpha_single_reg` (0)             | Magnitude regularizer on trunk single output: mean per-token Σ_c &#124;s&#124;^p / C. Observation-only at α=0.                                                                 |
 | Pair-repr reg   | `alpha_pair_reg` (1e-4)            | Same form on pair output. Controls DistogramHead logit magnitude; prevents late-trajectory distogram destabilization (see [regularization-story.md](regularization-story.md)). |
+
+#### Shape complementarity (`alpha_shape_comp`)
+
+Off by default. A Huber regression of the predicted surface-complementarity field
+onto the field computed from the ground truth, applied to the diffusion output
+next to smooth-lDDT (OpenDDE's `L_geom = L_diff + λ_shape·L_shape + …`).
+
+Each protein token gets an outward surface normal from the **same-chain** atomic
+density, `n_u = g_u / (‖g_u‖ + ε)` with
+`g_u = Σ_{a ∈ chain(u)} exp(-‖c_u-x_a‖²/2σ²)(c_u-x_a)/σ²` — the negative gradient
+of a Gaussian density, so it points away from the token's own chain, and its
+magnitude is a burial read-out (a buried token sits in an isotropic density and
+the gradient cancels). Every cross-chain pair inside
+`shape_comp_interface_cutoff` is then scored by whether the two surfaces face
+each other, carry opposed normals, sit at a plausible gap, and avoid a clash:
+
+```
+q_uv = ReLU(n_u·d̂) ReLU(n_v·(-d̂)) · (1 - n_u·n_v)/2
+       · exp(-((d - gap_mean)/gap_scale)²) · (1 - sigmoid((clash_distance - d)/clash_scale))
+q_u  = Σ_v softmax_v(-d²/pool_temperature) q_uv        q_global = mean_u q_u
+L    = λ_p·H(q_uv, q*_uv) + λ_t·H(q_u, q*_u) + λ_g·H(q_global, q*_global)
+```
+
+Properties worth knowing before enabling it:
+
+- **SE(3)-invariant** — no rigid alignment, so it constrains inter-chain geometry
+  without routing through a superposition dominated by the larger chain. Also
+  mirror-invariant (carries no chirality signal), and protein–protein only.
+- **GT-only masking.** The ground-truth field fixes which pairs are scored, so
+  the pair index set is static across the `S` diffusion samples and is built once
+  under `no_grad`. An interface the prediction *invents* where GT has none is
+  therefore invisible here (smooth-lDDT and the distogram already penalise it).
+- **~8 Å range of action.** Monotone in interface error to ~8 Å, saturated by
+  ~12 Å, exactly zero beyond the cutoff. A refinement objective, not a docking
+  one — it will not rescue a mis-docked pose.
+- **`shape_comp_huber_delta` is `F.smooth_l1_loss`'s `beta`, not
+  `F.huber_loss`'s `delta`.** PyTorch defines `huber(d) = d·smooth_l1(beta=d)`,
+  so the huber spelling would scale the term and its gradient by 0.01.
+- OpenDDE's own weight is `alpha_shape_comp = 3.0e-2`; at that value the term's
+  gradient measured 0.06–0.21× the smooth-lDDT gradient on rigidly perturbed
+  complexes. Neither the paper nor the released code ablates the term.
+
+Logged components: `shape_comp_{pair,token,global}` (raw Huber),
+`shape_comp_l1_token` (raw L1 — the interpretable scale),
+`shape_comp_coverage` (fraction of examples with a scorable interface), and
+`shape_comp_glob_{gt,pred}`.
+
+Full investigation, measurements and the arm plan: `export/shape-complementarity/`.
 
 #### GT-presence gating of geometric masks
 

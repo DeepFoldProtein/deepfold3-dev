@@ -1193,6 +1193,51 @@ class TrainingConfig:
     # smooth LDDT is turned off in fine-tune stage 1).
     alpha_smooth_lddt: float | None = 1.0
 
+    # ---- Shape complementarity (OpenDDE arXiv:2607.03787 §A.2.1) ----------
+    # SE(3)-invariant, orientation-aware, cross-chain protein-protein interface
+    # loss: a Huber regression of the predicted surface-complementarity field
+    # onto the field computed from the ground truth. Sits next to smooth-lDDT on
+    # the diffusion output (the paper's ``L_geom = L_diff + λ_shape·L_shape + …``).
+    #
+    # Off by default, like ``alpha_fape`` / ``alpha_chirality`` — merging must
+    # not change any existing run. **OpenDDE's own value is 3.0e-2**, which the
+    # arm config sets explicitly; at that weight the term's gradient measured
+    # 0.06-0.21x the smooth-lDDT gradient on rigidly perturbed complexes.
+    #
+    # Range of action is ~8 A of interface error (saturated by ~12 A, exactly
+    # zero beyond ``shape_comp_interface_cutoff``): a refinement objective, not
+    # a docking one. See ``export/shape-complementarity/``.
+    alpha_shape_comp: float = 0.0
+    # Relative weights of the three granularities (OpenDDE's ``{pair,token,
+    # global}_weight``). The token term carries 0.69-0.88 of the weighted sum in
+    # practice; the global term is a single degenerate scalar and is kept only
+    # for fidelity with the published objective.
+    shape_comp_pair_weight: float = 0.4
+    shape_comp_token_weight: float = 1.0
+    shape_comp_global_weight: float = 0.4
+    # ``beta`` of ``F.smooth_l1_loss`` — NOT the ``delta`` of ``F.huber_loss``.
+    # PyTorch defines ``huber(d) = d · smooth_l1(beta=d)``, so the huber spelling
+    # would scale this term and its gradient by 0.01. Chosen at the near-native
+    # residual scale so the term is L1-like above ~1 A of interface error.
+    shape_comp_huber_delta: float = 0.01
+    # Geometry — OpenDDE's shipped config values (which override the looser
+    # defaults in their own function signature).
+    shape_comp_density_sigma: float = 1.5
+    shape_comp_interface_cutoff: float = 16.0
+    shape_comp_gap_mean: float = 6.0
+    shape_comp_gap_scale: float = 3.0
+    shape_comp_clash_distance: float = 2.0
+    shape_comp_clash_scale: float = 0.5
+    shape_comp_pool_temperature: float = 16.0
+    shape_comp_normal_strength_min: float = 1e-4
+    # Token-axis chunk for the dense [N, A, 3] density step (0 = no chunking).
+    # Only affects peak memory, not the result.
+    shape_comp_chunk_size: int = 128
+    # Optional noise gate: skip the term for diffusion samples whose sigma
+    # exceeds this (at high sigma the denoised structure has no surface). None
+    # = never gate. Left off until the sigma profile says otherwise.
+    shape_comp_sigma_max: float | None = None
+
     # Single-representation magnitude regularization.  IntFold observed
     # activation explosions in later PairFormer transitions preceding the
     # gradient spikes from the diffusion loss backward; a mild penalty on
