@@ -390,10 +390,13 @@ def _extract_a3m(tar_bytes: bytes, n_chains: int, use_env: bool, use_pairing: bo
             blocks[current_key] = "".join(current_lines)
         return blocks
 
-    # Extract tar.gz in memory
+    # Extract the result tar in memory. Mode "r:*" rather than "r:gz": the
+    # ColabFold API returns gzip, but some compatible servers (DeepFold's
+    # otalign endpoint) return the tar uncompressed, which "r:gz" rejects
+    # outright with "not a gzip file". Transparent mode reads both.
     file_contents: dict[str, str] = {}
     m8_text = ""
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
         for member in tar.getmembers():
             if not member.isfile():
                 continue
