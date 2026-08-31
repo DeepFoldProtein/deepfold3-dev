@@ -203,11 +203,23 @@ AF3_INTERFACE_LDDT = {
 # row, where there is no published number to fall back to at all.
 #
 # `af3_ref` was folded template-free (the bench attached no `templates` field
-# until MAX_TEMPLATES landed in 949e5de), which is AlphaFold3's weakest supported
-# mode: on identical targets it trails the published AF3 by 3.8 points on
-# protein-protein and 9.9 on antibody-antigen. Every current df3 series folds
-# WITH templates, so a df3-minus-af3_ref delta is biased toward df3 by that
-# unquantified amount. Drop the entry once af3_ref is re-folded with templates.
+# until MAX_TEMPLATES landed in 949e5de) while every current df3 series folds
+# WITH templates, so a df3-minus-af3_ref delta is biased toward df3. That bias
+# used to be unquantified, and the 3.8 / 9.9 points af3_ref trails the published
+# AF3 by on protein-protein / antibody-antigen were assumed to be it.
+#
+# MEASURED 2026-08-31 against `af3_ref_tmpl` (same AF3 weights, same seeds and
+# samples, re-folded on the template-carrying inputs — templates the only
+# variable). The bias is small on the interface categories, mean DockQ:
+#
+#   protein-peptide     +0.073  (succ 68.6% -> 71.4%, n=35)
+#   antibody-antigen    +0.021  (succ 36.2% -> 36.2%, n=138)
+#   protein-protein     +0.005  (succ 66.7% -> 65.8%, n=240)
+#
+# So the caveat stays on the label — the fold IS template-free and peptide really
+# is affected — but it is now a quantified sub-point correction on pp/agab, not a
+# reason to read af3_ref as a loose floor. It also means the gap to the published
+# AF3 is not a template artefact and needs its own explanation.
 REF_SERIES_CAVEAT = {"af3_ref": "template-free"}
 
 # Categories where a ref series' fold is not comparable at all, so no line is

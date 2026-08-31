@@ -83,13 +83,32 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 # least `template_cutoff_days` before the query (11.4% of bench chains list
 # their own PDB entry as a hit, so the filter is not optional).
 #
-# The bench folded template-free until now, which is in-distribution for the
-# model (training draws k = min(Uniform[0, n_avail], 4), so k = 0 happens) but
-# is its weakest supported mode, and it made `af3_ref` a handicapped AlphaFold3:
-# on identical targets our template-free fold trails the published AF3 by 3.8
-# points on protein-protein and 9.9 on antibody-antigen — which is why af3_ref is
-# drawn with a "template-free" caveat rather than as a bare AF3 baseline
-# (see REF_SERIES).
+# The bench folded template-free until 2026-08, which is in-distribution for the
+# model (training draws k = min(Uniform[0, n_avail], 4), so k = 0 happens) but is
+# its weakest supported mode, so `af3_ref` was assumed to be a badly handicapped
+# AlphaFold3 — the 3.8 points it trails the published AF3 by on protein-protein
+# and the 9.9 on antibody-antigen were both attributed to the missing templates.
+#
+# MEASURED 2026-08-31 and that attribution is wrong. `af3_ref_tmpl` is the same
+# AF3 weights re-folded through this pipeline against the current
+# template-carrying inputs (4 seeds x 5 samples, everything else identical), so
+# templates are the ONLY variable. What they are worth, mean DockQ / succ@0.23:
+#
+#   protein-peptide     +0.073   68.6% -> 71.4%   (n=35)
+#   antibody-antigen    +0.021   36.2% -> 36.2%   (n=138)
+#   protein-protein     +0.005   66.7% -> 65.8%   (n=240)
+#
+# So templates buy AF3 almost nothing on the two interface categories we care
+# about most, and the gap to the published numbers is NOT a template artefact —
+# it is target-subset (num_tokens-capped) plus whatever our inference stack
+# costs. Peptide is the one category where the handicap is real, and there it is
+# worth ~half the DF3-minus-AF3 delta (+0.173 -> +0.100 after correction).
+#
+# Practical consequence: on protein-protein and antibody-antigen `af3_ref` is
+# usable as a like-for-like AF3 reference with a correction of well under one
+# point, NOT as a loose floor. On protein-peptide, quote `af3_ref_tmpl`.
+# `af3_ref_tmpl` covers those three categories only, which is why REF_SERIES
+# still defaults to `af3_ref`.
 #
 # CAUTION: turning this on changes the bench inputs, so numbers before and after
 # are not comparable. Do not flip it in the same window as a training-side
