@@ -46,7 +46,14 @@ import torch
 from deepfold3.scripts import cli
 
 
-def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str, msa_crop_size: int | None = None):
+def _load_model_once(
+    params: Path,
+    snapshot: str,
+    dev: torch.device,
+    optim: str,
+    msa_crop_size: int | None = None,
+    matmul_precision: str = "auto",
+):
     """Load weights + build model. Returns ``(model, model_cfg)``.
 
     Same as the top half of ``inference``. Extracted so batch loops can
@@ -105,8 +112,12 @@ def _load_model_once(params: Path, snapshot: str, dev: torch.device, optim: str,
         src = "flag" if msa_crop_size is not None else "default (MSA pool cap)"
         click.echo(f"[batch] msa_crop_size {prev} -> {want} per recycle [{src}]")
 
-    if optim and optim != "none":
+    if matmul_precision != "auto":
+        torch.set_float32_matmul_precision(matmul_precision)
+        click.echo(f"[batch] float32 matmul precision: {matmul_precision}")
+    elif optim and optim != "none":
         torch.set_float32_matmul_precision("high")
+    if optim and optim != "none":
         click.echo(f"[batch] optimizations: {optim}")
 
     model = DeepFold3(model_cfg)
@@ -362,6 +373,16 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
     show_default=True,
 )
+@click.option(
+    "--matmul-precision",
+    default="auto",
+    type=click.Choice(["auto", "highest", "high", "medium"]),
+    show_default=True,
+    help=(
+        "float32 matmul precision. 'auto' = TF32 whenever --optim is not 'none' "
+        "(historical behaviour); 'highest' forces true fp32 matmuls."
+    ),
+)
 @click.option("--plot-confidences", is_flag=True, default=False)
 @click.option(
     "--save-distogram/--no-save-distogram",
@@ -409,6 +430,7 @@ def inference_batch(
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
     optim: str,
+    matmul_precision: str,
     plot_confidences: bool,
     save_distogram: bool,
     logits_scheme: str,
@@ -438,7 +460,7 @@ def inference_batch(
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     click.echo(f"[batch] device: {dev}")
 
-    model, model_cfg = _load_model_once(params, snapshot, dev, optim, msa_crop_size)
+    model, model_cfg = _load_model_once(params, snapshot, dev, optim, msa_crop_size, matmul_precision)
 
     seed_list = list(dict.fromkeys(seeds))
 

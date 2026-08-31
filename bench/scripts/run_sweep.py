@@ -99,6 +99,7 @@ def run_step(
     seeds: list[int],
     snapshot: str,
     msa_crop_size: int | None = None,
+    matmul_precision: str = "auto",
 ) -> None:
     params = resolve_ckpt(series, step)
     if params is None:
@@ -151,6 +152,8 @@ def run_step(
             snapshot,
             "--optim",
             "inference",
+            "--matmul-precision",
+            matmul_precision,
             "--num-samples",
             str(num_samples),
             "--num-recycles",
@@ -200,6 +203,17 @@ def main() -> None:
         "once per seed (FoldBench uses 4). Default: 42.",
     )
     ap.add_argument("--snapshot", default="average", choices=["auto", "average", "shadow", "fast"])
+    ap.add_argument(
+        "--matmul-precision",
+        default="auto",
+        choices=["auto", "highest", "high", "medium"],
+        help=(
+            "float32 matmul precision passed to inference-batch. 'auto' = TF32 "
+            "(the historical bench setting); 'highest' = true fp32 matmuls, for "
+            "measuring what TF32 costs. Fold into a SEPARATE series — numbers "
+            "from the two settings are not comparable."
+        ),
+    )
     args = ap.parse_args()
 
     gpus = [int(g) for g in args.gpus.split(",") if g != ""]
@@ -213,12 +227,12 @@ def main() -> None:
         f"[sweep] series={args.series} steps={steps} gpus={gpus} "
         f"samples={args.num_samples} recycles={args.num_recycles} "
         f"msa_crop={args.msa_crop_size or 'ckpt'} "
-        f"seeds={seeds} snapshot={args.snapshot}"
+        f"seeds={seeds} snapshot={args.snapshot} matmul={args.matmul_precision}"
     )
     for step in steps:
         run_step(
             args.series, step, args.category, gpus, args.num_samples, args.num_recycles,
-            seeds, args.snapshot, args.msa_crop_size,
+            seeds, args.snapshot, args.msa_crop_size, args.matmul_precision,
         )
 
 

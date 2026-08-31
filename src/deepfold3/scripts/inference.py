@@ -145,6 +145,18 @@ from deepfold3.scripts._common import load_pt_snapshot, pin_cuda_device
     help="Optimization preset: inference (default, Triton+tiling), recommended (training), triton (no tiling), none, all (testing)",
 )
 @click.option(
+    "--matmul-precision",
+    default="auto",
+    type=click.Choice(["auto", "highest", "high", "medium"]),
+    show_default=True,
+    help=(
+        "float32 matmul precision (torch.set_float32_matmul_precision). 'auto' "
+        "keeps the historical behaviour: TF32 ('high') whenever --optim is not "
+        "'none', untouched otherwise. 'highest' forces true fp32 matmuls — "
+        "slower, but the reference for whether TF32 costs coordinate accuracy."
+    ),
+)
+@click.option(
     "--plot-confidences",
     is_flag=True,
     default=False,
@@ -177,6 +189,7 @@ def inference(
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
     optim: str | None,
+    matmul_precision: str,
     plot_confidences: bool,
     logits_scheme: str,
 ) -> None:
@@ -282,8 +295,12 @@ def inference(
         src = "flag" if msa_crop_size is not None else "default (MSA pool cap)"
         click.echo(f"[inference] msa_crop_size {prev} -> {want} per recycle [{src}]")
 
-    if optim and optim != "none":
+    if matmul_precision != "auto":
+        torch.set_float32_matmul_precision(matmul_precision)
+        click.echo(f"[inference] float32 matmul precision: {matmul_precision}")
+    elif optim and optim != "none":
         torch.set_float32_matmul_precision("high")  # TF32 for better perf
+    if optim and optim != "none":
         click.echo(f"[inference] optimizations: {optim}")
 
     model = DeepFold3(model_cfg)
