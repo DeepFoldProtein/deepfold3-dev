@@ -692,3 +692,233 @@ class TestPairFormerLayer0Jax:
             rtol=5e-3,
             err_msg="PairFormer layer 0: single output mismatch",
         )
+
+
+# ---------------------------------------------------------------------------
+# Diffusion transformer (AF3 diffusion_transformer.py)
+#
+# The diffusion head is 55% of AF3's parameters and had no JAX parity coverage:
+# the tests above verify the trunk's building blocks, which leaves the module
+# that actually turns the trunk's pair representation into coordinates unchecked.
+# ---------------------------------------------------------------------------
+
+
+def jax_adaptive_layernorm(x, single_cond, cond_norm_w, scale_w, scale_b, bias_w):
+    """AF3 ``diffusion_transformer.adaptive_layernorm`` (lines 32-60).
+
+    ``x`` is normalised with NO scale/offset; ``single_cond`` with scale only
+    (``create_offset=False``); the pair of projections then give AdaLN's
+    ``sigmoid(scale) * x + bias``.
+    """
+    xn = jax_layer_norm(x, 1.0, 0.0)
+    cn = jax_layer_norm(single_cond, cond_norm_w, 0.0)
+    single_scale = jax_linear(cn, scale_w, scale_b)
+    single_bias = jax_linear(cn, bias_w)
+    return jax.nn.sigmoid(single_scale) * xn + single_bias
+
+
+def jax_adaptive_zero_init(x, single_cond, out_w, cond_w, cond_b):
+    """AF3 ``adaptive_zero_init`` (lines 63-85) — AdaLN-zero output gate.
+
+    NOTE the gate reads the RAW ``single_cond``, not the layer-normed copy the
+    AdaLN above uses. Feeding it the normed one is a silent, plausible-looking
+    error, which is exactly why it is pinned here.
+    """
+    output = jax_linear(x, out_w)
+    cond = jax_linear(single_cond, cond_w, cond_b)
+    return jax.nn.sigmoid(cond) * output
+
+
+def _randomise(module, seed=0, std=0.3):
+    """Give every parameter a non-degenerate value.
+
+    AdaLN-zero ships several projections zero-initialised and the gate biases at
+    -2, so a freshly built block is partly a no-op: leaving it at init would let
+    a wrong wiring pass by multiplying zeros. Every test below randomises first.
+    """
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in module.parameters():
+            p.copy_(torch.randn(p.shape, generator=g) * std)
+
+
+class TestDiffusionAdaLayerNormJax:
+    def test_matches_jax(self):
+        from deepfold3.model.primitives import AdaLayerNorm
+
+        torch.manual_seed(0)
+        C, CS = 64, 48
+        ada = AdaLayerNorm(C, CS)
+        _randomise(ada, seed=1)
+
+        x = torch.randn(3, 7, C)
+        cond = torch.randn(3, 7, CS)
+        with torch.no_grad():
+            out_pt = ada(x, cond)
+
+        out_jax = jax_adaptive_layernorm(
+            jnp.array(_np(x)),
+            jnp.array(_np(cond)),
+            jnp.array(_np(ada.cond_norm_weight)),
+            jnp.array(_haiku_w(ada.cond_scale.weight)),
+            jnp.array(_np(ada.cond_scale.bias)),
+            jnp.array(_haiku_w(ada.cond_bias.weight)),
+        )
+        np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=1e-5, rtol=1e-5)
+
+
+class TestDiffusionTransitionJax:
+    """AF3 ``transition_block`` with ``single_cond`` (lines 87-121)."""
+
+    def test_matches_jax(self):
+        from deepfold3.model.primitives import AdaTransitionBlock
+
+        torch.manual_seed(0)
+        C, CS, F = 64, 48, 2
+        tb = AdaTransitionBlock(C, CS, num_intermediate_factor=F)
+        _randomise(tb, seed=2, std=0.15)
+
+        x = torch.randn(2, 5, C)
+        cond = torch.randn(2, 5, CS)
+        with torch.no_grad():
+            out_pt = tb(x, cond)
+
+        xj, cj = jnp.array(_np(x)), jnp.array(_np(cond))
+        act = jax_adaptive_layernorm(
+            xj, cj,
+            jnp.array(_np(tb.cond_norm_weight)),
+            jnp.array(_haiku_w(tb.cond_scale.weight)),
+            jnp.array(_np(tb.cond_scale.bias)),
+            jnp.array(_haiku_w(tb.cond_bias.weight)),
+        )
+        act = jax_linear(act, jnp.array(_haiku_w(tb.linear1.weight)))
+        a, b = jnp.split(act, 2, axis=-1)          # contiguous split, not interleaved
+        act = jax.nn.swish(a) * b
+        out_jax = jax_adaptive_zero_init(
+            act, cj,
+            jnp.array(_haiku_w(tb.linear2.weight)),
+            jnp.array(_haiku_w(tb.zero_cond.weight)),
+            jnp.array(_np(tb.zero_cond.bias)),
+        )
+        np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=1e-5, rtol=1e-5)
+
+
+def _jax_diffusion_self_attention(x, mask, pair_logits, single_cond, blk, num_head):
+    """AF3 ``diffusion_transformer.self_attention`` (lines 129-186), unbatched."""
+    key_dim = blk.to_k.weight.shape[0] // num_head
+    value_dim = blk.to_v.weight.shape[0] // num_head
+
+    bias = (1e9 * (mask - 1.0))[..., None, None, :]
+    xn = jax_adaptive_layernorm(
+        x, single_cond,
+        jnp.array(_np(blk.attn_cond_norm_w)),
+        jnp.array(_haiku_w(blk.attn_cond_scale.weight)),
+        jnp.array(_np(blk.attn_cond_scale.bias)),
+        jnp.array(_haiku_w(blk.attn_cond_bias.weight)),
+    )
+    n = xn.shape[-2]
+    q = (jax_linear(xn, jnp.array(_haiku_w(blk.to_q.weight)), jnp.array(_np(blk.to_q.bias)))
+         .reshape(n, num_head, key_dim))
+    k = jax_linear(xn, jnp.array(_haiku_w(blk.to_k.weight))).reshape(n, num_head, key_dim)
+    v = jax_linear(xn, jnp.array(_haiku_w(blk.to_v.weight))).reshape(n, num_head, value_dim)
+
+    logits = jnp.einsum("qhc,khc->hqk", q * key_dim ** (-0.5), k) + bias
+    if pair_logits is not None:
+        logits = logits + pair_logits
+    weights = jax.nn.softmax(logits, axis=-1)
+    weighted_avg = jnp.einsum("hqk,khc->qhc", weights, v).reshape(n, num_head * value_dim)
+
+    # `gating_query` passes bias_init=1.0 but NOT use_bias=True, and hm.Linear
+    # gates the parameter on use_bias (default False) — so there is no bias here
+    # and LinearNoBias is right. The stray bias_init is dead in the reference.
+    gate_logits = jax_linear(xn, jnp.array(_haiku_w(blk.to_g.weight)))
+    weighted_avg = weighted_avg * jax.nn.sigmoid(gate_logits)
+
+    return jax_adaptive_zero_init(
+        weighted_avg, single_cond,
+        jnp.array(_haiku_w(blk.out_proj.weight)),
+        jnp.array(_haiku_w(blk.zero_cond.weight)),
+        jnp.array(_np(blk.zero_cond.bias)),
+    )
+
+
+class TestDiffusionSelfAttentionJax:
+    """Attention half of the block: mask bias, pair bias, gating, AdaLN-zero out."""
+
+    @pytest.mark.parametrize("with_pair", [False, True])
+    def test_matches_jax(self, with_pair):
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        torch.manual_seed(0)
+        C, CS, H, N = 64, 48, 4, 9
+        blk = DiffusionTransformerBlock(C, CS, num_heads=H, num_intermediate_factor=2)
+        _randomise(blk, seed=3, std=0.12)
+
+        x = torch.randn(N, C)
+        cond = torch.randn(N, CS)
+        mask = torch.ones(N)
+        mask[-2:] = 0.0                                    # exercise the 1e9 mask bias
+        pair = torch.randn(H, N, N) * 0.5 if with_pair else None
+
+        # Run only the attention half: FFN gate zeroed so its residual drops out.
+        with torch.no_grad():
+            blk.ffn_zero_cond.bias.fill_(-40.0)            # sigmoid(-40) ~ 0
+            blk.ffn_zero_cond.weight.zero_()
+            out_pt = blk(x.unsqueeze(0), mask.unsqueeze(0), cond.unsqueeze(0),
+                         None if pair is None else pair.unsqueeze(0))[0]
+
+        delta = _jax_diffusion_self_attention(
+            jnp.array(_np(x)), jnp.array(_np(mask)),
+            None if pair is None else jnp.array(_np(pair)),
+            jnp.array(_np(cond)), blk, H,
+        )
+        out_jax = jnp.array(_np(x)) + delta
+        np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=2e-5, rtol=2e-5)
+
+
+class TestDiffusionTransformerBlockJax:
+    """The assembled block: ``act += self_attention(act)``, then ``act += transition(act)``.
+
+    Layer-level parity is not implied by the two halves passing — the residual
+    order and which activation feeds the FFN are exactly the kind of wiring that
+    a per-half test cannot see.
+    """
+
+    def test_matches_jax(self):
+        from deepfold3.model.diffusion import DiffusionTransformerBlock
+
+        torch.manual_seed(0)
+        C, CS, H, N = 64, 48, 4, 9
+        blk = DiffusionTransformerBlock(C, CS, num_heads=H, num_intermediate_factor=2)
+        _randomise(blk, seed=4, std=0.12)
+
+        x = torch.randn(N, C)
+        cond = torch.randn(N, CS)
+        mask = torch.ones(N)
+        mask[-1] = 0.0
+        pair = torch.randn(H, N, N) * 0.5
+
+        with torch.no_grad():
+            out_pt = blk(x.unsqueeze(0), mask.unsqueeze(0), cond.unsqueeze(0), pair.unsqueeze(0))[0]
+
+        xj, cj = jnp.array(_np(x)), jnp.array(_np(cond))
+        act = xj + _jax_diffusion_self_attention(
+            xj, jnp.array(_np(mask)), jnp.array(_np(pair)), cj, blk, H
+        )
+        ffn = jax_adaptive_layernorm(
+            act, cj,
+            jnp.array(_np(blk.ffn_cond_norm_w)),
+            jnp.array(_haiku_w(blk.ffn_cond_scale.weight)),
+            jnp.array(_np(blk.ffn_cond_scale.bias)),
+            jnp.array(_haiku_w(blk.ffn_cond_bias.weight)),
+        )
+        ffn = jax_linear(ffn, jnp.array(_haiku_w(blk.ffn_linear1.weight)))
+        a, b = jnp.split(ffn, 2, axis=-1)
+        ffn = jax.nn.swish(a) * b
+        out_jax = act + jax_adaptive_zero_init(
+            ffn, cj,
+            jnp.array(_haiku_w(blk.ffn_linear2.weight)),
+            jnp.array(_haiku_w(blk.ffn_zero_cond.weight)),
+            jnp.array(_np(blk.ffn_zero_cond.bias)),
+        )
+        np.testing.assert_allclose(_np(out_pt), np.array(out_jax), atol=2e-5, rtol=2e-5)

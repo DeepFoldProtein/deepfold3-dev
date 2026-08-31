@@ -79,6 +79,21 @@ Function-scoped (fresh per test):
 
 **JAX comparison**: critical for architecture equivalence. Helper functions convert between PyTorch and Haiku weight layouts (`_haiku_w` transposes `[out, in]` → `[in, out]`).
 
+Coverage is per-module, and the gap matters as much as the tests: the trunk's
+building blocks (LayerNorm, TransitionBlock, TriangleMul, OuterProductMean, the
+three attentions, one PairFormer layer) and the diffusion transformer
+(`AdaLayerNorm`, `AdaTransitionBlock`, diffusion self-attention with mask + pair
+bias, and the assembled `DiffusionTransformerBlock`) are pinned against a JAX
+reimplementation of the AF3 reference. `atom_cross_attn`, `template_embedding`,
+`confidence`, and the assembled forward with recycling are NOT — a converted-AF3
+divergence can still live there.
+
+Randomise before comparing (`_randomise`): AdaLN-zero ships several projections
+zero-initialised and its gate biases at -2, so a freshly built block is partly a
+no-op and a wrong wiring passes by multiplying zeros. New parity tests should be
+mutation-checked — break the wiring on purpose and confirm the test fails —
+since a test that cannot fail adds coverage only on paper.
+
 **Batch support**: explicit tests verifying unbatched `[N, ...]` and batched `[B, N, ...]` produce consistent results.
 
 **Markers**:
