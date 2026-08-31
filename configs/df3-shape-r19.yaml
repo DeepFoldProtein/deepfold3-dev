@@ -1,0 +1,56 @@
+base: df3-stage0-r19.yaml
+
+# Shape-complementarity arm — the live r19 config plus one weight, nothing else.
+#
+#   deepfold3 train --output runs/df3-shape-r19 \
+#       --config configs/df3-shape-r19.yaml \
+#       --resume runs/df3-stage0-r19/checkpoint_70000.pt
+#
+# `--resume`, NOT `--params`. This is the whole point of the file and it is easy
+# to get wrong:
+#
+#   * `--resume` restores `global_step = 70000`, so the LR lands on r19's own
+#     schedule — 0.9e-3 x 0.95^(70000 // 50000) = **8.55e-4**, the value the live
+#     run is on right now — and the next decay is shared at step 100k. It also
+#     restores the optimizer moments, the EMA shadow and the sampler position, so
+#     the arm continues from r19's exact optimizer state.
+#   * `--params` would reset the step counter to 0. The arm would then re-run the
+#     1000-step warmup from ~0 and afterwards sit at the undecayed **9.0e-4**
+#     (+5.3% against the control) until its own step 50k. A warmup dip plus a 5%
+#     LR offset is a second and a third knob, and both act on exactly the
+#     trajectory this arm is trying to measure.
+#
+# The resume audit is warn-only and the scheduler fields are yaml-wins on resume,
+# so a changed `alpha_shape_comp` resumes cleanly.
+#
+# Base is `df3-stage0-r19.yaml`, not `stage0.yaml`. The two are NOT
+# interchangeable here: stage0 carries `start_decay_after: 1000` against r19's
+# `0`, which offsets every decay window by 1000 steps. Basing on stage0 would
+# have made this a two-knob arm against the live run.
+#
+# Because the config is otherwise byte-identical to the live r19, **r19 itself is
+# the control** — matched architecture, data, schedule, optimizer state and warm
+# start. No second baseline run is needed.
+#
+# What to expect, and what not to. The term is a refinement objective with a
+# ~8 A radius of action. On the real failed AbAg structures it descends from the
+# predicted pose in 26-31% of the wrong-pose classes against 79% where the pose
+# is already acceptable (`export/ilddt-vs-dockq/shapecomp_probe.csv`), and ~62%
+# of those failures start at or above the loss's own saturation floor. The
+# readable prize is the 1-4 A band — DockQ Medium -> High, `fnat`, clash rate —
+# NOT the `never` fraction and NOT the AbAg gap. Report at N-matched sample
+# budget and carry the monomer control (lDDT / TM) to show folding did not pay
+# for it.
+#
+# Self-logged diagnostics: `shape_comp_coverage` (samples with a scorable
+# protein-protein interface; 0.575 at crop 384), `shape_comp_l1_token` (the
+# interpretable raw-L1 scale), `shape_comp_glob_gt` vs `shape_comp_glob_pred`,
+# and the three raw Huber terms.
+#
+# Smoke on this configuration (200 steps from checkpoint_65500 against an
+# alpha=0 twin): step time +0.93%, peak memory +0.1 GB, coverage 0.575.
+#
+# Full investigation: `export/shape-complementarity/`.
+
+training:
+  alpha_shape_comp: 3.0e-2

@@ -4,7 +4,7 @@ training:
   wandb_project: deepfold3-stage1
 
   alpha_bond: 1.0
-  alpha_smooth_lddt: null
+  alpha_smooth_lddt: 1.0
 
   accumulate_grad_batches: 2
   batch_size_per_rank: 1
@@ -13,3 +13,5 @@ training:
   max_atoms: 6912
   diffusion_batch_size: 32
   diffusion_chunk_size: 8
+
+  alpha_shape_comp: 0.03
