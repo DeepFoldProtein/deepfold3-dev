@@ -109,8 +109,17 @@ def fold_breakdown(series: str, category: str):
             tgt_mean[pdb] = {mk: sum(md[mk].values()) / len(md[mk]) for mk in metrics if md[mk]}
             ranks = rank_ts.get(pdb, {})
             if ranks:
-                best_sk = max(ranks, key=ranks.get)
-                cvals = {mk: md[mk][best_sk] for mk in metrics if best_sk in md.get(mk, {})}
+                # Mean over the samples TIED at the top ranking_score — see
+                # eval_ost.conf_pick / _run.rank1_value. `max(ranks, key=...)`
+                # silently resolved ties by dict insertion order, i.e. raw-CSV
+                # row order, which is itself not stable across evals.
+                top = max(ranks.values())
+                tied = [sk for sk, v in ranks.items() if v == top]
+                cvals = {}
+                for mk in metrics:
+                    vals = [md[mk][sk] for sk in tied if sk in md.get(mk, {})]
+                    if vals:
+                        cvals[mk] = sum(vals) / len(vals)
                 if cvals:
                     tgt_conf[pdb] = cvals
         by_cls = defaultdict(lambda: defaultdict(list))
@@ -406,10 +415,11 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt", select:
     rows to per-(seed, sample) values, then reduce over the target's samples:
 
     - ``select='mean'`` : mean over samples (the confidence-free floor).
-    - ``select='conf'`` : the confidence top-1 sample's value (highest
-      ``ranking_score``). Yields nothing when the raw CSV predates the
-      ranking_score column (pre-confidence-head evals), so the conf line is
-      simply absent for those steps.
+    - ``select='conf'`` : the confidence top-1 value — the highest
+      ``ranking_score`` sample, meaned over everything tied at that score (about
+      half of targets tie at the stored 4-decimal precision). Yields nothing when
+      the raw CSV predates the ranking_score column (pre-confidence-head evals),
+      so the conf line is simply absent for those steps.
     """
     out = []
     eval_root = BENCH / "runs" / series / "eval" / category
@@ -436,7 +446,12 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt", select:
                 cand = [(ranks[sk], sk) for sk in d if sk in ranks]
                 if not cand:
                     continue
-                per_t.append(d[max(cand)[1]])
+                # Mean over the tied top, not `max(cand)` — that broke ties on the
+                # (seed, sample) key, an arbitrary pick that disagreed with the
+                # other two rank-1 sites on the same quantity.
+                top = max(sc for sc, _ in cand)
+                tied = [d[sk] for sc, sk in cand if sc == top]
+                per_t.append(sum(tied) / len(tied))
             else:
                 per_t.append(sum(d.values()) / len(d))
         if not per_t:

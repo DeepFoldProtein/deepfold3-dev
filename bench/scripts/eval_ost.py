@@ -184,26 +184,42 @@ def _fnum(v):
 
 
 def conf_pick(rs: list[dict], key: str):
-    """Confidence top-1 value of ``key``: the metric of the sample with the
-    highest ``ranking_score``, skipping samples whose ``key`` is missing (e.g.
-    OST failed for that interface). ``None`` if no ranked sample has a value.
+    """Confidence top-1 value of ``key``: the metric of the highest-``ranking_score``
+    sample, MEANED over every sample tied at that score. Samples whose ``key`` is
+    missing (e.g. OST failed for that interface) are skipped; ``None`` if no
+    ranked sample has a value.
+
+    The tie rule is not a detail. ``ranking_score`` is stored to 4 decimals and a
+    converged run's samples for one target sit within ~5e-4, so roughly half of
+    targets have a tied top score. This function used to keep the first row with
+    a strictly greater score, i.e. the first tied row — and row order here comes
+    from ``as_completed`` over a thread pool, so it varied between runs of the
+    SAME cached OST results: re-aggregating df3v5r19s1 moved conf success by
+    +0.72 / +1.45 / -0.72 points on steps 72k / 76k / 78k, pure re-run noise on
+    top of every conf_* number. Picking the best tied sample instead would be
+    worse — that peeks at the answer and is a mini-oracle. Averaging the tied set
+    is what a ranking that cannot separate those samples gives you in
+    expectation, and it does not depend on order. Same rule as
+    ``export/foldbench-compare/_run.py:rank1_value``, which documents the history.
 
     Selection is by the whole-prediction ``ranking_score`` (0.8·ipTM+0.2·pTM),
     so for interfaces every row of a given (seed, sample) shares the score and
     the pick reflects the model's own top-ranked structure — the deployed number
     between the mean floor and the oracle (best-of-N) ceiling.
     """
-    best = best_score = None
+    scored = []
     for r in rs:
         v = r.get(key)
         if not isinstance(v, (int, float)):
             continue
         s = _fnum(r.get("ranking_score"))
-        if s is None:
-            continue
-        if best_score is None or s > best_score:
-            best_score, best = s, v
-    return best
+        if s is not None:
+            scored.append((s, v))
+    if not scored:
+        return None
+    top = max(s for s, _ in scored)
+    tied = [v for s, v in scored if s == top]
+    return sum(tied) / len(tied)
 
 
 def evaluate(series: str, step: int, category: str, workers: int, force: bool = False) -> None:
