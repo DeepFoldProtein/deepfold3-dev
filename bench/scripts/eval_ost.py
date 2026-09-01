@@ -156,6 +156,26 @@ def mean(xs):
     return round(sum(xs) / len(xs), 4) if xs else None
 
 
+def median(xs):
+    """Median of the numeric entries, or None when there are none.
+
+    Reported alongside ``mean`` for DockQ because the two answer different
+    questions on these distributions. Antibody-antigen DockQ is strongly
+    left-piled — most interfaces sit well below the 0.23 cut and the successes
+    live in the tail — so the mean is pulled around by a handful of targets
+    while the median tracks where the bulk actually is. Measured across
+    df3v5r19s1 steps 72k-82k the median moved with the oracle success rate
+    (CV 8.1% against oracle's 10.2%) where whole-model ``mean_ilddt`` did not
+    (CV 0.9%, desensitised by the unscored antibody H-L interface).
+    """
+    xs = sorted(x for x in xs if isinstance(x, (int, float)))
+    if not xs:
+        return None
+    n = len(xs)
+    mid = xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+    return round(mid, 4)
+
+
 def _fnum(v):
     try:
         return float(v)
@@ -324,6 +344,9 @@ def evaluate(series: str, step: int, category: str, workers: int, force: bool = 
             "mean_dockq": mean(mean_dq),
             "oracle_dockq": mean(oracle_dq),
             "conf_dockq": mean(conf_dq),
+            "median_dockq": median(mean_dq),
+            "oracle_median_dockq": median(oracle_dq),
+            "conf_median_dockq": median(conf_dq),
             "mean_lddt": mean(mean_ld),
             "conf_lddt": mean(conf_ld),
             "mean_bb_lddt": mean(mean_bld),
@@ -343,6 +366,8 @@ def evaluate(series: str, step: int, category: str, workers: int, force: bool = 
             f"mean={summary['success_rate_mean']}% conf={summary['success_rate_conf']}%  "
             f"mean_dockq={summary['mean_dockq']} oracle_dockq={summary['oracle_dockq']} "
             f"conf_dockq={summary['conf_dockq']}  "
+            f"median_dockq={summary['median_dockq']} "
+            f"oracle_median={summary['oracle_median_dockq']}  "
             f"ost_failed={n_ost_failed}"
         )
     else:

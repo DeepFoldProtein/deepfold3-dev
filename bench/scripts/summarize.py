@@ -608,6 +608,29 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     zorder=11,
                     label="conf top-1 success",
                 )
+            # Oracle DockQ MEDIAN, on the same 0-1 axis as the tier fractions.
+            # The stack says what fraction clears each cut; this says where the
+            # bulk of the distribution actually sits, which on antibody-antigen
+            # is a different story — the DockQ distribution is left-piled, so the
+            # median sits far below the cut while the success rate is carried by
+            # the tail. It also moves when the whole-model iLDDT panel below does
+            # not: on df3v5r19s1 72k-82k the median tracked oracle success
+            # (CV 8.1% vs 10.2%) while mean_ilddt was flat at CV 0.9%, because
+            # iLDDT includes the antibody H-L interface that DockQ never scores.
+            # Present only from the step median_dockq was added to eval_ost.
+            omed = [(int(x["step"]), fnum(x.get("oracle_median_dockq"))) for x in summaries]
+            omed = [(st, v) for st, v in omed if v is not None]
+            if omed:
+                axd.plot(
+                    [p[0] for p in omed],
+                    [p[1] for p in omed],
+                    "-^",
+                    color="#b2182b",
+                    lw=1.8,
+                    ms=5,
+                    zorder=12,
+                    label="oracle DockQ median",
+                )
             axd.set_ylim(0, 1.0)
             axd.set_ylabel("fraction of interfaces")
             axd.set_title(f"DockQ CAPRI tiers — oracle (best-of-N)  n={tiers[-1]['n']}")
