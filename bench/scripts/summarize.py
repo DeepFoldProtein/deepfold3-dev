@@ -636,6 +636,16 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
             omed = [(int(x["step"]), fnum(x.get("oracle_median_dockq"))) for x in summaries]
             omed = [(st, v) for st, v in omed if v is not None]
             if omed:
+                # The 0.23 cut, so the median line can be READ. The median and the
+                # stack are different quantities that happen to share 0-1 — one is
+                # a DockQ value, the other a fraction of interfaces — so their
+                # relative heights mean nothing. The only relation between them is
+                # the identity `median >= 0.23  <=>  stack >= 0.5`: half the
+                # interfaces clear the cut exactly when the median does. Drawing
+                # the cut turns the line into that statement instead of an
+                # invitation to compare it against the bars.
+                _cut = DOCKQ_TIERS[0][2]  # 0.23, the acceptable-tier floor
+                axd.axhline(_cut, color="#b2182b", alpha=0.35, lw=1.0, ls=":", zorder=3)
                 axd.plot(
                     [p[0] for p in omed],
                     [p[1] for p in omed],
@@ -644,10 +654,10 @@ def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> N
                     lw=1.8,
                     ms=5,
                     zorder=12,
-                    label="oracle DockQ median",
+                    label=f"oracle DockQ median (cut {_cut})",
                 )
             axd.set_ylim(0, 1.0)
-            axd.set_ylabel("fraction of interfaces")
+            axd.set_ylabel("fraction of interfaces   |   DockQ")
             axd.set_title(f"DockQ CAPRI tiers — oracle (best-of-N)  n={tiers[-1]['n']}")
             # Secondary axis: oracle QS-score (collapse-sensitive interface quality)
             # over the DockQ tiers — makes the decoupling visible (blob-inflated DockQ
