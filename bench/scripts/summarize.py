@@ -252,17 +252,31 @@ def af3_tag() -> str:
     return f"AF3{_REF_CAVEAT_TAG}"
 
 
-def resolve_ref_series(ref_series: str, series: str) -> str:
+def resolve_ref_series(ref_series: str, series: str, category: str = "") -> str:
     """``ref_series`` with self-reference stripped; stamps the handicap caveat.
 
     A caveated series is drawn (not refused) and ``af3_tag()`` starts returning
     the annotated name, so the caveat rides along on every label rather than
     living only in a comment.
+
+    Per-category upgrade: when a ``<ref>_tmpl`` sibling has been folded for THIS
+    category, prefer it. That is the same weights re-folded on the current
+    template-carrying inputs, so it drops the template-free handicap and the
+    caveat with it. It exists only for the categories it was re-folded on
+    (protein-protein, antibody-antigen, protein-peptide as of 2026-08-31), and
+    every other panel silently keeps the template-free series rather than losing
+    its measured overlay — which is why the upgrade is per category and not a
+    change of REF_SERIES.
     """
     global _REF_CAVEAT_TAG
     _REF_CAVEAT_TAG = ""
     if ref_series == series:  # don't draw a series' reference line against itself
         return ""
+    if category and not ref_series.endswith("_tmpl"):
+        tmpl = f"{ref_series}_tmpl"
+        if _ref_row(tmpl, category) is not None:
+            print(f"[summary] reference '{ref_series}' -> '{tmpl}' for {category} (re-folded with templates)")
+            ref_series = tmpl
     caveat = REF_SERIES_CAVEAT.get(ref_series)
     if caveat:
         _REF_CAVEAT_TAG = f" ({caveat})"
@@ -469,7 +483,7 @@ def interface_metric_dist(series: str, category: str, col: str = "lddt", select:
 
 
 def summarize(series: str, category: str, plot: bool, ref_series: str = "") -> None:
-    ref_series = resolve_ref_series(ref_series, series)
+    ref_series = resolve_ref_series(ref_series, series, category)
     if category in REF_SERIES_EXCLUDE_CATEGORIES.get(ref_series, ()):
         print(
             f"[summary] {ref_series}/{category}: fold not comparable "
