@@ -71,17 +71,36 @@ monomers AtlasFold is unsure of (pLDDT < 85) carry 84% of K-Fold's monomer defic
 Antibody–antigen runs the other way: the lead is largest on confidently folded chains
 (+18.8 pts over DF3, +16.4 over AF3), so it does not come from building the chains better.
 
-### Controls on the antibody–antigen lead
+### Controls: release date and K-Fold's validation overlap
+
+RCSB initial release dates (`export/kfold-foldbench/foldbench_small_release_dates.csv`; 903 of
+904 PDB entries, 8PNI has none) put **no FoldBench-small target in any category on or before
+2022-12-31** — the earliest is 2023-01-18. Cutting at the later of K-Fold's two stated training
+cutoffs therefore leaves every table above unchanged (`--after 2022-12-31` drops only the
+undated 8PNI interface). The stricter cut also removes 2023, the docstring's validation year:
+
+| released ≥ 2024-01-01, rank-1 | n | AF3 | DF3 r19 @120k | K-Fold |
+|---|---:|---:|---:|---:|
+| protein monomer † (lDDT) | 158 | 0.878 | **0.883** | 0.852 |
+| protein–protein (DockQ ≥ 0.23) | 109 | **63.3%** | **63.3%** | 56.9% |
+| antibody–antigen (DockQ ≥ 0.23) | 63 | 34.9% | 30.2% | **49.2%** |
+| protein–peptide (DockQ ≥ 0.23) | 21 | **81.0%** | 76.2% | 61.9% |
+| protein–DNA † (iLDDT) | 88 | 0.651 | **0.683** | 0.663 |
+
+RNA monomers, DNA monomers and protein–RNA keep only 8 / 4 / 15 targets after 2023.
 
 | antibody–antigen, rank-1 success | n | AF3 | DF3 r19 @120k | K-Fold |
 |---|---:|---:|---:|---:|
 | all targets | 138 | 41.3% | 32.6% | 50.0% |
-| released after 2023-06-01 | 107 | 40.2% | 32.7% | 49.5% |
+| released after 2023-06-01 (FoldBench's dates) | 107 | 40.2% | 32.7% | 49.5% |
 | without K-Fold's 2023 validation entries (`v261230`) | 118 | 39.0% | 30.5% | 49.2% |
+| released ≥ 2024-01-01 (RCSB dates) | 63 | 34.9% | 30.2% | 49.2% |
 
-The lead holds under both controls: 16.8–18.7 pts over DF3 and 8.7–10.2 pts over AF3. The
-same exclusion leaves protein–protein at 66.0 / 65.0 / 61.0% (AF3 / DF3 / K-Fold, n = 200).
-Both controls: `compare_series.py --after 2023-06-01` and
+The antibody–antigen lead holds under every control — 16.8–19.0 pts over DF3, 8.7–14.3 over
+AF3 — with K-Fold's own rate fixed at 49.2–50.0% while AF3's falls on the later targets. The
+protein–protein deficit is as stable (−6.2 pts on all targets, −6.4 on ≥ 2024; −4.0 without
+`v261230`). Commands: `compare_series.py --dates export/kfold-foldbench/foldbench_small_release_dates.csv
+--after 2023-12-31`, `--after 2023-06-01`, and
 `--exclude-ids references/kfold/assets/splits/v261230/validation_ids.txt`.
 
 ### Training cutoff, from the K-Fold source
@@ -94,8 +113,8 @@ Both controls: `compare_series.py --after 2023-06-01` and
   `assets/splits/v251213/validation_ids.txt` spans 2021-10-06 – 2023-01-11 (the code), while
   `v261230/validation_ids.txt` spans 2023-01-04 – 2023-12-27 (the docstring). No config ties
   the released weights (`kfold-260720`) to either.
-- Every dated FoldBench-small entry was released 2023-01-18 – 2024-03-27, after both
-  training cutoffs. **194 of them are in `v261230`'s validation list** (including 15 in
+- Every FoldBench-small entry RCSB dates (903 / 904) was released 2023-01-18 – 2024-10-30,
+  after both training cutoffs. **194 of them are in `v261230`'s validation list** (including 15 in
   antibody–antigen, 38 in protein–protein, 50 in protein–DNA) — not trained on, but available
   for checkpoint selection. The exclusion control above removes them.
 - Not stated anywhere in the code: the distillation sets, and the AtlasFold / AtlasLM cutoffs.

@@ -414,8 +414,15 @@ def main() -> None:
         "--after",
         default=None,
         metavar="YYYY-MM-DD",
-        help="Keep only targets released after this date (training-cutoff control), from "
-        "export/foldbench-compare/data/foldbench_target_dates.csv.",
+        help="Keep only targets released after this date (training-cutoff control), per --dates.",
+    )
+    ap.add_argument(
+        "--dates",
+        type=Path,
+        default=REPO / "export" / "foldbench-compare" / "data" / "foldbench_target_dates.csv",
+        help="CSV of pdb_id (target id, e.g. 7st5-assembly1) and released (YYYY-MM-DD). The default covers "
+        "protein-protein and antibody-antigen only; export/kfold-foldbench/foldbench_small_release_dates.csv "
+        "(RCSB initial release) covers every category.",
     )
     ap.add_argument(
         "--exclude-ids",
@@ -429,7 +436,7 @@ def main() -> None:
 
     keep = None
     if args.after:
-        dates = REPO / "export" / "foldbench-compare" / "data" / "foldbench_target_dates.csv"
+        dates = args.dates
         keep = {r["pdb_id"] for r in csv.DictReader(open(dates)) if (r.get("released") or "") > args.after}
         print(f"[compare] --after {args.after}: {len(keep)} FoldBench targets released later")
     drop: set[str] = set()
