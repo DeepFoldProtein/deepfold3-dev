@@ -376,17 +376,17 @@ Optional WandB integration: `--wandb <project>`. Logs train/eval losses, learnin
 
 ## Data Requirements
 
-Training data directory structure:
+Training data directory structure (`format: df3`; every file is sharded by the first two characters of its id, see `data/paths.py`). The inventory of every dataset on `/data`, including the `of3` / `of3pdb` layouts, is in [datasets.md](datasets.md).
 
 ```
 data_dir/
-├── manifest.json             # Record index (optional — auto-scanned if missing)
-├── structures/
-│   ├── {id}.npz              # Structure files (atoms, residues, chains, bonds)
-│   └── ...
+├── manifest.json                            # Record index (optional — auto-scanned if missing)
+├── structures/{ab}/{id}.npz                 # Structure (atoms, residues, chains, bonds)
+├── templates/{ab}/{id}.json                 # Multimer template index (optional)
+├── monomer_templates/{ab}/{msa_id}.json     # Monomer template index, per sequence (optional)
 └── msa/
-    ├── {msa_id}.npz          # MSA files (sequences, mask, deletion_matrix)
-    └── ...
+    ├── unpaired/{ab}/{msa_id}.npz           # MSA (sequences, mask, deletion_matrix)
+    └── paired/{ab}/{id}_paired_{hash}.npz   # Paired MSA (optional)
 ```
 
 Records are loaded via `discover_records()` from `data/prepare/manifest.py`: reads `manifest.json` if present, otherwise scans `structures/` for NPZ files.
