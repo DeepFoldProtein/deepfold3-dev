@@ -30,9 +30,21 @@ uv sync --dev
 
 ## Quick Start
 
-### 1. Convert weights
+### 1. Get weights
 
-Convert official AF3 parameters to safetensors format. `--af3-ref` should point to a local clone of [google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3) (used to read Haiku scope names):
+**Trained DeepFold3 weights** are hosted on Hugging Face at [`vv137/deepfold3`](https://huggingface.co/vv137/deepfold3) (private — log in with an account that has access). `huggingface_hub` is not a project dependency, so run the `hf` CLI through `uvx`:
+
+```bash
+uvx --from huggingface_hub hf auth login
+uvx --from huggingface_hub hf download vv137/deepfold3 \
+    df3-stage1-r19/checkpoint_120000.safetensors \
+    --local-dir resources/
+# -> resources/df3-stage1-r19/checkpoint_120000.safetensors, pass it as --params
+```
+
+The repo's model card lists every checkpoint with its run, step, weight snapshot, and SHA-256.
+
+**Official AF3 parameters** can be converted to safetensors instead. `--af3-ref` should point to a local clone of [google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3) (used to read Haiku scope names):
 
 ```bash
 deepfold3 convert \
