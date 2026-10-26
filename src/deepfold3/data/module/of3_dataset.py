@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
-from deepfold3.data import const
+from deepfold3.data import const, pack
 from deepfold3.data.crop.cropper import Cropper
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.io_cache import read_npz
@@ -273,13 +273,19 @@ def discover_of3_records(
                     ids.append(line)
         logger.info("Loaded %d OF3 structure IDs from %s", len(ids), list_path)
     else:
-        # Fast directory scan — no stat beyond is_dir()
-        with os.scandir(of3_dir) as it:
-            for entry in it:
-                if entry.is_dir(follow_symlinks=False):
-                    ids.append(entry.name)
-        ids.sort()
-        logger.info("Scanned %d OF3 structures from %s", len(ids), of3_dir)
+        if (rd := pack.reader_for(of3_dir)) is not None:
+            # Packed set without ids.txt: one id per packed structure.npz.
+            suffix = "/structure.npz"
+            ids = sorted(k.decode()[: -len(suffix)] for k in rd.iter_keys_with_suffix(suffix))
+            logger.info("Listed %d OF3 structures from pack %s", len(ids), rd.pack_dir)
+        else:
+            # Fast directory scan — no stat beyond is_dir()
+            with os.scandir(of3_dir) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        ids.append(entry.name)
+            ids.sort()
+            logger.info("Scanned %d OF3 structures from %s", len(ids), of3_dir)
 
         # Cache to ids.txt so subsequent runs (and other DDP ranks) skip the scan.
         # Atomic write via temp file + rename to avoid DDP race conditions.
@@ -368,6 +374,9 @@ class OF3Dataset(torch.utils.data.Dataset):
         # See ``TrainingDataset.__init__`` for the full rationale.
         self.name = name
         self.of3_dir = Path(of3_dir)
+        pack.register(self.of3_dir)
+        if mmcif_dir:
+            pack.register(mmcif_dir)
         self.max_tokens = max_tokens
         self.max_atoms = max_atoms
         self.max_msa_seqs = max_msa_seqs
@@ -425,14 +434,14 @@ class OF3Dataset(torch.utils.data.Dataset):
 
         # 1. Load and convert structure
         struct_npz = sample_dir / "structure.npz"
-        if not struct_npz.exists():
+        if not pack.exists(struct_npz):
             raise FileNotFoundError(f"OF3 structure not found: {struct_npz}")
         structure, live_record = convert_of3_structure(struct_npz, pdb_id=struct_id)
 
         # 2. Load and convert MSA (optional)
         unpaired_msa: dict[int, MSA] = {}
         aln_npz = sample_dir / "alignment.npz"
-        if aln_npz.exists():
+        if pack.exists(aln_npz):
             try:
                 msa = convert_of3_alignment(aln_npz, max_seqs=self.max_msa_seqs)
                 if msa.sequences.size > 0:
@@ -444,7 +453,7 @@ class OF3Dataset(torch.utils.data.Dataset):
         template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None
         if self.mmcif_dir is not None:
             tpl_npz = sample_dir / "template.npz"
-            if tpl_npz.exists():
+            if pack.exists(tpl_npz):
                 template_feats_per_chain = self._load_templates(tpl_npz, live_record)
 
         # 4. Build Input (monomer: no paired MSA)

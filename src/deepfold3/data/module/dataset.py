@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
-from deepfold3.data import const
+from deepfold3.data import const, pack
 from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols, remap_msa_col_idx_to_slice
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.feature.ref_atoms import get_ref_atoms
@@ -380,7 +380,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         # time. Pre-scanning would walk hundreds of thousands of files per worker
         # under DDP and is unnecessary — kernel dentry cache makes the per-record
         # exists() effectively free after the first hit.
-        self._has_masks = (self.data_dir / "masks").is_dir()
+        pack.register(self.data_dir)
+        self._has_masks = pack.is_dir(self.data_dir / "masks")
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
         self.max_templates = max_templates
         self.template_cutoff_days = template_cutoff_days
@@ -395,8 +396,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.template_struct_space = template_struct_space
         # One-shot guard for the legacy-index warning in ``_indices_are_struct``.
         self._warned_index_space = False
-        self._has_templates = (self.data_dir / "templates").is_dir()
-        self._has_monomer_templates = (self.data_dir / "monomer_templates").is_dir()
+        self._has_templates = pack.is_dir(self.data_dir / "templates")
+        self._has_monomer_templates = pack.is_dir(self.data_dir / "monomer_templates")
         # Per-chain template cache (memory LRU + hierarchical sharded disk).
         # Replaces the per-hit full-mmCIF gemmi parse with a cached per-chain
         # slice — the dominant, query-size-independent dataloader-stall cost.
@@ -433,7 +434,7 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         # Load structure
         struct_path = structure_path(self.data_dir / "structures", record.id)
-        if not struct_path.exists():
+        if not pack.exists(struct_path):
             raise FileNotFoundError(f"Structure file not found: {struct_path}")
         structure = Structure.load(struct_path)
 
@@ -485,7 +486,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         # Skip disk-stored masks even when present — see _DISK_TOKEN_MASKS_ENABLED.
         if _DISK_TOKEN_MASKS_ENABLED and self._has_masks:
             mp = mask_path(self.data_dir / "masks", record.id)
-            if mp.exists():
+            if pack.exists(mp):
                 tokenized = tokenized.with_mask(TokenMask.load(str(mp)))
 
         # Synthesize the per-token loss-weight channel from mol_type when the
@@ -548,7 +549,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                 template_feats_per_chain = self._load_monomer_templates(record, surviving_asym, dropped_chain_ids)
             elif self._has_templates:
                 tpl_index = template_path(self.data_dir / "templates", record.id)
-                if tpl_index.exists():
+                if pack.exists(tpl_index):
                     # AF3 §2.4 sampling (``k = min(Uniform[0, n_avail],
                     # max_templates)``) is applied inside
                     # ``_load_multimer_templates`` from the actual hit count.
@@ -629,7 +630,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             if cols is None:
                 continue  # ligand / chain contributes no MSA column to the crop
             msa_path = unpaired_msa_path(msa_dir, str(chain_info.msa_id))
-            if msa_path.exists():
+            if pack.exists(msa_path):
                 m = self._load_msa_sliced(msa_path, cols)
                 if m is not None:
                     unpaired_msa[cid] = m
@@ -655,7 +656,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                     _count_drop("MSA file missing (self-MSA fallback)", f"{record.id} chain {cid}: {msa_path}")
             if chain_info.paired_msa_id is not None:
                 paired_path = paired_msa_path(msa_dir, str(chain_info.paired_msa_id))
-                if paired_path.exists():
+                if pack.exists(paired_path):
                     m = self._load_msa_sliced(paired_path, cols)
                     if m is not None:
                         paired_msa[cid] = m
@@ -817,7 +818,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             if skip_chain_ids and chain_info.chain_id in skip_chain_ids:
                 continue
             tpl_path = monomer_template_path(templates_root, str(chain_info.msa_id))
-            if not tpl_path.exists():
+            if not pack.exists(tpl_path):
                 continue
             try:
                 hits = load_monomer_template_hits(tpl_path)

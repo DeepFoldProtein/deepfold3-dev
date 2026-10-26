@@ -767,6 +767,25 @@ unresolved atoms (rewritten to `0` + `is_present=False`), and `chain_id`, which 
 OF3's integer-valued chain **key** rather than a chain letter (`label_asym_id`
 supplies the letter). See `docs/training.md` § _Importing from OpenFold 3_.
 
+### Packed data roots (`data/pack.py`)
+
+Any data root can be replaced by a **pack** — `{root}/_pack/` with tar shards
+and a sorted index (`keys.npy` relative paths, `loc.npy` shard/offset/size) —
+for filesystems with a per-account file-count quota (Hangang Lustre: 5M per
+group vs ~63M training files). Loaders keep building ordinary paths; the
+dataset constructors and `PdbChainCache` call `pack.register(root)`, and the
+read sites go through `io_cache.read_npz`, `pack.exists` / `pack.is_dir` /
+`pack.read_json`, so a packed and an unpacked root are interchangeable. A path
+under a registered root that is missing from the index is an authoritative
+miss when the pack covers that subtree (`meta.json` `include`, or the first
+path component for whole-tree packs) and a filesystem passthrough otherwise —
+that is how `manifest.json`, `ids.txt` and `df3_cache/` stay plain files next
+to `_pack/`. A packed chain cache is read-only (cold parses are not written
+back). Build with `deepfold3 pack` (resumable; size-balanced shards; threaded
+read-ahead for NFS sources), check with `deepfold3 pack-verify`; the Hangang
+workflow is in `hangang/README.md`. Verified on `patchr_training`: 100 samples
+tensor-identical between the packed and unpacked root.
+
 ## Batch Collation (`data/module/collate.py`)
 
 ```python

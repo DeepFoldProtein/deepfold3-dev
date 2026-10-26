@@ -38,6 +38,7 @@ class _LazyGroup(click.Group):
         import deepfold3.scripts.inspect_example  # noqa: F401
         import deepfold3.scripts.msa_batch  # noqa: F401
         import deepfold3.scripts.msa_search  # noqa: F401
+        import deepfold3.scripts.pack  # noqa: F401
         import deepfold3.scripts.plm_prepare  # noqa: F401
         import deepfold3.scripts.plm_train  # noqa: F401
         import deepfold3.scripts.plot_confidences  # noqa: F401

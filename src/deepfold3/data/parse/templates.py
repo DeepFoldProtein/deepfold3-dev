@@ -387,19 +387,20 @@ def read_pdb_mmcif_local(pdb_id: str, pdb_mmcif_dir: Path) -> str | None:
         pdb_mmcif_dir / mid2 / f"{pdb_id}.cif",
     ]
 
+    from deepfold3.data import pack
+
+    pack.register(pdb_mmcif_dir)
     for path in candidates:
-        if path.is_file():
+        if pack.is_file(path):
             logger.debug("Found local template %s at %s", pdb_id, path)
             s = str(path)
+            raw = pack.read_file(path)
             if s.endswith(".zst"):
-                dctx = zstd.ZstdDecompressor()
-                with open(path, "rb") as f:
-                    return dctx.decompress(f.read()).decode("utf-8")
+                return zstd.ZstdDecompressor().decompress(raw).decode("utf-8")
             elif s.endswith(".gz"):
-                with gzip.open(path, "rt", encoding="utf-8") as f:
-                    return f.read()
+                return gzip.decompress(raw).decode("utf-8")
             else:
-                return path.read_text()
+                return raw.decode("utf-8")
 
     return None
 

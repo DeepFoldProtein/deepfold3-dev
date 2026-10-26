@@ -44,6 +44,14 @@ Three rules are in use. A path built with the wrong one looks valid and points a
 
 The df3 key comes from whichever id names the file, so the fan-out follows that id's alphabet: 256 shards for SHA-256 ids (`msa/unpaired/`, `monomer_templates/`), up to 324 for PDB ids (247 in `patchr_training`), and only 90 (`10`–`99`) for teddymer's numeric record ids.
 
+## Packed copies (`_pack/`)
+
+Any root above can also exist as a pack: `{root}/_pack/` (tar shards + index)
+next to its small plain files. The loaders read either form unchanged
+(`data/pack.py`, `docs/data-pipeline.md` § _Packed data roots_). The packed
+staging tree for Hangang, built by `hangang/pack_all.sh`, mirrors this volume
+with ~6k files in place of ~63M.
+
 ## `format: df3`
 
 Written by `deepfold3 prepare` / `import-*` / `msa-batch` / `prepare-templates`, read by `TrainingDataset`:

@@ -474,9 +474,10 @@ def save_template_hits(hits: list[MultimerTemplateHit], path: Path) -> None:
 
 
 def load_template_hits(path: Path) -> list[MultimerTemplateHit]:
-    """Load multimer template hits from a JSON file."""
-    with open(path) as f:
-        data = json.load(f)
+    """Load multimer template hits from a JSON file (read through a pack when registered)."""
+    from deepfold3.data import pack
+
+    data = pack.read_json(path)
     return [
         MultimerTemplateHit(
             template_pdb_id=d["template_pdb_id"],
@@ -501,7 +502,8 @@ def save_monomer_template_hits(hits: list[MonomerTemplateHit], path: Path) -> No
 
 
 def load_monomer_template_hits(path: Path) -> list[MonomerTemplateHit]:
-    """Load per-sequence monomer template hits from a JSON file."""
-    with open(path) as f:
-        data = json.load(f)
+    """Load per-sequence monomer template hits from a JSON file (read through a pack when registered)."""
+    from deepfold3.data import pack
+
+    data = pack.read_json(path)
     return [MonomerTemplateHit(**{"index_space": None, **d}) for d in data]

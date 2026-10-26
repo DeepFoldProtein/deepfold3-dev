@@ -79,6 +79,9 @@ deepfold3 drop-obsolete --data-dir /data/training --delete-files
 deepfold3 refilter      --data-dir /data/training --max-unk-fraction 0.10 --max-tight-clashes 5
 deepfold3 export-complexes --data-dir /data/training --output complexes.json
 deepfold3 build-masks   --data-dir /data/training --json-dir /data/patchr/inpainting --workers 32
+deepfold3 pack          --src /data/distillation/afdb_nvda --include structures --include msa --include monomer_templates --exclude '*.tar.gz' --out /packed/distillation/afdb_nvda/_pack --workers 32
+deepfold3 pack          --src /data/distillation/long_monomers/preprocessed --ids-file ids.txt --member structure.npz --member alignment.npz --member template.npz --out /packed/distillation/long_monomers/preprocessed/_pack
+deepfold3 pack-verify   --pack /packed/distillation/afdb_nvda/_pack --src /data/distillation/afdb_nvda --sample 2000 --checksums
 deepfold3 inspect-example --data-dir /data/training --id 7jyb
 deepfold3 inspect-example --data-dir /data/training --id 7jyb,8qy0,1pfe --json
 deepfold3 train     --data-dir /data/training --output runs/exp1 --params weights.safetensors
@@ -180,13 +183,14 @@ src/deepfold3/
 │   ├── masking.py        # TokenMask (per-token mask channels for loss control: fixed, region)
 │   ├── ccd.py            # CcdMolecule, load_ccd_molecule(), smiles_to_molecule()
 │   ├── paths.py          # shard(), structure_path, mask_path, template_path — sharded layout helpers
+│   ├── pack.py           # packed data roots: tar shards + sorted index, read transparently (register/read_bytes/exists/is_dir)
 │   ├── msa/             # mmseqs2.py (search) + paths.py (unpaired_msa_path, paired_msa_path)
 │   ├── parse/            # mmcif.py (mol_type_from_gemmi), a3m.py (parse_a3m + convert_a3m_file_to_npz), templates.py (find_pdb_mmcif_path), template_realign.py, hhr.py, json_input.py (4 dialects), pdb_chain_cache.py (PdbChainCache: per-chain template cache, mem LRU + sharded disk)
 │   ├── tokenize/         # tokenizer.py (Input → Tokenized)
 │   ├── crop/             # cropper.py (contiguous + spatial + interface-seeded)
 │   ├── sample/           # weighted.py (WeightedClusterSampler — AF3-style cluster-balanced)
 │   ├── feature/          # ref_atoms.py (CCD), featurizer.py (Tokenized → Tensor dict)
-│   ├── prepare/          # structure.py (mmCIF→NPZ + AF3-aligned metadata extract), filters.py, manifest.py (atomic save), clustering.py, template_search.py, materialize.py (parallel A3M→NPZ runner), entries_idx.py (wwPDB TSV parser), openfold3.py (OF3 AtomArray NPZ → Structure), of3_pdb_cache.py (OF3 dataset-cache JSON → mmap'd columnar cache; no LMDB)
+│   ├── prepare/          # structure.py (mmCIF→NPZ + AF3-aligned metadata extract), filters.py, manifest.py (atomic save), clustering.py, template_search.py, materialize.py (parallel A3M→NPZ runner), entries_idx.py (wwPDB TSV parser), openfold3.py (OF3 AtomArray NPZ → Structure), of3_pdb_cache.py (OF3 dataset-cache JSON → mmap'd columnar cache; no LMDB), pack_build.py (`deepfold3 pack` / `pack-verify`)
 │   └── module/           # dataset.py (TrainingDataset, InferenceInput), of3_dataset.py (format: of3), of3_pdb_dataset.py (format: of3pdb — OF3 pdb_training_set in place), collate.py (batch)
 ├── complexlm/       # Complex language model (MLM over multi-chain complexes)
 │   ├── config.py         # ComplexLMConfig (layer_pattern = the architecture ablation), Data/Train/Source/Masking
@@ -222,6 +226,7 @@ src/deepfold3/
 │   ├── inspect_example.py # `deepfold3 inspect-example`
 │   ├── msa_batch.py      # `deepfold3 msa-batch`
 │   ├── msa_search.py     # `deepfold3 msa`
+│   ├── pack.py           # `deepfold3 pack`, `pack-verify`
 │   ├── plm_prepare.py    # `deepfold3 plm-prepare {structure,pairs,cluster,stats}`
 │   ├── plm_train.py      # `deepfold3 plm-train`
 │   ├── plot_confidences.py # `deepfold3 plot`
@@ -232,6 +237,8 @@ src/deepfold3/
 │   ├── train.py          # `deepfold3 train`
 │   └── warmup_triton.py  # `deepfold3 warmup-triton`
 └── params.py        # read_af3_params() (zstd decompression)
+
+hangang/                     # KISTI Hangang: pack_all.sh, transfer.sh, env.sh, setup_env.sh, check.sbatch, submit.sh + train.sbatch (see hangang/README.md)
 
 scripts/                     # Shell scripts for database setup and GPU server
 ├── setup_databases.sh       # Download and index UniRef30, ColabFoldDB, PDB100

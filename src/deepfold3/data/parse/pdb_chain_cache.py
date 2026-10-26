@@ -47,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from deepfold3.data import const
+from deepfold3.data import const, pack
 from deepfold3.data.paths import shard
 
 logger = logging.getLogger(__name__)
@@ -289,6 +289,11 @@ class PdbChainCache:
     ):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.mmcif_dir = Path(mmcif_dir) if mmcif_dir else None
+        # A packed cache is read-only: cold parses still fill the memory LRU
+        # but are not written back (the pack cannot grow, and writing loose
+        # files beside it is exactly the file count packing removes).
+        self._disk_writable = self.cache_dir is not None and not pack.register(self.cache_dir)
+        pack.register(self.mmcif_dir)
         self.mem_capacity = max(1, int(mem_capacity))
         self.max_atoms = max_atoms
         # (pdb_lower, chain_id) -> ChainTemplate | _NEG
@@ -335,14 +340,16 @@ class PdbChainCache:
         """Disk lookup. Returns ChainTemplate (hit), ``_NEG`` (known miss via
         sentinel), or ``None`` (unknown — needs a parse)."""
         path = chain_cache_path(self.cache_dir, pdb_id, chain_id)
-        if path.exists():
+        if pack.exists(path):
             try:
-                with np.load(path, allow_pickle=False) as data:
+                # Not ``read_npz``: this tier is re-read constantly (~99.8% hit
+                # rate), so its pages must stay cached.
+                with np.load(pack.open_binary(path), allow_pickle=False) as data:
                     return _deserialize(data)
             except (OSError, ValueError, EOFError, KeyError) as e:
                 logger.debug("Corrupt chain cache %s: %s — reparsing", path, e)
                 return None
-        if pdb_done_path(self.cache_dir, pdb_id).exists():
+        if pack.exists(pdb_done_path(self.cache_dir, pdb_id)):
             return _NEG  # PDB parsed, this chain absent → known miss
         return None
 
@@ -362,7 +369,7 @@ class PdbChainCache:
         if st is None:
             return None
         chains = extract_chains_from_structure(st, self.max_atoms)
-        if self.cache_dir is not None:
+        if self._disk_writable:
             for cname, ct in chains.items():
                 try:
                     _atomic_write_npz(chain_cache_path(self.cache_dir, pdb_id, cname), **_serialize(ct))

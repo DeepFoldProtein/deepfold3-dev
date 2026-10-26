@@ -80,9 +80,17 @@ def read_npz(path: str | Path, *, allow_pickle: bool = False) -> Any:
         allow_pickle: Forwarded to :func:`numpy.load`. Required by the
             OpenFold-3 alignment / template files, which store object arrays.
 
+    A path under a registered pack (:mod:`deepfold3.data.pack`) is read from
+    its shard instead, with the same page-cache policy applied to the range.
+
     Returns:
         Whatever :func:`numpy.load` returns for this file.
     """
+    from deepfold3.data import pack
+
+    packed = pack.read_bytes(path, drop_cache=_drop_page_cache)
+    if packed is not None:
+        return np.load(io.BytesIO(packed), allow_pickle=allow_pickle)
     if not _drop_page_cache:
         return np.load(path, allow_pickle=allow_pickle)
     with open(path, "rb") as f:

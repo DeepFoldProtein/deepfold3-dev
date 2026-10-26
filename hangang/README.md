@@ -1,0 +1,110 @@
+# Training on Hangang (KISTI 6th supercomputer)
+
+Hangang's Lustre `/scratch` gives a group **80 TB and 5M files**, purges files
+not read for **15 days**, and its GPU nodes are **aarch64 GH200 ×4**. The
+unpacked training data is ~63M files, so it moves as **packs**: each bulky
+subtree becomes `_pack/` (a few thousand tar shards + a sorted index, see
+[`src/deepfold3/data/pack.py`](../src/deepfold3/data/pack.py)). The loaders read
+packs transparently — configs and code paths are unchanged, only `/data` →
+`/scratch/$USER/deepfold3/data`.
+
+```
+local (source host)                          Hangang
+───────────────────                          ───────
+/store/deepfold3/data   ──pack_all.sh──▶  /store/deepfold3/packed  ──transfer.sh──▶  /scratch/$USER/deepfold3/data
+(63M files, symlinks)                     (~6k files, ~40 TB)       (data mover)     (same tree)
+```
+
+| Script | Where | What |
+| --- | --- | --- |
+| `pack_all.sh` | source host | build the packed staging tree (resumable, verifies each pack) |
+| `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover) |
+| `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_SLURM_*` and `DF3_OFI_NCCL_LIB`** |
+| `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen` |
+| `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
+| `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
+| `keepalive.sh` | Hangang | report files close to the 15-day purge (optionally refresh atime) |
+| `smoke_data.py` | (called by `check.sbatch`) | builds the real DataLoader from a config and times it |
+
+## 1. Build the packed tree (source host)
+
+```bash
+cd /store/deepfold3/deepfold3-dev
+bash hangang/pack_all.sh                     # all steps; re-run to resume
+ONLY="patchr_training afdb_nvda" bash hangang/pack_all.sh
+```
+
+`$DEST` (default `/store/deepfold3/packed`) mirrors `/data`:
+
+```
+packed/
+├── components.cif.gz  ccd_cache.json  mmcif_meta.json
+├── pdb/cache/_pack                       template chain cache (mmCIF + assemblies)
+├── pdb/divided/_pack                     mmCIF mirror (the of3 sets parse it for templates)
+├── pdb_training_set/{_pack, df3_cache/, df3_cache_val/}
+└── distillation/
+    ├── long_monomers/preprocessed/{_pack, ids.txt}
+    ├── short_monomers/preprocessed/{_pack, ids.txt}
+    ├── afdb_nvda/{_pack, manifest.json}
+    ├── teddymer/{_pack, manifest.json}
+    └── patchr_training/{_pack, manifest.json, ...}
+```
+
+Each `_pack/` holds `meta.json`, `keys.npy`, `loc.npy`, `SHA256SUMS`,
+`shards/*.tar` and a local-only `_build/` (resume state, not transferred).
+Shards are plain tar files: `tar tf shards/00000.tar` lists the original paths.
+
+## 2. Transfer (source host → Hangang data mover)
+
+```bash
+export HANGANG_USER=<kisti-id>
+bash hangang/transfer.sh connect       # OTP + password once; the master connection lives 24 h
+bash hangang/transfer.sh push          # STREAMS=8 parallel rsync; re-run to resume
+bash hangang/transfer.sh verify        # every shard's sha256, every other file's sha256
+bash hangang/transfer.sh status        # anything missing or short
+```
+
+Push a small set first (`ONLY="distillation/patchr_training" bash hangang/transfer.sh push`)
+to measure the line rate; at 1 GB/s the full ~40 TB takes ~11 h, at 100 MB/s ~5 days.
+The data mover (`hangang-dm.ksc.re.kr`) has no CPU-time limit, unlike the login nodes.
+
+## 3. Environment and pre-flight (Hangang)
+
+```bash
+ssh <kisti-id>@hangang.ksc.re.kr                       # GPU login node (aarch64)
+cd /scratch/$USER/deepfold3/deepfold3-dev               # repo copied/cloned here
+vi hangang/env.sh                                       # DF3_SLURM_FIELD/APPL (showappl), DF3_OFI_NCCL_LIB
+bash hangang/setup_env.sh
+sbatch --comment="$(source hangang/env.sh; df3_slurm_comment)" hangang/check.sbatch
+```
+
+`check.sbatch` must end with `=== check passed`. In its smoke-test section
+every dataset should report `pack` (not `plain`/`MISSING`), and the per-dataset
+sample counts should show `msa>1` and `templates` for most samples.
+
+## 4. Train
+
+```bash
+bash hangang/submit.sh df3-hangang-001                  # 8 nodes = 32 GH200, 5 × 24 h links
+NODES=16 EXTRA_ARGS="--wandb deepfold3-stage0" bash hangang/submit.sh df3-hangang-002
+```
+
+`train.sbatch` writes `$RUNS/<run>/config.yaml` once (from `configs/initial.yaml`
+with `/data/` → `$DATA/`) and every link reuses it. Ten minutes before the
+walltime the job asks the ranks to checkpoint (SIGTERM → `ShutdownCoordinator`);
+the next link resumes from the newest checkpoint.
+
+## Things to confirm on the machine
+
+- **Slingshot NCCL plugin.** The venv's NCCL wheel has no libfabric plugin;
+  without `DF3_OFI_NCCL_LIB` multi-node training falls back to TCP. Find the
+  system plugin (`kisti-container --doctor`, `module avail`) and check the job
+  log for `Selected provider is cxi`. Alternatively run inside the KISTI
+  Slingshot PyTorch image via `kisti-container --runtime pyxis --nccl ofi`.
+- **PyPI from the login node.** `setup_env.sh` needs it once; if blocked, build
+  the venv inside the KISTI PyTorch container instead.
+- **Purge policy.** Training keeps touched shards fresh; `keepalive.sh` reports
+  what is ageing. Ask KISTI before automating `--touch`. Anything purged can be
+  re-sent with `transfer.sh status` + `push`.
+- **Quota.** `check.sbatch` prints the file count under `$DF3_ROOT` and
+  `lfs quota`; the data is ~6k files, the venv ~30–50k.

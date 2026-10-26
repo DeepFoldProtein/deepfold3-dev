@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
-from deepfold3.data import const
+from deepfold3.data import const, pack
 from deepfold3.data.crop.cropper import Cropper, compute_chain_msa_cols, remap_msa_col_idx_to_slice
 from deepfold3.data.feature.featurizer import Featurizer
 from deepfold3.data.io_cache import read_npz
@@ -551,6 +551,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
     ):
         self.cache = cache
         self.root = Path(root)
+        pack.register(self.root)
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
         self.structures_dir = Path(
             structures_dir or self.root / "preprocessed_pdb_data" / "standard" / "structure_files"
@@ -561,12 +562,15 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         # pointed at the same root still gets templates instead of silently none.
         if template_cache_dir is None:
             template_cache_dir = self.root / "templates" / "train_template_cache"
-            if not template_cache_dir.is_dir():
+            if not pack.is_dir(template_cache_dir):
                 alt = self.root / "templates" / "val_template_cache"
-                if alt.is_dir():
+                if pack.is_dir(alt):
                     template_cache_dir = alt
         self.template_cache_dir = Path(template_cache_dir)
         self.template_array_dir = Path(template_array_dir or self.root / "templates" / "template_structure_arrays")
+        # Explicit dirs may live outside ``root``; each may carry its own pack.
+        for d in (self.structures_dir, self.alignment_dir, self.template_cache_dir, self.template_array_dir):
+            pack.register(d)
 
         self.name = name
         self.max_tokens = max_tokens
@@ -620,8 +624,8 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         # deliberately template-free run: every hit resolved to a missing array
         # file, got skipped at debug level, and training quietly proceeded at
         # T=0 with nothing in the log to say so. Fail loud once, up front.
-        self._has_templates = cache.has_templates and self.template_cache_dir.is_dir()
-        if self._has_templates and not self.template_array_dir.is_dir():
+        self._has_templates = cache.has_templates and pack.is_dir(self.template_cache_dir)
+        if self._has_templates and not pack.is_dir(self.template_array_dir):
             logger.warning(
                 "%s: template hits are present (%s) but the template geometry directory "
                 "%s does not exist — TEMPLATES ARE DISABLED for this dataset. Sync "
@@ -729,7 +733,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         pdb_id = self.cache.pdb_id(si)
 
         struct_npz = self.structures_dir / pdb_id / f"{pdb_id}.npz"
-        if not struct_npz.exists():
+        if not pack.exists(struct_npz):
             raise FileNotFoundError(f"OF3 structure not found: {struct_npz}")
         # build_record=False: every field a Record would carry is already in the
         # columnar cache (chain metadata, interfaces), and deriving it costs
@@ -871,7 +875,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
         for aid, rep in wanted.items():
             if rep not in blocks_by_rep:
                 path = self.alignment_dir / f"{rep}.npz"
-                if not path.exists():
+                if not pack.exists(path):
                     continue
                 try:
                     blocks_by_rep[rep] = read_of3_alignment(path, keys)
@@ -972,7 +976,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
                 # gap, burying any real one.
                 continue
             path = self.template_cache_dir / f"{meta.aln_rep_id}.npz"
-            if not path.exists():
+            if not pack.exists(path):
                 _count_drop("OF3 template hit list missing", f"{pdb_id} chain {aid}: {path}")
                 continue
             try:
@@ -1004,7 +1008,7 @@ class OF3PdbDataset(torch.utils.data.Dataset):
             feats: list[TemplateFeatures] = []
             for tid, hit in chosen:
                 arr_path = self.template_array_dir / tid.split("_")[0] / f"{tid}.npz"
-                if not arr_path.exists():
+                if not pack.exists(arr_path):
                     # A *partially* synced geometry tree passes the directory
                     # check in __init__ and then loses templates one file at a
                     # time. The k draw above already happened, so each miss
