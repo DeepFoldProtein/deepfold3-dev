@@ -181,16 +181,18 @@ training:
   wandb_run_name: null
 
 datasets:
-  # No `template_struct_space` below: the frame now travels with the data. Every
-  # hit in patchr / afdb_nvda / teddymer records `index_space: struct` (2.3M
-  # files back-filled by `deepfold3 stamp-template-index-space` on 2026-08-22),
-  # and the recorded value always wins over the flag. It stayed a config knob
-  # only because the index files predated the field, and it is the one setting
-  # whose being wrong is invisible — the two frames differ by each template's
-  # unresolved N-terminal count, so a wrong guess silently turns every template
-  # into noise. A NEW df3 source still needs the frame verified (re-derive each
-  # hit's identity and compare against the identity the search recorded; the
-  # correct frame agrees to ~1 pt) and then stamped, not set here.
+  # Template index frame: a hit's recorded `index_space` always wins; the
+  # `template_struct_space` flag is only the fallback for unstamped files. The
+  # /data copies of patchr / afdb_nvda / teddymer were back-filled with
+  # `index_space: struct` (2026-08-22), but the /store/database sources of
+  # afdb_nvda and teddymer are NOT stamped, so both carry the flag below
+  # (measured: 84% / 92% of hits re-derive their recorded identity under
+  # struct vs 20% / 22% under seqres). On stamped data it is a no-op. A wrong
+  # frame is invisible — the two differ by each template's unresolved
+  # N-terminal count, so templates silently become noise. A NEW df3 source
+  # needs the frame verified (re-derive each hit's identity and compare
+  # against the identity the search recorded; the correct frame agrees to
+  # ~1 pt) and then stamped or flagged.
   # - name: patchr
   #   data_dir: /data/distillation/patchr_training
   #   weight: 0.50
@@ -236,6 +238,7 @@ datasets:
     is_distillation: true
     format: df3
     max_template_date: "2018-04-30" # AFDB = AF2 predictions; AF2 template cutoff (AF3 §2.4)
+    template_struct_space: true # unstamped source; struct-space hits (see above)
     crop_weights: { contiguous: 0.1, spatial: 0.5, interface: 0.4 }
 
   - name: teddymer
@@ -245,6 +248,7 @@ datasets:
     is_distillation: true
     format: df3
     max_template_date: "2018-04-30" # AFDB = AF2 predictions
+    template_struct_space: true # unstamped source; struct-space hits (see above)
     crop_weights: { contiguous: 0.1, spatial: 0.5, interface: 0.4 }
 
   # ---------------------------------------------------------------------
