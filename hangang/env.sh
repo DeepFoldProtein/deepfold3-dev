@@ -23,9 +23,11 @@ export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${HOME}/.local/share/uv/p
 export UV_LINK_MODE=copy
 
 # Slurm accounting: every job must carry --comment="field=...;appl=..." with
-# values from `showappl` on a login node. Set these once.
-export DF3_SLURM_FIELD="${DF3_SLURM_FIELD:-CHANGE_ME}"
-export DF3_SLURM_APPL="${DF3_SLURM_APPL:-CHANGE_ME}"
+# values from `showappl` on a login node (AI-for-science, PyTorch DDP). The
+# same default is baked into the #SBATCH headers of check.sbatch/train.sbatch,
+# so keep them in sync if you change it; submit.sh passes this one explicitly.
+export DF3_SLURM_FIELD="${DF3_SLURM_FIELD:-sciai}"
+export DF3_SLURM_APPL="${DF3_SLURM_APPL:-pytorch-ddp}"
 
 # Multi-node NCCL over HPE Slingshot needs the libfabric (OFI) net plugin with
 # the CXI provider; without it NCCL silently falls back to TCP sockets. The

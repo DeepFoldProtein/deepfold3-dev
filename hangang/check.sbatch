@@ -3,11 +3,14 @@
 # Run after transfer.sh verify and setup_env.sh, before the first training job:
 #
 #   cd /scratch/$USER/deepfold3/deepfold3-dev      # jobs must be submitted from /scratch
-#   sbatch --comment="$(source hangang/env.sh; df3_slurm_comment)" hangang/check.sbatch
-#   CHECKSUMS=1 sbatch ... hangang/check.sbatch    # also re-hash every shard (slow: reads all data)
+#   sbatch hangang/check.sbatch
+#   CHECKSUMS=1 sbatch hangang/check.sbatch        # also re-hash every shard (slow: reads all data)
+#
+# Hangang rejects jobs without --comment="field=...;appl=..." (see env.sh).
 #
 #SBATCH --job-name=df3-check
 #SBATCH --partition=normal
+#SBATCH --comment="field=sciai;appl=pytorch-ddp"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72

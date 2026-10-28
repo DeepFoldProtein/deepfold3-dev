@@ -6,6 +6,7 @@
 #
 #SBATCH --job-name=df3
 #SBATCH --partition=normal
+#SBATCH --comment="field=sciai;appl=pytorch-ddp"
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=72
 #SBATCH --gres=gpu:4

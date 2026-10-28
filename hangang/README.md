@@ -19,7 +19,7 @@ local (source host)                          Hangang
 | --- | --- | --- |
 | `pack_all.sh` | source host | build the packed staging tree (resumable, verifies each pack) |
 | `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover) |
-| `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_SLURM_*` and `DF3_OFI_NCCL_LIB`** |
+| `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_OFI_NCCL_LIB`** (`DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp`) |
 | `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen` |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
 | `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
@@ -73,9 +73,9 @@ The data mover (`hangang-dm.ksc.re.kr`) has no CPU-time limit, unlike the login 
 ```bash
 ssh <kisti-id>@hangang.ksc.re.kr                       # GPU login node (aarch64)
 cd /scratch/$USER/deepfold3/deepfold3-dev               # repo copied/cloned here
-vi hangang/env.sh                                       # DF3_SLURM_FIELD/APPL (showappl), DF3_OFI_NCCL_LIB
+vi hangang/env.sh                                       # DF3_OFI_NCCL_LIB (DF3_SLURM_FIELD/APPL: check showappl)
 bash hangang/setup_env.sh
-sbatch --comment="$(source hangang/env.sh; df3_slurm_comment)" hangang/check.sbatch
+sbatch hangang/check.sbatch                             # carries --comment in its #SBATCH header
 ```
 
 `check.sbatch` must end with `=== check passed`. In its smoke-test section

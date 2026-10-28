@@ -21,8 +21,8 @@ RUN_NAME="${1:?usage: submit.sh <run-name>}"
 NODES="${NODES:-8}"
 LINKS="${LINKS:-5}"
 PARTITION="${PARTITION:-normal}"
-if [[ "${DF3_SLURM_FIELD}" == CHANGE_ME || "${DF3_SLURM_APPL}" == CHANGE_ME ]]; then
-    echo "Set DF3_SLURM_FIELD / DF3_SLURM_APPL (values from 'showappl') in hangang/env.sh or the environment." >&2
+if [[ -z "${DF3_SLURM_FIELD}" || -z "${DF3_SLURM_APPL}" ]]; then
+    echo "DF3_SLURM_FIELD / DF3_SLURM_APPL are empty; Slurm requires --comment (values from 'showappl')." >&2
     exit 1
 fi
 case "$(pwd -P)" in /scratch/*) ;; *) echo "Submit from /scratch (cwd is $(pwd -P))." >&2; exit 1 ;; esac

@@ -202,3 +202,6 @@ wandb/
 # Research notebooks and their raw plot data live on disk, not in git
 # (4.4 GB of predictions/figures; the tracked slice alone was 44 MB of png/csv).
 export/
+
+# Hangang transfer snapshots (bash hangang/transfer.sh status > hangang/status)
+hangang/status
