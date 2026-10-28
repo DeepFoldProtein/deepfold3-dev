@@ -790,15 +790,17 @@ class DiffusionHead(nn.Module):
 
         ``use_conditioning=False`` is the OpenFold-3 trunk-conditioning drop
         (``use_conditioning_prob``, `diffusion_conditioning.py:241-249`): the
-        trunk single/pair are zeroed on the way into the conditioning block
-        while ``target_feat`` / ``rel_feat`` survive. Matching OF3 and AF3
+        trunk pair — and with ``cfg.cond_drop == "both"`` the trunk single — is
+        zeroed on the way into the conditioning block while ``target_feat`` /
+        ``rel_feat`` survive. Matching OF3 and AF3
         Algorithm 20, the **un-zeroed** trunk single is still handed to the atom
         encoder below (`diffusion_module.py:198-204`), so the drop is partial.
         """
         cond_single, cond_pair = embeddings["single"], embeddings["pair"]
         if not use_conditioning:
-            cond_single = cond_single * 0
             cond_pair = cond_pair * 0
+            if self.cfg.cond_drop == "both":
+                cond_single = cond_single * 0
         single_cond_pre_noise, pair_cond = self.conditioning.compute_static(
             single_emb=cond_single,
             pair_emb=cond_pair,
@@ -1108,7 +1110,7 @@ class DiffusionHead(nn.Module):
                 return None
             return t if has_batch else t.unsqueeze(0)
 
-        static = self.compute_static(
+        static_inputs = dict(
             embeddings={k: _ensure_b(v) for k, v in embeddings.items()},
             ref_pos=_ensure_b(ref_pos),
             ref_mask=_ensure_b(ref_mask),
@@ -1119,10 +1121,23 @@ class DiffusionHead(nn.Module):
             seq_mask=_ensure_b(seq_mask),
             rel_feat=_ensure_b(rel_feat),
         )
+        static = self.compute_static(**static_inputs)
         # Pre-expand to [B*num_samples, ...] once. ``_denoise_samples`` will
         # use this directly for all 200 steps instead of materialising a
         # fresh expanded copy each step.
         static_bs = static.expand_for_samples(cfg.num_samples)
+
+        # Classifier-free guidance: a second static under the ``cond_drop``
+        # drop, built only when guidance is on so w == 1 costs nothing.
+        w = cfg.guidance_scale
+        static_u_bs = None
+        if w != 1.0:
+            static_u_bs = self.compute_static(**static_inputs, use_conditioning=False).expand_for_samples(
+                cfg.num_samples
+            )
+            # Host-side interval test per step: noise_levels is tiny, one sync here.
+            sig_hat_host = (noise_levels[:-1] * (1 + gammas)).tolist()
+            lo, hi = cfg.guidance_sigma_range or (float("-inf"), float("inf"))
 
         for step in range(cfg.steps):
             sigma_prev = noise_levels[step]
@@ -1140,6 +1155,10 @@ class DiffusionHead(nn.Module):
             positions_hat = positions + noise_scale * torch.randn_like(positions, generator=generator)
 
             denoised = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_bs)
+            if static_u_bs is not None and lo <= sig_hat_host[step] <= hi:
+                # Same positions_hat → both predictions share the augmented frame.
+                den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
+                denoised = den_u + w * (denoised - den_u)
             d_t = sigma_next - sigma_hat
             positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
 

@@ -437,7 +437,13 @@ class DiffusionConfig:
     # code default and overrides to 0.8 (20% drop) in every training YAML
     # (`examples/training_yamls/initial_training.yml:45`).
     #
-    # Dropped exactly as OF3 does it: ``single``/``pair`` are multiplied by zero
+    # ``cond_drop`` picks what a drop zeroes: "pair" (default) zeroes only the
+    # trunk pair, so the unconditional branch still sees the sequence, the
+    # chain topology (``rel_feat``) and the trunk single — the guidance knob
+    # below then scales the trunk's pair (contact / distance) signal alone.
+    # "both" is OF3's drop of ``single`` and ``pair`` together.
+    #
+    # Dropped exactly as OF3 does it: the trunk inputs are multiplied by zero
     # *only* on the way into ``DiffusionConditioningBlock.compute_static``
     # (`diffusion_conditioning.py:241-249`). ``target_feat`` and ``rel_feat``
     # survive, the Fourier noise embedding survives, and — matching OF3 /
@@ -449,9 +455,23 @@ class DiffusionConfig:
     # (OF3 uses one ``random.random()`` per step). Zeroing an input still
     # reaches every parameter, so DDP ``static_graph=True`` is unaffected.
     #
-    # OF3 has no inference-time guidance that consumes this; training with it
-    # is what would make classifier-free guidance possible later.
+    # OF3 has no inference-time guidance that consumes this; ``guidance_scale``
+    # below does, and needs a checkpoint trained with ``use_conditioning_prob
+    # < 1`` and the same ``cond_drop`` — otherwise the unconditional branch is
+    # an input the model has never seen.
     use_conditioning_prob: float = 1.0
+    cond_drop: Literal["pair", "both"] = "pair"
+    # --- Classifier-free guidance (inference ``sample()`` only) ---------------
+    # Per Euler step, D̃ = D_u + w·(D_c − D_u), with D_u the denoiser under the
+    # ``cond_drop`` drop and the SAME noisy positions / augmentation. ``1.0`` =
+    # no guidance and no extra forward (bit-identical to the unguided path);
+    # ``0.0`` = the unconditional model. ``guidance_sigma_range = (lo, hi)``
+    # applies it only where lo ≤ σ̂ ≤ hi (Kynkäänniemi et al. 2024): stereo-
+    # chemistry is settled at small σ, where guidance tends to break it. Never
+    # applied to the training mini-rollout, so the confidence head is trained
+    # on unguided samples — rank guided samples with that in mind.
+    guidance_scale: float = 1.0
+    guidance_sigma_range: tuple[float, float] | None = None
     # --- Masked / partial diffusion (motif scaffolding) -----------------------
     # NOT an OF3 feature — OF3 noises every atom unconditionally
     # (`projects/of3_all_atom/model.py:466-485`). Written from scratch here.
@@ -495,6 +515,17 @@ class DiffusionConfig:
     diffusion_mask_max_frac: float = 0.75
     transformer: DiffusionTransformerConfig = field(default_factory=DiffusionTransformerConfig)
     atom_cross_att: AtomCrossAttConfig = field(default_factory=AtomCrossAttConfig)
+
+    def __post_init__(self) -> None:
+        if self.cond_drop not in ("pair", "both"):
+            raise ValueError(f"DiffusionConfig.cond_drop must be 'pair' or 'both', got {self.cond_drop!r}")
+        if self.guidance_sigma_range is not None:
+            self.guidance_sigma_range = tuple(self.guidance_sigma_range)
+            lo, hi = self.guidance_sigma_range
+            if not lo <= hi:
+                raise ValueError(
+                    f"DiffusionConfig.guidance_sigma_range needs lo <= hi, got {self.guidance_sigma_range}"
+                )
 
 
 @dataclass
