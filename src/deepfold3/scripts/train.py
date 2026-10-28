@@ -119,6 +119,11 @@ def _apply_overrides(cfg: object, overrides: dict) -> None:
         cur = getattr(cfg, key)
         if isinstance(val, dict) and hasattr(cur, "__dataclass_fields__"):
             _apply_overrides(cur, val)
+            # setattr bypasses the dataclass's own validation; re-run it so a
+            # YAML typo (e.g. an unknown enum string) fails here instead of
+            # silently selecting a default branch.
+            if hasattr(cur, "__post_init__"):
+                cur.__post_init__()
         else:
             setattr(cfg, key, val)
 

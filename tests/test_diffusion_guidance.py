@@ -269,3 +269,30 @@ def test_inference_interface_guidance_passes_the_interface_mask():
     with torch.no_grad():
         model(batch, num_recycles=0)
     assert torch.equal(seen["keep"], interface_pair_keep(batch["asym_id"]))
+
+
+def test_stage2_yaml_enables_the_drop_on_top_of_stage1():
+    from deepfold3.config_loader import load_config
+    from deepfold3.model.config import ModelConfig
+    from deepfold3.scripts.train import _apply_overrides
+
+    s1, s2 = ModelConfig(), ModelConfig()
+    _apply_overrides(s1, load_config("configs/stage1.yaml")["model"])
+    _apply_overrides(s2, load_config("configs/stage2.yaml")["model"])
+    d = s2.diffusion
+    assert (d.use_conditioning_prob, d.cond_drop, d.cond_drop_interface_frac) == (0.8, "pair", 0.5)
+    assert d.guidance_scale == 1.0  # training config: eval rollouts stay unguided
+    for k in ("use_conditioning_prob", "cond_drop", "cond_drop_interface_frac"):
+        setattr(d, k, getattr(s1.diffusion, k))
+    assert s2 == s1  # nothing else differs from stage1
+
+
+def test_yaml_overrides_are_validated():
+    from deepfold3.model.config import ModelConfig
+    from deepfold3.scripts.train import _apply_overrides
+
+    with pytest.raises(ValueError):
+        _apply_overrides(ModelConfig(), {"diffusion": {"guidance_drop": "interfce"}})
+    cfg = ModelConfig()
+    _apply_overrides(cfg, {"diffusion": {"guidance_sigma_range": [1.0, 160.0]}})
+    assert cfg.diffusion.guidance_sigma_range == (1.0, 160.0)
