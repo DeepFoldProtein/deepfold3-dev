@@ -1,0 +1,41 @@
+base: stage1.yaml
+
+# Stage 2 — stage1 + trunk-pair conditioning dropout, so the checkpoint
+# supports classifier-free guidance at inference (full and interface).
+#
+# Everything else (architecture, crop, losses, dataset mix) is stage1's.
+#
+# Drop schedule per training forward:
+#   20% of forwards drop the trunk pair going into the diffusion conditioning
+#   (use_conditioning_prob 0.8; OF3 / common CFG practice is 10–20%).
+#   Half of those, on crops with >= 2 chains, zero a random subset of
+#   INTER-CHAIN pair blocks instead (r ~ U(0,1) per chain pair, >= 1 pair);
+#   the rest, and every drop on a single-chain crop, zero the whole pair.
+#
+#   On a multichain crop: 80% conditioned / 10% full drop / 10% interface drop.
+#   Multichain share of the mix ≈ of3_pdb's multichain entries (ligands and
+#   ions count: each has its own asym_id) + afdb_nvda (all dimers, 0.15) +
+#   teddymer (0.10) — roughly 0.6, so ≈ 14% full / 6% interface overall.
+#
+#   A dimer has one interface, so its interface drop is always the
+#   all-interfaces drop; partial-interface drops are learned from >= 3-chain
+#   crops (PDB assemblies, or a protein pair plus a ligand).
+#
+# cond_drop: pair — with conditioning_use_trunk_single: false (stage0) the
+# conditioning never reads the trunk single, so "both" would be the same drop;
+# "pair" states the intent.
+#
+# Inference with guidance (separate config / override, not set here so the
+# eval rollouts stay unguided):
+#   model.diffusion.guidance_scale: 2.0
+#   model.diffusion.guidance_drop: interface   # or full
+#   model.diffusion.guidance_sigma_range: [1.0, 160.0]   # optional
+
+training:
+  wandb_project: deepfold3-stage2
+
+model:
+  diffusion:
+    use_conditioning_prob: 0.8
+    cond_drop: pair
+    cond_drop_interface_frac: 0.5
