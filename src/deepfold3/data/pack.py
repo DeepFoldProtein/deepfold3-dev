@@ -45,6 +45,7 @@ import io
 import json
 import os
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +63,79 @@ _PASS = -2  # not covered: the filesystem answers
 
 _HAS_FADVISE = hasattr(os, "posix_fadvise")
 
+ENV_MAX_FDS = "DEEPFOLD3_PACK_MAX_FDS"
+
+
+def _default_max_fds() -> int:
+    """Open shard descriptors kept per process, across all packs.
+
+    A long-running DataLoader worker eventually touches every shard
+    (``long_monomers`` alone has 4,371), and an unbounded descriptor cache
+    would hit ``RLIMIT_NOFILE`` — the resulting ``EMFILE`` surfaces as
+    "corrupt MSA / template, skipping" in the loaders, i.e. a silent quality
+    drop. Bound it to a quarter of the soft limit (the rest of the process
+    needs descriptors too), at most 1024; ``$DEEPFOLD3_PACK_MAX_FDS``
+    overrides.
+    """
+    env = os.environ.get(ENV_MAX_FDS)
+    if env:
+        return max(1, int(env))
+    try:
+        import resource
+
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        if soft == resource.RLIM_INFINITY:
+            soft = 1 << 20
+    except (ImportError, ValueError, OSError):
+        soft = 1024
+    return int(max(16, min(1024, soft // 4)))
+
+
+class _FdCache:
+    """Process-wide LRU of open shard descriptors (reset, not closed, after fork)."""
+
+    def __init__(self) -> None:
+        self._pid: int | None = None
+        self._fds: OrderedDict[str, int] = OrderedDict()
+        self._max = 0
+        self._lock = threading.Lock()
+
+    def get(self, path: str) -> int:
+        pid = os.getpid()
+        with self._lock:
+            if self._pid != pid:
+                # Inherited descriptors are the parent's; closing them here
+                # would be harmless but they are few — just forget them.
+                self._fds = OrderedDict()
+                self._max = _default_max_fds()
+                self._pid = pid
+            fd = self._fds.get(path)
+            if fd is not None:
+                self._fds.move_to_end(path)
+                return fd
+            fd = os.open(path, os.O_RDONLY)
+            if _HAS_FADVISE:
+                # Reads are random single members; stop speculative readahead
+                # from pulling neighbouring members nobody asked for.
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+                except OSError:
+                    pass
+            self._fds[path] = fd
+            while len(self._fds) > self._max:
+                _, old = self._fds.popitem(last=False)
+                try:
+                    os.close(old)
+                except OSError:
+                    pass
+            return fd
+
+    def __len__(self) -> int:
+        return len(self._fds) if self._pid == os.getpid() else 0
+
+
+_FDS = _FdCache()
+
 
 def shard_name(k: int) -> str:
     """File name of shard ``k`` inside ``{pack}/shards/``."""
@@ -72,8 +146,9 @@ class PackReader:
     """Random-access reader over one pack. Cheap to construct; opens lazily.
 
     Index arrays are memory-mapped (shared page cache across workers on a
-    node); shard file descriptors are opened on first use and reopened after
-    a fork so workers never share a file offset or a stale descriptor.
+    node). Shard descriptors come from a bounded process-wide LRU
+    (:class:`_FdCache`) that starts empty in every forked worker; reads are
+    ``pread``, so no file offset is ever shared.
     """
 
     def __init__(self, pack_dir: Path):
@@ -88,7 +163,6 @@ class PackReader:
         self._pid: int | None = None
         self._keys: np.ndarray | None = None
         self._loc: np.ndarray | None = None
-        self._fds: dict[int, int] = {}
         self._lock = threading.Lock()
 
     # -- index ------------------------------------------------------------
@@ -100,10 +174,6 @@ class PackReader:
         with self._lock:
             if self._pid == pid:
                 return
-            # After a fork the inherited descriptors belong to the parent's
-            # bookkeeping; drop them (without closing — the parent still uses
-            # them) and start fresh.
-            self._fds = {}
             self._keys = np.load(self.pack_dir / "keys.npy", mmap_mode="r")
             self._loc = np.load(self.pack_dir / "loc.npy", mmap_mode="r")
             self._pid = pid
@@ -156,11 +226,7 @@ class PackReader:
     # -- data -------------------------------------------------------------
 
     def _fd(self, shard: int) -> int:
-        fd = self._fds.get(shard)
-        if fd is None:
-            fd = os.open(self.pack_dir / "shards" / shard_name(shard), os.O_RDONLY)
-            self._fds[shard] = fd
-        return fd
+        return _FDS.get(f"{self.pack_dir}/shards/{shard_name(shard)}")
 
     def read_index(self, i: int, *, drop_cache: bool = False) -> bytes:
         """Bytes of entry ``i``."""
