@@ -62,6 +62,7 @@ _MISS = -1  # authoritative miss: covered by the pack, not in it
 _PASS = -2  # not covered: the filesystem answers
 
 _HAS_FADVISE = hasattr(os, "posix_fadvise")
+_PAGE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 ENV_MAX_FDS = "DEEPFOLD3_PACK_MAX_FDS"
 
@@ -243,8 +244,16 @@ class PackReader:
                 raise OSError(f"short read in {self.pack_dir}/shards/{shard_name(shard)} at {offset + got}")
             got += n
         if drop_cache and _HAS_FADVISE:
+            # DONTNEED keeps any page the range only partly covers, and tar
+            # members are 512-aligned, so the exact range would leave the head
+            # and tail pages of every member cached (up to 128 KiB with 64 KiB
+            # pages) — the slow page-cache growth io_cache exists to stop.
+            # Widen to page bounds; the neighbours' edge pages are not reused
+            # under random access either.
+            lo = offset - offset % _PAGE
+            hi = -(-(offset + size) // _PAGE) * _PAGE
             try:
-                os.posix_fadvise(fd, offset, size, os.POSIX_FADV_DONTNEED)
+                os.posix_fadvise(fd, lo, hi - lo, os.POSIX_FADV_DONTNEED)
             except OSError:
                 pass
         return bytes(buf)

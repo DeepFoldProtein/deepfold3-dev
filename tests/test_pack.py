@@ -283,3 +283,38 @@ def test_exclude_and_size_bounds(tmp_path):
     member = 512 + np.ceil(sizes / 512) * 512
     for lo, hi in zip(b[:-1], b[1:], strict=True):
         assert member[lo:hi].sum() <= 6000 + member[lo:hi].max()
+
+
+@pytest.mark.skipif(shutil.which("fincore") is None, reason="needs util-linux fincore")
+def test_drop_cache_evicts_member_edge_pages(tmp_path):
+    import os
+    import subprocess
+
+    page = os.sysconf("SC_PAGE_SIZE")
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    rng = np.random.default_rng(0)
+    for i in range(3):  # several page-unaligned members in one shard
+        p = src / "structures" / "ab" / f"ab{i}.npz"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(rng.bytes(5 * page + 700))
+    (src / "manifest.json").write_text("{}")
+    _deploy(src, dst, include=["structures"], workers=1)
+    shard = dst / "_pack" / "shards" / pack.shard_name(0)
+
+    def resident() -> int:
+        out = subprocess.run(["fincore", "-nb", "-o", "RES", str(shard)], capture_output=True, text=True)
+        return int(out.stdout.split()[0])
+
+    fd = os.open(shard, os.O_RDONLY)
+    try:
+        os.fsync(fd)  # DONTNEED only drops clean pages
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    if resident() != 0:
+        pytest.skip("filesystem ignores POSIX_FADV_DONTNEED")
+
+    assert pack.register(dst)
+    for i in range(3):
+        pack.read_bytes(dst / "structures" / "ab" / f"ab{i}.npz", drop_cache=True)
+    assert resident() == 0

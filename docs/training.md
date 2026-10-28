@@ -327,7 +327,7 @@ During training, the number of recycles is randomly sampled per microstep: `n �
 
 | Policy | Mechanism | Scope |
 | --- | --- | --- |
-| Page cache | `set_drop_page_cache(True)` makes `data/io_cache.py:read_npz` read whole + `POSIX_FADV_DONTNEED` | Every dataset-path NPZ read (`Structure.load`, `MSA.load`, `TokenMask.load`, OF3 loaders). Records are drawn at random from 10⁶–10⁷-structure datasets, so a cached NPZ is never re-read. |
+| Page cache | `set_drop_page_cache(True)` makes `data/io_cache.py:read_npz` read whole + `POSIX_FADV_DONTNEED` | Every dataset-path NPZ read (`Structure.load`, `MSA.load`, `TokenMask.load`, OF3 loaders). Records are drawn at random from 10⁶–10⁷-structure datasets, so a cached NPZ is never re-read. Packed members (`data/pack.py`) drop their byte range widened to page bounds, since `DONTNEED` keeps partly-covered pages and tar members are 512-aligned. |
 | Copy-on-write | `os.register_at_fork(before=gc.freeze)` | Dataloader workers fork from the trainer and inherit its heap; a GC pass in a worker writes to every object's GC header and un-shares those pages. Bounds the growth — refcount updates still dirty objects on first touch. |
 
 The page-cache policy is **off by default**, so offline CLIs (`prepare`, `import-of3`, `refilter`, `build-masks`, …) that share those loaders keep normal caching and readahead. Loaders with genuine reuse must not use `read_npz` — `data/parse/pdb_chain_cache.py` runs at a ~99.8% hit rate, and dropping its pages would turn every hit into a re-read.
