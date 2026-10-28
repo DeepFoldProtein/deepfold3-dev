@@ -617,6 +617,7 @@ class DeepFold3(nn.Module):
                     embeddings=mini_embeddings,
                     seq_mask=seq_mask,
                     rel_feat=rel_feat.detach(),
+                    guidance=False,  # the confidence head trains on unguided samples
                     **{k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in ref_kwargs.items()},
                 )
             finally:
@@ -685,6 +686,22 @@ class DeepFold3(nn.Module):
         use_conditioning = True
         if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
             use_conditioning = bool(torch.rand(()) < diff_cfg_t.use_conditioning_prob)
+        # A fired drop may instead zero a random subset of inter-chain pair
+        # blocks (``cond_drop_interface_frac``). Expressed as a masked copy of
+        # the trunk pair with ``use_conditioning`` back on; crops without an
+        # interface keep the full drop. No RNG draw unless a drop fired.
+        cond_pair_keep = None
+        if (
+            not use_conditioning
+            and diff_cfg_t.cond_drop_interface_frac > 0.0
+            and features.get("asym_id") is not None
+            and bool(torch.rand(()) < diff_cfg_t.cond_drop_interface_frac)
+        ):
+            from deepfold3.model.diffusion import draw_interface_pair_keep
+
+            cond_pair_keep = draw_interface_pair_keep(features["asym_id"], seq_mask)
+            if cond_pair_keep is not None:
+                use_conditioning = True
 
         # Masked / partial diffusion (motif scaffolding) — see
         # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs
@@ -733,6 +750,10 @@ class DeepFold3(nn.Module):
                 "single": single_det,
                 "target_feat": target_feat_det,
             }
+            if cond_pair_keep is not None:
+                from deepfold3.model.diffusion import mask_trunk_pair
+
+                emb_det = mask_trunk_pair(emb_det, cond_pair_keep)
 
             num_chunks = diffusion_batch_size // diffusion_chunk_size
             logged: dict[str, torch.Tensor] = {}
@@ -814,10 +835,15 @@ class DeepFold3(nn.Module):
             pred["__diffusion_total__"] = weighted_total
             pred["__diffusion_logged__"] = logged
         else:
+            diff_embeddings = embeddings
+            if cond_pair_keep is not None:
+                from deepfold3.model.diffusion import mask_trunk_pair
+
+                diff_embeddings = mask_trunk_pair(embeddings, cond_pair_keep)
             gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
                 gt_positions=diffusion_gt_pos,
                 gt_mask=diffusion_gt_mask,
-                embeddings=embeddings,
+                embeddings=diff_embeddings,
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,
                 num_samples=diffusion_batch_size,
@@ -925,11 +951,18 @@ class DeepFold3(nn.Module):
             device = features["res_type"].device
             generator = torch.Generator(device=device).manual_seed(seed)
 
+            diff_cfg = self.diffusion_head.cfg
+            guidance_pair_keep = None
+            if diff_cfg.guidance_scale != 1.0 and diff_cfg.guidance_drop == "interface":
+                from deepfold3.model.diffusion import interface_pair_keep
+
+                guidance_pair_keep = interface_pair_keep(features["asym_id"].to(device))
             sample_result = self.diffusion_head.sample(
                 embeddings=embeddings,
                 seq_mask=seq_mask,
                 rel_feat=rel_feat,
                 generator=generator,
+                guidance_pair_keep=guidance_pair_keep,
                 **self._ref_kwargs(features),
             )
 

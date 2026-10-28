@@ -194,6 +194,59 @@ def build_diffusion_clean_mask(
     return mask
 
 
+def interface_pair_keep(asym_id: torch.Tensor) -> torch.Tensor:
+    """``[B?, N, N]`` bool: True on intra-chain pairs, False on every inter-chain pair."""
+    return asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2)
+
+
+def draw_interface_pair_keep(
+    asym_id: torch.Tensor,  # [B, N]
+    seq_mask: torch.Tensor,  # [B, N]
+    generator: torch.Generator | None = None,
+) -> torch.Tensor | None:
+    """Random inter-chain pair-block drop for training (``cond_drop_interface_frac``).
+
+    Per batch element: r ~ U(0, 1), each unordered pair of chains present in
+    ``seq_mask`` dropped with probability r (both blocks), at least one pair
+    always dropped. Returns ``[B, N, N]`` bool keep (True = conditioned), with
+    intra-chain and padding entries always True, or ``None`` when any element
+    has fewer than two chains — there is no interface to drop.
+    """
+    B, N = asym_id.shape
+    keep = torch.ones(B, N, N, dtype=torch.bool, device=asym_id.device)
+    for b in range(B):
+        valid = seq_mask[b].bool()
+        chains = asym_id[b][valid].unique()  # sorted
+        C = chains.numel()
+        if C < 2:
+            return None
+        r = torch.rand((), generator=generator, device=asym_id.device)
+        drop = torch.rand(C, C, generator=generator, device=asym_id.device) < r
+        drop = torch.triu(drop, diagonal=1)
+        if not bool(drop.any()):
+            iu = torch.triu_indices(C, C, offset=1, device=asym_id.device)
+            k = int(torch.randint(iu.shape[1], (), generator=generator, device=asym_id.device))
+            drop[iu[0, k], iu[1, k]] = True
+        drop = drop | drop.T
+        idx = torch.searchsorted(chains, asym_id[b]).clamp_(max=C - 1)
+        keep_b = ~drop[idx.unsqueeze(-1), idx.unsqueeze(-2)]
+        keep[b] = keep_b | ~(valid.unsqueeze(-1) & valid.unsqueeze(-2))
+    return keep
+
+
+def mask_trunk_pair(embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Copy of ``embeddings`` with the trunk pair zeroed where ``pair_keep`` is False.
+
+    Same effect as ``compute_static(use_conditioning=False)`` restricted to
+    those entries: ``pair_cond`` is computed per (i, j), so a dropped entry
+    gets exactly its fully-dropped value and a kept one its conditioned value.
+    The caller's dict (shared with the confidence / distogram heads) is not
+    modified.
+    """
+    pair = embeddings["pair"]
+    return {**embeddings, "pair": pair * pair_keep.unsqueeze(-1).to(pair.dtype)}
+
+
 def _augment_in_place(
     positions: torch.Tensor,  # [B?, S, N, M, 3]
     mask: torch.Tensor,  # [B?, N, M] bool
@@ -1033,14 +1086,28 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,  # [B?, N, N, rel_feat_dim]
         generator: torch.Generator | None = None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
+        guidance: bool = True,
+        guidance_pair_keep: torch.Tensor | None = None,  # [B?, N, N] bool
     ) -> dict[str, torch.Tensor]:
         """Draw samples from the diffusion model (Euler-Maruyama sampler).
 
         Supports both unbatched and batched inputs. For unbatched inputs,
         returns 'atom_positions' [S, N, M, 3] and 'mask' [S, N, M].
         For batched inputs, returns [B, S, N, M, 3] and [B, S, N, M].
+
+        Classifier-free guidance follows ``cfg.guidance_*``; ``guidance=False``
+        turns it off for this call (the training mini-rollout). The
+        unconditional branch zeroes the trunk pair where
+        ``guidance_pair_keep`` is False — any subset of chain pairs — and
+        falls back to the ``cond_drop`` drop when it is ``None``.
+        ``cfg.guidance_drop == "interface"`` requires it (see
+        :func:`interface_pair_keep`).
         """
         cfg = self.cfg
+        if not guidance or cfg.guidance_scale == 1.0:
+            guidance_pair_keep, guidance = None, False
+        elif cfg.guidance_drop == "interface" and guidance_pair_keep is None:
+            raise ValueError("guidance_drop='interface' needs guidance_pair_keep (interface_pair_keep(asym_id))")
         if cfg.skip_amp_sample:
             # Protenix-style ``skip_amp.sample_diffusion``: upcast float
             # inputs and run the full sampler with autocast disabled.
@@ -1064,6 +1131,8 @@ class DiffusionHead(nn.Module):
                 rel_feat,
                 generator,
                 ref_space_uid=ref_space_uid,
+                guidance=guidance,
+                guidance_pair_keep=guidance_pair_keep,
             )
 
     def _sample_impl(
@@ -1078,6 +1147,8 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,
         generator: torch.Generator | None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
+        guidance: bool = True,
+        guidance_pair_keep: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         N, M = ref_mask.shape[-2:]
@@ -1127,14 +1198,20 @@ class DiffusionHead(nn.Module):
         # fresh expanded copy each step.
         static_bs = static.expand_for_samples(cfg.num_samples)
 
-        # Classifier-free guidance: a second static under the ``cond_drop``
-        # drop, built only when guidance is on so w == 1 costs nothing.
+        # Classifier-free guidance: a second static for the unconditional
+        # branch, built only when guidance is on so w == 1 costs nothing.
         w = cfg.guidance_scale
         static_u_bs = None
-        if w != 1.0:
-            static_u_bs = self.compute_static(**static_inputs, use_conditioning=False).expand_for_samples(
-                cfg.num_samples
-            )
+        if guidance and w != 1.0:
+            if guidance_pair_keep is not None:
+                u_inputs = {
+                    **static_inputs,
+                    "embeddings": mask_trunk_pair(static_inputs["embeddings"], _ensure_b(guidance_pair_keep)),
+                }
+                static_u = self.compute_static(**u_inputs)
+            else:
+                static_u = self.compute_static(**static_inputs, use_conditioning=False)
+            static_u_bs = static_u.expand_for_samples(cfg.num_samples)
             # Host-side interval test per step: noise_levels is tiny, one sync here.
             sig_hat_host = (noise_levels[:-1] * (1 + gammas)).tolist()
             lo, hi = cfg.guidance_sigma_range or (float("-inf"), float("inf"))

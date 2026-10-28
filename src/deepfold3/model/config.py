@@ -461,6 +461,18 @@ class DiffusionConfig:
     # an input the model has never seen.
     use_conditioning_prob: float = 1.0
     cond_drop: Literal["pair", "both"] = "pair"
+    # Fraction of drops that zero a random subset of INTER-CHAIN pair blocks
+    # instead of the full ``cond_drop`` drop, so the model also learns
+    # "these interfaces unconditioned, everything else conditioned" — what
+    # ``guidance_drop: interface`` and a custom ``guidance_pair_keep`` sample
+    # under. Per drawn subset: r ~ U(0, 1), each unordered chain pair {a, b}
+    # dropped with probability r (both (a,b) and (b,a) blocks), at least one
+    # pair always dropped, so r → 1 is the all-interfaces drop and small r a
+    # single interface. Intra-chain blocks and the trunk single are never
+    # touched. Crops where any batch element has < 2 chains have no interface
+    # and take the full drop instead. ``0.0`` = off; the extra RNG draw only
+    # happens when a drop has already fired, so the default changes nothing.
+    cond_drop_interface_frac: float = 0.0
     # --- Classifier-free guidance (inference ``sample()`` only) ---------------
     # Per Euler step, D̃ = D_u + w·(D_c − D_u), with D_u the denoiser under the
     # ``cond_drop`` drop and the SAME noisy positions / augmentation. ``1.0`` =
@@ -472,6 +484,13 @@ class DiffusionConfig:
     # on unguided samples — rank guided samples with that in mind.
     guidance_scale: float = 1.0
     guidance_sigma_range: tuple[float, float] | None = None
+    # What the unconditional branch drops: "full" = the ``cond_drop`` drop;
+    # "interface" = every inter-chain pair block (intra-chain pair and trunk
+    # single stay conditioned), i.e. guidance on the trunk's interface signal
+    # only. Needs ``cond_drop_interface_frac > 0`` at training. Callers of
+    # ``DiffusionHead.sample`` can instead pass ``guidance_pair_keep`` to
+    # drop any chosen subset of chain pairs.
+    guidance_drop: Literal["full", "interface"] = "full"
     # --- Masked / partial diffusion (motif scaffolding) -----------------------
     # NOT an OF3 feature — OF3 noises every atom unconditionally
     # (`projects/of3_all_atom/model.py:466-485`). Written from scratch here.
@@ -519,6 +538,12 @@ class DiffusionConfig:
     def __post_init__(self) -> None:
         if self.cond_drop not in ("pair", "both"):
             raise ValueError(f"DiffusionConfig.cond_drop must be 'pair' or 'both', got {self.cond_drop!r}")
+        if self.guidance_drop not in ("full", "interface"):
+            raise ValueError(f"DiffusionConfig.guidance_drop must be 'full' or 'interface', got {self.guidance_drop!r}")
+        if not 0.0 <= self.cond_drop_interface_frac <= 1.0:
+            raise ValueError(
+                f"DiffusionConfig.cond_drop_interface_frac must be in [0, 1], got {self.cond_drop_interface_frac}"
+            )
         if self.guidance_sigma_range is not None:
             self.guidance_sigma_range = tuple(self.guidance_sigma_range)
             lo, hi = self.guidance_sigma_range

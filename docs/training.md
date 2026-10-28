@@ -135,7 +135,9 @@ from the RNG, so enabling the code cannot perturb an existing run's random strea
 | `model.diffusion.use_conditioning_prob` | `1.0` | probability of *keeping* the trunk conditioning | OF3 `use_conditioning_prob`, YAMLs use `0.8` |
 | `model.diffusion.cond_drop` | `"pair"` | what a drop zeroes: trunk pair only, or `"both"` single + pair | `"both"` is OF3's drop |
 | `model.diffusion.guidance_scale` | `1.0` | inference CFG weight w: `D_u + w·(D_c − D_u)`; needs a checkpoint trained with the drop | written from scratch — **OF3 has none** |
+| `model.diffusion.cond_drop_interface_frac` | `0.0` | fraction of drops that zero a random subset of inter-chain pair blocks instead (r ~ U(0,1) per chain pair, ≥1 pair); single-chain crops take the full drop | written from scratch |
 | `model.diffusion.guidance_sigma_range` | `null` | `[lo, hi]`: apply guidance only for σ̂ in range | Kynkäänniemi et al. 2024 |
+| `model.diffusion.guidance_drop` | `"full"` | unconditional branch: `"full"` (`cond_drop`) or `"interface"` (all inter-chain pair blocks; needs `cond_drop_interface_frac > 0` in training). `DiffusionHead.sample(guidance_pair_keep=…)` takes any chain-pair subset | written from scratch |
 | `model.confidence.use_pair_emb_prob` | `1.0` | probability of *keeping* the trunk pair emb in the confidence head | OF3 `use_confidence_emb_prob`, YAMLs use `0.8` |
 
 **Masked / partial diffusion (motif scaffolding).** With probability `diffusion_mask_prob` a
