@@ -191,6 +191,10 @@ def training_step(
     # per-term values get a per-key denominator.
     total_loss = torch.stack(losses_list).mean()
     loss_dict, loss_dict_counts = aggregate_sample_losses(per_sample_losses)
+    # One draw per forward (not per batch element), so each counts once.
+    for k, v in pred.get("__cond_drop__", {}).items():
+        loss_dict[f"cond_drop/{k}"] = v
+        loss_dict_counts[f"cond_drop/{k}"] = 1
 
     if _timing:
         torch.cuda.synchronize(device)

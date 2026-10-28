@@ -234,6 +234,40 @@ def draw_interface_pair_keep(
     return keep
 
 
+def cond_drop_stats(
+    asym_id: torch.Tensor | None,  # [B, N]
+    seq_mask: torch.Tensor,  # [B, N]
+    *,
+    use_conditioning: bool,
+    pair_keep: torch.Tensor | None,  # [B, N, N]; set iff an interface drop fired
+) -> dict[str, torch.Tensor]:
+    """Per-forward conditioning-drop indicators for logging (0-d float tensors).
+
+    ``none`` / ``full`` / ``interface`` are one-hot, so their window means are
+    the realised drop rates. ``multichain`` is whether every batch element has
+    ≥ 2 chains — the condition an interface drop needs — so its mean is the
+    share of forwards eligible for one. ``interface_pair_frac`` (fraction of
+    inter-chain token pairs zeroed) is present only on an interface drop.
+    """
+    dev = seq_mask.device
+    interface = pair_keep is not None
+    full = not use_conditioning
+    out = {
+        "none": torch.tensor(float(not full and not interface), device=dev),
+        "full": torch.tensor(float(full), device=dev),
+        "interface": torch.tensor(float(interface), device=dev),
+    }
+    if asym_id is not None:
+        valid = seq_mask.bool()
+        multi = all(asym_id[b][valid[b]].unique().numel() >= 2 for b in range(asym_id.shape[0]))
+        out["multichain"] = torch.tensor(float(multi), device=dev)
+        if interface:
+            pv = valid.unsqueeze(-1) & valid.unsqueeze(-2)
+            inter = pv & ~interface_pair_keep(asym_id)
+            out["interface_pair_frac"] = (~pair_keep & inter).sum() / inter.sum().clamp(min=1)
+    return out
+
+
 def mask_trunk_pair(embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor) -> dict[str, torch.Tensor]:
     """Copy of ``embeddings`` with the trunk pair zeroed where ``pair_keep`` is False.
 

@@ -8,6 +8,7 @@ import torch
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.diffusion import (
     DiffusionHead,
+    cond_drop_stats,
     draw_interface_pair_keep,
     interface_pair_keep,
     mask_trunk_pair,
@@ -296,3 +297,111 @@ def test_yaml_overrides_are_validated():
     cfg = ModelConfig()
     _apply_overrides(cfg, {"diffusion": {"guidance_sigma_range": [1.0, 160.0]}})
     assert cfg.diffusion.guidance_sigma_range == (1.0, 160.0)
+
+
+def test_cond_drop_stats_one_hot_and_pair_frac():
+    asym, seq_mask = _asym(2, 1, 1, pad=1)
+    st = cond_drop_stats(asym, seq_mask, use_conditioning=True, pair_keep=None)
+    assert {k: float(v) for k, v in st.items()} == {"none": 1.0, "full": 0.0, "interface": 0.0, "multichain": 1.0}
+    assert float(cond_drop_stats(asym, seq_mask, use_conditioning=False, pair_keep=None)["full"]) == 1.0
+    keep = interface_pair_keep(asym).clone()
+    keep[0, 2, 3] = keep[0, 3, 2] = True  # leave the chain-1/chain-2 interface conditioned
+    st = cond_drop_stats(asym, seq_mask, use_conditioning=True, pair_keep=keep)
+    assert float(st["interface"]) == 1.0 and float(st["none"]) == 0.0
+    # inter-chain valid pairs: 2*(2*1 + 2*1 + 1*1) = 10; 2 kept -> 8/10 zeroed
+    assert float(st["interface_pair_frac"]) == pytest.approx(0.8)
+    single, sm = _asym(3, pad=1)
+    assert float(cond_drop_stats(single, sm, use_conditioning=False, pair_keep=None)["multichain"]) == 0.0
+
+
+def test_training_forward_reports_cond_drop_stats():
+    model = _tiny_model(use_conditioning_prob=0.0, cond_drop_interface_frac=1.0).train()
+    seen = {}
+
+    def stop(*a, **kw):
+        raise _Stop
+
+    model.diffusion_head.sample_training = stop
+    orig = model.forward_training
+
+    # ``__cond_drop__`` is written into ``pred`` before the diffusion step;
+    # read it off the dict the forward builds.
+    import deepfold3.model.diffusion as diffusion
+
+    real = diffusion.cond_drop_stats
+
+    def spy(*a, **kw):
+        seen["stats"] = real(*a, **kw)
+        return seen["stats"]
+
+    diffusion.cond_drop_stats = spy
+    try:
+        with pytest.raises(_Stop):
+            orig(_tiny_batch(), num_recycles=0, diffusion_batch_size=2, mini_rollout_steps=2, compute_confidence=False)
+    finally:
+        diffusion.cond_drop_stats = real
+    st = {k: float(v) for k, v in seen["stats"].items()}
+    assert st["interface"] == 1.0 and st["multichain"] == 1.0 and 0.0 < st["interface_pair_frac"] <= 1.0
+
+
+def test_no_cond_drop_stats_when_drop_is_off():
+    import deepfold3.model.diffusion as diffusion
+
+    model = _tiny_model().train()
+    called = []
+    real = diffusion.cond_drop_stats
+    diffusion.cond_drop_stats = lambda *a, **kw: called.append(1) or real(*a, **kw)
+
+    def stop(*a, **kw):
+        raise _Stop
+
+    model.diffusion_head.sample_training = stop
+    try:
+        with pytest.raises(_Stop):
+            model.forward_training(
+                _tiny_batch(), num_recycles=0, diffusion_batch_size=2, mini_rollout_steps=2, compute_confidence=False
+            )
+    finally:
+        diffusion.cond_drop_stats = real
+    assert called == []  # default config logs nothing new
+
+
+def test_training_step_logs_cond_drop_under_its_own_prefix(monkeypatch):
+    """``pred["__cond_drop__"]`` reaches ``loss_dict`` as ``cond_drop/*`` with
+    count 1 each (one draw per forward), which the trainer logs as
+    ``train/cond_drop/*``."""
+    from contextlib import nullcontext
+
+    import deepfold3.training.step as step
+    from deepfold3.model.config import ModelConfig, TrainingConfig
+
+    stats = {"none": torch.tensor(0.0), "full": torch.tensor(0.0), "interface": torch.tensor(1.0)}
+
+    def fake_model(features, **kw):
+        return {"__cond_drop__": stats}
+
+    monkeypatch.setattr(
+        step, "training_loss", lambda pred, feats, cfg: (torch.tensor(1.0), {"loss": torch.tensor(1.0)})
+    )
+    monkeypatch.setattr(step, "prepare_features", lambda f, d: f)
+
+    class _Acc:
+        def chunk_context(self, **kw):
+            return nullcontext()
+
+    _, loss_dict, counts, *_ = step.training_step(
+        fake_model,
+        {"seq_mask": torch.ones(1, 3)},
+        cfg=TrainingConfig(batch_size_per_rank=1),
+        model_cfg=ModelConfig(),
+        global_step=0,
+        accumulator=_Acc(),
+        scaler=None,
+        device=torch.device("cpu"),
+    )
+    assert {k: float(v) for k, v in loss_dict.items() if k.startswith("cond_drop/")} == {
+        "cond_drop/none": 0.0,
+        "cond_drop/full": 0.0,
+        "cond_drop/interface": 1.0,
+    }
+    assert all(counts[k] == 1 for k in loss_dict if k.startswith("cond_drop/"))

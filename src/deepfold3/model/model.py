@@ -702,6 +702,15 @@ class DeepFold3(nn.Module):
             cond_pair_keep = draw_interface_pair_keep(features["asym_id"], seq_mask)
             if cond_pair_keep is not None:
                 use_conditioning = True
+        if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
+            from deepfold3.model.diffusion import cond_drop_stats
+
+            # Read by ``training_step`` into ``train/cond_drop/*``. Emitted on
+            # every forward whenever the drop is configured, so all ranks log
+            # the same key set.
+            pred["__cond_drop__"] = cond_drop_stats(
+                features.get("asym_id"), seq_mask, use_conditioning=use_conditioning, pair_keep=cond_pair_keep
+            )
 
         # Masked / partial diffusion (motif scaffolding) — see
         # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs
