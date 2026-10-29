@@ -30,7 +30,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 "${PY}" -c "import torch; assert torch.cuda.device_count() == 4, torch.cuda.device_count(); print('cuda ok:', torch.cuda.get_device_name(0))"
 
 echo "=== 2. NCCL all-reduce across the node's 4 GPUs (srun + rank wrapper)"
-srun --mpi=none --gpu-bind=none --ntasks=4 "${REPO}/hangang/srun_rank.sh" "${PY}" - <<'EOF'
+srun --mpi=none --gpu-bind=none --gres-flags=allow-task-sharing --ntasks=4 "${REPO}/hangang/srun_rank.sh" "${PY}" - <<'EOF'
 import os, time, torch, torch.distributed as dist
 r, w = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))

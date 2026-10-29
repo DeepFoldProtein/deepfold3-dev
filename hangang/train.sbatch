@@ -16,7 +16,6 @@
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
 #SBATCH --distribution=block:block
-#SBATCH --gres-flags=allow-task-sharing
 #SBATCH --signal=B:USR1@600
 #SBATCH --output=%x-%j.out
 
@@ -44,7 +43,9 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # link resumes from.
 trap 'echo "USR1: walltime near, asking ranks to checkpoint"; kill -TERM "${SRUN_PID}" 2>/dev/null || true' USR1
 
-srun --mpi=none --gpu-bind=none --kill-on-bad-exit=1 \
+# --gres-flags=allow-task-sharing lets each task open all 4 GPUs of its node
+# (NCCL P2P / CUDA IPC between ranks); Slurm accepts it only on srun.
+srun --mpi=none --gpu-bind=none --gres-flags=allow-task-sharing --kill-on-bad-exit=1 \
     "${REPO}/hangang/srun_rank.sh" \
     "${REPO}/.venv/bin/python" -m deepfold3.scripts.train \
     --config "${RUN_DIR}/config.yaml" \
