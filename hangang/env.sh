@@ -46,11 +46,22 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 df3_slurm_comment() { echo "field=${DF3_SLURM_FIELD};appl=${DF3_SLURM_APPL}"; }
 
-# Rewrite a config's /data/... paths to $DATA (configs are written for the
-# trainjob volume /data; a list-valued `datasets:` cannot be patched through
-# `base:` inheritance, so the paths are substituted in a per-run copy).
+# Freeze a config into a self-contained per-run copy: resolve its `base:`
+# chain (a relative `base:` would otherwise be looked up next to the copy, in
+# the run directory) and rewrite /data/... paths to $DATA (configs are written
+# for the trainjob volume /data; a list-valued `datasets:` cannot be patched
+# through `base:` inheritance). Written via a temp file so a failure never
+# leaves a half-written config for the next chain link to reuse.
 df3_make_config() {
     local src=$1 dst=$2
     mkdir -p "$(dirname "${dst}")"
-    sed "s#\([[:space:]:]\)/data/#\1${DATA}/#g" "${src}" >"${dst}"
+    "${REPO}/.venv/bin/python" - "${src}" "${dst}.tmp" <<'PY' || { rm -f "${dst}.tmp"; return 1; }
+import sys, yaml
+from deepfold3.config_loader import resolve_config
+with open(sys.argv[2], "w") as f:
+    f.write(f"# Frozen from {sys.argv[1]} (base chain resolved)\n")
+    yaml.safe_dump(resolve_config(sys.argv[1]), f, default_flow_style=False, sort_keys=False)
+PY
+    sed -i "s#\([[:space:]:]\)/data/#\1${DATA}/#g" "${dst}.tmp"
+    mv "${dst}.tmp" "${dst}"
 }
