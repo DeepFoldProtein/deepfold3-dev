@@ -84,6 +84,26 @@ df3_slingshot_env() {
     export NCCL_DEBUG="${DF3_NCCL_DEBUG:-INFO}"
     export NCCL_DEBUG_SUBSYS=INIT,NET
 
+    # GPUDirect RDMA. Cray's libfabric dlopens the unversioned "libcudart.so"
+    # for CUDA HMEM; the venv's CUDA runtime wheel ships only libcudart.so.12,
+    # so HMEM init failed and aws-ofi-nccl logged "Could not disable CUDA API
+    # usage for HMEM, disabling GDR" (every transfer staged through host
+    # memory). A symlink to the same file torch already loaded keeps a single
+    # cudart in the process. GDRCOPY / GDR_LEVEL follow Isambard-AI's GH200 +
+    # Slingshot NCCL defaults. Check the log for "GPU Direct RDMA Enabled".
+    local cudart
+    cudart=$(ls "${REPO}"/.venv/lib/python3*/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12 2>/dev/null | head -n1)
+    if [[ -n "${cudart}" ]]; then
+        mkdir -p "${DF3_ROOT}/lib/cudart"
+        ln -sfn "${cudart}" "${DF3_ROOT}/lib/cudart/libcudart.so"
+        export LD_LIBRARY_PATH="${DF3_ROOT}/lib/cudart${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    else
+        echo "df3_slingshot_env: no libcudart.so.12 in the venv; GDR stays off" >&2
+    fi
+    export FI_HMEM_CUDA_USE_GDRCOPY=1
+    export NCCL_GDRCOPY_ENABLE=1
+    export NCCL_NET_GDR_LEVEL=PHB
+
     if [[ "${DF3_RDZV_HSN:-0}" != 1 ]]; then
         echo "slingshot: $(module -t list 2>&1 | tr '\n' ' '); MASTER_ADDR = first node's hostname"
         return 0
