@@ -256,6 +256,30 @@ def test_training_interface_drop_masks_only_inter_chain_pair():
     assert torch.equal(zero, zero.T)
 
 
+def test_chunked_training_backward_with_interface_drop():
+    """Chunked diffusion back-props once per chunk through the detached trunk
+    leaves. The interface mask must be applied per chunk: masked once outside
+    the loop, the second chunk's backward re-walks the freed mask node
+    ("Trying to backward through the graph a second time"), the crash of the
+    first 2-node stage2 smoke run."""
+    from deepfold3.model.config import TrainingConfig
+
+    model = _tiny_model(use_conditioning_prob=0.0, cond_drop_interface_frac=1.0).train()
+    batch = _tiny_batch()
+    torch.manual_seed(0)
+    model.forward_training(
+        batch,
+        num_recycles=0,
+        diffusion_batch_size=2,
+        diffusion_chunk_size=1,
+        mini_rollout_steps=2,
+        compute_confidence=False,
+        backward_fn=lambda loss: loss.backward(),
+        loss_cfg=TrainingConfig(),
+    )
+    assert next(model.diffusion_head.parameters()).grad is not None
+
+
 def test_inference_interface_guidance_passes_the_interface_mask():
     model = _tiny_model(guidance_scale=2.0, guidance_drop="interface").eval()
     batch = _tiny_batch()

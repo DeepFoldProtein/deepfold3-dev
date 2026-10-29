@@ -762,8 +762,6 @@ class DeepFold3(nn.Module):
             if cond_pair_keep is not None:
                 from deepfold3.model.diffusion import mask_trunk_pair
 
-                emb_det = mask_trunk_pair(emb_det, cond_pair_keep)
-
             num_chunks = diffusion_batch_size // diffusion_chunk_size
             logged: dict[str, torch.Tensor] = {}
             weighted_total: torch.Tensor = pair_real.new_zeros(())
@@ -777,10 +775,13 @@ class DeepFold3(nn.Module):
                 cm_c = None
                 if clean_mask is not None:
                     cm_c = clean_mask[:, chunk_i * diffusion_chunk_size : (chunk_i + 1) * diffusion_chunk_size]
+                # Mask per chunk: each chunk's backward frees its graph, and a
+                # mask node built once before the loop would be part of it.
+                emb_c = emb_det if cond_pair_keep is None else mask_trunk_pair(emb_det, cond_pair_keep)
                 gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
                     gt_positions=diffusion_gt_pos,
                     gt_mask=diffusion_gt_mask,
-                    embeddings=emb_det,
+                    embeddings=emb_c,
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
                     num_samples=diffusion_chunk_size,
