@@ -3,8 +3,8 @@
 #
 # Usage (from /scratch — Slurm only accepts jobs submitted there):
 #   cd /scratch/$USER/deepfold3/deepfold3-dev
-#   bash hangang/submit.sh my-run                    # 8 nodes (32 GPUs), 5 links
-#   NODES=16 LINKS=5 bash hangang/submit.sh my-run
+#   bash hangang/submit.sh my-run                    # 64 nodes (256 GPUs), 5 × 24 h links
+#   NODES=16 LINKS=5 bash hangang/submit.sh my-run   # smaller allocation
 #   EXTRA_ARGS="--wandb deepfold3-stage0 --override max_steps=50000" bash hangang/submit.sh my-run
 #   CONFIG_SRC=configs/df3-stage0-r12.yaml bash hangang/submit.sh my-r12
 #
@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 source hangang/env.sh
 
 RUN_NAME="${1:?usage: submit.sh <run-name>}"
-NODES="${NODES:-8}"
+NODES="${NODES:-64}"  # 64 × 4 GH200 = 256 GPUs
 LINKS="${LINKS:-5}"
 PARTITION="${PARTITION:-normal}"
 if [[ -z "${DF3_SLURM_FIELD}" || -z "${DF3_SLURM_APPL}" ]]; then

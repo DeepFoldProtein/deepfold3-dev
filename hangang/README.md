@@ -85,7 +85,7 @@ sample counts should show `msa>1` and `templates` for most samples.
 ## 4. Train
 
 ```bash
-bash hangang/submit.sh df3-hangang-001                  # 8 nodes = 32 GH200, 5 × 24 h links
+bash hangang/submit.sh df3-hangang-001                  # 64 nodes = 256 GH200, 5 × 24 h links
 NODES=16 EXTRA_ARGS="--wandb deepfold3-stage0" bash hangang/submit.sh df3-hangang-002
 ```
 
