@@ -148,3 +148,26 @@ EXTRA_ARGS="--params ${RUNS}/<stage1-run>/checkpoint_<step>.pt --seed 202 --wand
   re-sent with `transfer.sh status` + `push`.
 - **Quota.** `check.sbatch` prints the file count under `$DF3_ROOT` and
   `lfs quota`; the data is ~6k files, the venv ~30–50k.
+
+## Known pitfalls (found during the first stage2 launch, 2026-10-29)
+
+Each of these failed a 64-node submission or cost a debugging round. The fix
+is already in the scripts unless the item says otherwise.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `sbatch: error: --gres-flags=allow-task-sharing is only used with srun.` | Slurm 26.05 accepts the flag only on `srun` | on the `srun` line in `train.sbatch` / `check.sbatch` |
+| `FileNotFoundError: Config file not found: …/runs/<run>/stage1.yaml` | the frozen per-run config was a plain copy, so a relative `base:` was looked up in the run dir | `df3_make_config` resolves the `base:` chain into one self-contained YAML |
+| `The NVIDIA driver on your system is too old (found version 12080)` | driver 570.124.06 is CUDA 12.8; the lockfile's PyPI torch is the CUDA 13 build | `setup_env.sh` reinstalls the same torch version as `+cu126` (`DF3_TORCH_CUDA`). **Never `uv run` / `uv sync` on Hangang**: both revert it |
+| Every chain link would restart from step 0 | configs inherit `auto_resume: false` | `train.sbatch` passes `--override auto_resume=true` |
+| Job `.out` stops after `No primary data_dir specified …` and looks hung | Python block-buffers stdout under `srun` | `PYTHONUNBUFFERED=1` in `env.sh`; `$RUNS/<run>/train.log` (rank 0) was always current |
+| `TCP client failed to connect … <node>:<port>` after 600 s, `Connection refused` on that port | Slurm does not put task 0 on the first host of `SLURM_JOB_NODELIST`: rank 0's TCPStore listened on node0228 while `MASTER_ADDR` was node0061 | `srun_rank.sh` derives `RANK` from the node's position in the node list, so rank 0 is always on `MASTER_ADDR`. KISTI's `torchrun --rdzv-backend=c10d` example avoids this by electing the store host by name |
+| Multi-node NCCL silently on TCP sockets | the venv's NCCL wheel has no Slingshot plugin | `df3_slingshot_env` (multi-node only): `aws-ofi-nccl/1.20.0` + `libfabric/2.3.1`, `NCCL_PROTO=^LL128` (LL128 gave wrong AllReduce results in KISTI's tests). Check for `Using network AWS Libfabric` |
+
+Facts worth knowing:
+
+- **Network:** node hostnames resolve to the management network (`bond0`, `10.161.64.x`, `*.hostmgmt`); Slingshot is `hsn0..3` (`10.169.x`). Rendezvous over the hostname works once rank 0 is on the right node; `DF3_RDZV_HSN=1` switches it to the first node's `hsn0` address.
+- **Not yet verified (as of 2026-10-29):** whether the venv's NCCL (2.29.3, cu12 wheel) works with KISTI's `aws-ofi-nccl/1.20.0`; KISTI validated the plugin with the NCCL in their containers. If the log shows `Using network Socket` or `Failed to initialize any NET plugin`, the fallback is the Slingshot image `/apps/common/kisti-container/images/slingshot/kisti-pytorch-25.03-gh200-r1-aarch64.sif` via `kisti-container --runtime singularity --nccl ofi` (torch 2.7-era: check API / Triton compatibility first).
+- **Slurm limits:** partition `normal`, 24 h walltime, 5 active jobs per user (a full chain uses all 5, so run `check` / `warmup` before `submit.sh`), jobs submitted only from `/scratch` or `/appsdata`, `--comment="field=…;appl=…"` mandatory.
+- **Filesystem:** 4 KiB pages; `/scratch` (Lustre) honours `posix_fadvise(DONTNEED)` and `fincore` reports it correctly; files untouched for 15 days are purged.
+- **`EXTRA_ARGS`** travels through `sbatch --export`, so no commas.
