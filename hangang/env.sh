@@ -22,6 +22,12 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
 export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${HOME}/.local/share/uv/python}"
 export UV_LINK_MODE=copy
 
+# Unbuffered Python output: under srun stdout is a pipe, so Python block-buffers
+# it (~8 KB) and the job's .out file lags far behind what the ranks have done
+# (rank 0's progress lines sit unflushed). env.sh is sourced by every job
+# script and srun passes the environment to the ranks.
+export PYTHONUNBUFFERED=1
+
 # Persistent Triton autotune cache (``deepfold3 warmup-triton`` fills it, every
 # training rank reads it at import). $HOME: visible on every node, not purged,
 # and the cache is a few dozen JSON files. Keyed by GPU model, so one warmup
