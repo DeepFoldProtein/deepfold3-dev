@@ -3,6 +3,9 @@
 # Submit through hangang/submit.sh, which sets the run name, node count and
 # the 24 h job chain; the trainer auto-resumes from the newest checkpoint in
 # the run directory, so every link of the chain runs the same command.
+# auto_resume is forced on below: every shipped config inherits
+# `auto_resume: false` from initial.yaml, which would make each link restart
+# from step 0 (or from --params) instead of continuing the chain.
 #
 #SBATCH --job-name=df3
 #SBATCH --partition=normal
@@ -49,6 +52,7 @@ srun --mpi=none --gpu-bind=none --kill-on-bad-exit=1 \
     --ccd "${DATA}/components.cif.gz" \
     --ccd-cache "${DATA}/ccd_cache.json" \
     --mmcif-dir "${DATA}/pdb/divided" \
+    --override auto_resume=true \
     ${EXTRA_ARGS:-} &
 SRUN_PID=$!
 set +e

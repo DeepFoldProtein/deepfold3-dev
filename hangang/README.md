@@ -92,7 +92,30 @@ NODES=16 EXTRA_ARGS="--wandb deepfold3-stage0" bash hangang/submit.sh df3-hangan
 `train.sbatch` writes `$RUNS/<run>/config.yaml` once (from `configs/initial.yaml`
 with `/data/` → `$DATA/`) and every link reuses it. Ten minutes before the
 walltime the job asks the ranks to checkpoint (SIGTERM → `ShutdownCoordinator`);
-the next link resumes from the newest checkpoint.
+the next link resumes from the newest checkpoint (`train.sbatch` forces
+`auto_resume=true`; the configs default it to false).
+
+Starting from another run's weights, with a different seed:
+
+```bash
+CONFIG_SRC=configs/stage2.yaml \
+EXTRA_ARGS="--params ${RUNS}/<stage1-run>/checkpoint_<step>.pt --seed 202 --wandb deepfold3-stage2" \
+    bash hangang/submit.sh df3-stage2-001
+```
+
+- `--params` loads model weights only (`ckpt["model"]` from a `.pt`, or a
+  `.safetensors`); step, optimizer and LR schedule start fresh. Every link
+  passes it, but once the run directory has a checkpoint, auto-resume
+  overwrites those weights together with the optimizer state and step, so
+  only the first link actually starts from `--params`.
+- `--seed` sets `training.seed` (data sampling order and init RNG); keep it
+  the same on every link of a chain, which `EXTRA_ARGS` does automatically.
+- `EXTRA_ARGS` travels through `sbatch --export`, so it must not contain a
+  comma.
+- `CONFIG_SRC` is read only by the first link, which freezes it into
+  `$RUNS/<run>/config.yaml`; to change a started run's config, edit that file.
+  `EXTRA_ARGS` is passed to every link, and re-running `submit.sh` to extend a
+  chain uses that invocation's `EXTRA_ARGS` for the new links.
 
 ## Things to confirm on the machine
 
