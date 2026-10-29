@@ -19,7 +19,7 @@ local (source host)                          Hangang
 | --- | --- | --- |
 | `pack_all.sh` | source host | build the packed staging tree (resumable, verifies each pack) |
 | `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover) |
-| `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_OFI_NCCL_LIB`** (`DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp`) |
+| `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings (`df3_slingshot_env`: aws-ofi-nccl module, hsn0 rendezvous; multi-node only) — `DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp` |
 | `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen`, then torch swapped to the `cu126` build (driver is CUDA 12.8); afterwards never `uv run`/`uv sync` there |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
 | `warmup.sbatch` | 1 GPU node | fills the Triton autotune cache (`$HOME/.cache/deepfold3-triton`) for a training config, once before `submit.sh` |
@@ -74,7 +74,7 @@ The data mover (`hangang-dm.ksc.re.kr`) has no CPU-time limit, unlike the login 
 ```bash
 ssh <kisti-id>@hangang.ksc.re.kr                       # GPU login node (aarch64)
 cd /scratch/$USER/deepfold3/deepfold3-dev               # repo copied/cloned here
-vi hangang/env.sh                                       # DF3_OFI_NCCL_LIB (DF3_SLURM_FIELD/APPL: check showappl)
+vi hangang/env.sh                                       # optional: DF3_SLURM_FIELD/APPL (check showappl)
 bash hangang/setup_env.sh
 sbatch hangang/check.sbatch                             # carries --comment in its #SBATCH header
 ```
@@ -130,11 +130,17 @@ EXTRA_ARGS="--params ${RUNS}/<stage1-run>/checkpoint_<step>.pt --seed 202 --wand
 
 ## Things to confirm on the machine
 
-- **Slingshot NCCL plugin.** The venv's NCCL wheel has no libfabric plugin;
-  without `DF3_OFI_NCCL_LIB` multi-node training falls back to TCP. Find the
-  system plugin (`kisti-container --doctor`, `module avail`) and check the job
-  log for `Selected provider is cxi`. Alternatively run inside the KISTI
-  Slingshot PyTorch image via `kisti-container --runtime pyxis --nccl ofi`.
+- **Slingshot NCCL plugin.** Multi-node jobs load `aws-ofi-nccl/1.20.0` +
+  `libfabric/2.3.1` and KISTI's NCCL settings (`df3_slingshot_env` in
+  `env.sh`). The job log must show `NCCL INFO Using network AWS Libfabric`;
+  `Using network Socket` means the plugin did not load. The plugin runs
+  against the venv's NCCL (cu12 wheel); KISTI validated it with their own
+  NCCL, so a version mismatch would show up here first.
+- **Rendezvous.** `MASTER_ADDR` is the first node's hostname (KISTI's
+  example), which resolves to the management network (`bond0`). If init times
+  out with `TCP client failed to connect ... <node>:<port>`, resubmit with
+  `DF3_RDZV_HSN=1` in the environment to rendezvous over the first node's
+  `hsn0` address instead.
 - **PyPI from the login node.** `setup_env.sh` needs it once; if blocked, build
   the venv inside the KISTI PyTorch container instead.
 - **Purge policy.** Training keeps touched shards fresh; `keepalive.sh` reports

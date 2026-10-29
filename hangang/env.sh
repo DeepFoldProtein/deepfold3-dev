@@ -47,20 +47,59 @@ export DF3_TORCH_CUDA="${DF3_TORCH_CUDA-cu126}"
 export DF3_SLURM_FIELD="${DF3_SLURM_FIELD:-sciai}"
 export DF3_SLURM_APPL="${DF3_SLURM_APPL:-pytorch-ddp}"
 
-# Multi-node NCCL over HPE Slingshot needs the libfabric (OFI) net plugin with
-# the CXI provider; without it NCCL silently falls back to TCP sockets. The
-# venv's NCCL (nvidia-nccl-cu12 wheel, with DF3_TORCH_CUDA=cu126) does not ship the plugin, so point
-# NCCL at the system one. Find it with
-#   /apps/common/kisti-container/bin/kisti-container --doctor
-# or `module avail aws-ofi-nccl`, and set DF3_OFI_NCCL_LIB to the directory
-# holding libnccl-net*.so. Confirm in a job log: "Selected provider is cxi".
-export DF3_OFI_NCCL_LIB="${DF3_OFI_NCCL_LIB:-}"
-if [[ -n "${DF3_OFI_NCCL_LIB}" ]]; then
-    export LD_LIBRARY_PATH="${DF3_OFI_NCCL_LIB}:${LD_LIBRARY_PATH:-}"
-    export NCCL_NET="${NCCL_NET:-AWS Libfabric}"
-    export FI_PROVIDER="${FI_PROVIDER:-cxi}"
-fi
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# Multi-node setup over HPE Slingshot, called by train.sbatch when the job has
+# more than one node (never on a single node: KISTI notes the OFI plugin can
+# fail NCCL init when no Slingshot VNI is allocated). Follows
+# docs-ksc.gitbook.io/hangang-user-guide/software/{nccl-slingshot,pytorch}:
+#   - aws-ofi-nccl/1.20.0 + libfabric/2.3.1: the CXI net plugin. The venv's
+#     NCCL wheel ships none and would fall back to TCP sockets. The module also
+#     sets NCCL_SOCKET_IFNAME=hsn0..3 and FI_CXI_* defaults.
+#   - NCCL_PROTO=^LL128: LL128 gave wrong multi-node AllReduce results in
+#     KISTI's validation.
+#   - NCCL_DEBUG=INFO with INIT,NET: the job log must show
+#     "NCCL INFO Using network AWS Libfabric" ("Using network Socket" = the
+#     plugin did not load).
+# Rendezvous: MASTER_ADDR stays the first node's hostname, as KISTI's PyTorch
+# example sets it (srun_rank.sh). Hostnames resolve to the management network
+# (bond0, *.hostmgmt), not Slingshot. DF3_RDZV_HSN=1 points MASTER_ADDR (the
+# TCPStore every rank dials at init) and Gloo at the first node's hsn0 address
+# instead: the fallback if init again times out connecting to <host>:<port>.
+df3_slingshot_env() {
+    set +u
+    if ! type module >/dev/null 2>&1; then
+        for init in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash; do
+            [[ -f "${init}" ]] && source "${init}" && break
+        done
+    fi
+    type module >/dev/null 2>&1 || { echo "df3_slingshot_env: no 'module' command" >&2; return 1; }
+    module purge || true  # Lmod may warn about sticky modules
+    module load aws-ofi-nccl/1.20.0 libfabric/2.3.1 || { set -u; return 1; }
+    set -u
+    export NCCL_NET="AWS Libfabric"
+    export FI_PROVIDER=cxi
+    export NCCL_IB_DISABLE=1
+    export NCCL_PROTO=^LL128
+    export NCCL_DEBUG="${DF3_NCCL_DEBUG:-INFO}"
+    export NCCL_DEBUG_SUBSYS=INIT,NET
+
+    if [[ "${DF3_RDZV_HSN:-0}" != 1 ]]; then
+        echo "slingshot: $(module -t list 2>&1 | tr '\n' ' '); MASTER_ADDR = first node's hostname"
+        return 0
+    fi
+    export GLOO_SOCKET_IFNAME=hsn0
+    local first addr
+    first=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
+    if [[ "$(hostname -s)" == "${first}" ]]; then
+        addr=$(ip -4 -o addr show hsn0 | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    else
+        addr=$(srun --overlap -N1 -n1 -w "${first}" ip -4 -o addr show hsn0 | awk '{print $4}' | cut -d/ -f1 | head -n1)
+    fi
+    [[ -n "${addr}" ]] || { echo "df3_slingshot_env: no hsn0 address on ${first}" >&2; return 1; }
+    export MASTER_ADDR="${addr}"
+    echo "slingshot: MASTER_ADDR=${MASTER_ADDR} (${first} hsn0), $(module -t list 2>&1 | tr '\n' ' ')"
+}
 
 df3_slurm_comment() { echo "field=${DF3_SLURM_FIELD};appl=${DF3_SLURM_APPL}"; }
 

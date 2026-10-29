@@ -35,6 +35,9 @@ echo "job ${SLURM_JOB_ID}: ${SLURM_JOB_NUM_NODES} nodes x 4 GPUs -> ${RUN_DIR}"
 echo "nodes: ${SLURM_JOB_NODELIST}"
 
 export OMP_NUM_THREADS=8
+if (( SLURM_JOB_NUM_NODES > 1 )); then
+    df3_slingshot_env
+fi
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
 # 10 min before the walltime Slurm sends USR1 to this script; forward it as
