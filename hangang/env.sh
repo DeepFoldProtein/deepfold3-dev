@@ -28,6 +28,11 @@ export UV_LINK_MODE=copy
 # script and srun passes the environment to the ranks.
 export PYTHONUNBUFFERED=1
 
+# GH200 has 96 GB of HBM, and the variable-size crops fragment the caching
+# allocator: the first stage2 smoke run hit OOM asking for 2 GiB with 1.9 GiB
+# free. Expandable segments let freed blocks merge instead of stranding them.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
+
 # Persistent Triton autotune cache (``deepfold3 warmup-triton`` fills it, every
 # training rank reads it at import). $HOME: visible on every node, not purged,
 # and the cache is a few dozen JSON files. Keyed by GPU model, so one warmup

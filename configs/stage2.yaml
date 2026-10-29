@@ -33,6 +33,10 @@ base: stage1.yaml
 
 training:
   wandb_project: deepfold3-stage2
+  # Half of stage1's 8: each chunk back-props on its own, so this halves the
+  # diffusion activation peak (needed on Hangang's 96 GB GH200) with the same
+  # gradients, at some speed cost.
+  diffusion_chunk_size: 4
 
 model:
   diffusion:
