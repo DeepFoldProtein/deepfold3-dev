@@ -22,6 +22,12 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
 export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${HOME}/.local/share/uv/python}"
 export UV_LINK_MODE=copy
 
+# CUDA build of torch for the venv. The lockfile pins PyPI's torch, which is
+# the CUDA 13 build; Hangang's driver supports CUDA 12.8 (driver API 12080),
+# so setup_env.sh swaps in the same torch version from PyTorch's cu126 index.
+# Set to "" to keep the lockfile's build (e.g. after a driver upgrade).
+export DF3_TORCH_CUDA="${DF3_TORCH_CUDA-cu126}"
+
 # Slurm accounting: every job must carry --comment="field=...;appl=..." with
 # values from `showappl` on a login node (AI-for-science, PyTorch DDP). The
 # same default is baked into the #SBATCH headers of check.sbatch/train.sbatch,
@@ -31,7 +37,7 @@ export DF3_SLURM_APPL="${DF3_SLURM_APPL:-pytorch-ddp}"
 
 # Multi-node NCCL over HPE Slingshot needs the libfabric (OFI) net plugin with
 # the CXI provider; without it NCCL silently falls back to TCP sockets. The
-# venv's NCCL (nvidia-nccl-cu13 wheel) does not ship the plugin, so point
+# venv's NCCL (nvidia-nccl-cu12 wheel, with DF3_TORCH_CUDA=cu126) does not ship the plugin, so point
 # NCCL at the system one. Find it with
 #   /apps/common/kisti-container/bin/kisti-container --doctor
 # or `module avail aws-ofi-nccl`, and set DF3_OFI_NCCL_LIB to the directory

@@ -20,7 +20,7 @@ local (source host)                          Hangang
 | `pack_all.sh` | source host | build the packed staging tree (resumable, verifies each pack) |
 | `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover) |
 | `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_OFI_NCCL_LIB`** (`DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp`) |
-| `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen` |
+| `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen`, then torch swapped to the `cu126` build (driver is CUDA 12.8); afterwards never `uv run`/`uv sync` there |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
 | `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
 | `keepalive.sh` | Hangang | report files close to the 15-day purge (optionally refresh atime) |
