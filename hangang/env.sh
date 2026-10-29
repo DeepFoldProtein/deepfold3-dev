@@ -22,6 +22,12 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
 export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${HOME}/.local/share/uv/python}"
 export UV_LINK_MODE=copy
 
+# Persistent Triton autotune cache (``deepfold3 warmup-triton`` fills it, every
+# training rank reads it at import). $HOME: visible on every node, not purged,
+# and the cache is a few dozen JSON files. Keyed by GPU model, so one warmup
+# serves every GH200 job; see hangang/warmup.sbatch.
+export DEEPFOLD3_TRITON_CACHE_DIR="${DEEPFOLD3_TRITON_CACHE_DIR:-${HOME}/.cache/deepfold3-triton}"
+
 # CUDA build of torch for the venv. The lockfile pins PyPI's torch, which is
 # the CUDA 13 build; Hangang's driver supports CUDA 12.8 (driver API 12080),
 # so setup_env.sh swaps in the same torch version from PyTorch's cu126 index.

@@ -22,6 +22,7 @@ local (source host)                          Hangang
 | `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings — **edit `DF3_OFI_NCCL_LIB`** (`DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp`) |
 | `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen`, then torch swapped to the `cu126` build (driver is CUDA 12.8); afterwards never `uv run`/`uv sync` there |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
+| `warmup.sbatch` | 1 GPU node | fills the Triton autotune cache (`$HOME/.cache/deepfold3-triton`) for a training config, once before `submit.sh` |
 | `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
 | `keepalive.sh` | Hangang | report files close to the 15-day purge (optionally refresh atime) |
 | `smoke_data.py` | (called by `check.sbatch`) | builds the real DataLoader from a config and times it |
@@ -77,6 +78,16 @@ vi hangang/env.sh                                       # DF3_OFI_NCCL_LIB (DF3_
 bash hangang/setup_env.sh
 sbatch hangang/check.sbatch                             # carries --comment in its #SBATCH header
 ```
+
+Then warm the Triton autotune cache for the config you will train, so the
+training ranks do not each benchmark every kernel shape on their first steps:
+
+```bash
+CONFIG_SRC=configs/stage2.yaml sbatch --comment="$(source hangang/env.sh; df3_slurm_comment)" hangang/warmup.sbatch
+```
+
+It must end with `=== warmup done`. Re-run it after changing the model widths,
+`max_tokens` or `batch_size_per_rank`; already-cached shapes are skipped.
 
 `check.sbatch` must end with `=== check passed`. In its smoke-test section
 every dataset should report `pack` (not `plain`/`MISSING`), and the per-dataset
