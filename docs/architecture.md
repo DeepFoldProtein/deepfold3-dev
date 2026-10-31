@@ -144,7 +144,7 @@ still uniform, i.e. inert. See `export/mhr-trimul/README.md`.
 
 ### `evoformer.py` -- Trunk
 
-**`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition
+**`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition. With `OptimConfig.use_fused_msa_transition_inference` and grad disabled, the MSA transition runs as one in-place kernel (`triton/msa_transition.py`); weights and state-dict keys stay on the same `msa_transition` block.
 
 **`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition (the last two are dropped by `use_single_track=False`)
 
