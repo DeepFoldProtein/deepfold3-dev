@@ -46,7 +46,7 @@ import click
 import torch
 
 from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
-from deepfold3.model.guidance import check_guidance_training
+from deepfold3.model.guidance import check_guidance_training, has_residue_ranges
 from deepfold3.scripts import cli
 from deepfold3.scripts._common import apply_det_recipe
 from deepfold3.scripts.inference import _describe_guidance, _parse_guidance
@@ -154,6 +154,7 @@ def _run_one_job(
     bucket: bool = False,
     precision: str = "fp32",
     guidance_specs: tuple = (),
+    allow_overlap: bool = False,
     manifest_fields: dict | None = None,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
@@ -236,7 +237,14 @@ def _run_one_job(
 
         chain_index = {_resolve(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
         try:
-            guidance_terms = build_guidance_terms(guidance_specs, feats["asym_id"], chain_index, original_n)
+            guidance_terms = build_guidance_terms(
+                guidance_specs,
+                feats["asym_id"],
+                chain_index,
+                original_n,
+                residue_index=feats.get("residue_index"),
+                allow_overlap=allow_overlap,
+            )
         except ValueError as e:
             raise click.ClickException(f"--guidance on {json_input.name}: {e}") from e
 
@@ -517,6 +525,15 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     help="Classifier-free guidance term, as ``inference --guidance``; applied to every job.",
 )
 @click.option(
+    "--allow-guidance-overlap",
+    is_flag=True,
+    default=False,
+    help=(
+        "Accept --guidance selections (as ``inference``) that drop the same pair block twice: a union inside one "
+        "term, and summed weights across terms (otherwise an error and a warning)."
+    ),
+)
+@click.option(
     "--det",
     is_flag=True,
     default=False,
@@ -546,6 +563,7 @@ def inference_batch(
     precision: str,
     hoist_sampler: bool,
     guidance_specs: tuple,
+    allow_guidance_overlap: bool,
     det: bool,
     plot_confidences: bool,
     save_distogram: bool,
@@ -597,6 +615,8 @@ def inference_batch(
         except ValueError as e:
             raise click.UsageError(f"--guidance: {e}") from e
         click.echo(f"[batch] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+        if has_residue_ranges(guidance_specs):
+            click.echo("[batch] note: a residue-subset drop is finer than the training drop (whole chain pairs)")
 
     checkpoint = checkpoint_record(params)
     checkpoint["sha256"] = sha256_file(params)
@@ -659,6 +679,7 @@ def inference_batch(
             bucket=bucket,
             precision=precision,
             guidance_specs=guidance_specs,
+            allow_overlap=allow_guidance_overlap,
             manifest_fields=manifest_fields,
         )
         n_done += 1
