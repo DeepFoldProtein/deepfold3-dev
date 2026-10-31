@@ -365,6 +365,20 @@ def set_nearest_shape_lookup(enabled: bool) -> None:
     _nearest_shape_lookup = enabled
 
 
+_fixed_config = False
+
+
+def set_fixed_config(enabled: bool) -> None:
+    """Serve each kernel its first config, ignoring the cache and never benchmarking.
+
+    Tile sizes change the order of floating-point sums, so a benchmark winner
+    (which depends on timing) or a cached config (which depends on the host)
+    can change the low bits of a result. For ``inference --det``.
+    """
+    global _fixed_config
+    _fixed_config = enabled
+
+
 # ── Persistent Autotune Decorator ────────────────────────────────────────
 
 
@@ -477,6 +491,12 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
             # a prior autotune run or from our pre-hook injection on a
             # previous call). Skip the persistent-cache machinery entirely.
             if triton_key is not None and triton_key in autotuned_fn.cache:
+                return _original_run(*args, **kwargs)
+
+            if _fixed_config:
+                if triton_key is None:
+                    raise RuntimeError(f"Triton {fn_name}: cannot fix the config, no cache key for this call")
+                autotuned_fn.cache[triton_key] = configs[0]
                 return _original_run(*args, **kwargs)
 
             # ── Pre-hook: inject from persistent cache if Triton hasn't

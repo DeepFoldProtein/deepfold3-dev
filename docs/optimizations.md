@@ -191,6 +191,26 @@ See the **B200 End-to-End Benchmark** at the top for the measured training/infer
 - **For inference**: `--optim inference` (= `OptimConfig.inference()`) — all four pair-scale kernels + `ln_transpose` + tiled pair transitions. 1.44–1.49× over baseline. `pair_bias` is safe here (no backward).
 - **Debugging**: omit `--optim` — pure PyTorch, no compiled graphs, easy to debug.
 
+### Inference output writes
+
+`deepfold3 inference` compresses logits on a background thread (`io/background_writer.py`), so the next
+seed starts while they are written. The files are byte-identical to inline writes. Measured on real
+logits, 5 samples, `checkpoint_120000.pt`, RTX 6000 Ada:
+
+| Tokens | Forward per seed | Logit writes | mmCIF + confidences | Time between seeds, before → after |
+|---|---|---|---|---|
+| 566 | 90 s | 10.8 s | 2.0 s | 12.6 s → 2.9 s |
+| 1016 | 298 s | 41.5 s | 3.2 s | 44.9 s → 6.8 s (replay) |
+
+Deflate does not get cheaper on real logits: 26 MB/s against 37 MB/s on random ones. Scaled by N² that
+is about 160 s per seed at N=2000. Confidences stay on the caller's thread because they run on the GPU
+and CPU arithmetic may round differently. `--plot-confidences` drains the writer first, as the plot reads
+those files, so it gets no gain. A failed write stops the run at the next submit, and the run does not
+exit until every queued write has finished.
+
+`inference-batch` still writes inline. It writes no per-sample logits, so mmCIF and confidences are its
+whole tail (about 1%), and `--skip-existing` trusts `model.cif` written after the distogram.
+
 ## Installation
 
 Triton kernels require the `optim` dependency group:
@@ -311,6 +331,28 @@ Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (
   > B200 paid no autotune cost. It was removed (~2,200 lines, incomplete — `_attn_bwd_db`
   > never had configs, crops > 384 weren't covered) in favor of the shared-cache + warmup
   > workflow below. On an empty cache, kernels now autotune on first call and persist.
+
+#### `--det`: fixed configs
+
+Tile sizes change the order of floating-point sums, so a config picked by timing, or read from a host's
+cache, can move the low bits of a result. `deepfold3 inference --det` serves each kernel its first config
+(`set_fixed_config`), and neither reads nor writes the cache. It also sets `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+(unless already set), `torch.use_deterministic_algorithms(True)` (which raises on an op with no deterministic
+path) and cuDNN deterministic mode. It refuses `torch.compile` presets and `DEEPFOLD3_TRITON_NO_CACHE=1`.
+
+**Guarantee.** The same input, weights, seeds and flags give the same output bytes on the same GPU model,
+driver, software stack and CPU thread count. Measured on 7st5 (N=566, two seeds, five samples): two `--det`
+runs were byte-identical on all 34 files, one with an empty cache directory that stayed empty.
+`PYTHONHASHSEED` cannot be set from inside the process, but feature tensors were identical across three
+hash seeds on three inputs, including a ligand job.
+
+**Not guaranteed.** Reproduction across GPU models, drivers, or torch/Triton versions (compare
+`run_manifest.json`); agreement with a run without `--det`; agreement between `--bucket` and `--no-bucket`,
+whose sampler noise differs. Only `--optim inference`-style presets were tested. `inference-batch` has no `--det`.
+
+**Cost.** Forward 99.6 s against 90.0 s per seed (+10.7%) with the default warmed cache. Against that
+default, coordinates and distogram logits were bit-identical; confidence outputs differed in the low bits
+(per-atom pLDDT by up to 0.012, ranking scores unchanged at four decimals).
 
 #### Recommended workflow: warmup once, read from a shared cache
 

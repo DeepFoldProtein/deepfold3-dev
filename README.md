@@ -100,6 +100,10 @@ This produces:
 
 - `prediction.cif` -- mmCIF with MODEL blocks per diffusion sample, pLDDT as B-factors
 - `prediction_confidences.json` -- full confidence metrics (PAE, PDE, pTM, ipTM, contacts, etc.)
+- `prediction_run_manifest.json` -- git commit, versions, GPU, checkpoint digest, seeds and settings of the run (`run_manifest.json` for `--json`)
+
+Weights that leave a model parameter unset are refused unless you pass `--allow-missing-keys`.
+`--det` makes a rerun byte-identical on the same GPU model and software stack; see `docs/optimizations.md`.
 
 ### 4. Plot confidence maps
 
