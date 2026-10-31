@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 
@@ -439,15 +441,49 @@ def _parse(text: str):
 
 
 def test_guidance_spec_syntax():
+    from deepfold3.model.guidance import ChainSel
+
     assert _parse("2").target == "full"
     assert _parse("1.5@all").target == "all"
     pairs = _parse("2@A:B,AA:B")
-    assert (pairs.target, pairs.pairs) == ("pairs", (("A", "B"), ("AA", "B")))
+    assert (pairs.target, pairs.pairs) == ("pairs", ((ChainSel("A"), ChainSel("B")), (ChainSel("AA"), ChainSel("B"))))
     assert _parse("2@full@1e-4..160").sigma_range == (1e-4, 160.0)
 
 
+def test_residue_selector_syntax():
+    from deepfold3.model.guidance import ChainSel, has_residue_ranges
+
+    spec = _parse("2@A/25-40+88:B")
+    assert spec.pairs == ((ChainSel("A", ((25, 40), (88, 88))), ChainSel("B")),)
+    assert str(spec.pairs[0][0]) == "A/25-40+88"  # round-trips for the run manifest / echo
+    assert has_residue_ranges([spec])
+    assert not has_residue_ranges([_parse("2@A:B"), _parse("2@all"), _parse("2")])
+    assert not has_residue_ranges([_parse("1@A/25-40:B")])  # w = 1 is inert
+
+
 @pytest.mark.parametrize(
-    "text", ["", "x", "nan", "2@A", "2@A:A", "2@A:B:C", "2@A:", "2@A:B,", "2@all@5..1", "2@all@1", "2@all@1..2@x"]
+    "text",
+    [
+        "",
+        "x",
+        "nan",
+        "2@A",
+        "2@A:A",
+        "2@A:B:C",
+        "2@A:",
+        "2@A:B,",
+        "2@all@5..1",
+        "2@all@1",
+        "2@all@1..2@x",
+        "2@A/:B",  # '/' with no residues
+        "2@A/x:B",  # not a number
+        "2@A/40-25:B",  # LO > HI
+        "2@A/25-:B",
+        "2@A/25-40-60:B",
+        "2@A/-5:B",  # no negative residue numbers
+        "2@A/25+:B",
+        "2@A/25-40:A/60-80",  # still the same chain
+    ],
 )
 def test_guidance_spec_rejects_malformed(text):
     with pytest.raises(ValueError):
@@ -463,6 +499,88 @@ def test_pair_term_drops_exactly_the_named_chain_pairs():
     dropped = {(int(asym[0, i]), int(asym[0, j])) for i, j in (~keep).nonzero().tolist()}
     assert dropped == {(0, 2), (2, 0)}
     assert torch.equal(keep, keep.T)
+
+
+def test_residue_selector_drops_only_the_named_blocks():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym = torch.tensor([0, 0, 0, 1, 1])
+    res = torch.tensor([1, 2, 3, 1, 2])
+    keep = build_guidance_terms([_parse("2@A/2-3:B")], asym, {"A": 0, "B": 1}, residue_index=res)[0].pair_keep
+    dropped = {tuple(ij) for ij in (~keep).nonzero().tolist()}
+    # tokens 1,2 (chain A, residues 2-3) against tokens 3,4 (chain B), both blocks
+    assert dropped == {(1, 3), (1, 4), (2, 3), (2, 4), (3, 1), (4, 1), (3, 2), (4, 2)}
+    assert bool(keep[0].all()) and bool(keep[:, 0].all())  # residue 1 keeps its conditioning
+
+
+def test_pairs_of_one_term_are_a_union_not_two_branches():
+    """Commas inside one term union into ONE mask, so one more denoiser pass.
+
+    Two ``--guidance`` values of the same weight are a different thing: two
+    unconditional branches, two differences, two passes.
+    """
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym = torch.tensor([0, 0, 1, 2])
+    res = torch.tensor([1, 2, 1, 1])
+    args = (asym, {"A": 0, "B": 1, "C": 2})
+    both = build_guidance_terms([_parse("2@A/1:B,A/2:C")], *args, residue_index=res)
+    assert len(both) == 1
+    one = build_guidance_terms([_parse("2@A/1:B")], *args, residue_index=res)[0].pair_keep
+    two = build_guidance_terms([_parse("2@A/2:C")], *args, residue_index=res)[0].pair_keep
+    assert torch.equal(both[0].pair_keep, one & two)
+
+
+def test_overlapping_pairs_in_one_term_are_an_error():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym, res = torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 1])
+    with pytest.raises(ValueError, match="already dropped by"):
+        build_guidance_terms([_parse("2@A/1-2:B,A/2-3:B")], asym, {"A": 0, "B": 1}, residue_index=res)
+    # disjoint residues of the same chain pair are fine
+    build_guidance_terms([_parse("2@A/1:B,A/3:B")], asym, {"A": 0, "B": 1}, residue_index=res)
+
+
+def test_overlapping_terms_warn_about_the_summed_weight():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym, res = torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 1])
+    args = (asym, {"A": 0, "B": 1})
+    with pytest.warns(UserWarning, match="not either weight"):
+        build_guidance_terms([_parse("2@A/1-2:B"), _parse("-1@A/2-3:B")], *args, residue_index=res)
+    with warnings.catch_warnings():  # disjoint blocks, and disjoint σ̂ ranges, stay quiet
+        # (σ̂ bounds are inclusive on both sides: 0..100 and 100..4608 would share σ̂ = 100)
+        warnings.simplefilter("error")
+        build_guidance_terms([_parse("2@A/1:B"), _parse("-1@A/3:B")], *args, residue_index=res)
+        build_guidance_terms([_parse("2@A/1-2:B@100..4608"), _parse("-1@A/2-3:B@0..99.9")], *args, residue_index=res)
+        build_guidance_terms([_parse("2"), _parse("2@all")], *args, residue_index=res)  # full is exempt
+
+
+def test_residue_selector_needs_residue_index():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    with pytest.raises(ValueError, match="residue_index"):
+        build_guidance_terms([_parse("2@A/2-3:B")], torch.tensor([0, 1]), {"A": 0, "B": 1})
+
+
+def test_residue_selector_that_selects_nothing_is_an_error():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym, res = torch.tensor([0, 0, 1]), torch.tensor([1, 2, 1])
+    with pytest.raises(ValueError, match="A/9-20 selects no token"):
+        build_guidance_terms([_parse("2@A/9-20:B")], asym, {"A": 0, "B": 1}, residue_index=res)
+
+
+def test_residue_selector_never_drops_bucket_padding():
+    asym = torch.tensor([0, 0, 1, 0, 0])  # the last two are padding, asym_id 0
+    res = torch.tensor([1, 2, 1, 1, 2])  # padding repeats the residue numbers
+    from deepfold3.model.guidance import build_guidance_terms
+
+    keep = build_guidance_terms([_parse("2@A/1-2:B")], asym, {"A": 0, "B": 1}, n_tokens=3, residue_index=res)[
+        0
+    ].pair_keep
+    assert (~keep).sum() == 4  # (0,2), (1,2) and their mirrors
+    assert bool(keep[3:].all()) and bool(keep[:, 3:].all())
 
 
 def test_pair_term_never_drops_bucket_padding():
@@ -581,3 +699,64 @@ def test_forward_passes_terms_to_the_sampler():
     model.diffusion_head.sample = spy
     model(batch, num_recycles=0, num_samples=1, guidance_terms=terms)
     assert seen["terms"] is terms
+
+
+def test_allow_overlap_takes_the_union_quietly():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym, res = torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 1])
+    args = (asym, {"A": 0, "B": 1})
+    union = build_guidance_terms([_parse("2@A/1-2:B,A/2-3:B")], *args, residue_index=res, allow_overlap=True)[
+        0
+    ].pair_keep
+    expected = build_guidance_terms([_parse("2@A/1-3:B")], *args, residue_index=res)[0].pair_keep
+    assert torch.equal(union, expected)
+    with warnings.catch_warnings():  # and it silences the cross-term warning too
+        warnings.simplefilter("error")
+        build_guidance_terms([_parse("2@A/1-2:B"), _parse("-1@A/2-3:B")], *args, residue_index=res, allow_overlap=True)
+
+
+def test_residue_numbers_are_the_input_sequence_positions(tmp_path):
+    """End to end: the selector's numbering is the job JSON's own, 1-based.
+
+    The guidance mask is built from ``feats["residue_index"]``, which carries
+    res_id. For a sequence given in the JSON that is its 1-based position, so
+    ``B/2-3`` must be the second and third residue of the chain the input calls
+    B — not an internal index, and not 0-based.
+    """
+    import json
+
+    from deepfold3.data.module.dataset import InferenceInput, job_chain_ids
+    from deepfold3.data.parse.json_input import parse_json_input
+    from deepfold3.io.mmcif import resolve_chain_name
+    from deepfold3.model.guidance import build_guidance_terms
+
+    path = tmp_path / "job.json"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "t",
+                "dialect": "deepfold3",
+                "version": 3,
+                "modelSeeds": [1],
+                "sequences": [
+                    {"protein": {"id": "A", "sequence": "GGGG"}},
+                    {"protein": {"id": "B", "sequence": "AAWAA"}},
+                ],
+            }
+        )
+    )
+    job = parse_json_input(path)[0]
+    feats = InferenceInput.from_job(job)
+    names = job_chain_ids(job)  # exactly what ``inference`` passes
+    chain_index = {resolve_chain_name(a, names): a for a in feats["asym_id"].unique().tolist()}
+
+    keep = build_guidance_terms(
+        [_parse("2@B/2-3:A")],
+        feats["asym_id"],
+        chain_index,
+        residue_index=feats["residue_index"],
+    )[0].pair_keep
+    rows = sorted({int(i) for i, _ in (~keep).nonzero().tolist()} & set(range(4, 9)))
+    assert rows == [5, 6]  # chain A is tokens 0..3, so B's residues 2,3 are tokens 5,6
+    assert feats["residue_index"][5:7].tolist() == [2, 3]

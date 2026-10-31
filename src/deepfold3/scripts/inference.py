@@ -63,6 +63,7 @@ from deepfold3.model.guidance import (
     GuidanceSpec,
     build_guidance_terms,
     check_guidance_training,
+    has_residue_ranges,
     parse_guidance_spec,
 )
 from deepfold3.scripts import cli
@@ -77,7 +78,7 @@ def _parse_guidance(_ctx, _param, values: tuple[str, ...]) -> tuple[GuidanceSpec
 
 
 def _describe_guidance(spec: GuidanceSpec) -> str:
-    target = ",".join(":".join(p) for p in spec.pairs) or spec.target
+    target = ",".join(f"{a}:{b}" for a, b in spec.pairs) or spec.target
     sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
     return f"w={spec.scale:g} {target}{sigma}"
 
@@ -244,8 +245,21 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
         "Classifier-free guidance term; repeat for a linear combination "
         "D_c + Σ (W−1)·(D_c − D_u). TARGET is what the term's unconditional branch "
         "drops: full (default), all (every interface) or chain pairs A:B,AA:B. "
+        "Either side of a pair may name residues of that chain instead of all of "
+        "it, in the input's own numbering, with + between ranges: A/25-40+88:B. "
+        "A residue subset is a finer drop than training ever did (whole chain-pair "
+        "blocks), so W far from 1 there is extrapolation. "
         "LO..HI limits the term to that σ̂ range (absolute, 0.0077..4608 is the "
         "whole schedule). Each active term adds one denoiser pass per step."
+    ),
+)
+@click.option(
+    "--allow-guidance-overlap",
+    is_flag=True,
+    default=False,
+    help=(
+        "Accept --guidance selections that drop the same pair block twice: a union inside one "
+        "term, and summed weights across terms (otherwise an error and a warning)."
     ),
 )
 @click.option(
@@ -301,6 +315,7 @@ def inference(
     precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
+    allow_guidance_overlap: bool,
     hoist_sampler: bool,
     allow_missing_keys: bool,
     det: bool,
@@ -541,10 +556,19 @@ def inference(
 
         chain_index = {resolve_chain_name(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
         try:
-            guidance_terms = build_guidance_terms(guidance_specs, feats["asym_id"], chain_index, original_n)
+            guidance_terms = build_guidance_terms(
+                guidance_specs,
+                feats["asym_id"],
+                chain_index,
+                original_n,
+                residue_index=feats.get("residue_index"),
+                allow_overlap=allow_guidance_overlap,
+            )
         except ValueError as e:
             raise click.UsageError(f"--guidance: {e}") from e
         click.echo(f"[inference] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+        if has_residue_ranges(guidance_specs):
+            click.echo("[inference] note: a residue-subset drop is finer than the training drop (whole chain pairs)")
 
     # ------------------------------------------------------------------
     # Determine seed list. JSON inputs honour the JSON's modelSeeds
