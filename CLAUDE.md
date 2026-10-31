@@ -45,6 +45,7 @@ deepfold3 inference --json input.json --output output_dir/ --params weights.safe
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --msa-crop-size 4096
 deepfold3 inference --json input.json --output output_dir/ --params stage2.safetensors --guidance 2.0@H:A,L:A
 deepfold3 inference --json input.json --output output_dir/ --params stage2.safetensors --guidance 1.5@all@1..160 --guidance 2.0@H:A
+deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --no-hoist-sampler
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 export    --checkpoint runs/exp1/checkpoint_final.pt --output weights.safetensors --snapshot average
 deepfold3 plot      --input out_confidences.json --output confidences.png

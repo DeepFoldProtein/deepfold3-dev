@@ -377,6 +377,11 @@ class DiffusionConfig:
     gamma_min: float = 1.0
     noise_scale: float = 1.003
     step_scale: float = 1.5
+    # Inference sampler: drop empty atom windows and compute step-invariant
+    # conditioning once (``DiffusionHead.hoist_static``). Same noise draws, 2.8x
+    # faster at 566 tokens, lower peak. The output moves within the sampler's own
+    # TF32 tolerance: see docs/optimizations.md. On for ``deepfold3 inference``.
+    hoist_sampler: bool = False
     # Noise schedule
     sigma_data: float = 16.0
     smin: float = 0.0004

@@ -235,6 +235,16 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
         "whole schedule). Each active term adds one denoiser pass per step."
     ),
 )
+@click.option(
+    "--hoist-sampler/--no-hoist-sampler",
+    default=True,
+    show_default=True,
+    help=(
+        "Drop empty atom windows and compute step-invariant conditioning once in the "
+        "diffusion sampler. Same noise draws; coordinates can move within the TF32 "
+        "tolerance, ~0.1 Å per denoiser call. --no-hoist-sampler runs the plain sampler."
+    ),
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -257,6 +267,7 @@ def inference(
     precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
+    hoist_sampler: bool,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -352,6 +363,7 @@ def inference(
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
     # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
+    model_cfg.diffusion.hoist_sampler = hoist_sampler
 
     if guidance_specs:
         if ckpt_model_cfg is None:
