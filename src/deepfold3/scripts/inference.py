@@ -218,8 +218,10 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     type=click.Choice(["fp32", "bf16"]),
     show_default=True,
     help=(
-        "Compute dtype of the forward pass. bf16 is what training runs under and "
-        "halves activation memory; fp32 is the historical inference behaviour."
+        "Compute dtype of the trunk, as training and eval run it: the MSA stack, "
+        "Pairformer and confidence blocks. The diffusion sampler, the atom conditioning "
+        "encoder and the final confidence layers stay fp32 either way, as the checkpoint's "
+        "own precision config asks. fp32 is the historical inference behaviour."
     ),
 )
 @click.option(
