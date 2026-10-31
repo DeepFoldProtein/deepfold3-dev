@@ -69,7 +69,7 @@ Written by `deepfold3 prepare` / `import-*` / `msa-batch` / `prepare-templates`,
 └── records/{ab}/{record_id}.json              per-record Record from prepare; the loader reads manifest.json
 ```
 
-Every template hit in the three sets records `index_space: struct` (back-filled 2026-08-22 by `stamp-template-index-space`).
+Template index frames (measured 2026-10-31 on `/store/deepfold3/data` by re-deriving each hit's identity): `afdb_nvda` and `teddymer` are structure-space and unstamped there and on Hangang, so they rely on `template_struct_space: true`; `patchr_training` is mixed per hit (about 85% `seqres`, 15% `struct`) and records it in `index_space`.
 
 | | `afdb_nvda` | `teddymer` | `patchr_training` |
 | --- | --- | --- | --- |
