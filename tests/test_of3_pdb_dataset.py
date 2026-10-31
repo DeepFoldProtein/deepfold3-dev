@@ -701,3 +701,31 @@ def test_template_cache_dir_survives_config_normalisation(tmp_path):
         ]
     )
     assert out[0]["template_cache_dir"] == "/x/templates/val_template_cache"
+
+
+def test_paired_blocks_start_with_the_query_row():
+    """The featurizer takes paired row 0 as the query and starts the unpaired
+    block at row 1, so without it no row of the MSA holds the query."""
+    from deepfold3.data.module.of3_pdb_dataset import pair_uniprot_msas
+
+    def block(seq, hits):
+        rows = [seq, *(h for _, h in hits)]
+        meta = ["query", *(f"tr|X{i}|X{i}_{sp}/1-4" for i, (sp, _) in enumerate(hits))]
+        return {
+            "uniprot_hits": {
+                "msa": np.array([list(r) for r in rows], dtype="<U1"),
+                "deletion_matrix": np.zeros((len(rows), len(seq)), dtype=np.int32),
+                "metadata": np.array(meta),
+            }
+        }
+
+    per_rep = {
+        "a": block("MKTA", [("HUMAN", "MKSA"), ("MOUSE", "MRTA")]),
+        "b": block("GWSV", [("HUMAN", "GWTV"), ("YEAST", "GASV")]),
+    }
+    out = pair_uniprot_msas(per_rep, dict.fromkeys(per_rep, const.MOL_PROTEIN), dict.fromkeys(per_rep))
+    from deepfold3.data.module.of3_pdb_dataset import _encode_msa
+
+    for rep, seq in (("a", "MKTA"), ("b", "GWSV")):
+        assert out[rep].sequences[0].tolist() == _encode_msa(np.array([list(seq)]), const.MOL_PROTEIN)[0].tolist()
+    assert out["a"].sequences.shape[0] == 2  # the query + the HUMAN pair

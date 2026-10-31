@@ -213,6 +213,16 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     ),
 )
 @click.option(
+    "--precision",
+    default="fp32",
+    type=click.Choice(["fp32", "bf16"]),
+    show_default=True,
+    help=(
+        "Compute dtype of the forward pass. bf16 is what training runs under and "
+        "halves activation memory; fp32 is the historical inference behaviour."
+    ),
+)
+@click.option(
     "--bucket/--no-bucket",
     default=True,
     show_default=True,
@@ -276,6 +286,7 @@ def inference(
     matmul_precision: str,
     plot_confidences: bool,
     logits_scheme: str,
+    precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
     allow_missing_keys: bool,
@@ -576,6 +587,7 @@ def inference(
         bucket={"enabled": use_bucket, "num_tokens": original_n, "padded_tokens": feats["res_type"].shape[0]},
         guidance=[{**asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
         optim=optim,
+        precision=precision,
         matmul_precision=torch.get_float32_matmul_precision(),
         logits_scheme=logits_scheme,
         det=det,
@@ -598,7 +610,10 @@ def inference(
                     f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
                 )
                 t0 = time.perf_counter()
-                with torch.inference_mode():
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(dev.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+                ):
                     model_output = model(
                         feats,
                         seed=current_seed,

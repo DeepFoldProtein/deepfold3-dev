@@ -318,8 +318,10 @@ def pair_uniprot_msas(
     first so the depth budget goes to the fullest pairs.
 
     Returns row-aligned per-representative :class:`MSA` blocks — the featurizer
-    zips them by row index, so every returned block has the same depth. ``{}``
-    when fewer than two representatives have a pairable block.
+    zips them by row index, so every returned block has the same depth. Row 0 is
+    the query of every chain: the featurizer takes it as the query row and starts
+    the unpaired block at each chain's row 1. ``{}`` when fewer than two
+    representatives have a pairable block.
     """
     reps = [r for r, blocks in per_rep.items() if any(k in blocks for k in PAIRING_KEYS)]
     if len(reps) < 2:
@@ -360,7 +362,7 @@ def pair_uniprot_msas(
         return {}
 
     candidates.sort(key=lambda t: (-t[0], t[1]))
-    candidates = candidates[:max_rows]
+    candidates = [(len(raw), 0, dict.fromkeys(raw, 0)), *candidates[:max_rows]]
 
     out: dict[str, MSA] = {}
     n_rows = len(candidates)
