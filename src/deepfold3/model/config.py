@@ -706,6 +706,10 @@ class OptimConfig:
     use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
+    # Evoformer MSA transition as one in-place forward-only kernel (no [..., 2*hidden]
+    # tensor; see model/triton/msa_transition.py). Served only with grad disabled, so
+    # keep it off in training presets. A call it cannot serve logs why and goes stock.
+    use_fused_msa_transition_inference: bool = False
     # dropout_add fuses per-batch row/column-wise dropout with a residual add and
     # samples the mask on the fly via tl.rand (see model/triton/dropout_add.py).
     # Default True preserves current behavior (Triton always active on CUDA);
@@ -721,6 +725,12 @@ class OptimConfig:
     # Tiled outer product mean: chunk rows to avoid [N,N,32,32] intermediate.
     # Saves ~3.6 GB at N=768. 0 = disabled, >0 = chunk size (128 recommended).
     tiled_opm_chunk: int = 0
+    # Inference only: evaluate the row-independent MSA ops (transition, row
+    # attention, OPM projections) this many MSA rows at a time into one output.
+    # Their intermediates dominate peak memory at deep MSAs, far above the MSA
+    # itself, and a fixed row count keeps Triton autotune keys constant across
+    # MSA depths. 0 = whole tensor. Ignored whenever grad is enabled.
+    msa_row_chunk: int = 0
 
     # Gradient checkpointing on the 4-layer Evoformer (MSA) stack and the
     # 48-layer PairFormer trunk. Essential for training — without it, 48 layers
@@ -797,9 +807,11 @@ class OptimConfig:
             use_fused_triangle_mul=True,
             use_fused_transition_pair=True,
             use_fused_ln_transpose=True,
+            use_fused_msa_transition_inference=True,
             use_tiled_linear=True,
             tiled_linear_inference=True,
             tiled_opm_chunk=128,
+            msa_row_chunk=512,
         )
 
     @classmethod

@@ -46,9 +46,11 @@ from deepfold3.model.primitives import (
     LayerNorm,
     LinearNoBias,
     block_residual_scale,
+    map_row_chunks,
 )
 from deepfold3.model.template_embedding import TemplateEmbedding
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
+from deepfold3.model.triton.msa_transition import msa_transition_residual_
 
 _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -122,6 +124,8 @@ class EvoformerBlock(nn.Module):
         self.outer_product = OuterProductMean(c_msa, c_pair, c_hidden=outer_product_hidden)
         if optim is not None and optim.tiled_opm_chunk > 0:
             self.outer_product._chunk_size = optim.tiled_opm_chunk
+        self.msa_row_chunk = optim.msa_row_chunk if optim is not None else 0
+        self.outer_product._row_chunk = self.msa_row_chunk
         tk = trimul_kwargs or {}
         self.tri_mul_out = TriangleMulOutgoing(c_pair, optim=optim, **tk)
         self.tri_mul_in = TriangleMulIncoming(c_pair, optim=optim, **tk)
@@ -131,6 +135,7 @@ class EvoformerBlock(nn.Module):
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
         self.msa_transition = make_transition_block(c_msa, config=optim)
+        self.use_fused_msa_transition = optim.use_fused_msa_transition_inference if optim is not None else False
         self.msa_dropout = msa_dropout
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
@@ -149,7 +154,13 @@ class EvoformerBlock(nn.Module):
         s = self.residual_out_scale
         pair = pair + s * self.outer_product(msa, msa_mask)
         msa = dropout_add_rowwise(msa, s * self.row_attn(msa, msa_mask, pair), p_msa, training, use_fused)
-        msa = msa + s * self.msa_transition(msa)
+        # ``msa`` is the fresh sum above, so the in-place kernel cannot clobber a caller's tensor.
+        # The kernel materialises no intermediate at all; row chunks bound the fallback's.
+        fused_msa = msa_transition_residual_(self.msa_transition, msa, s) if self.use_fused_msa_transition else None
+        if fused_msa is not None:
+            msa = fused_msa
+        else:
+            msa = msa + s * map_row_chunks(self.msa_transition, msa, self.msa_row_chunk)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
         if self.use_triangle_attention:

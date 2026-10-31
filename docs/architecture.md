@@ -144,7 +144,7 @@ still uniform, i.e. inert. See `export/mhr-trimul/README.md`.
 
 ### `evoformer.py` -- Trunk
 
-**`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition
+**`EvoformerBlock`** (x4): MSA column attention -> MSA row attention (pair-biased) -> MSA transition -> OuterProductMean -> pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition. With `OptimConfig.use_fused_msa_transition_inference` and grad disabled, the MSA transition runs as one in-place kernel (`triton/msa_transition.py`); weights and state-dict keys stay on the same `msa_transition` block.
 
 **`PairFormerBlock`** (x48): pair TriangleMul (out+in) -> pair GridSelfAttention (row+col) -> pair transition -> SingleAttention (pair-biased) -> single transition (the last two are dropped by `use_single_track=False`)
 
@@ -403,6 +403,8 @@ When fused Triton kernels are enabled (via `OptimConfig`), modules create derive
 - **`EMA`** skips fused parameters during shadow initialization (they would double-decay against the base params they shadow)
 
 This ensures checkpoints are portable — the same `.pt` file loads correctly whether fused kernels are enabled or not. The marker list is defined once in `OptimConfig.FUSED_STATE_DICT_MARKERS`.
+
+`inference` and `inference-batch` load with `strict=False`, then `check_loaded_keys` (`scripts/_common.py`) fails the run on any missing key outside those markers, because that parameter would stay random. `--allow-missing-keys` is the opt-out; `inference` records the keys in `run_manifest.json`. Raw AF3 params always need it, as they lack the Fourier weights.
 
 ## Weight Compatibility
 

@@ -8,6 +8,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -236,3 +237,36 @@ def pytest_sessionfinish(session, exitstatus):
     out.parent.mkdir(exist_ok=True)
     out.write_text(text + "\n")
     print("\n" + text)
+
+
+@pytest.fixture(scope="module")
+def tiny_job(tmp_path_factory):
+    """Tiny native weights and a two-chain JSON input with two seeds."""
+    from dataclasses import asdict
+
+    from safetensors.torch import save_file
+
+    from deepfold3.model.config import SAFETENSORS_MODEL_CFG_KEY
+    from deepfold3.model.model import DeepFold3
+    from tests.test_batch import _tiny_config
+
+    root = tmp_path_factory.mktemp("tiny")
+    cfg = _tiny_config()
+    cfg.diffusion.steps = 2
+    cfg.diffusion.use_conditioning_prob = 0.8  # trained with the drop, so --guidance is accepted
+    cfg.diffusion.cond_drop_interface_frac = 0.5
+    state = {k: v.clone() for k, v in DeepFold3(cfg).state_dict().items()}
+    params = root / "tiny.safetensors"
+    save_file(state, params, metadata={SAFETENSORS_MODEL_CFG_KEY: json.dumps(asdict(cfg))})
+    seq = "MKTAYIAKQR"
+    protein = {"sequence": seq, "unpairedMsa": f">q\n{seq}\n", "pairedMsa": "", "templates": []}
+    job = {
+        "name": "t",
+        "dialect": "alphafold3",
+        "version": 2,
+        "modelSeeds": [1, 2],
+        "sequences": [{"protein": {"id": c, **protein}} for c in "AB"],
+    }
+    in_json = root / "in.json"
+    in_json.write_text(json.dumps(job))
+    return in_json, params
