@@ -202,6 +202,16 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
     ),
 )
 @click.option(
+    "--precision",
+    default="fp32",
+    type=click.Choice(["fp32", "bf16"]),
+    show_default=True,
+    help=(
+        "Compute dtype of the forward pass. bf16 is what training runs under and "
+        "halves activation memory; fp32 is the historical inference behaviour."
+    ),
+)
+@click.option(
     "--bucket/--no-bucket",
     default=True,
     show_default=True,
@@ -244,6 +254,7 @@ def inference(
     matmul_precision: str,
     plot_confidences: bool,
     logits_scheme: str,
+    precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
 ) -> None:
@@ -522,7 +533,10 @@ def inference(
             f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
         )
         t0 = time.perf_counter()
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            torch.autocast(dev.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+        ):
             model_output = model(
                 feats,
                 seed=current_seed,
