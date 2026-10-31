@@ -592,6 +592,7 @@ class OuterProductMean(nn.Module):
         self.out_w = nn.Parameter(torch.zeros(c_hidden, c_hidden, c_z))
         self.out_b = nn.Parameter(torch.zeros(c_z))
         self._chunk_size: int = 0  # 0 = disabled, >0 = tiled OPM
+        self._row_chunk: int = 0  # 0 = disabled, >0 = OptimConfig.msa_row_chunk
 
     def _outer_product_contract(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """Compute outer product mean contraction: (a^T b) @ w + bias.
@@ -604,6 +605,19 @@ class OuterProductMean(nn.Module):
         """
         ab = torch.einsum("bsie,bsjf->bijef", a, b)
         return torch.einsum("bijef,efc->bijc", ab, self.out_w) + self.out_b
+
+    def _project_rows(self, msa: torch.Tensor, m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The left and right projections, with the LayerNorm output alive one chunk at a time."""
+        a = b = None
+        for s0 in range(0, msa.shape[1], self._row_chunk):
+            s1 = s0 + self._row_chunk
+            rows = self.norm(msa[:, s0:s1])
+            a_r, b_r = self.proj_a(rows) * m[:, s0:s1], self.proj_b(rows) * m[:, s0:s1]
+            if a is None:
+                shape = (*msa.shape[:3], a_r.shape[-1])
+                a, b = a_r.new_empty(shape), b_r.new_empty(shape)
+            a[:, s0:s1], b[:, s0:s1] = a_r, b_r
+        return a, b
 
     def forward(self, msa: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -618,10 +632,13 @@ class OuterProductMean(nn.Module):
             msa = msa.unsqueeze(0)
             mask = mask.unsqueeze(0)
 
-        msa = self.norm(msa)
         m = mask.unsqueeze(-1)  # [B, S, N, 1]
-        a = self.proj_a(msa) * m  # [B, S, N, c_hidden]
-        b = self.proj_b(msa) * m  # [B, S, N, c_hidden]
+        if 0 < self._row_chunk < msa.shape[1] and not torch.is_grad_enabled():
+            a, b = self._project_rows(msa, m)
+        else:
+            msa = self.norm(msa)
+            a = self.proj_a(msa) * m  # [B, S, N, c_hidden]
+            b = self.proj_b(msa) * m  # [B, S, N, c_hidden]
 
         chunk = self._chunk_size
         N = a.shape[2]

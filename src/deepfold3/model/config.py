@@ -716,6 +716,12 @@ class OptimConfig:
     # Tiled outer product mean: chunk rows to avoid [N,N,32,32] intermediate.
     # Saves ~3.6 GB at N=768. 0 = disabled, >0 = chunk size (128 recommended).
     tiled_opm_chunk: int = 0
+    # Inference only: evaluate the row-independent MSA ops (transition, row
+    # attention, OPM projections) this many MSA rows at a time into one output.
+    # Their intermediates dominate peak memory at deep MSAs, far above the MSA
+    # itself, and a fixed row count keeps Triton autotune keys constant across
+    # MSA depths. 0 = whole tensor. Ignored whenever grad is enabled.
+    msa_row_chunk: int = 0
 
     # Gradient checkpointing on the 4-layer Evoformer (MSA) stack and the
     # 48-layer PairFormer trunk. Essential for training — without it, 48 layers
@@ -795,6 +801,7 @@ class OptimConfig:
             use_tiled_linear=True,
             tiled_linear_inference=True,
             tiled_opm_chunk=128,
+            msa_row_chunk=512,
         )
 
     @classmethod

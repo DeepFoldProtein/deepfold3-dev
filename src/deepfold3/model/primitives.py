@@ -304,3 +304,30 @@ class AdaTransitionBlock(nn.Module):
         # AdaLN-zero gate
         gate = torch.sigmoid(self.zero_cond(cond))
         return gate * out
+
+
+def map_row_chunks(fn, x: torch.Tensor, chunk: int) -> torch.Tensor:
+    """``fn(x)`` over ``chunk`` rows of dim ``-3`` at a time, into one output.
+
+    ``fn`` must treat rows independently and keep the shape. Inference only:
+    with grad enabled, or ``chunk`` of 0 or at least the row count, this is
+    plain ``fn(x)``.
+
+    Args:
+        fn: Row-independent function of ``[..., S, N, C]``.
+        x: Input ``[..., S, N, C]``.
+        chunk: Rows per call.
+
+    Returns:
+        The same as ``fn(x)``.
+    """
+    S = x.shape[-3]
+    if chunk <= 0 or S <= chunk or torch.is_grad_enabled():
+        return fn(x)
+    first = fn(x[..., :chunk, :, :])
+    out = first.new_empty(*x.shape[:-3], S, *first.shape[-2:])
+    out[..., :chunk, :, :] = first
+    del first
+    for s0 in range(chunk, S, chunk):
+        out[..., s0 : s0 + chunk, :, :] = fn(x[..., s0 : s0 + chunk, :, :])
+    return out
