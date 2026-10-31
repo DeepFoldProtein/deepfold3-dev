@@ -231,7 +231,8 @@ def extract_from_index_pairs(
     Args:
         mmcif_text: mmCIF file contents.
         query_indices: 0-based query token positions.
-        template_indices: Residue label_seq_id numbers in the template CIF.
+        template_indices: 0-based positions in the template chain's sequence
+            (AF3's ``templateIndices``); ``label_seq_id`` is this + 1.
         query_length: Total number of tokens in the query.
         chain_id: Chain to use from the template (None = first polymer).
         max_atoms: Maximum atoms per residue.
@@ -260,8 +261,8 @@ def extract_from_index_pairs(
     for qi, ti in zip(query_indices, template_indices, strict=False):
         if qi < 0 or qi >= query_length:
             continue
-        if ti in residue_lookup:
-            aa, pos, msk = residue_lookup[ti]
+        if ti + 1 in residue_lookup:
+            aa, pos, msk = residue_lookup[ti + 1]
             aatype_arr[qi] = aa
             pos_arr[qi] = pos
             mask_arr[qi] = msk
@@ -281,10 +282,9 @@ def extract_from_seqres_alignment(
 ) -> TemplateFeatures:
     """Extract template features using seqres-based alignment positions.
 
-    Unlike :func:`extract_from_index_pairs` which expects ``label_seq_id``
-    values, this function takes **0-based PDB seqres positions** (as produced
-    by :func:`cigar_to_index_pairs` from m8 hits) and automatically realigns
-    them to the resolved mmCIF structure.
+    Like :func:`extract_from_index_pairs` this takes **0-based positions**, but
+    in the PDB seqres (as produced by :func:`cigar_to_index_pairs` from m8 hits),
+    and automatically realigns them to the resolved mmCIF structure.
 
     This is the correct extraction path for search-derived alignments (MMseqs2,
     HHsearch) where template positions reference the PDB SEQRES.

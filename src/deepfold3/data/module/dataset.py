@@ -1224,28 +1224,13 @@ class InferenceInput:
         # Ligand chains don't have MSA — skip
 
         # Convert template hits to features
-        template_feats: list[TemplateFeatures] | None = None
+        # Every hit is aligned to its own chain: ``queryIndices`` in the AF3
+        # dialect and the HHR/templatesPath forms all count from that chain's
+        # first residue.
         template_feats_per_chain: dict[int, list[TemplateFeatures]] = {}
-
-        # Check for whole-complex JSON template hits (query_indices populated)
-        json_tmpl_found = False
-        for _asym_id, (_seq, _mt, _, _, tmpl_hits) in enumerate(chain_specs):
-            if tmpl_hits and tmpl_hits[0].query_indices is not None:
-                # JSON-mode templates: whole-complex alignment
-                total_tokens = sum(len(s) for s, _, _, _, _ in chain_specs)
-                template_feats = [template_hit_input_to_features(h, total_tokens) for h in tmpl_hits]
-                if not template_feats:
-                    template_feats = None
-                json_tmpl_found = True
-                break
-
-        # Fall back to per-chain HHR templates
-        if not json_tmpl_found:
-            for asym_id, (seq, mt, _, _, tmpl_hits) in enumerate(chain_specs):
-                if mt == const.MOL_PROTEIN and tmpl_hits:
-                    chain_templates = [template_hit_input_to_features(h, len(seq)) for h in tmpl_hits]
-                    if chain_templates:
-                        template_feats_per_chain[asym_id] = chain_templates
+        for asym_id, (seq, mt, _, _, tmpl_hits) in enumerate(chain_specs):
+            if mt == const.MOL_PROTEIN and tmpl_hits:
+                template_feats_per_chain[asym_id] = [template_hit_input_to_features(h, len(seq)) for h in tmpl_hits]
 
         inp = Input(structure=structure, paired_msa=paired_msa_dict, unpaired_msa=unpaired_msa_dict)
         # A single templated chain goes through the per-chain path too: the flat
@@ -1254,7 +1239,6 @@ class InferenceInput:
         return _tokenize_and_featurize(
             inp,
             max_msa_seqs=max_msa_seqs,
-            templates=template_feats,
             template_feats_per_chain=template_feats_per_chain or None,
         )
 

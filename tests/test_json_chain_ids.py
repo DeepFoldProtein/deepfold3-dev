@@ -138,3 +138,63 @@ def test_ordering_matches_from_job_asym_ids(tmp_path):
             f"asym_id {a} has {n_tok} tokens (chain {by_len[n_tok]}) but was named "
             f"{resolve_chain_name(int(a), names)!r} — job_chain_ids drifted from from_job"
         )
+
+
+def _template_cif(tmp_path, seq: str):
+    """A template chain of ``seq`` with ``label_seq_id`` 1..len(seq)."""
+    gemmi = pytest.importorskip("gemmi")
+    st = gemmi.Structure()
+    st.name = "TMPL"
+    model = gemmi.Model("1")
+    chain = gemmi.Chain("A")
+    for i, aa in enumerate(seq):
+        res = gemmi.Residue()
+        res.name = gemmi.expand_one_letter(aa, gemmi.ResidueKind.AA)
+        res.seqid = gemmi.SeqId(i + 1, " ")
+        res.label_seq = i + 1
+        res.entity_type = gemmi.EntityType.Polymer
+        for j, (name, el) in enumerate([("N", "N"), ("CA", "C"), ("C", "C"), ("O", "O"), ("CB", "C")]):
+            atom = gemmi.Atom()
+            atom.name = name
+            atom.element = gemmi.Element(el)
+            atom.pos = gemmi.Position(3.8 * i + j * 0.5, j * 1.1, 0.3 * j)
+            res.add_atom(atom)
+        chain.add_residue(res)
+    model.add_chain(chain)
+    st.add_model(model)
+    st.setup_entities()
+    path = tmp_path / "tmpl.cif"
+    st.make_mmcif_document().write_file(str(path))
+    return path
+
+
+def test_json_template_lands_on_its_own_chain_with_zero_based_indices(tmp_path):
+    """``queryIndices`` / ``templateIndices`` are 0-based and local to the chain
+    declaring them. A hit on chain C used to land on chain A, one residue off,
+    and every chain after the first templated one lost its hits."""
+    from deepfold3.data.module.dataset import InferenceInput
+
+    seqs = {"A": "MKTAYIAKQR", "B": "GWSVLDEPNH", "C": "FYHRTGLWKC"}
+    cif = _template_cif(tmp_path, seqs["C"])
+    idx = list(range(len(seqs["C"])))
+
+    def protein(cid):
+        seq = seqs[cid]
+        p = {"id": cid, "sequence": seq, "unpairedMsa": f">q\n{seq}\n", "pairedMsa": "", "templates": []}
+        if cid == "C":
+            p["templates"] = [{"mmcifPath": str(cif), "queryIndices": idx, "templateIndices": idx}]
+        return {"protein": p}
+
+    entry = {
+        "name": "t",
+        "modelSeeds": [1],
+        "dialect": "alphafold3",
+        "version": 2,
+        "sequences": [protein(c) for c in seqs],
+    }
+    feats = InferenceInput.from_job(parse_json_input(_write(tmp_path, entry))[0])
+    mask = feats["template_pseudo_beta_mask"][0].bool()
+    on_c = feats["asym_id"] == 2
+    assert mask[on_c].all()
+    assert not mask[~on_c].any()
+    assert feats["template_aatype"][0][on_c].tolist() == feats["res_type"][on_c].tolist()
