@@ -230,8 +230,22 @@ def rigid_displacement(
     """Displacement that moves each restrained chain as a rigid body.
 
     The per-atom gradient is projected onto the six rigid degrees of freedom of
-    the chain it acts on — a net force and a net torque — and the chain is then
-    translated and rotated by them. Internal geometry is untouched by
+    the chain it acts on, and the chain is translated and rotated by the
+    result. This is geometry, not dynamics: there is no mass, no velocity and
+    nothing is integrated. Each atom has a displacement it would like to make,
+    ``u_i = -weight/2 * dU/dx_i``, and the projection is the least-squares fit
+    of that field to a rigid motion,
+
+        min over (t, omega) of  sum_i |t + omega x r_i - u_i|^2
+
+    whose normal equations give ``t = mean(u)`` and
+    ``(sum_i |r_i|^2 I - r_i r_i^T) omega = sum_i r_i x u_i``. The matrix on
+    the left has the form of an inertia tensor of unit masses, but it is the
+    Gram matrix of the rotation generators; the names below say force and
+    torque because the formulas coincide, not because anything is accelerating.
+    With no momentum in the loop, nothing overshoots on its own: instability
+    could only come from the step size, which is why the penalty is quadratic
+    and the step is clipped. Internal geometry is untouched by
     construction, which the per-atom pull does not promise: steering a subset
     of residues stretches the chain at the edge of the selection, and on an
     8weo sample whose CDRs started 19 A away it pulled two peptide bonds out to
@@ -273,7 +287,7 @@ def rigid_displacement(
             g = flat_grad[..., sel, :]
             centre = p.mean(-2, keepdim=True)
             r = p - centre
-            # Descent direction is -g: net force, and torque about the centroid.
+            # Least-squares rigid fit of the desired displacement field -g.
             # Normalised by the atoms the restraint actually pulls on, not by
             # the whole chain. A least-squares rigid fit would divide by every
             # atom, which dilutes a 22-residue selection on a 126-residue chain
@@ -283,10 +297,11 @@ def rigid_displacement(
             # those residues are asking for", and weight means the same thing
             # in both modes.
             pulled = (g.abs().sum(-1) > 0).sum(-1).clamp(min=1).unsqueeze(-1)  # [..., 1]
-            force = (-g).sum(-2) / pulled
-            torque = torch.cross(r, -g, dim=-1).sum(-2)  # [..., 3]
-            # omega = I^-1 tau, with I the moment of inertia of unit masses,
-            # scaled the same way so a patch can turn the body it sits on.
+            force = (-g).sum(-2) / pulled  # the fit's translation
+            torque = torch.cross(r, -g, dim=-1).sum(-2)  # sum r x u, the fit's rhs
+            # The rotation solves the normal equation above; its matrix is an
+            # inertia tensor only by coincidence of form. Scaled like the
+            # translation so a patch can turn the body it sits on.
             eye = torch.eye(3, dtype=p.dtype, device=p.device)
             inertia = (r.pow(2).sum(-1)[..., None, None] * eye) - r.unsqueeze(-1) * r.unsqueeze(-2)
             inertia = inertia.sum(-3) + 1e-6 * eye
