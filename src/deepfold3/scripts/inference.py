@@ -66,6 +66,7 @@ from deepfold3.model.guidance import (
     has_residue_ranges,
     parse_guidance_spec,
 )
+from deepfold3.model.restraints import RestraintSpec, build_restraints, describe_restraint, parse_restraint_spec
 from deepfold3.scripts import cli
 from deepfold3.scripts._common import apply_det_recipe, check_loaded_keys, load_pt_snapshot, pin_cuda_device
 
@@ -73,6 +74,13 @@ from deepfold3.scripts._common import apply_det_recipe, check_loaded_keys, load_
 def _parse_guidance(_ctx, _param, values: tuple[str, ...]) -> tuple[GuidanceSpec, ...]:
     try:
         return tuple(parse_guidance_spec(v) for v in values)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+
+def _parse_restraints(_ctx, _param, values: tuple[str, ...]) -> tuple[RestraintSpec, ...]:
+    try:
+        return tuple(parse_restraint_spec(v) for v in values)
     except ValueError as e:
         raise click.BadParameter(str(e)) from e
 
@@ -263,6 +271,43 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     ),
 )
 @click.option(
+    "--restraint",
+    "restraint_specs",
+    multiple=True,
+    metavar="SEL:SEL[@DIST[@LO..HI]]",
+    callback=_parse_restraints,
+    help=(
+        "Distance restraint steered into the sampler: every residue of the left selector "
+        "must come within DIST Å (default 6, range 2–30) of the right one. Selectors are "
+        "``--guidance``'s (A/25-40+88:B). LO..HI limits it to that σ̂ range. Unlike "
+        "--guidance this acts on coordinates, not on the conditioning, and nothing was "
+        "trained for it; repeat for several restraints."
+    ),
+)
+@click.option(
+    "--restraint-rigid/--restraint-residues",
+    default=True,
+    show_default=True,
+    help=(
+        "Rigid: project the restraint force onto each chain's six rigid degrees of freedom, "
+        "so the chain is translated and rotated and its internal geometry is untouched. "
+        "--restraint-residues pulls the named residues alone, which stretches the chain "
+        "where the selection ends."
+    ),
+)
+@click.option(
+    "--restraint-max-step",
+    default=2.0,
+    show_default=True,
+    help="Å cap on the displacement one sampler step may apply per restraint (steering needs the clip).",
+)
+@click.option(
+    "--restraint-weight",
+    default=0.2,
+    show_default=True,
+    help="Fraction of each restraint's remaining violation removed per sampler step.",
+)
+@click.option(
     "--hoist-sampler/--no-hoist-sampler",
     default=True,
     show_default=True,
@@ -316,6 +361,10 @@ def inference(
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
     allow_guidance_overlap: bool,
+    restraint_specs: tuple[RestraintSpec, ...],
+    restraint_weight: float,
+    restraint_rigid: bool,
+    restraint_max_step: float,
     hoist_sampler: bool,
     allow_missing_keys: bool,
     det: bool,
@@ -570,6 +619,26 @@ def inference(
         if has_residue_ranges(guidance_specs):
             click.echo("[inference] note: a residue-subset drop is finer than the training drop (whole chain pairs)")
 
+    restraints = ()
+    if restraint_specs:
+        from deepfold3.io.mmcif import resolve_chain_name
+
+        chain_index = {resolve_chain_name(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
+        try:
+            restraints = build_restraints(
+                restraint_specs,
+                feats["asym_id"],
+                chain_index,
+                original_n,
+                residue_index=feats.get("residue_index"),
+            )
+        except ValueError as e:
+            raise click.UsageError(f"--restraint: {e}") from e
+        click.echo(
+            f"[inference] restraints (weight {restraint_weight:g}): "
+            + " + ".join(describe_restraint(r) for r in restraint_specs)
+        )
+
     # ------------------------------------------------------------------
     # Determine seed list. JSON inputs honour the JSON's modelSeeds
     # (with --seed prepended if explicitly passed); MSA/sequence inputs
@@ -624,6 +693,9 @@ def inference(
         msa_crop_size=model_cfg.msa_crop_size,
         bucket={"enabled": use_bucket, "num_tokens": original_n, "padded_tokens": feats["res_type"].shape[0]},
         guidance=[{**asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
+        restraints=[
+            {**asdict(r), "description": describe_restraint(r), "weight": restraint_weight} for r in restraint_specs
+        ],
         optim=optim,
         precision=precision,
         matmul_precision=torch.get_float32_matmul_precision(),
@@ -658,6 +730,10 @@ def inference(
                         num_recycles=num_recycles,
                         num_samples=num_samples,
                         guidance_terms=guidance_terms,
+                        restraints=restraints,
+                        restraint_weight=restraint_weight,
+                        restraint_rigid=restraint_rigid,
+                        restraint_max_step=restraint_max_step,
                     )
 
                 iter_feats = feats

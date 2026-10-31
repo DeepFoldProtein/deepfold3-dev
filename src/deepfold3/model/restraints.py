@@ -1,0 +1,322 @@
+"""Distance restraints steered into the diffusion sampler.
+
+A restraint says "these residues must touch those residues". It is not
+conditioning: nothing is fed to the trunk and nothing was trained for it. At
+each sampler step the predicted clean structure ``D`` is nudged down the
+gradient of a flat-bottom penalty before the Euler update uses it, so the
+restraint acts on coordinates directly rather than on what the model believes.
+
+That distinction is the point. Measurement on the antibody-antigen w grid says
+the model builds physically sound interfaces (no clashes, 87-90 % of the
+native packing density, native side-chain involvement) on the *wrong* patch,
+and that classifier-free guidance only shifts how often the sampler lands in
+one basin or another. Amplifying a belief cannot fix a wrong belief; a
+restraint does not need the belief to be right.
+
+One ``--restraint`` value is ``SEL:SEL[@DIST[@LO..HI]]`` with the selector
+syntax of :mod:`deepfold3.model.guidance` (``A/25-40+88:B@6``): every residue
+named on the left must come within ``DIST`` A of the group on the right.
+
+Relation to Boltz's steering potentials, from which the idea is taken: their
+flat-bottom energy is linear in the violation, so the force has the same
+magnitude at 1 A over the bound as at 10 A and the constraint rings rather
+than settles; their soft-min sharpness decays to zero, which spreads the pull
+over every pair of a group exactly when it should be committing to the closest
+one; and the guidance is applied every fourth step. Here the penalty is
+quadratic (the force falls off as the restraint is met), the soft-min sharpens
+as the noise falls, and it applies on every step inside its sigma range.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from deepfold3.model.guidance import ChainSel, _parse_sel, _sel_mask
+
+if TYPE_CHECKING:
+    import torch
+
+DEFAULT_DISTANCE = 6.0  # A, as Boltz's pocket/contact constraints default to
+MIN_DISTANCE, MAX_DISTANCE = 2.0, 30.0
+
+
+@dataclass(frozen=True)
+class RestraintSpec:
+    """One parsed ``--restraint`` value, before chain names are resolved.
+
+    Attributes:
+        groups: The two selectors; the left one's residues are restrained.
+        distance: The flat bottom, in A.
+        sigma_range: ``(lo, hi)`` in absolute sigma-hat, or ``None`` for every step.
+    """
+
+    groups: tuple[ChainSel, ChainSel]
+    distance: float = DEFAULT_DISTANCE
+    sigma_range: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class Restraint:
+    """A resolved restraint the sampler can apply.
+
+    Attributes:
+        tokens_a: ``[N]`` bool, the residues that must make the contact.
+        tokens_b: ``[N]`` bool, what they must touch.
+        distance: The flat bottom, in A.
+        sigma_range: ``(lo, hi)`` in absolute sigma-hat, or ``None``.
+    """
+
+    tokens_a: torch.Tensor
+    tokens_b: torch.Tensor
+    distance: float = DEFAULT_DISTANCE
+    sigma_range: tuple[float, float] | None = None
+    chain_a: torch.Tensor | None = None  # [N] bool: all of the left selector's chain
+    chain_b: torch.Tensor | None = None  # [N] bool: all of the right selector's chain
+
+
+def parse_restraint_spec(text: str) -> RestraintSpec:
+    """Parse ``SEL:SEL[@DIST[@LO..HI]]``.
+
+    Args:
+        text: The option value.
+
+    Returns:
+        The parsed restraint.
+
+    Raises:
+        ValueError: If ``text`` does not follow the syntax.
+    """
+    from deepfold3.model.guidance import _parse_sigma_range
+
+    fields = text.split("@")
+    if len(fields) > 3:
+        raise ValueError(f"expected SEL:SEL[@DIST[@LO..HI]], got {text!r}")
+    sides = fields[0].split(":")
+    if len(sides) != 2 or not all(sides):
+        raise ValueError(f"expected two selectors like A/25-40:B, got {fields[0]!r}")
+    a, b = (_parse_sel(s) for s in sides)
+    if a.chain == b.chain:
+        raise ValueError(f"a restraint needs two chains, got {fields[0]!r}")
+    distance = float(fields[1]) if len(fields) > 1 else DEFAULT_DISTANCE
+    if not MIN_DISTANCE <= distance <= MAX_DISTANCE:
+        raise ValueError(f"restraint distance must be {MIN_DISTANCE:g}..{MAX_DISTANCE:g} A, got {distance:g}")
+    sigma_range = _parse_sigma_range(fields[2]) if len(fields) > 2 else None
+    return RestraintSpec((a, b), distance, sigma_range)
+
+
+def describe_restraint(spec: RestraintSpec) -> str:
+    """One line for the run log and the manifest."""
+    a, b = spec.groups
+    sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
+    return f"{a}:{b} ≤ {spec.distance:g} Å{sigma}"
+
+
+def build_restraints(
+    specs: Sequence[RestraintSpec],
+    asym_id: torch.Tensor,  # [N]
+    chain_index: Mapping[str, int],
+    n_tokens: int | None = None,
+    residue_index: torch.Tensor | None = None,  # [N]
+) -> tuple[Restraint, ...]:
+    """Resolve the selectors into token masks.
+
+    Args:
+        specs: The parsed restraints.
+        asym_id: Token chain ids, possibly bucket-padded.
+        chain_index: Chain name to ``asym_id`` for this input.
+        n_tokens: Tokens before bucket padding; padding is never restrained.
+        residue_index: Token residue numbers, for selectors that name residues.
+
+    Returns:
+        One resolved restraint per spec, in order.
+
+    Raises:
+        ValueError: If a selector names something the input does not have.
+    """
+    out = []
+    for spec in specs:
+        a, b = (_sel_mask(sel, asym_id, chain_index, residue_index, n_tokens) for sel in spec.groups)
+        # The whole chain of each side, for the rigid mode: the restraint names
+        # residues, but what moves as one body is the chain they sit on.
+        whole = [_sel_mask(ChainSel(sel.chain), asym_id, chain_index, None, n_tokens) for sel in spec.groups]
+        out.append(Restraint(a, b, spec.distance, spec.sigma_range, whole[0], whole[1]))
+    return tuple(out)
+
+
+def _soft_min(d: torch.Tensor, sharpness: float) -> torch.Tensor:
+    """Softmax-weighted mean of ``d`` along its last axis.
+
+    Lies between the minimum and the mean, tends to the minimum as
+    ``sharpness`` grows, and — unlike ``-logsumexp(-λd)/λ`` — does not shift
+    with the number of entries, so a restraint on a large group means the same
+    thing as one on a small group.
+    """
+    import torch
+
+    w = torch.softmax(-sharpness * d, dim=-1)
+    return (w * d).sum(-1)
+
+
+def restraint_gradient(
+    positions: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    restraints: Sequence[Restraint],
+    sharpness: float,
+) -> torch.Tensor:
+    """``dU/dx`` of the flat-bottom penalty, same shape as ``positions``.
+
+    For every restrained residue i, ``d_i`` is a soft minimum over the
+    distances from its atoms to the atoms of the other group, and
+
+        U = Σ_i max(0, d_i − distance)²
+
+    so a residue already inside the bound contributes nothing and the force on
+    a violating one falls off as it comes in. ``sharpness`` is the soft-min's
+    lambda in 1/A: the larger it is, the more the pull concentrates on the
+    closest atom pair rather than on the group's centre.
+
+    The gradient is taken with autograd on a copy, so this is safe to call
+    from the sampler's ``no_grad`` block — and from ``inference_mode``, which
+    needs more than ``enable_grad``: a tensor made under inference mode records
+    no graph even inside ``enable_grad`` (``requires_grad_(True)`` succeeds and
+    the energy still comes back with ``requires_grad=False``), so the copy is
+    made under ``inference_mode(False)``. Without that the restraint is a
+    silent no-op, which is exactly how it first shipped.
+    """
+    import torch
+
+    if not restraints:
+        return torch.zeros_like(positions)
+    with torch.inference_mode(False):
+        x = torch.empty_like(positions).copy_(positions).requires_grad_(True)
+    with torch.inference_mode(False), torch.enable_grad():
+        energy = x.new_zeros(())
+        for r in restraints:
+            rows = (r.tokens_a.unsqueeze(-1) & atom_mask).reshape(-1)  # [N*M]
+            cols = (r.tokens_b.unsqueeze(-1) & atom_mask).reshape(-1)
+            if not (bool(rows.any()) and bool(cols.any())):
+                continue
+            flat = x.reshape(*x.shape[:-3], -1, 3)
+            a = flat[..., rows, :]  # [..., A, 3]
+            b = flat[..., cols, :]  # [..., B, 3]
+            d = torch.cdist(a, b)  # [..., A, B]
+            # Soft minimum over the other group, then over each residue's atoms.
+            # A softmax-weighted mean of the distances, NOT -logsumexp(-λd)/λ:
+            # the latter sits below the true minimum by ln(count)/λ, so a group
+            # of many atoms would read as satisfied while it is still ln(count)/λ
+            # too far away, and the bias would grow with the selection's size.
+            token_of_row = torch.nonzero(rows, as_tuple=False).squeeze(-1) // x.shape[-2]
+            per_atom = _soft_min(d, sharpness)  # [..., A]
+            per_res = [_soft_min(per_atom[..., token_of_row == t], sharpness) for t in torch.unique(token_of_row)]
+            dist = torch.stack(per_res, dim=-1)  # [..., R]
+            energy = energy + (torch.clamp(dist - r.distance, min=0.0) ** 2).sum()
+        if not energy.requires_grad:
+            # Every restraint is already satisfied, so the clamp cut the graph.
+            return torch.zeros_like(positions)
+        (grad,) = torch.autograd.grad(energy, x)
+    return grad
+
+
+def rigid_displacement(
+    positions: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    restraints: Sequence[Restraint],
+    weight: float,
+    sharpness: float,
+    max_step: float,
+) -> torch.Tensor:
+    """Displacement that moves each restrained chain as a rigid body.
+
+    The per-atom gradient is projected onto the six rigid degrees of freedom of
+    the chain it acts on — a net force and a net torque — and the chain is then
+    translated and rotated by them. Internal geometry is untouched by
+    construction, which the per-atom pull does not promise: steering a subset
+    of residues stretches the chain at the edge of the selection, and on an
+    8weo sample whose CDRs started 19 A away it pulled two peptide bonds out to
+    2.99 A. The sampler can absorb a rigid move, since the next denoiser call
+    re-predicts everything from the moved coordinates; it cannot always repair
+    a stretched bond.
+
+    The rotation is applied as a rotation, not as its linearisation, so the
+    move stays exactly rigid however large the angle. Both the translation and
+    the largest displacement the rotation produces are clipped to ``max_step``
+    angstroms per call — steering needs that clip: the force is unbounded in
+    the violation, and one big step early leaves the trajectory somewhere the
+    denoiser has never seen.
+
+    Returns:
+        ``positions``-shaped displacement to ADD to the coordinates.
+    """
+    import torch
+
+    grad = restraint_gradient(positions, atom_mask, restraints, sharpness)
+    out = torch.zeros_like(positions)
+    if float(grad.abs().max()) == 0.0:
+        return out
+    flat_pos = positions.reshape(*positions.shape[:-3], -1, 3)
+    flat_grad = grad.reshape(*grad.shape[:-3], -1, 3)
+    flat_out = out.reshape(*out.shape[:-3], -1, 3)
+
+    seen: set[tuple] = set()
+    for restraint in restraints:
+        for chain in (restraint.chain_a, restraint.chain_b):
+            if chain is None:
+                continue
+            sel = (chain.unsqueeze(-1) & atom_mask).reshape(-1)
+            key = tuple(sel.nonzero(as_tuple=False).flatten().tolist()[:1]) + (int(sel.sum()),)
+            if key in seen or not bool(sel.any()):
+                continue
+            seen.add(key)
+            p = flat_pos[..., sel, :]  # [..., K, 3]
+            g = flat_grad[..., sel, :]
+            centre = p.mean(-2, keepdim=True)
+            r = p - centre
+            # Descent direction is -g: net force, and torque about the centroid.
+            # Normalised by the atoms the restraint actually pulls on, not by
+            # the whole chain. A least-squares rigid fit would divide by every
+            # atom, which dilutes a 22-residue selection on a 126-residue chain
+            # about six-fold: the move then stays a couple of angstroms while
+            # the denoiser puts the chain back, and the restraint reads as
+            # inert. Dividing by the pulled atoms means "move the body by what
+            # those residues are asking for", and weight means the same thing
+            # in both modes.
+            pulled = (g.abs().sum(-1) > 0).sum(-1).clamp(min=1).unsqueeze(-1)  # [..., 1]
+            force = (-g).sum(-2) / pulled
+            torque = torch.cross(r, -g, dim=-1).sum(-2)  # [..., 3]
+            # omega = I^-1 tau, with I the moment of inertia of unit masses,
+            # scaled the same way so a patch can turn the body it sits on.
+            eye = torch.eye(3, dtype=p.dtype, device=p.device)
+            inertia = (r.pow(2).sum(-1)[..., None, None] * eye) - r.unsqueeze(-1) * r.unsqueeze(-2)
+            inertia = inertia.sum(-3) + 1e-6 * eye
+            omega = torch.linalg.solve(inertia, torque.unsqueeze(-1)).squeeze(-1)  # [..., 3]
+            omega = omega * (p.shape[-2] / pulled)
+
+            step = 0.5 * weight
+            t = force * step
+            omega = omega * step
+            # Clip: the translation, and the arc the rotation sweeps at the
+            # atom furthest from the centroid.
+            radius = r.norm(dim=-1).amax(-1, keepdim=True)  # [..., 1]
+            t = t * (max_step / t.norm(dim=-1, keepdim=True).clamp(min=max_step))
+            angle = omega.norm(dim=-1, keepdim=True)
+            cap = (max_step / radius.clamp(min=1e-6)).clamp(max=float("inf"))
+            omega = omega * (cap / angle.clamp(min=cap))
+            angle = omega.norm(dim=-1, keepdim=True)
+
+            axis = omega / angle.clamp(min=1e-12)
+            cos, sin = torch.cos(angle).unsqueeze(-2), torch.sin(angle).unsqueeze(-2)
+            axis_e = axis.unsqueeze(-2)
+            rotated = (  # Rodrigues
+                r * cos
+                + torch.cross(axis_e.expand_as(r), r, dim=-1) * sin
+                + axis_e * (axis_e * r).sum(-1, keepdim=True) * (1 - cos)
+            )
+            flat_out[..., sel, :] = rotated - r + t.unsqueeze(-2)
+    return out
+
+
+def active_restraints(restraints: Sequence[Restraint], sigma_hat: float) -> tuple[Restraint, ...]:
+    """The restraints whose sigma range covers this step."""
+    return tuple(r for r in restraints if r.sigma_range is None or r.sigma_range[0] <= sigma_hat <= r.sigma_range[1])

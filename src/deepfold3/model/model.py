@@ -30,6 +30,7 @@ from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.masked_msa import MaskedMSAHead, apply_bert_mask
 from deepfold3.model.precision import fp32_scope
 from deepfold3.model.primitives import TRUNCATED_NORMAL_STDDEV_FACTOR, LayerNorm, LinearNoBias
+from deepfold3.model.restraints import Restraint
 
 # Disable the determinism metadata check that compares saved vs recomputed
 # tensor shapes.  View reshapes inside checkpointed functions (e.g.
@@ -933,6 +934,10 @@ class DeepFold3(nn.Module):
         num_recycles: int | None = None,
         num_samples: int | None = None,
         guidance_terms: Sequence[GuidanceTerm] | None = None,
+        restraints: Sequence[Restraint] = (),
+        restraint_weight: float = 0.0,
+        restraint_rigid: bool = True,
+        restraint_max_step: float = 2.0,
     ) -> DeepFold3Output:
         """Run full forward pass.
 
@@ -947,6 +952,15 @@ class DeepFold3(nn.Module):
             num_samples: override default number of diffusion samples
             guidance_terms: classifier-free guidance terms, replacing the
                 ``cfg.diffusion.guidance_*`` settings
+            restraints: distance restraints steered into the sampler
+                (:mod:`deepfold3.model.restraints`); unlike guidance these act
+                on coordinates, not on the conditioning
+            restraint_weight: how much of each restraint's violation to remove
+                per step
+            restraint_rigid: move each restrained chain as a rigid body rather
+                than pulling the named residues alone
+            restraint_max_step: angstrom cap on the displacement one step may
+                apply
         """
         if num_recycles is None:
             num_recycles = self.cfg.num_recycles
@@ -978,6 +992,10 @@ class DeepFold3(nn.Module):
                 generator=generator,
                 guidance_pair_keep=guidance_pair_keep,
                 guidance_terms=guidance_terms,
+                restraints=restraints,
+                restraint_weight=restraint_weight,
+                restraint_rigid=restraint_rigid,
+                restraint_max_step=restraint_max_step,
                 **self._ref_kwargs(features),
             )
 
