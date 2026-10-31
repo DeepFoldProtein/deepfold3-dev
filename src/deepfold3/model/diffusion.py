@@ -39,6 +39,7 @@ from deepfold3.model.primitives import (
     af3_linear_init_,
     layer_norm,
 )
+from deepfold3.model.restraints import Restraint, active_restraints, restraint_gradient, rigid_displacement
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -1224,6 +1225,10 @@ class DiffusionHead(nn.Module):
         guidance: bool = True,
         guidance_pair_keep: torch.Tensor | None = None,  # [B?, N, N] bool
         guidance_terms: Sequence[GuidanceTerm] | None = None,
+        restraints: Sequence[Restraint] = (),
+        restraint_weight: float = 0.0,
+        restraint_rigid: bool = True,
+        restraint_max_step: float = 2.0,
     ) -> dict[str, torch.Tensor]:
         """Draw samples from the diffusion model (Euler-Maruyama sampler).
 
@@ -1274,6 +1279,10 @@ class DiffusionHead(nn.Module):
                 generator,
                 ref_space_uid=ref_space_uid,
                 guidance_terms=terms,
+                restraints=tuple(restraints),
+                restraint_weight=restraint_weight,
+                restraint_rigid=restraint_rigid,
+                restraint_max_step=restraint_max_step,
             )
 
     def _sample_impl(
@@ -1289,6 +1298,10 @@ class DiffusionHead(nn.Module):
         generator: torch.Generator | None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
         guidance_terms: tuple[GuidanceTerm, ...] = (),
+        restraints: tuple[Restraint, ...] = (),
+        restraint_weight: float = 0.0,
+        restraint_rigid: bool = True,
+        restraint_max_step: float = 2.0,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         N, M = ref_mask.shape[-2:]
@@ -1358,9 +1371,10 @@ class DiffusionHead(nn.Module):
                 static_u = self.compute_static(**static_inputs, use_conditioning=False)
             lo, hi = term.sigma_range or (float("-inf"), float("inf"))
             uncond.append((term.scale, _for_samples(static_u), lo, hi))
-        if uncond:
-            # Host-side interval test per step: noise_levels is tiny, one sync here.
-            sig_hat_host = (noise_levels[:-1] * (1 + gammas)).tolist()
+        # Host-side sigma per step: noise_levels is tiny, one sync here. Both
+        # the guidance interval test and the restraint schedule read it.
+        sig_hat_host_all = (noise_levels[:-1] * (1 + gammas)).tolist()
+        sig_hat_host = sig_hat_host_all
 
         for step in range(cfg.steps):
             sigma_prev = noise_levels[step]
@@ -1384,6 +1398,34 @@ class DiffusionHead(nn.Module):
                     # Same positions_hat → all predictions share the augmented frame.
                     den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
                     denoised = denoised + (w - 1.0) * (den_c - den_u)
+            if restraints and restraint_weight:
+                # Steer the predicted clean structure, not the noisy positions:
+                # D is what the Euler step aims at, so pulling it into the
+                # restraint moves the trajectory without adding noise of its
+                # own. A gradient step of weight/2 on the quadratic penalty
+                # removes that fraction of each violation, so the restraint is
+                # approached geometrically over the steps rather than snapped.
+                # The soft-min sharpens as the noise falls: early on the pull
+                # is on the group, late on the closest atoms.
+                active = active_restraints(restraints, sig_hat_host_all[step])
+                if active:
+                    sharp = 0.25 + 1.75 * (1.0 - min(sig_hat_host_all[step] / cfg.sigma_data, 1.0))
+                    if restraint_rigid:
+                        # Move each restrained chain as a body: a subset pull
+                        # stretches the chain where the selection ends.
+                        denoised = denoised + rigid_displacement(
+                            denoised,
+                            ref_mask.bool(),
+                            active,
+                            weight=restraint_weight,
+                            sharpness=sharp,
+                            max_step=restraint_max_step,
+                        )
+                    else:
+                        grad = restraint_gradient(denoised, ref_mask.bool(), active, sharpness=sharp)
+                        move = -0.5 * restraint_weight * grad
+                        norm = move.norm(dim=-1, keepdim=True)
+                        denoised = denoised + move * (restraint_max_step / norm.clamp(min=restraint_max_step))
             d_t = sigma_next - sigma_hat
             positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
 

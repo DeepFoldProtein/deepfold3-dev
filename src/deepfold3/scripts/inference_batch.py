@@ -47,9 +47,10 @@ import torch
 
 from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
 from deepfold3.model.guidance import check_guidance_training, has_residue_ranges
+from deepfold3.model.restraints import RestraintSpec, build_restraints, describe_restraint
 from deepfold3.scripts import cli
 from deepfold3.scripts._common import apply_det_recipe
-from deepfold3.scripts.inference import _describe_guidance, _parse_guidance
+from deepfold3.scripts.inference import _describe_guidance, _parse_guidance, _parse_restraints
 
 
 def _load_model_once(
@@ -155,6 +156,10 @@ def _run_one_job(
     precision: str = "fp32",
     guidance_specs: tuple = (),
     allow_overlap: bool = False,
+    restraint_specs: tuple = (),
+    restraint_weight: float = 0.0,
+    restraint_rigid: bool = True,
+    restraint_max_step: float = 2.0,
     manifest_fields: dict | None = None,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
@@ -248,6 +253,22 @@ def _run_one_job(
         except ValueError as e:
             raise click.ClickException(f"--guidance on {json_input.name}: {e}") from e
 
+    restraints = ()
+    if restraint_specs:
+        from deepfold3.io.mmcif import resolve_chain_name as _resolve2
+
+        chain_index = {_resolve2(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
+        try:
+            restraints = build_restraints(
+                restraint_specs,
+                feats["asym_id"],
+                chain_index,
+                original_n,
+                residue_index=feats.get("residue_index"),
+            )
+        except ValueError as e:
+            raise click.ClickException(f"--restraint on {json_input.name}: {e}") from e
+
     json_seeds = list(job.model_seeds) if job.model_seeds else [42]
     # CLI seeds (when provided) are authoritative — replace the JSON's own
     # seeds so a benchmark sweep folds exactly the requested set. Dedup while
@@ -265,6 +286,10 @@ def _run_one_job(
         padded_tokens=feats["res_type"].shape[0],
         msa_rows=S,
         guidance=[{**dataclasses.asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
+        restraints=[
+            {**dataclasses.asdict(r), "description": describe_restraint(r), "weight": restraint_weight}
+            for r in restraint_specs
+        ],
         precision=precision,
         **(manifest_fields or {}),
     )
@@ -294,6 +319,10 @@ def _run_one_job(
                 num_recycles=num_recycles,
                 num_samples=num_samples,
                 guidance_terms=guidance_terms,
+                restraints=restraints,
+                restraint_weight=restraint_weight,
+                restraint_rigid=restraint_rigid,
+                restraint_max_step=restraint_max_step,
             )
 
         iter_feats = feats
@@ -534,6 +563,37 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     ),
 )
 @click.option(
+    "--restraint",
+    "restraint_specs",
+    multiple=True,
+    metavar="SEL:SEL[@DIST[@LO..HI]]",
+    callback=_parse_restraints,
+    help="Distance restraint steered into the sampler, as ``inference --restraint``; applied to every job.",
+)
+@click.option(
+    "--restraint-rigid/--restraint-residues",
+    default=True,
+    show_default=True,
+    help=(
+        "Rigid: project the restraint force onto each chain's six rigid degrees of freedom, "
+        "so the chain is translated and rotated and its internal geometry is untouched. "
+        "--restraint-residues pulls the named residues alone, which stretches the chain "
+        "where the selection ends."
+    ),
+)
+@click.option(
+    "--restraint-max-step",
+    default=2.0,
+    show_default=True,
+    help="Å cap on the displacement one sampler step may apply per restraint (steering needs the clip).",
+)
+@click.option(
+    "--restraint-weight",
+    default=0.2,
+    show_default=True,
+    help="Fraction of each restraint's remaining violation removed per sampler step.",
+)
+@click.option(
     "--det",
     is_flag=True,
     default=False,
@@ -564,6 +624,10 @@ def inference_batch(
     hoist_sampler: bool,
     guidance_specs: tuple,
     allow_guidance_overlap: bool,
+    restraint_specs: tuple[RestraintSpec, ...],
+    restraint_weight: float,
+    restraint_rigid: bool,
+    restraint_max_step: float,
     det: bool,
     plot_confidences: bool,
     save_distogram: bool,
@@ -615,6 +679,11 @@ def inference_batch(
         except ValueError as e:
             raise click.UsageError(f"--guidance: {e}") from e
         click.echo(f"[batch] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+    if restraint_specs:
+        click.echo(
+            f"[batch] restraints (weight {restraint_weight:g}): "
+            + " + ".join(describe_restraint(r) for r in restraint_specs)
+        )
         if has_residue_ranges(guidance_specs):
             click.echo("[batch] note: a residue-subset drop is finer than the training drop (whole chain pairs)")
 
@@ -680,6 +749,10 @@ def inference_batch(
             precision=precision,
             guidance_specs=guidance_specs,
             allow_overlap=allow_guidance_overlap,
+            restraint_specs=restraint_specs,
+            restraint_weight=restraint_weight,
+            restraint_rigid=restraint_rigid,
+            restraint_max_step=restraint_max_step,
             manifest_fields=manifest_fields,
         )
         n_done += 1

@@ -760,3 +760,172 @@ def test_residue_numbers_are_the_input_sequence_positions(tmp_path):
     rows = sorted({int(i) for i, _ in (~keep).nonzero().tolist()} & set(range(4, 9)))
     assert rows == [5, 6]  # chain A is tokens 0..3, so B's residues 2,3 are tokens 5,6
     assert feats["residue_index"][5:7].tolist() == [2, 3]
+
+
+# --- distance restraints (model/restraints.py) -------------------------------
+
+
+def _restraint(text: str):
+    from deepfold3.model.restraints import parse_restraint_spec
+
+    return parse_restraint_spec(text)
+
+
+def test_restraint_syntax():
+    from deepfold3.model.guidance import ChainSel
+    from deepfold3.model.restraints import DEFAULT_DISTANCE, describe_restraint
+
+    r = _restraint("A/25-40+88:B")
+    assert r.groups == (ChainSel("A", ((25, 40), (88, 88))), ChainSel("B"))
+    assert (r.distance, r.sigma_range) == (DEFAULT_DISTANCE, None)
+    r = _restraint("A:B@8@16..4608")
+    assert (r.distance, r.sigma_range) == (8.0, (16.0, 4608.0))
+    assert describe_restraint(_restraint("A/2:B@4")) == "A/2:B ≤ 4 Å"
+
+
+@pytest.mark.parametrize(
+    "text", ["", "A", "A:A", "A:B:C", "A:B@1", "A:B@50", "A:B@x", "A/:B", "A:B@6@5..1", "A:B@6@1..2@x"]
+)
+def test_restraint_rejects_malformed(text):
+    with pytest.raises(ValueError):
+        _restraint(text)
+
+
+def _two_chains(sep: float):
+    """5 tokens x 2 atoms: chain A at x = 0,1,2 and chain B `sep` away."""
+    pos = torch.zeros(1, 5, 2, 3)
+    pos[:, :3, :, 0] = torch.arange(3.0).view(1, 3, 1)
+    pos[:, 3:, :, 0] = sep
+    return pos, torch.ones(5, 2, dtype=torch.bool), torch.tensor([0, 0, 0, 1, 1]), torch.tensor([1, 2, 3, 1, 2])
+
+
+def test_restraint_pulls_only_the_named_residues():
+    from deepfold3.model.restraints import build_restraints, restraint_gradient
+
+    pos, mask, asym, res = _two_chains(30.0)
+    r = build_restraints([_restraint("A/2-3:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+    g = restraint_gradient(pos, mask, r, sharpness=1.0)
+    per_token = g.norm(dim=-1).sum(-1).squeeze(0)
+    assert float(per_token[0]) == 0.0  # residue 1 is not named
+    assert all(float(per_token[i]) > 0 for i in (1, 2, 3, 4))
+    moved = pos - 0.5 * 0.2 * g
+    assert moved[0, 2, 0, 0] > pos[0, 2, 0, 0]  # the two groups approach each other
+    assert moved[0, 3, 0, 0] < pos[0, 3, 0, 0]
+
+
+def test_restraint_already_satisfied_is_a_no_op():
+    from deepfold3.model.restraints import build_restraints, restraint_gradient
+
+    pos, mask, asym, res = _two_chains(4.0)  # inside the 6 Å bottom
+    r = build_restraints([_restraint("A/2-3:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+    assert float(restraint_gradient(pos, mask, r, sharpness=1.0).abs().max()) == 0.0
+
+
+def test_restraint_force_falls_off_as_it_is_met():
+    """Quadratic, not Boltz's linear flat bottom: the pull shrinks on approach."""
+    from deepfold3.model.restraints import build_restraints, restraint_gradient
+
+    def pull(sep: float) -> float:
+        pos, mask, asym, res = _two_chains(sep)
+        r = build_restraints([_restraint("A/2-3:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+        return float(restraint_gradient(pos, mask, r, sharpness=1.0).norm())
+
+    assert pull(30.0) > pull(15.0) > pull(8.0) > 0.0
+
+
+def test_restraint_sigma_range_selects_the_steps():
+    from deepfold3.model.restraints import active_restraints, build_restraints
+
+    _, _, asym, res = _two_chains(30.0)
+    rs = build_restraints(
+        [_restraint("A/2:B@6@100..4608"), _restraint("A/3:B@6")], asym, {"A": 0, "B": 1}, residue_index=res
+    )
+    assert len(active_restraints(rs, 500.0)) == 2
+    assert len(active_restraints(rs, 10.0)) == 1  # only the unrestricted one
+
+
+def test_restraint_never_pulls_bucket_padding():
+    from deepfold3.model.restraints import build_restraints
+
+    asym = torch.tensor([0, 0, 1, 0, 0])  # the last two are padding, asym_id 0
+    res = torch.tensor([1, 2, 1, 1, 2])
+    r = build_restraints([_restraint("A/1-2:B@6")], asym, {"A": 0, "B": 1}, n_tokens=3, residue_index=res)[0]
+    assert r.tokens_a.tolist() == [True, True, False, False, False]
+
+
+def test_restraint_gradient_survives_inference_mode():
+    """The sampler runs under inference_mode, where enable_grad is not enough.
+
+    A tensor created inside inference mode records no graph even within
+    enable_grad, so the energy comes back detached and the restraint silently
+    does nothing. This pins the inference_mode(False) copy that fixes it.
+    """
+    from deepfold3.model.restraints import build_restraints, restraint_gradient
+
+    pos, mask, asym, res = _two_chains(30.0)
+    r = build_restraints([_restraint("A/2-3:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+    with torch.inference_mode():
+        g = restraint_gradient(pos, mask, r, sharpness=1.0)
+    assert float(g.norm()) > 0.0
+
+
+def _two_bodies():
+    """Chain A (8 residues) and chain B (6), 30 Å apart and offset, 3 atoms each."""
+    n_a, n_b, m = 8, 6, 3
+    pos = torch.zeros(1, n_a + n_b, m, 3)
+    for i in range(n_a):
+        pos[0, i, :, 0] = i * 3.8
+        pos[0, i, :, 1] = torch.tensor([0.0, 1.0, 2.0])
+    for j in range(n_b):
+        pos[0, n_a + j, :, 0] = 30.0 + j * 3.8
+        pos[0, n_a + j, :, 1] = torch.tensor([20.0, 21.0, 22.0])
+    mask = torch.ones(n_a + n_b, m, dtype=torch.bool)
+    asym = torch.tensor([0] * n_a + [1] * n_b)
+    res = torch.tensor(list(range(1, n_a + 1)) + list(range(1, n_b + 1)))
+    return pos, mask, asym, res
+
+
+def test_rigid_mode_keeps_every_internal_distance():
+    """The whole point of the rigid projection: no stretched bonds."""
+    from deepfold3.model.restraints import build_restraints, rigid_displacement
+
+    pos, mask, asym, res = _two_bodies()
+    r = build_restraints([_restraint("A/1-2:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+
+    def inner(p, s):
+        return torch.cdist(p[0, s].reshape(-1, 3), p[0, s].reshape(-1, 3))
+
+    before = (inner(pos, slice(0, 8)), inner(pos, slice(8, None)))
+    p = pos.clone()
+    for _ in range(40):
+        p = p + rigid_displacement(p, mask, r, weight=0.4, sharpness=1.0, max_step=2.0)
+    after = (inner(p, slice(0, 8)), inner(p, slice(8, None)))
+    assert all(float((x - y).abs().max()) < 1e-3 for x, y in zip(before, after, strict=True))
+    far = torch.cdist(pos[0, :2].reshape(-1, 3), pos[0, 8:].reshape(-1, 3)).min()
+    near = torch.cdist(p[0, :2].reshape(-1, 3), p[0, 8:].reshape(-1, 3)).min()
+    assert float(far) > 25.0 and float(near) < 7.0  # and it still closes the restraint
+
+
+def test_rigid_mode_rotates_not_only_translates():
+    """A patch facing away has to be turned, not just moved in."""
+    from deepfold3.model.restraints import build_restraints, rigid_displacement
+
+    pos, mask, asym, res = _two_bodies()
+    r = build_restraints([_restraint("A/1-2:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+    p = pos.clone()
+    for _ in range(40):
+        p = p + rigid_displacement(p, mask, r, weight=0.4, sharpness=1.0, max_step=2.0)
+    # the chain's own axis has turned: compare the first-to-last residue vector
+    v0 = (pos[0, 7, 0] - pos[0, 0, 0]) / (pos[0, 7, 0] - pos[0, 0, 0]).norm()
+    v1 = (p[0, 7, 0] - p[0, 0, 0]) / (p[0, 7, 0] - p[0, 0, 0]).norm()
+    assert float(torch.dot(v0, v1)) < 0.99
+
+
+def test_rigid_step_is_capped():
+    from deepfold3.model.restraints import build_restraints, rigid_displacement
+
+    pos, mask, asym, res = _two_bodies()
+    r = build_restraints([_restraint("A/1-2:B@6")], asym, {"A": 0, "B": 1}, residue_index=res)
+    for cap in (0.5, 2.0):
+        d = rigid_displacement(pos, mask, r, weight=10.0, sharpness=1.0, max_step=cap)
+        assert float(d.norm(dim=-1).max()) <= cap * 2 + 1e-4  # translation + rotation arc
