@@ -33,7 +33,7 @@ Usage::
     deepfold3 warmup-triton --skip-gemm
 
     # Inference kernels only: the real forward pass, no backward
-    deepfold3 warmup-triton --config configs/stage2.yaml --inference-only
+    deepfold3 warmup-triton --config configs/stage2.yaml --inference-only --precision bf16
 
 After this script finishes, the cache JSON files in ``~/.cache/deepfold3-triton/``
 hold a config for every shape; subsequent training runs on this GPU model load
@@ -531,11 +531,16 @@ def warmup_real_model(
     logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
 
 
-def warmup_inference(mcfg, buckets: Iterable[int], n_msa: int, num_samples: int, device: torch.device) -> None:
+def warmup_inference(
+    mcfg, buckets: Iterable[int], n_msa: int, num_samples: int, device: torch.device, precision: str = "fp32"
+) -> None:
     """Warm the cache by driving the model's inference ``forward``.
 
     Runs under ``OptimConfig.inference()``, as ``deepfold3 inference`` does by
     default, so inference-only kernels warm too and no backward kernel does.
+    ``precision`` must match what ``deepfold3 inference`` will run: the cache
+    keys carry the shapes, and the big fp32 shapes need more memory than bf16.
+
     Inference pads tokens to these buckets, but its MSA depth varies by input,
     so MSA-track shapes reach these entries through the nearest-shape lookup
     (:func:`~deepfold3.model.triton.cache.set_nearest_shape_lookup`). Templates
@@ -550,10 +555,13 @@ def warmup_inference(mcfg, buckets: Iterable[int], n_msa: int, num_samples: int,
     mcfg.diffusion.steps = 2  # every step is the same shape
     model = DeepFold3(mcfg).to(device).eval()
     for n_pad in buckets:
-        logger.info(f"=== inference: N={n_pad} S_msa={n_msa} samples={num_samples} ===")
+        logger.info(f"=== inference: N={n_pad} S_msa={n_msa} samples={num_samples} {precision} ===")
         feats = {k: v[0] for k, v in _synthetic_training_features(n_pad, 1, n_msa, device).items()}
         t0 = time.time()
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            torch.autocast(device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+        ):
             model(feats, seed=0, num_recycles=1, num_samples=num_samples)
         torch.cuda.synchronize()
         logger.info(f"  fwd N={n_pad} → {time.time() - t0:.1f}s")
@@ -607,6 +615,13 @@ def warmup_inference(mcfg, buckets: Iterable[int], n_msa: int, num_samples: int,
     ),
 )
 @click.option(
+    "--precision",
+    default="fp32",
+    type=click.Choice(["fp32", "bf16"]),
+    show_default=True,
+    help="With --inference-only, the compute dtype to warm, as ``inference --precision``.",
+)
+@click.option(
     "--inference-only",
     is_flag=True,
     help=(
@@ -655,6 +670,7 @@ def main(
     batch_sizes: str,
     skip_gemm: bool,
     real_model: bool,
+    precision: str,
     inference_only: bool,
     full_depth: bool,
     msa_depth: int | None,
@@ -679,9 +695,9 @@ def main(
             collapse_to_depth_1(mcfg)
         bucket_list = sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else _INFERENCE_BUCKETS
         n_msa = msa_depth if msa_depth is not None else _INFERENCE_MSA_DEPTH
-        logger.info(f"Inference warmup on {name} for buckets: {bucket_list} (S_msa={n_msa})")
+        logger.info(f"Inference warmup on {name} for buckets: {bucket_list} (S_msa={n_msa}, {precision})")
         t0 = time.time()
-        warmup_inference(mcfg, bucket_list, n_msa, mcfg.diffusion.num_samples, dev)
+        warmup_inference(mcfg, bucket_list, n_msa, mcfg.diffusion.num_samples, dev, precision)
         logger.info(f"Total warmup time: {time.time() - t0:.1f}s")
         return
 
