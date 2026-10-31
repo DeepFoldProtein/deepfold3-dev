@@ -22,7 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
-from deepfold3.model.atom_cross_attn import AtomDecoder, AtomEncoder, AtomEncoderStatic
+from deepfold3.model.atom_cross_attn import (
+    AtomDecoder,
+    AtomEncoder,
+    AtomEncoderStatic,
+    broadcast_for_samples,
+    expand_for_samples_shared,
+)
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.precision import upcast_fp32 as _upcast_fp32
@@ -61,6 +67,9 @@ class DiffusionStatic:
     ref_pos: torch.Tensor  # [B?, N, M, 3] — for input scaling
     ref_mask: torch.Tensor  # [B?, N, M] — for input/output masking
     seq_mask: torch.Tensor  # [B?, N]
+    # Set by ``DiffusionHead.hoist_static``: per super-block token pair logits
+    # with the padding mask folded in. ``single_cond_pre_noise`` then stays [B, ...].
+    pair_logits: tuple[torch.Tensor, ...] | None = None
 
     def expand_for_samples(self, num_samples: int) -> DiffusionStatic:
         if num_samples == 1:
@@ -469,7 +478,7 @@ class DiffusionTransformerBlock(nn.Module):
     def _compute(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,  # None: already folded into ``pair_logits``
         single_cond: torch.Tensor,
         pair_logits: torch.Tensor | None,
     ) -> torch.Tensor:
@@ -490,12 +499,11 @@ class DiffusionTransformerBlock(nn.Module):
         k = self.to_k(xn).view(B, N, H, Dk).permute(0, 2, 1, 3).float()
         v = self.to_v(xn).view(B, N, H, Dv).permute(0, 2, 1, 3).to(x.dtype)
 
-        bias_mask = 1e9 * (mask.float() - 1.0)  # [B, N]
-
         logits = torch.matmul(q * self.scale, k.transpose(-2, -1))  # [B, H, N, N]
         if pair_logits is not None:
             logits = logits + pair_logits.float()
-        logits = logits + bias_mask.view(B, 1, 1, N)
+        if mask is not None:
+            logits = logits + (1e9 * (mask.float() - 1.0)).view(B, 1, 1, N)
         w = F.softmax(logits, dim=-1).to(x.dtype)
 
         out = torch.matmul(w, v)  # [B, H, N, Dv]
@@ -608,6 +616,34 @@ class DiffusionTransformer(nn.Module):
 
         # Scale-only output norm (create_offset=False in AF3)
         self.output_norm_w = nn.Parameter(torch.ones(c))
+
+    def hoist_pair_logits(
+        self,
+        pair_cond: torch.Tensor,  # [B, N, N, c_pair]
+        mask: torch.Tensor,  # [B, N]  float
+    ) -> tuple[torch.Tensor, ...]:
+        """Per super-block pair logits ``[B, sbs*H, N, N]``, padding mask folded in."""
+        pair_norm = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+        bias = 1e9 * (mask.float() - 1.0)[:, None, None, :]
+        return tuple(proj(pair_norm).movedim(-1, -3).float() + bias for proj in self.pair_logits_proj)
+
+    def forward_hoisted(
+        self,
+        act: torch.Tensor,  # [B, N, c]
+        single_cond: torch.Tensor,  # [1 or B, N, c]
+        pair_logits: tuple[torch.Tensor, ...],  # from :meth:`hoist_pair_logits`
+    ) -> torch.Tensor:
+        """:meth:`forward` on hoisted logits; ``single_cond`` may broadcast over ``act``."""
+        H = self.layers[0].num_heads
+        sbs = self.super_block_size
+        if self.layers[0]._fused_ada_ln_linear is not None:  # the kernel does not broadcast
+            single_cond = single_cond.expand(act.shape[0], -1, -1)
+        for super_idx, pair_logits_all in enumerate(pair_logits):
+            for block_in_super in range(sbs):
+                start = block_in_super * H
+                pl = pair_logits_all[..., start : start + H, :, :]
+                act = self.layers[super_idx * sbs + block_in_super]._compute(act, None, single_cond, pl)
+        return layer_norm(act, [act.shape[-1]]) * self.output_norm_w
 
     def forward(
         self,
@@ -934,6 +970,41 @@ class DiffusionHead(nn.Module):
             seq_mask=seq_mask,
         )
 
+    def hoist_static(self, static: DiffusionStatic, num_samples: int) -> DiffusionStatic:
+        """``static`` for a sampler of ``num_samples``, with the work the plain
+        expansion repeats per step moved here.
+
+        Replaces :meth:`DiffusionStatic.expand_for_samples` in the sampler
+        (``cfg.hoist_sampler``): drops atom windows that hold no atoms, computes
+        the pair logits and atom AdaLN terms once, and keeps one copy of the
+        state rather than ``num_samples``. The result is read-only and assumes
+        one noise level across the batch, which the sampler guarantees.
+
+        The arithmetic is unchanged but GEMM shapes are not, and under TF32
+        (``matmul_precision("high")``) cuBLAS results depend on shape: changing
+        only the sample count already moves the plain denoiser by ~0.1 Å. Expect
+        that, not bit equality; see docs/optimizations.md.
+        """
+        enc = static.encoder_static.trim_empty_subsets()
+        hoist_args = (enc.queries_single, enc.keys_single, enc.keys_mask, enc.atom_pair)
+        encoder_hoist = self.atom_encoder.atom_transformer.hoist(*hoist_args)
+        decoder_hoist = self.atom_decoder.atom_transformer.hoist(*hoist_args)
+        pair_logits = self.transformer.hoist_pair_logits(static.pair_cond, static.seq_mask)
+        shared = enc.share_for_samples(num_samples)
+        return DiffusionStatic(
+            encoder_static=dataclasses.replace(
+                shared,
+                encoder_hoist=tuple(h.broadcast_for_samples(num_samples) for h in encoder_hoist),
+                decoder_hoist=tuple(h.broadcast_for_samples(num_samples) for h in decoder_hoist),
+            ),
+            pair_cond=static.pair_cond,
+            single_cond_pre_noise=static.single_cond_pre_noise,
+            ref_pos=static.ref_pos,
+            ref_mask=expand_for_samples_shared(static.ref_mask, num_samples),
+            seq_mask=static.seq_mask,
+            pair_logits=tuple(broadcast_for_samples(t, num_samples) for t in pair_logits),
+        )
+
     def denoise(
         self,
         noisy_pos: torch.Tensor,  # [B?, N, M, 3]
@@ -986,7 +1057,13 @@ class DiffusionHead(nn.Module):
         act_pos = act_pos / (nl**2 + sd**2).sqrt()
 
         # Add noise embedding to single conditioning
-        single_cond = self.conditioning.add_noise(static.single_cond_pre_noise, noise_level)
+        if static.pair_logits is None:
+            single_cond = self.conditioning.add_noise(static.single_cond_pre_noise, noise_level)
+        else:
+            # One noise level per step, so each molecule needs one row.
+            S = noisy_pos.shape[0] // static.single_cond_pre_noise.shape[0]
+            single_cond = self.conditioning.add_noise(static.single_cond_pre_noise, noise_level[::S])
+            single_cond = broadcast_for_samples(single_cond, S)
 
         # Atom encoder (uses cached static)
         enc = self.atom_encoder(noisy_atom_pos=act_pos, static=static.encoder_static)
@@ -997,7 +1074,10 @@ class DiffusionHead(nn.Module):
         act = act + self.single_cond_embedding_projection(sc_norm)
 
         # Main transformer (already batch-aware)
-        act = self.transformer(act, seq_mask_eff, single_cond, pair_cond)
+        if static.pair_logits is None:
+            act = self.transformer(act, seq_mask_eff, single_cond, pair_cond)
+        else:
+            act = self.transformer.forward_hoisted(act, single_cond, static.pair_logits)
 
         # Atom decoder
         pos_update = self.atom_decoder(act, enc)
@@ -1253,10 +1333,16 @@ class DiffusionHead(nn.Module):
             rel_feat=_ensure_b(rel_feat),
         )
         static = self.compute_static(**static_inputs)
+
         # Pre-expand to [B*num_samples, ...] once. ``_denoise_samples`` will
         # use this directly for all 200 steps instead of materialising a
         # fresh expanded copy each step.
-        static_bs = static.expand_for_samples(cfg.num_samples)
+        def _for_samples(st: DiffusionStatic) -> DiffusionStatic:
+            return (
+                self.hoist_static(st, cfg.num_samples) if cfg.hoist_sampler else st.expand_for_samples(cfg.num_samples)
+            )
+
+        static_bs = _for_samples(static)
 
         # Classifier-free guidance: one static per unconditional branch, built
         # only for active terms so the unguided path costs nothing.
@@ -1271,7 +1357,7 @@ class DiffusionHead(nn.Module):
             else:
                 static_u = self.compute_static(**static_inputs, use_conditioning=False)
             lo, hi = term.sigma_range or (float("-inf"), float("inf"))
-            uncond.append((term.scale, static_u.expand_for_samples(cfg.num_samples), lo, hi))
+            uncond.append((term.scale, _for_samples(static_u), lo, hi))
         if uncond:
             # Host-side interval test per step: noise_levels is tiny, one sync here.
             sig_hat_host = (noise_levels[:-1] * (1 + gammas)).tolist()

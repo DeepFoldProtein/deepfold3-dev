@@ -249,6 +249,16 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     ),
 )
 @click.option(
+    "--hoist-sampler/--no-hoist-sampler",
+    default=True,
+    show_default=True,
+    help=(
+        "Drop empty atom windows and compute step-invariant conditioning once in the "
+        "diffusion sampler. Same noise draws; coordinates can move within the TF32 "
+        "tolerance, ~0.1 Å per denoiser call. --no-hoist-sampler runs the plain sampler."
+    ),
+)
+@click.option(
     "--allow-missing-keys",
     is_flag=True,
     default=False,
@@ -291,6 +301,7 @@ def inference(
     precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
+    hoist_sampler: bool,
     allow_missing_keys: bool,
     det: bool,
 ) -> None:
@@ -391,6 +402,7 @@ def inference(
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
     # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
+    model_cfg.diffusion.hoist_sampler = hoist_sampler
 
     if det and model_cfg.optim.use_torch_compile:
         raise click.UsageError("--det does not cover torch.compile; use --optim inference")

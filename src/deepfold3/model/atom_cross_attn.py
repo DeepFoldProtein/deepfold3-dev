@@ -24,6 +24,7 @@ Haiku scope prefixes:
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,29 @@ class AtomSubsets:
     # Scatter: queries [S*Q] → token-atoms [N, M]
     q_to_ta_idx: torch.Tensor  # [N, M] long — indices into flattened [S*Q]
     q_to_ta_mask: torch.Tensor  # [N, M] bool
+
+    def trim_empty(self) -> AtomSubsets:
+        """Drop trailing windows that hold no real atom (batched layout).
+
+        ``S`` follows the ``N*M`` capacity so that training shapes do not depend
+        on the data, which leaves most windows empty: 291 of 425 for 566 tokens
+        with 4280 atoms. Real atoms are packed first, each window only attends
+        within itself, and a key slot past the kept range is padding that
+        ``q_to_k_mask`` already masks, so its index is free to be remapped.
+        """
+        num_real = int(self.q_to_ta_mask.flatten(1).sum(-1).max())
+        keep = max(1, math.ceil(num_real / self.Q))
+        q_to_k_idx = self.q_to_k_idx[:, :keep]
+        return dataclasses.replace(
+            self,
+            num_subsets=keep,
+            ta_to_q_idx=self.ta_to_q_idx[:, :keep],
+            ta_to_q_mask=self.ta_to_q_mask[:, :keep],
+            q_to_k_idx=q_to_k_idx.masked_fill(q_to_k_idx >= keep * self.Q, 0),
+            q_to_k_mask=self.q_to_k_mask[:, :keep],
+            token_for_query=self.token_for_query[:, :keep],
+            token_for_key=self.token_for_key[:, :keep],
+        )
 
 
 def build_atom_subsets(ref_mask: torch.Tensor, Q: int = 32, K: int = 128) -> AtomSubsets:
@@ -238,6 +262,17 @@ def _scatter_from_subsets(arr: torch.Tensor, idx: torch.Tensor, mask: torch.Tens
     return _flat_take(arr.reshape(-1, *arr.shape[2:]), idx, mask)
 
 
+def broadcast_for_samples(t: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """``[B, ...]`` state shared by a sample batch: with one molecule it stays
+    ``[1, ...]`` and broadcasts, otherwise it is repeated to ``[B*S, ...]``."""
+    return t if t.shape[0] == 1 else t.repeat_interleave(num_samples, dim=0)
+
+
+def expand_for_samples_shared(t: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """``[B, ...]`` → ``[B*S, ...]`` read-only: a view with one molecule."""
+    return t.expand(num_samples, *t.shape[1:]) if t.shape[0] == 1 else t.repeat_interleave(num_samples, dim=0)
+
+
 def _gather_q_to_k(arr: torch.Tensor, q_to_k_idx: torch.Tensor, q_to_k_mask: torch.Tensor) -> torch.Tensor:
     """Gather from queries ``[B?, S, Q, *F]`` to keys ``[B?, S, K, *F]``.
 
@@ -284,6 +319,31 @@ class AtomCrossAttEncoderOutput:
     keys_single_cond: torch.Tensor  # [S, K, per_atom_channels]
     pair_cond: torch.Tensor  # [S, Q, K, pair_ch]
     subsets: AtomSubsets  # precomputed indices for decoder
+    decoder_hoist: tuple[AtomBlockHoist, ...] | None = None
+
+
+@dataclasses.dataclass
+class AtomBlockHoist:
+    """One :class:`AtomCrossAttTransformer` block's noise-independent terms.
+
+    Everything a block derives from the single / pair conditioning alone, so
+    the sampler computes it once instead of once per step and sample.
+    """
+
+    logit_bias: torch.Tensor  # [B?, S, H, Q, K] pair logits + key mask
+    q_scale: torch.Tensor  # [B?, S, Q, c]
+    q_bias: torch.Tensor  # [B?, S, Q, c]
+    k_scale: torch.Tensor  # [B?, S, K, c]
+    k_bias: torch.Tensor  # [B?, S, K, c]
+    attn_gate: torch.Tensor  # [B?, S, Q, c]
+    ffn_scale: torch.Tensor  # [B?, S, Q, c]
+    ffn_bias: torch.Tensor  # [B?, S, Q, c]
+    ffn_gate: torch.Tensor  # [B?, S, Q, c]
+
+    def broadcast_for_samples(self, num_samples: int) -> AtomBlockHoist:
+        return AtomBlockHoist(
+            *(broadcast_for_samples(getattr(self, f.name), num_samples) for f in dataclasses.fields(self))
+        )
 
 
 @dataclasses.dataclass
@@ -308,6 +368,51 @@ class AtomEncoderStatic:
     keys_mask: torch.Tensor  # [B, S_sub, K]
     atom_pair: torch.Tensor  # [B, S_sub, Q, K, cp]
     ref_mask: torch.Tensor  # [B, N, M] — needed for the aggregation denominator
+    encoder_hoist: tuple[AtomBlockHoist, ...] | None = None
+    decoder_hoist: tuple[AtomBlockHoist, ...] | None = None
+
+    def trim_empty_subsets(self) -> AtomEncoderStatic:
+        """Same state without the windows :meth:`AtomSubsets.trim_empty` drops."""
+        subsets = self.subsets.trim_empty()
+        keep = subsets.num_subsets
+        return dataclasses.replace(
+            self,
+            subsets=subsets,
+            queries_single=self.queries_single[:, :keep],
+            queries_mask=self.queries_mask[:, :keep],
+            keys_single=self.keys_single[:, :keep],
+            keys_mask=self.keys_mask[:, :keep],
+            atom_pair=self.atom_pair[:, :keep],
+        )
+
+    def share_for_samples(self, num_samples: int) -> AtomEncoderStatic:
+        """:meth:`expand_for_samples` for a sampler that only reads this state:
+        one molecule yields views, so S samples hold one copy."""
+
+        def exp(t: torch.Tensor) -> torch.Tensor:
+            return expand_for_samples_shared(t, num_samples)
+
+        subsets = self.subsets
+        return dataclasses.replace(
+            self,
+            subsets=dataclasses.replace(
+                subsets,
+                ta_to_q_idx=exp(subsets.ta_to_q_idx),
+                ta_to_q_mask=exp(subsets.ta_to_q_mask),
+                q_to_k_idx=exp(subsets.q_to_k_idx),
+                q_to_k_mask=exp(subsets.q_to_k_mask),
+                token_for_query=exp(subsets.token_for_query),
+                token_for_key=exp(subsets.token_for_key),
+                q_to_ta_idx=exp(subsets.q_to_ta_idx),
+                q_to_ta_mask=exp(subsets.q_to_ta_mask),
+            ),
+            queries_single=exp(self.queries_single),
+            queries_mask=exp(self.queries_mask),
+            keys_single=exp(self.keys_single),
+            keys_mask=exp(self.keys_mask),
+            atom_pair=exp(self.atom_pair),
+            ref_mask=exp(self.ref_mask),
+        )
 
     def expand_for_samples(self, num_samples: int) -> AtomEncoderStatic:
         """Repeat each field along the leading batch dim by ``num_samples``
@@ -596,6 +701,80 @@ class AtomCrossAttTransformer(nn.Module):
             nn.init.zeros_(s.bias)
             self.ffn_cond_scale.append(s)
             self.ffn_cond_bias.append(LinearNoBias(c, c, initializer="zeros"))
+
+    def hoist(
+        self,
+        queries_single_cond: torch.Tensor,  # [B, S, Q, c]
+        keys_single_cond: torch.Tensor,  # [B, S, K, c]
+        keys_mask: torch.Tensor,  # [B, S, K] float
+        pair_cond: torch.Tensor,  # [B, S, Q, K, cp]
+    ) -> tuple[AtomBlockHoist, ...]:
+        """The per-block terms of :meth:`forward` that ignore ``queries_act``."""
+        C = queries_single_cond.shape[-1]
+        B, S, Q, K = pair_cond.shape[:4]
+        pair_normed = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+        pair_logits = self.pair_logits_proj(pair_normed)  # [B, S, Q, K, nb*H]
+        pair_logits = pair_logits.reshape(B, S, Q, K, self.num_blocks, self.num_heads).movedim((-2, -1), (0, 3))
+        key_bias = 1e9 * (keys_mask.unsqueeze(-2).unsqueeze(-2) - 1.0)  # [B, S, 1, 1, K]
+        q_norm = layer_norm(queries_single_cond, [C])
+        k_norm = layer_norm(keys_single_cond, [C])
+
+        blocks = []
+        for i, (attn, ffn) in enumerate(zip(self.attn_blocks, self.ffn_blocks, strict=True)):
+            cn_q = q_norm * self.attn_cond_w[i]
+            cn_k = k_norm * self.k_cond_w[i]
+            cn_f = q_norm * self.ffn_cond_w[i]
+            blocks.append(
+                AtomBlockHoist(
+                    logit_bias=pair_logits[i] + key_bias,
+                    q_scale=torch.sigmoid(self.attn_cond_scale[i](cn_q)),
+                    q_bias=self.attn_cond_bias[i](cn_q),
+                    k_scale=torch.sigmoid(self.k_cond_scale[i](cn_k)),
+                    k_bias=self.k_cond_bias[i](cn_k),
+                    attn_gate=torch.sigmoid(attn["zero_cond"](queries_single_cond)),
+                    ffn_scale=torch.sigmoid(self.ffn_cond_scale[i](cn_f)),
+                    ffn_bias=self.ffn_cond_bias[i](cn_f),
+                    ffn_gate=torch.sigmoid(ffn["zero_cond"](queries_single_cond)),
+                )
+            )
+        return tuple(blocks)
+
+    def forward_hoisted(
+        self,
+        queries_act: torch.Tensor,  # [B, S, Q, c]
+        hoist: tuple[AtomBlockHoist, ...],
+        q_to_k_idx: torch.Tensor,  # [B, S, K] long
+        q_to_k_mask: torch.Tensor,  # [B, S, K] bool
+    ) -> torch.Tensor:  # [B, S, Q, c]
+        """:meth:`forward` on terms from :meth:`hoist`, the batched path only.
+
+        The key mask sits in ``logit_bias``: ``(qk + pl) + m`` becomes
+        ``qk + (pl + m)``, the same bits where ``m`` is 0 and -1e9 either way
+        where it is not.
+        """
+        B, S, Q, C = queries_act.shape
+        H = self.num_heads
+        D = self.head_dim
+        K = q_to_k_idx.shape[-1]
+        for i, (attn, ffn, h) in enumerate(zip(self.attn_blocks, self.ffn_blocks, hoist, strict=True)):
+            keys_act = _gather_q_to_k(queries_act, q_to_k_idx, q_to_k_mask)
+            xn_q = h.q_scale * self.attn_norms[i](queries_act) + h.q_bias
+            xn_k = h.k_scale * layer_norm(keys_act, [C]) + h.k_bias
+
+            q = attn["to_q"](xn_q).view(B, S, Q, H, D).permute(0, 1, 3, 2, 4)
+            k = attn["to_k"](xn_k).view(B, S, K, H, D).permute(0, 1, 3, 2, 4)
+            v = attn["to_v"](xn_k).view(B, S, K, H, D).permute(0, 1, 3, 2, 4)
+            logits = torch.matmul(q * (D**-0.5), k.transpose(-2, -1)) + h.logit_bias
+            w = F.softmax(logits.float(), dim=-1).to(queries_act.dtype)
+            out = torch.matmul(w, v).permute(0, 1, 3, 2, 4).reshape(B, S, Q, C)
+
+            out = out * torch.sigmoid(attn["to_g"](xn_q))
+            queries_act = queries_act + h.attn_gate * attn["out_proj"](out)
+
+            xn = h.ffn_scale * self.ffn_norms[i](queries_act) + h.ffn_bias
+            a, b = ffn["linear1"](xn).chunk(2, dim=-1)
+            queries_act = queries_act + h.ffn_gate * ffn["linear2"](F.silu(a) * b)
+        return queries_act
 
     def forward(
         self,
@@ -1013,16 +1192,21 @@ class AtomEncoder(nn.Module):
         else:
             queries_act = queries_single
 
-        queries_act = self.atom_transformer(
-            queries_act=queries_act,
-            queries_mask=queries_mask,
-            queries_single_cond=queries_single,
-            keys_single_cond=keys_single,
-            keys_mask=keys_mask,
-            pair_cond=atom_pair,
-            q_to_k_idx=subsets.q_to_k_idx,
-            q_to_k_mask=subsets.q_to_k_mask,
-        )
+        if static.encoder_hoist is not None:
+            queries_act = self.atom_transformer.forward_hoisted(
+                queries_act, static.encoder_hoist, subsets.q_to_k_idx, subsets.q_to_k_mask
+            )
+        else:
+            queries_act = self.atom_transformer(
+                queries_act=queries_act,
+                queries_mask=queries_mask,
+                queries_single_cond=queries_single,
+                keys_single_cond=keys_single,
+                keys_mask=keys_mask,
+                pair_cond=atom_pair,
+                q_to_k_idx=subsets.q_to_k_idx,
+                q_to_k_mask=subsets.q_to_k_mask,
+            )
         queries_act = queries_act * queries_mask.unsqueeze(-1)
 
         atom_proj = _scatter_from_subsets(
@@ -1040,6 +1224,7 @@ class AtomEncoder(nn.Module):
             keys_single_cond=keys_single,
             pair_cond=atom_pair,
             subsets=subsets,
+            decoder_hoist=static.decoder_hoist,
         )
 
 
@@ -1090,16 +1275,21 @@ class AtomDecoder(nn.Module):
         queries_act = queries_act * enc.queries_mask.unsqueeze(-1)
 
         # Cross-attention transformer (reuses encoder's pair/single conditioning)
-        queries_act = self.atom_transformer(
-            queries_act=queries_act,
-            queries_mask=enc.queries_mask,
-            queries_single_cond=enc.queries_single_cond,
-            keys_single_cond=enc.keys_single_cond,
-            keys_mask=enc.keys_mask,
-            pair_cond=enc.pair_cond,
-            q_to_k_idx=enc.subsets.q_to_k_idx,
-            q_to_k_mask=enc.subsets.q_to_k_mask,
-        )
+        if enc.decoder_hoist is not None:
+            queries_act = self.atom_transformer.forward_hoisted(
+                queries_act, enc.decoder_hoist, enc.subsets.q_to_k_idx, enc.subsets.q_to_k_mask
+            )
+        else:
+            queries_act = self.atom_transformer(
+                queries_act=queries_act,
+                queries_mask=enc.queries_mask,
+                queries_single_cond=enc.queries_single_cond,
+                keys_single_cond=enc.keys_single_cond,
+                keys_mask=enc.keys_mask,
+                pair_cond=enc.pair_cond,
+                q_to_k_idx=enc.subsets.q_to_k_idx,
+                q_to_k_mask=enc.subsets.q_to_k_mask,
+            )
         queries_act = queries_act * enc.queries_mask.unsqueeze(-1)
 
         # Normalize and project to 3D position updates

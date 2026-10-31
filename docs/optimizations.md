@@ -61,6 +61,61 @@ neither pollute the global CPU RNG stream nor correlate masks across DDP ranks; 
 (~2 µs) is cheaper than an on-GPU seed (~10 µs, launch-bound), so the seed is never a
 bottleneck.
 
+## Diffusion sampler (`DiffusionConfig.hoist_sampler`, 2026-10-31)
+
+`DiffusionHead.hoist_static` replaces `DiffusionStatic.expand_for_samples` in the
+sampler. On for `deepfold3 inference` (`--no-hoist-sampler` disables it), off everywhere
+else, including `inference-batch` and the training mini-rollout, whose path stays
+byte-identical to the plain sampler. It does three things:
+
+- **Drops empty atom windows.** `build_atom_subsets` sizes `S` from the `N*M` capacity so
+  training shapes are data-independent, which leaves 291 of 425 windows empty at 566
+  tokens / 4280 atoms. They were the largest single waste in the step.
+- **Computes step-invariant terms once:** token pair logits, atom pair logits, atom AdaLN
+  scale / bias / gates. The padding and key masks are folded into the logits.
+- **Keeps one copy of the state.** Sample-shared tensors are views or broadcast, and the
+  token `single_cond` is computed for one row per step.
+
+Measured on an RTX 6000 Ada, 7st5 (566 tokens, 5 samples, 200 steps), checkpoint 5500,
+fp32 + TF32, warm (first pass per arm discarded):
+
+| Guidance | Plain | Hoisted | Speedup | Peak plain → hoisted |
+| --- | --- | --- | --- | --- |
+| none | 6.89 s/sample | 2.43 s/sample | 2.84× | 7.61 → 5.22 GiB |
+| 1 term | 13.67 s/sample | 4.90 s/sample | 2.79× | 10.58 → 6.65 GiB |
+| 2 terms | 20.46 s/sample | 7.38 s/sample | 2.77× | 12.80 → 7.77 GiB |
+| 2 terms, one σ̂-limited | 16.51 s/sample | 5.91 s/sample | 2.79× | 12.80 → 7.77 GiB |
+
+Peaks include 1.83 GiB of head + inputs. The gain shrinks with size: 1.16× at 64 tokens,
+2.18× at 128, 2.90× at 256, 3.08× at 384 (crops of the same input, 2 terms). Each
+guidance term still costs one denoiser pass per step, plus 1.1–1.4 GiB of hoisted state
+(2.2–3.0 GiB on the plain path). Nothing in the path catches an OOM.
+
+**Equivalence.** The noise and augmentation draws are the plain sampler's exactly. The
+denoiser is not bit-identical in general, because cuBLAS TF32 results depend on GEMM
+shape and window trimming changes those shapes. For the same reason the plain denoiser
+disagrees with itself across batch sizes, so this is its existing tolerance:
+
+| One denoiser call, σ = 100, max coordinate difference | `high` (TF32, CLI default) | `highest` (fp32) |
+| --- | --- | --- |
+| plain vs hoisted | 0 or 0.09–0.14 Å, depending on shape | 0.9–2.6e-4 Å |
+| plain S=5 vs plain S=1, same sample | 0.07–0.11 Å | 0.9–2.6e-4 Å |
+
+After 200 steps under `high`, aligned per-sample RMSD to the plain sampler is 0–0.09 Å
+(a different seed: 0.4–8.9 Å), and 566 tokens / 5 samples happened to come out exactly
+equal. Under `highest` it is 1e-5–6e-5 Å. Do not expect `--no-hoist-sampler` to reproduce
+a hoisted run's files byte for byte.
+
+**Measured and not done:**
+
+- *CUDA graph for the step:* replay matches eager, 167 vs 166 ms plain and 60.6 vs 61.3 ms
+  hoisted. The step is GPU-bound at this size, and a graph adds capture and invalidation
+  risk for ~1%.
+- *One denoiser call for the conditional and unconditional passes:* slower, not faster:
+  553 ms for one S=15 call vs 514 ms for three S=5 calls, at 21.18 GiB peak vs 12.80.
+- *Host syncs:* none per step; the 7 found are all in setup.
+- *Vectorised augmentation:* 0.76 ms per step, 1.2% of the hoisted step.
+
 ## Benchmark Results (RTX 5090, bf16, 2026-03-16)
 
 ### Winners (enabled by `--optim recommended`)

@@ -368,6 +368,14 @@ The diffusion head implements a 200-step reverse denoising process:
 
 **Output**: `[num_samples, N, M, 3]` atom positions (default `num_samples=5`).
 
+**Step-invariant state**: `DiffusionHead.compute_static` runs once per sample call, once per
+guidance branch, and the S samples share one batched denoiser call per step. With
+`DiffusionConfig.hoist_sampler` (on for `deepfold3 inference`), `hoist_static` also drops
+the empty atom windows (`AtomSubsets.trim_empty`), precomputes the token and atom pair
+logits and atom AdaLN terms (`DiffusionTransformer.forward_hoisted`,
+`AtomCrossAttTransformer.forward_hoisted`), and shares one copy across samples. See
+`docs/optimizations.md` § _Diffusion sampler_.
+
 ## Batch Dimension Support
 
 All core model modules support both unbatched and batched (leading B dim) inputs:
