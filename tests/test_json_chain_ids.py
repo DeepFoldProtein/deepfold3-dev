@@ -138,3 +138,34 @@ def test_ordering_matches_from_job_asym_ids(tmp_path):
             f"asym_id {a} has {n_tok} tokens (chain {by_len[n_tok]}) but was named "
             f"{resolve_chain_name(int(a), names)!r} — job_chain_ids drifted from from_job"
         )
+
+
+def test_chain_without_paired_msa_keeps_its_query_row(tmp_path):
+    """Paired row 0 is the query row. A chain absent from the paired MSA still
+    has to appear there: the unpaired block starts at its row 1."""
+    from deepfold3.data.module.dataset import InferenceInput
+
+    seqs = {"A": "MKTAYIAKQR", "B": "GWSVLDEPNH", "C": "FYHRTGLWKC"}
+
+    def protein(cid):
+        seq = seqs[cid]
+        paired = "" if cid == "B" else f">q\n{seq}\n>p\n{seq}\n"
+        return {
+            "protein": {
+                "id": cid,
+                "sequence": seq,
+                "unpairedMsa": f">q\n{seq}\n>u\n{seq}\n",
+                "pairedMsa": paired,
+                "templates": [],
+            }
+        }
+
+    entry = {
+        "name": "t",
+        "modelSeeds": [1],
+        "dialect": "alphafold3",
+        "version": 2,
+        "sequences": [protein(c) for c in seqs],
+    }
+    feats = InferenceInput.from_job(parse_json_input(_write(tmp_path, entry))[0])
+    assert feats["msa"][0].tolist() == feats["res_type"].tolist()
