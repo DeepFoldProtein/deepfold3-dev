@@ -185,6 +185,20 @@ def test_json_template_lands_on_its_own_chain_with_zero_based_indices(tmp_path):
             p["templates"] = [{"mmcifPath": str(cif), "queryIndices": idx, "templateIndices": idx}]
         return {"protein": p}
 
+    entry = {
+        "name": "t",
+        "modelSeeds": [1],
+        "dialect": "alphafold3",
+        "version": 2,
+        "sequences": [protein(c) for c in seqs],
+    }
+    feats = InferenceInput.from_job(parse_json_input(_write(tmp_path, entry))[0])
+    mask = feats["template_pseudo_beta_mask"][0].bool()
+    on_c = feats["asym_id"] == 2
+    assert mask[on_c].all()
+    assert not mask[~on_c].any()
+    assert feats["template_aatype"][0][on_c].tolist() == feats["res_type"][on_c].tolist()
+
 
 def test_chain_without_paired_msa_keeps_its_query_row(tmp_path):
     """Paired row 0 is the query row. A chain absent from the paired MSA still
@@ -214,10 +228,4 @@ def test_chain_without_paired_msa_keeps_its_query_row(tmp_path):
         "sequences": [protein(c) for c in seqs],
     }
     feats = InferenceInput.from_job(parse_json_input(_write(tmp_path, entry))[0])
-    mask = feats["template_pseudo_beta_mask"][0].bool()
-    on_c = feats["asym_id"] == 2
-    assert mask[on_c].all()
-    assert not mask[~on_c].any()
-    assert feats["template_aatype"][0][on_c].tolist() == feats["res_type"][on_c].tolist()
-
     assert feats["msa"][0].tolist() == feats["res_type"].tolist()
