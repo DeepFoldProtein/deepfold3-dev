@@ -183,9 +183,9 @@ training:
 datasets:
   # Template index frame: a hit's recorded `index_space` always wins; the
   # `template_struct_space` flag is only the fallback for unstamped files. The
-  # /data copies of patchr / afdb_nvda / teddymer were back-filled with
-  # `index_space: struct` (2026-08-22), but the /store/database sources of
-  # afdb_nvda and teddymer are NOT stamped, so both carry the flag below
+  # /data copies of patchr / afdb_nvda / teddymer were back-filled
+  # (2026-08-22), but other copies of afdb_nvda and teddymer (the
+  # /store/database sources, Hangang) are NOT stamped, so both carry the flag below
   # (measured: 84% / 92% of hits re-derive their recorded identity under
   # struct vs 20% / 22% under seqres). On stamped data it is a no-op. A wrong
   # frame is invisible — the two differ by each template's unresolved
