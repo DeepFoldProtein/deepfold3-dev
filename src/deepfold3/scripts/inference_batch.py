@@ -458,6 +458,11 @@ def inference_batch(
     click.echo(f"[batch] {len(jobs)} jobs queued")
 
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    # MSA depth varies by input even with --bucket: see ``set_nearest_shape_lookup``.
+    from deepfold3.model.triton.cache import set_nearest_shape_lookup
+
+    set_nearest_shape_lookup(True)
     click.echo(f"[batch] device: {dev}")
 
     model, model_cfg = _load_model_once(params, snapshot, dev, optim, msa_crop_size, matmul_precision)

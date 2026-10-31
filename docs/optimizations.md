@@ -264,7 +264,7 @@ src/deepfold3/model/triton/
 
 **Autotune coverage** — kernels marked "autotuned" use `@persistent_autotune` so block
 sizes are picked by `triton.autotune` per (M, N, K) shape, with results persisted to disk
-and reloaded on later runs (warm the cache once via `deepfold3 warmup-triton`):
+and reloaded on later runs (warm the cache once via `deepfold3 warmup-triton`; inference pads tokens to a bucket and reuses the nearest cached shape for MSA depths it has not seen):
 
 | Kernel                                                                            | Autotune key              | Notes                                                                                                                                     |
 | --------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
@@ -390,6 +390,7 @@ context.
 
 ```bash
 deepfold3 warmup-triton --config configs/initial.yaml --real-model
+deepfold3 warmup-triton --config configs/stage2.yaml --inference-only   # inference forward only, no backward
 ```
 
 **Synthetic (default, lighter).** Drives each fused kernel at hand-enumerated `(M, N, K)`

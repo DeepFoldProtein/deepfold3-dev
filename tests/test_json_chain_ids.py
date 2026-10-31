@@ -185,6 +185,27 @@ def test_json_template_lands_on_its_own_chain_with_zero_based_indices(tmp_path):
             p["templates"] = [{"mmcifPath": str(cif), "queryIndices": idx, "templateIndices": idx}]
         return {"protein": p}
 
+
+def test_chain_without_paired_msa_keeps_its_query_row(tmp_path):
+    """Paired row 0 is the query row. A chain absent from the paired MSA still
+    has to appear there: the unpaired block starts at its row 1."""
+    from deepfold3.data.module.dataset import InferenceInput
+
+    seqs = {"A": "MKTAYIAKQR", "B": "GWSVLDEPNH", "C": "FYHRTGLWKC"}
+
+    def protein(cid):
+        seq = seqs[cid]
+        paired = "" if cid == "B" else f">q\n{seq}\n>p\n{seq}\n"
+        return {
+            "protein": {
+                "id": cid,
+                "sequence": seq,
+                "unpairedMsa": f">q\n{seq}\n>u\n{seq}\n",
+                "pairedMsa": paired,
+                "templates": [],
+            }
+        }
+
     entry = {
         "name": "t",
         "modelSeeds": [1],
@@ -198,3 +219,5 @@ def test_json_template_lands_on_its_own_chain_with_zero_based_indices(tmp_path):
     assert mask[on_c].all()
     assert not mask[~on_c].any()
     assert feats["template_aatype"][0][on_c].tolist() == feats["res_type"][on_c].tolist()
+
+    assert feats["msa"][0].tolist() == feats["res_type"].tolist()

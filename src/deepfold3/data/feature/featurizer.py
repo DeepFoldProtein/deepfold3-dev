@@ -879,6 +879,18 @@ class Featurizer:
                     combined_seqs.append(row_seq[None])
                     combined_masks.append(row_mask[None])
                     combined_dels.append(row_del[None])
+                # Paired row 0 is the query row. A chain with no paired MSA (DNA,
+                # or a chain the search missed) has only gaps there, and the
+                # unpaired block below skips its row 0, so copy it in here or the
+                # chain's own sequence reaches no row at all.
+                paired_aids = {aid for aid, _ in paired_chains}
+                for asym_id, msa in data.unpaired_msa.items():
+                    aid = int(asym_id)
+                    if aid in paired_aids or msa.sequences.shape[0] == 0 or len(chain_pos_map.get(aid, ())) == 0:
+                        continue
+                    _scatter_msa(combined_seqs[0][0], aid, msa.sequences[0])
+                    _scatter_msa(combined_masks[0][0], aid, msa.mask[0])
+                    _scatter_msa(combined_dels[0][0], aid, msa.deletion_matrix[0])
 
         # --- 1b. Auto-synthesise paired rows for homo-multimer entities ---
         # When ColabFold/MMseqs2 didn't produce a paired MSA for this record

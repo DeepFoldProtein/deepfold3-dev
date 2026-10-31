@@ -108,6 +108,7 @@ torchrun --nproc_per_node=4 -m deepfold3.scripts.train --data-dir /data/training
 # Pre-warm the persistent Triton autotune cache (run once per GPU model on a single rank
 # before launching DDP training; B200 ships with hardcoded configs and skips this step).
 deepfold3 warmup-triton --config configs/initial.json
+deepfold3 warmup-triton --config configs/stage2.yaml --inference-only
 ```
 
 ## Ruff Configuration
