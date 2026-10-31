@@ -9,11 +9,14 @@ Hosts the boilerplate that multiple commands were repeating verbatim:
   ``.pt`` training checkpoint (shared by ``inference``, ``inference-batch``,
   and ``export``).
 * ``pin_cuda_device`` — resolve + pin the current CUDA device.
+* ``check_loaded_keys`` — refuse weights that leave model parameters unset.
+* ``apply_det_recipe`` — the ``inference --det`` settings.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -146,9 +149,7 @@ def select_snapshot(ckpt: dict, choice: str) -> dict:
                 f"({len(order)}); checkpoint and model config disagree."
             )
         z_state = {order[idx]: z for idx, z in sorted(z_by_id.items()) if idx < len(order)}
-        mismatched = [
-            n for n, z in z_state.items() if n in model and tuple(z.shape) != tuple(model[n].shape)
-        ]
+        mismatched = [n for n, z in z_state.items() if n in model and tuple(z.shape) != tuple(model[n].shape)]
         if mismatched:
             raise click.ClickException(
                 f"--snapshot fast: {len(mismatched)} z tensors disagree in shape with "
@@ -217,3 +218,57 @@ def pin_cuda_device(device: str | None):
     if dev.type == "cuda" and dev.index is not None:
         torch.cuda.set_device(dev)
     return dev
+
+
+def check_loaded_keys(missing: list[str], unexpected: list[str], *, allow_missing: bool) -> list[str]:
+    """Check the result of ``load_state_dict(strict=False)``.
+
+    A missing key leaves that parameter at its random initialisation, so the
+    run would fold with untrained layers. Legacy fused-kernel names
+    (``OptimConfig.FUSED_STATE_DICT_MARKERS``) do not count.
+
+    Args:
+        missing: Missing keys from ``load_state_dict``.
+        unexpected: Unexpected keys; these only warn, the weights in use loaded.
+        allow_missing: Warn instead of raising (``--allow-missing-keys``).
+
+    Returns:
+        The missing keys that count.
+
+    Raises:
+        click.ClickException: Keys are missing and ``allow_missing`` is False.
+    """
+    from deepfold3.model.config import OptimConfig
+
+    real_missing = [k for k in missing if not any(m in k for m in OptimConfig.FUSED_STATE_DICT_MARKERS)]
+    if real_missing and not allow_missing:
+        shown = "\n  ".join(real_missing[:10])
+        raise click.ClickException(
+            f"{len(real_missing)} model keys are missing from the weights, so those layers would stay random:\n"
+            f"  {shown}\n"
+            "Raw AF3 params lack the Fourier weights: convert them first, or accept the gap with --allow-missing-keys."
+        )
+    if real_missing:
+        click.echo(f"  [WARN] missing keys   : {len(real_missing)} (allowed by --allow-missing-keys)")
+    if unexpected:
+        click.echo(f"  [WARN] unexpected keys: {len(unexpected)}")
+    return real_missing
+
+
+def apply_det_recipe() -> None:
+    """Apply the ``inference --det`` settings. Call before the first CUDA use.
+
+    Pins cuBLAS's workspace, makes torch use its deterministic algorithms (and
+    raise where it has none), and serves every Triton kernel a fixed config.
+    """
+    import torch
+
+    from deepfold3.model.triton.cache import set_fixed_config
+
+    if os.environ.get("DEEPFOLD3_TRITON_NO_CACHE") == "1":
+        raise click.UsageError("--det cannot fix Triton configs with DEEPFOLD3_TRITON_NO_CACHE=1; unset it")
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    set_fixed_config(True)

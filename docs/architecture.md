@@ -396,6 +396,8 @@ When fused Triton kernels are enabled (via `OptimConfig`), modules create derive
 
 This ensures checkpoints are portable — the same `.pt` file loads correctly whether fused kernels are enabled or not. The marker list is defined once in `OptimConfig.FUSED_STATE_DICT_MARKERS`.
 
+`inference` and `inference-batch` load with `strict=False`, then `check_loaded_keys` (`scripts/_common.py`) fails the run on any missing key outside those markers, because that parameter would stay random. `--allow-missing-keys` is the opt-out; `inference` records the keys in `run_manifest.json`. Raw AF3 params always need it, as they lack the Fourier weights.
+
 ## Weight Compatibility
 
 - All weights load from AF3 Haiku params via `convert/af3.py` (Haiku scope -> PyTorch state_dict)

@@ -44,11 +44,16 @@ For ``--msa`` / ``--sequence`` input, a single mmCIF file with all
 samples stacked as MODEL blocks is written to ``--output``, with
 ``{stem}[_sample{s}]_logits.npz`` per sample and ``{stem}_distogram.npz``
 per seed alongside it. Per-atom pLDDT is stored in the B-factor column.
+
+Every run also writes ``run_manifest.json`` (``{stem}_run_manifest.json`` for
+``--msa`` / ``--sequence``): code, versions, GPU, checkpoint digest and the
+settings that change a result. See ``deepfold3.io.run_manifest``.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -61,7 +66,7 @@ from deepfold3.model.guidance import (
     parse_guidance_spec,
 )
 from deepfold3.scripts import cli
-from deepfold3.scripts._common import load_pt_snapshot, pin_cuda_device
+from deepfold3.scripts._common import apply_det_recipe, check_loaded_keys, load_pt_snapshot, pin_cuda_device
 
 
 def _parse_guidance(_ctx, _param, values: tuple[str, ...]) -> tuple[GuidanceSpec, ...]:
@@ -75,6 +80,12 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
     target = ",".join(":".join(p) for p in spec.pairs) or spec.target
     sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
     return f"w={spec.scale:g} {target}{sigma}"
+
+
+def _save_logits(save, path: Path, *args, **kwargs) -> None:
+    """Run a logit saver on the writer thread and log the file it wrote."""
+    if save(path, *args, **kwargs):
+        click.echo(f"  saved  {path.resolve()}")
 
 
 @cli.command("inference")
@@ -207,8 +218,10 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
     type=click.Choice(["fp32", "bf16"]),
     show_default=True,
     help=(
-        "Compute dtype of the forward pass. bf16 is what training runs under and "
-        "halves activation memory; fp32 is the historical inference behaviour."
+        "Compute dtype of the trunk, as training and eval run it: the MSA stack, "
+        "Pairformer and confidence blocks. The diffusion sampler, the atom conditioning "
+        "encoder and the final confidence layers stay fp32 either way, as the checkpoint's "
+        "own precision config asks. fp32 is the historical inference behaviour."
     ),
 )
 @click.option(
@@ -235,6 +248,27 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
         "whole schedule). Each active term adds one denoiser pass per step."
     ),
 )
+@click.option(
+    "--allow-missing-keys",
+    is_flag=True,
+    default=False,
+    help=(
+        "Run even if the weights leave model parameters at random initialisation. Without it a "
+        "missing key is an error. Needed for raw AF3 params, which lack the Fourier weights."
+    ),
+)
+@click.option(
+    "--det",
+    is_flag=True,
+    default=False,
+    help=(
+        "Deterministic inference: the same input, weights, seed and flags give the same bytes on the "
+        "same GPU model, driver, software stack and CPU thread count. Fixes cuBLAS's workspace, uses "
+        "torch's deterministic algorithms and serves each Triton kernel one fixed config instead of "
+        "the tuned one, so runs may be slower and differ from a run without it in the low bits. Not "
+        "reproducible across GPU models or torch/Triton versions. Refuses torch.compile presets."
+    ),
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -257,6 +291,8 @@ def inference(
     precision: str,
     bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
+    allow_missing_keys: bool,
+    det: bool,
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -264,6 +300,9 @@ def inference(
         raise click.UsageError("Provide either --msa or --json")
     if msa is not None and json_input is not None:
         raise click.UsageError("Provide only one of --msa or --json, not both")
+    if det:
+        apply_det_recipe()  # before pin_cuda_device: cuBLAS reads its workspace at first use
+
     # ------------------------------------------------------------------
     # Device
     # ------------------------------------------------------------------
@@ -277,7 +316,7 @@ def inference(
     # than stall on an autotune benchmark (``warmup-triton --inference-only``).
     from deepfold3.model.triton.cache import set_nearest_shape_lookup
 
-    set_nearest_shape_lookup(True)
+    set_nearest_shape_lookup(True)  # ignored under --det, which serves fixed configs
 
     # ------------------------------------------------------------------
     # Load model weights
@@ -353,6 +392,9 @@ def inference(
         model_cfg.optim = OptimConfig.triton_only()
     # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
 
+    if det and model_cfg.optim.use_torch_compile:
+        raise click.UsageError("--det does not cover torch.compile; use --optim inference")
+
     if guidance_specs:
         if ckpt_model_cfg is None:
             click.echo("  [WARN] no embedded model_cfg: cannot check that --guidance matches the training drop")
@@ -386,11 +428,7 @@ def inference(
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     # Filter legacy fused-kernel key names (no-op for current checkpoints).
-    real_missing = [k for k in missing if not any(p in k for p in OptimConfig.FUSED_STATE_DICT_MARKERS)]
-    if real_missing:
-        click.echo(f"  [WARN] missing keys   : {len(real_missing)}")
-    if unexpected:
-        click.echo(f"  [WARN] unexpected keys: {len(unexpected)}")
+    real_missing = check_loaded_keys(missing, unexpected, allow_missing=allow_missing_keys)
     model.to(dev).eval()
     click.echo(f"  loaded in {time.perf_counter() - t0:.1f}s")
 
@@ -510,6 +548,7 @@ def inference(
     else:
         seed_list = [seed if seed is not None else 42]
 
+    from deepfold3.io.background_writer import BackgroundWriter, logits_to_host
     from deepfold3.io.confidences import (
         save_confidences_json,
         save_distogram_logits,
@@ -526,133 +565,197 @@ def inference(
         output_dir = cif_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    from deepfold3.io.run_manifest import (
+        checkpoint_record,
+        gpu_name,
+        new_manifest,
+        sha256_file,
+        write_manifest,
+    )
+
+    manifest_path = output_dir / (
+        "run_manifest.json" if json_input is not None else f"{cif_path.stem}_run_manifest.json"
+    )
+    checkpoint = {**checkpoint_record(params), "snapshot": snapshot if params.suffix == ".pt" else None}
+    manifest = new_manifest(
+        device=str(dev),
+        gpu=gpu_name(dev),
+        checkpoint=checkpoint,
+        missing_keys=real_missing,
+        seeds=[int(s) for s in seed_list],
+        num_samples=num_samples,
+        num_recycles=num_recycles,
+        msa_crop_size=model_cfg.msa_crop_size,
+        bucket={"enabled": use_bucket, "num_tokens": original_n, "padded_tokens": feats["res_type"].shape[0]},
+        guidance=[{**asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
+        optim=optim,
+        precision=precision,
+        matmul_precision=torch.get_float32_matmul_precision(),
+        logits_scheme=logits_scheme,
+        det=det,
+    )
+    write_manifest(manifest_path, manifest)
+
+    def _record_digest() -> None:
+        checkpoint["sha256"] = sha256_file(params)
+
     summaries: list[dict] = []  # one entry per (seed, sample), augmented with seed/sample
 
-    for current_seed in seed_list:
-        click.echo(
-            f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
-        )
-        t0 = time.perf_counter()
-        with (
-            torch.inference_mode(),
-            torch.autocast(dev.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
-        ):
-            model_output = model(
-                feats,
-                seed=current_seed,
-                num_recycles=num_recycles,
-                num_samples=num_samples,
-                guidance_terms=guidance_terms,
-            )
-
-        iter_feats = feats
-        if use_bucket and original_n < feats["res_type"].shape[0]:
-            from deepfold3.model.bucket import unpad_features, unpad_output
-
-            model_output = unpad_output(model_output, original_n)
-            iter_feats = unpad_features(feats, original_n)
-
-        elapsed = time.perf_counter() - t0
-        click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
-
-        # Trunk distogram logits are shared across all samples of this seed, so
-        # they are written once per seed (not duplicated per sample).
-        if json_input is not None:
-            distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
-        else:
-            distogram_npz = output_dir / f"{cif_path.stem}_distogram.npz"
-        if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(current_seed)):
-            click.echo(f"  saved  {distogram_npz.resolve()}")
-
-        # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
-        # per-sample directories.  Either way, save_confidences_json
-        # returns the per-sample summary used for ranking.
-        if json_input is None:
-            click.echo(f"[inference] writing {cif_path} …")
-            save_mmcif(
-                cif_path,
-                model_output,
-                iter_feats,
-                entity_descriptions=entity_descriptions,
-                title=job_title,
-                chain_names=chain_names,
-            )
-            click.echo(f"  saved  {cif_path.resolve()}")
-
-        for s in range(num_samples):
-            if json_input is not None:
-                sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
-                sample_dir.mkdir(parents=True, exist_ok=True)
-                save_mmcif(
-                    sample_dir / "model.cif",
-                    model_output,
-                    iter_feats,
-                    entity_descriptions=entity_descriptions,
-                    title=job_title,
-                    sample_idx=s,
-                    chain_names=chain_names,
-                )
-                conf_path = sample_dir / "confidences.json"
-                logits_npz = sample_dir / "logits.npz"
-            else:
-                stem = cif_path.stem
-                suffix = "" if num_samples == 1 else f"_sample{s}"
-                conf_path = output_dir / f"{stem}{suffix}_confidences.json"
-                logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
-
-            summary = save_confidences_json(
-                conf_path,
-                model_output,
-                iter_feats,
-                sample_idx=s,
-                seed=int(current_seed),
-                chain_names=chain_names,
-            )
-            summary = {**summary, "seed": int(current_seed), "sample": int(s)}
-            summaries.append(summary)
-
-            # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
-            # float matrices that used to live in confidences.json.
-            if save_sample_logits(logits_npz, model_output, sample_idx=s, scheme=logits_scheme, seed=int(current_seed)):
-                click.echo(f"  saved  {logits_npz.resolve()}")
-
-            iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
-            clash_str = ", CLASH" if summary["has_clash"] else ""
-            click.echo(
-                f"  seed {current_seed} sample {s}: "
-                f"pLDDT={summary['mean_plddt']:.1f}, pTM={summary['ptm']:.3f}{iptm_str}, "
-                f"gPDE={summary['average_pde']:.2f}, disorder={summary['fraction_disordered']:.3f}"
-                f"{clash_str}, ranking={summary['ranking_score']:.3f}"
-            )
-            click.echo(f"  saved  {conf_path.resolve()}")
-
-            if plot_confidences:
-                from deepfold3.scripts.plot_confidences import plot_confidences_file
-
-                plot_path = conf_path.with_suffix(".png")
-                if plot_confidences_file(conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz):
-                    click.echo(f"  saved  {plot_path.resolve()}")
-
-    # ------------------------------------------------------------------
-    # Aggregate ranking outputs (JSON input only)
-    # ------------------------------------------------------------------
-    if json_input is not None and summaries:
-        ranking_csv = output_dir / "ranking_scores.csv"
-        save_ranking_scores_csv(ranking_csv, summaries)
-        click.echo(f"  saved  {ranking_csv.resolve()}")
-
-        summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
-        summary_path = output_dir / summary_name
-        save_summary_confidences_json(summary_path, summaries, job_name=job_name)
-        click.echo(f"  saved  {summary_path.resolve()}")
-
-        if len(summaries) > 1:
-            ranked = sorted(summaries, key=lambda r: r["ranking_score"], reverse=True)
-            click.echo("[inference] ranking:")
-            for rank, row in enumerate(ranked, 1):
+    # Logit compression is the bulk of the write time and does not depend on the
+    # device, so it runs behind the next seed's forward. One seed's worth may
+    # queue; everything is on disk, or the run has failed, past this block.
+    try:
+        with BackgroundWriter(max_pending=num_samples + 2) as writer:
+            writer.submit("checkpoint digest", _record_digest)
+            for current_seed in seed_list:
                 click.echo(
-                    f"  #{rank}  seed-{row['seed']}_sample-{row['sample']}  ranking_score={row['ranking_score']:.4f}"
+                    f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
                 )
+                t0 = time.perf_counter()
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(dev.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+                ):
+                    model_output = model(
+                        feats,
+                        seed=current_seed,
+                        num_recycles=num_recycles,
+                        num_samples=num_samples,
+                        guidance_terms=guidance_terms,
+                    )
+
+                iter_feats = feats
+                if use_bucket and original_n < feats["res_type"].shape[0]:
+                    from deepfold3.model.bucket import unpad_features, unpad_output
+
+                    model_output = unpad_output(model_output, original_n)
+                    iter_feats = unpad_features(feats, original_n)
+
+                elapsed = time.perf_counter() - t0
+                click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
+
+                # Trunk distogram logits are shared across all samples of this seed, so
+                # they are written once per seed (not duplicated per sample).
+                if json_input is not None:
+                    distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
+                else:
+                    distogram_npz = output_dir / f"{cif_path.stem}_distogram.npz"
+                host_logits = logits_to_host(model_output)
+                writer.submit(
+                    distogram_npz.name,
+                    _save_logits,
+                    save_distogram_logits,
+                    distogram_npz,
+                    host_logits,
+                    scheme=logits_scheme,
+                    seed=int(current_seed),
+                )
+
+                # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
+                # per-sample directories.  Either way, save_confidences_json
+                # returns the per-sample summary used for ranking.
+                if json_input is None:
+                    click.echo(f"[inference] writing {cif_path} …")
+                    save_mmcif(
+                        cif_path,
+                        model_output,
+                        iter_feats,
+                        entity_descriptions=entity_descriptions,
+                        title=job_title,
+                        chain_names=chain_names,
+                    )
+                    click.echo(f"  saved  {cif_path.resolve()}")
+
+                for s in range(num_samples):
+                    if json_input is not None:
+                        sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
+                        sample_dir.mkdir(parents=True, exist_ok=True)
+                        save_mmcif(
+                            sample_dir / "model.cif",
+                            model_output,
+                            iter_feats,
+                            entity_descriptions=entity_descriptions,
+                            title=job_title,
+                            sample_idx=s,
+                            chain_names=chain_names,
+                        )
+                        conf_path = sample_dir / "confidences.json"
+                        logits_npz = sample_dir / "logits.npz"
+                    else:
+                        stem = cif_path.stem
+                        suffix = "" if num_samples == 1 else f"_sample{s}"
+                        conf_path = output_dir / f"{stem}{suffix}_confidences.json"
+                        logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
+
+                    summary = save_confidences_json(
+                        conf_path,
+                        model_output,
+                        iter_feats,
+                        sample_idx=s,
+                        seed=int(current_seed),
+                        chain_names=chain_names,
+                    )
+                    summary = {**summary, "seed": int(current_seed), "sample": int(s)}
+                    summaries.append(summary)
+
+                    # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
+                    # float matrices that used to live in confidences.json.
+                    writer.submit(
+                        str(logits_npz),
+                        _save_logits,
+                        save_sample_logits,
+                        logits_npz,
+                        host_logits,
+                        sample_idx=s,
+                        scheme=logits_scheme,
+                        seed=int(current_seed),
+                    )
+
+                    iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
+                    clash_str = ", CLASH" if summary["has_clash"] else ""
+                    click.echo(
+                        f"  seed {current_seed} sample {s}: "
+                        f"pLDDT={summary['mean_plddt']:.1f}, pTM={summary['ptm']:.3f}{iptm_str}, "
+                        f"gPDE={summary['average_pde']:.2f}, disorder={summary['fraction_disordered']:.3f}"
+                        f"{clash_str}, ranking={summary['ranking_score']:.3f}"
+                    )
+                    click.echo(f"  saved  {conf_path.resolve()}")
+
+                    if plot_confidences:
+                        from deepfold3.scripts.plot_confidences import plot_confidences_file
+
+                        writer.drain()  # the plot reads the logit files just queued
+                        plot_path = conf_path.with_suffix(".png")
+                        if plot_confidences_file(
+                            conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz
+                        ):
+                            click.echo(f"  saved  {plot_path.resolve()}")
+
+        # ------------------------------------------------------------------
+        # Aggregate ranking outputs (JSON input only)
+        # ------------------------------------------------------------------
+        if json_input is not None and summaries:
+            ranking_csv = output_dir / "ranking_scores.csv"
+            save_ranking_scores_csv(ranking_csv, summaries)
+            click.echo(f"  saved  {ranking_csv.resolve()}")
+
+            summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
+            summary_path = output_dir / summary_name
+            save_summary_confidences_json(summary_path, summaries, job_name=job_name)
+            click.echo(f"  saved  {summary_path.resolve()}")
+
+            if len(summaries) > 1:
+                ranked = sorted(summaries, key=lambda r: r["ranking_score"], reverse=True)
+                click.echo("[inference] ranking:")
+                for rank, row in enumerate(ranked, 1):
+                    click.echo(
+                        f"  #{rank}  seed-{row['seed']}_sample-{row['sample']}  ranking_score={row['ranking_score']:.4f}"
+                    )
+    except BaseException as e:
+        write_manifest(manifest_path, {**manifest, "status": "failed", "error": repr(e)})
+        raise
+    write_manifest(manifest_path, {**manifest, "status": "complete"})
+    click.echo(f"  saved  {manifest_path.resolve()}")
 
 
 if __name__ == "__main__":

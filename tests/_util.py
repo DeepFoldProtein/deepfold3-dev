@@ -28,3 +28,19 @@ def wake_zero_init(module, std: float = 0.02, seed: int = 0):
             if p.dim() >= 1 and not bool(p.any()):
                 p.copy_(torch.empty_like(p).normal_(0.0, std, generator=gen))
     return module
+
+
+def run_tiny_inference(tiny_job, output, *extra, params=None):
+    """Run ``deepfold3 inference`` on CPU on the ``tiny_job`` fixture; returns the CliRunner result."""
+    from click.testing import CliRunner
+
+    from deepfold3.scripts.inference import inference
+
+    in_json, tiny_params = tiny_job
+    # fmt: off
+    args = [
+        "--json", str(in_json), "--params", str(params or tiny_params), "--output", str(output), "--device", "cpu",
+        "--optim", "none", "--num-recycles", "1", "--num-samples", "2", "--msa-crop-size", "16",
+    ]
+    # fmt: on
+    return CliRunner().invoke(inference, [*args, *extra])

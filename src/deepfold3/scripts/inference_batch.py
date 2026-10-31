@@ -53,6 +53,7 @@ def _load_model_once(
     optim: str,
     msa_crop_size: int | None = None,
     matmul_precision: str = "auto",
+    allow_missing_keys: bool = False,
 ):
     """Load weights + build model. Returns ``(model, model_cfg)``.
 
@@ -61,7 +62,7 @@ def _load_model_once(
     """
     from deepfold3.model.config import ModelConfig, OptimConfig
     from deepfold3.model.model import DeepFold3
-    from deepfold3.scripts._common import load_pt_snapshot
+    from deepfold3.scripts._common import check_loaded_keys, load_pt_snapshot
 
     click.echo(f"[batch] loading parameters from {params} …")
     t0 = time.perf_counter()
@@ -122,11 +123,7 @@ def _load_model_once(
 
     model = DeepFold3(model_cfg)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    real_missing = [k for k in missing if not any(p in k for p in OptimConfig.FUSED_STATE_DICT_MARKERS)]
-    if real_missing:
-        click.echo(f"  [WARN] missing keys   : {len(real_missing)}")
-    if unexpected:
-        click.echo(f"  [WARN] unexpected keys: {len(unexpected)}")
+    check_loaded_keys(missing, unexpected, allow_missing=allow_missing_keys)
     model.to(dev).eval()
     click.echo(f"  loaded in {time.perf_counter() - t0:.1f}s")
     return model, model_cfg
@@ -416,6 +413,12 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     "pre-warmable via warmup-triton) instead of a ~60s re-autotune per target. "
     "Recommended for multi-target sweeps; auto-on when torch.compile is used.",
 )
+@click.option(
+    "--allow-missing-keys",
+    is_flag=True,
+    default=False,
+    help="Run even if the weights leave model parameters at random initialisation.",
+)
 def inference_batch(
     inputs_file: Path | None,
     json_paths: tuple[Path, ...],
@@ -436,6 +439,7 @@ def inference_batch(
     logits_scheme: str,
     skip_existing: bool,
     bucket: bool,
+    allow_missing_keys: bool,
 ) -> None:
     """Run inference on many JSON inputs without reloading the model."""
     if not inputs_file and not json_paths:
@@ -465,7 +469,9 @@ def inference_batch(
     set_nearest_shape_lookup(True)
     click.echo(f"[batch] device: {dev}")
 
-    model, model_cfg = _load_model_once(params, snapshot, dev, optim, msa_crop_size, matmul_precision)
+    model, model_cfg = _load_model_once(
+        params, snapshot, dev, optim, msa_crop_size, matmul_precision, allow_missing_keys=allow_missing_keys
+    )
 
     seed_list = list(dict.fromkeys(seeds))
 
