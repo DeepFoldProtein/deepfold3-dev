@@ -332,6 +332,28 @@ Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (
   > never had configs, crops > 384 weren't covered) in favor of the shared-cache + warmup
   > workflow below. On an empty cache, kernels now autotune on first call and persist.
 
+#### `--det`: fixed configs
+
+Tile sizes change the order of floating-point sums, so a config picked by timing, or read from a host's
+cache, can move the low bits of a result. `deepfold3 inference --det` serves each kernel its first config
+(`set_fixed_config`), and neither reads nor writes the cache. It also sets `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+(unless already set), `torch.use_deterministic_algorithms(True)` (which raises on an op with no deterministic
+path) and cuDNN deterministic mode. It refuses `torch.compile` presets and `DEEPFOLD3_TRITON_NO_CACHE=1`.
+
+**Guarantee.** The same input, weights, seeds and flags give the same output bytes on the same GPU model,
+driver, software stack and CPU thread count. Measured on 7st5 (N=566, two seeds, five samples): two `--det`
+runs were byte-identical on all 34 files, one with an empty cache directory that stayed empty.
+`PYTHONHASHSEED` cannot be set from inside the process, but feature tensors were identical across three
+hash seeds on three inputs, including a ligand job.
+
+**Not guaranteed.** Reproduction across GPU models, drivers, or torch/Triton versions (compare
+`run_manifest.json`); agreement with a run without `--det`; agreement between `--bucket` and `--no-bucket`,
+whose sampler noise differs. Only `--optim inference`-style presets were tested. `inference-batch` has no `--det`.
+
+**Cost.** Forward 99.6 s against 90.0 s per seed (+10.7%) with the default warmed cache. Against that
+default, coordinates and distogram logits were bit-identical; confidence outputs differed in the low bits
+(per-atom pLDDT by up to 0.012, ranking scores unchanged at four decimals).
+
 #### Recommended workflow: warmup once, read from a shared cache
 
 This is the canonical path (it replaced the hardcoded `B200_PRETUNED` table).
