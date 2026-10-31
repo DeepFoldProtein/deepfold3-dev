@@ -71,3 +71,18 @@ def test_chunking_is_ignored_with_grad_enabled():
     msa, mask, pair = _inputs()
     module(msa.requires_grad_(), mask, pair).sum().backward()
     assert msa.grad is not None
+
+
+def test_every_chunk_has_one_shape():
+    """A short last chunk would be a new Triton autotune key at every MSA depth."""
+    calls = []
+
+    def fn(rows):
+        calls.append(rows.shape[-3])
+        return rows * 2
+
+    x = torch.randn(1, 7, 3, 4)
+    with torch.no_grad():
+        out = map_row_chunks(fn, x, 3)
+    assert calls == [3, 3, 3]
+    assert torch.equal(out, x * 2)

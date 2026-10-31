@@ -50,7 +50,7 @@ import torch
 import torch.nn as nn
 
 from deepfold3.model.config import OptimConfig
-from deepfold3.model.primitives import LayerNorm, LinearNoBias
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, pad_row_chunk
 
 
 def _triangle_matmul_outgoing(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -611,8 +611,9 @@ class OuterProductMean(nn.Module):
         a = b = None
         for s0 in range(0, msa.shape[1], self._row_chunk):
             s1 = s0 + self._row_chunk
-            rows = self.norm(msa[:, s0:s1])
-            a_r, b_r = self.proj_a(rows) * m[:, s0:s1], self.proj_b(rows) * m[:, s0:s1]
+            rows = self.norm(pad_row_chunk(msa[:, s0:s1], self._row_chunk))
+            n = min(self._row_chunk, msa.shape[1] - s0)
+            a_r, b_r = self.proj_a(rows)[:, :n] * m[:, s0:s1], self.proj_b(rows)[:, :n] * m[:, s0:s1]
             if a is None:
                 shape = (*msa.shape[:3], a_r.shape[-1])
                 a, b = a_r.new_empty(shape), b_r.new_empty(shape)

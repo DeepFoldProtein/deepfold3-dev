@@ -306,6 +306,18 @@ class AdaTransitionBlock(nn.Module):
         return gate * out
 
 
+def pad_row_chunk(rows: torch.Tensor, chunk: int) -> torch.Tensor:
+    """Zero-pad dim ``-3`` to ``chunk`` rows, so every call has one shape.
+
+    Triton autotune keys are exact shapes. The padded rows' output is discarded,
+    which is safe because the ops chunked this way treat rows independently.
+    """
+    missing = chunk - rows.shape[-3]
+    if missing == 0:
+        return rows
+    return torch.cat([rows, rows.new_zeros(*rows.shape[:-3], missing, *rows.shape[-2:])], dim=-3)
+
+
 def map_row_chunks(fn, x: torch.Tensor, chunk: int) -> torch.Tensor:
     """``fn(x)`` over ``chunk`` rows of dim ``-3`` at a time, into one output.
 
@@ -324,10 +336,11 @@ def map_row_chunks(fn, x: torch.Tensor, chunk: int) -> torch.Tensor:
     S = x.shape[-3]
     if chunk <= 0 or S <= chunk or torch.is_grad_enabled():
         return fn(x)
-    first = fn(x[..., :chunk, :, :])
-    out = first.new_empty(*x.shape[:-3], S, *first.shape[-2:])
-    out[..., :chunk, :, :] = first
-    del first
-    for s0 in range(chunk, S, chunk):
-        out[..., s0 : s0 + chunk, :, :] = fn(x[..., s0 : s0 + chunk, :, :])
+    out = None
+    for s0 in range(0, S, chunk):
+        rows = pad_row_chunk(x[..., s0 : s0 + chunk, :, :], chunk)
+        update = fn(rows)
+        if out is None:
+            out = update.new_empty(*x.shape[:-3], S, *update.shape[-2:])
+        out[..., s0 : s0 + chunk, :, :] = update[..., : min(chunk, S - s0), :, :]
     return out
