@@ -13,6 +13,11 @@ the cache falls back to GPUs with similar memory/SM count (within 20%).
 Environment variables:
     DEEPFOLD3_TRITON_CACHE_DIR: Override cache directory.
     DEEPFOLD3_TRITON_NO_CACHE:  Set to "1" to disable caching entirely.
+
+Keys are exact shapes. Training fixes N and the MSA depth, so a warmed cache
+always hits. Inference pads N to a bucket but its MSA depth varies by input, so
+a new shape would benchmark from scratch: ``set_nearest_shape_lookup`` makes a
+miss reuse the closest cached shape instead.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -321,6 +327,43 @@ class CacheManager:
         for kernel_name in list(self._dirty):
             self.save(kernel_name)
 
+    def get_nearest_config(self, kernel_name: str, key_args: list[str], args: dict) -> tuple[str, dict] | None:
+        """Config of the cached shape closest to ``args``, as ``(input_key, config)``.
+
+        Distance is the summed ``|log a − log b|`` over ``key_args``; only
+        entries with the same key form count. ``None`` when nothing is cached.
+        """
+        target = [args.get(k) for k in key_args]
+        if not all(isinstance(v, int) and v > 0 for v in target):
+            return None
+        form = re.compile("_".join(rf"{re.escape(k)}(\d+)" for k in key_args))
+        cache = self._caches.get(kernel_name)
+        if cache is None:
+            cache = self.load(kernel_name)
+        best: tuple[float, str, dict] | None = None
+        for input_key, entry in cache.items():
+            m = form.fullmatch(input_key)
+            if m is None or not isinstance(entry, dict) or "config" not in entry:
+                continue
+            dist = sum(abs(math.log(max(int(c), 1) / t)) for c, t in zip(m.groups(), target, strict=True))
+            if best is None or dist < best[0]:
+                best = (dist, input_key, entry["config"])
+        return None if best is None else (best[1], best[2])
+
+
+_nearest_shape_lookup = False
+
+
+def set_nearest_shape_lookup(enabled: bool) -> None:
+    """On a cache miss, reuse the closest cached shape's config instead of benchmarking.
+
+    For single-process inference, where each input is a new shape. The config
+    only picks tile sizes, so this trades a little speed on far shapes for no
+    autotune stall. Training leaves it off and benchmarks its one fixed shape.
+    """
+    global _nearest_shape_lookup
+    _nearest_shape_lookup = enabled
+
 
 # ── Persistent Autotune Decorator ────────────────────────────────────────
 
@@ -446,6 +489,12 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
                     all_args = {**nargs, **kwargs}
                     input_key = make_input_key(all_args, key)
                     cached_cfg = mgr.get_config(fn_name, input_key) if input_key else None
+                    if cached_cfg is None and input_key and _nearest_shape_lookup:
+                        nearest = mgr.get_nearest_config(fn_name, key, all_args)
+                        if nearest is not None:
+                            logger.info("Triton %s: %s uses the config of %s", fn_name, input_key, nearest[0])
+                            cached_cfg = nearest[1]
+                            _persisted.add(input_key)  # borrowed, not a measurement of this shape
                     if cached_cfg is not None:
                         # Reconstruct a triton.Config and inject directly so
                         # ``Autotuner.run`` finds it on the cache lookup.

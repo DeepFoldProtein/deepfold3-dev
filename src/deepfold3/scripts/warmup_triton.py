@@ -32,6 +32,9 @@ Usage::
     # Skip the GEMM kernels (already-cached deployments)
     deepfold3 warmup-triton --skip-gemm
 
+    # Inference kernels only: the real forward pass, no backward
+    deepfold3 warmup-triton --config configs/stage2.yaml --inference-only
+
 After this script finishes, the cache JSON files in ``~/.cache/deepfold3-triton/``
 hold a config for every shape; subsequent training runs on this GPU model load
 those configs at decorator-import time and skip the autotune benchmark phase.
@@ -56,6 +59,9 @@ from deepfold3.scripts import cli
 from deepfold3.scripts._common import pin_cuda_device
 
 logger = logging.getLogger(__name__)
+
+_INFERENCE_BUCKETS = [b for b in BUCKET_SIZES if b <= 1024]
+_INFERENCE_MSA_DEPTH = 2048
 
 
 @dataclass
@@ -525,6 +531,36 @@ def warmup_real_model(
     logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
 
 
+def warmup_inference(mcfg, buckets: Iterable[int], n_msa: int, num_samples: int, device: torch.device) -> None:
+    """Warm the cache by driving the model's inference ``forward``.
+
+    Runs under ``OptimConfig.inference()``, as ``deepfold3 inference`` does by
+    default, so inference-only kernels warm too and no backward kernel does.
+    Inference pads tokens to these buckets, but its MSA depth varies by input,
+    so MSA-track shapes reach these entries through the nearest-shape lookup
+    (:func:`~deepfold3.model.triton.cache.set_nearest_shape_lookup`). Templates
+    are not warmed: the synthetic features carry none.
+    """
+    from deepfold3.model.config import OptimConfig
+    from deepfold3.model.model import DeepFold3
+    from deepfold3.model.triton.cache import CacheManager
+
+    mcfg.optim = OptimConfig.inference()
+    mcfg.msa_crop_size = n_msa
+    mcfg.diffusion.steps = 2  # every step is the same shape
+    model = DeepFold3(mcfg).to(device).eval()
+    for n_pad in buckets:
+        logger.info(f"=== inference: N={n_pad} S_msa={n_msa} samples={num_samples} ===")
+        feats = {k: v[0] for k, v in _synthetic_training_features(n_pad, 1, n_msa, device).items()}
+        t0 = time.time()
+        with torch.inference_mode():
+            model(feats, seed=0, num_recycles=1, num_samples=num_samples)
+        torch.cuda.synchronize()
+        logger.info(f"  fwd N={n_pad} → {time.time() - t0:.1f}s")
+    CacheManager.get().save_all()
+    logger.info(f"Cache flushed to {CacheManager.get()._cache_dir}")
+
+
 @cli.command(name="warmup-triton")
 @click.option(
     "--config",
@@ -571,10 +607,19 @@ def warmup_real_model(
     ),
 )
 @click.option(
+    "--inference-only",
+    is_flag=True,
+    help=(
+        "Warm by driving the model's inference forward pass under the inference "
+        "kernel preset, with no backward. Default buckets = every bucket up to 1024, "
+        "MSA depth = 2048 (see --msa-depth), depth-1 stacks unless --full-depth."
+    ),
+)
+@click.option(
     "--full-depth",
     is_flag=True,
     help=(
-        "With --real-model, build the full-depth model instead of collapsing "
+        "With --real-model or --inference-only, build the full-depth model instead of collapsing "
         "every block stack to a single layer. The Triton cache is shape-keyed "
         "so depth-1 warms the identical entries; this flag is only an escape "
         "hatch and costs ~N× more memory/time for no extra coverage."
@@ -610,6 +655,7 @@ def main(
     batch_sizes: str,
     skip_gemm: bool,
     real_model: bool,
+    inference_only: bool,
     full_depth: bool,
     msa_depth: int | None,
     device: str,
@@ -625,6 +671,19 @@ def main(
     dev = pin_cuda_device(device)
     name = torch.cuda.get_device_name(dev)
     mcfg, chunk_size, train_cfg, explicit_training = _load_configs(config_path, override)
+
+    if real_model and inference_only:
+        raise click.UsageError("--real-model warms training, --inference-only warms inference: pick one")
+    if inference_only:
+        if not full_depth:
+            collapse_to_depth_1(mcfg)
+        bucket_list = sorted({int(x) for x in buckets.split(",") if x.strip()}) if buckets else _INFERENCE_BUCKETS
+        n_msa = msa_depth if msa_depth is not None else _INFERENCE_MSA_DEPTH
+        logger.info(f"Inference warmup on {name} for buckets: {bucket_list} (S_msa={n_msa})")
+        t0 = time.time()
+        warmup_inference(mcfg, bucket_list, n_msa, mcfg.diffusion.num_samples, dev)
+        logger.info(f"Total warmup time: {time.time() - t0:.1f}s")
+        return
 
     if real_model:
         if full_depth:

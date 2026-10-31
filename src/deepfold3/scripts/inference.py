@@ -202,6 +202,16 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
     ),
 )
 @click.option(
+    "--bucket/--no-bucket",
+    default=True,
+    show_default=True,
+    help=(
+        "Pad tokens to the next bucket size (masked, removed from the outputs), so "
+        "shapes stay few and warmed kernels hit. The sampler's noise then differs "
+        "from an unpadded run of the same seed."
+    ),
+)
+@click.option(
     "--guidance",
     "guidance_specs",
     multiple=True,
@@ -234,6 +244,7 @@ def inference(
     matmul_precision: str,
     plot_confidences: bool,
     logits_scheme: str,
+    bucket: bool,
     guidance_specs: tuple[GuidanceSpec, ...],
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
@@ -250,6 +261,12 @@ def inference(
     # --device (e.g. cuda:1) otherwise trips "cannot be accessed from Triton".
     dev = pin_cuda_device(device)
     click.echo(f"[inference] device: {dev}")
+
+    # Each input is a new shape: reuse the closest warmed Triton config rather
+    # than stall on an autotune benchmark (``warmup-triton --inference-only``).
+    from deepfold3.model.triton.cache import set_nearest_shape_lookup
+
+    set_nearest_shape_lookup(True)
 
     # ------------------------------------------------------------------
     # Load model weights
@@ -442,9 +459,10 @@ def inference(
     T = feats.get("template_aatype", torch.zeros(0)).shape[0]
     click.echo(f"  {N} tokens, {S} MSA sequences, {T} templates  ({time.perf_counter() - t0:.1f}s)")
 
-    # Bucket padding for torch.compile efficiency (avoids per-shape recompilation)
+    # Bucket padding: a small set of token counts keeps the Triton autotune cache
+    # (exact-shape keys) and torch.compile from redoing their work per input.
     original_n = N
-    use_bucket = model_cfg.optim.use_torch_compile
+    use_bucket = bucket or model_cfg.optim.use_torch_compile
     if use_bucket:
         from deepfold3.model.bucket import next_bucket, pad_features
 
