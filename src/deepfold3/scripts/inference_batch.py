@@ -37,13 +37,19 @@ template-cache, pdb-mmcif-dir) apply uniformly to every line.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
 from pathlib import Path
 
 import click
 import torch
 
+from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
+from deepfold3.model.guidance import check_guidance_training
 from deepfold3.scripts import cli
+from deepfold3.scripts._common import apply_det_recipe
+from deepfold3.scripts.inference import _describe_guidance, _parse_guidance
 
 
 def _load_model_once(
@@ -146,6 +152,9 @@ def _run_one_job(
     logits_scheme: str = "int8_softmax",
     skip_existing: bool,
     bucket: bool = False,
+    precision: str = "fp32",
+    guidance_specs: tuple = (),
+    manifest_fields: dict | None = None,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
     branch of ``inference``.
@@ -220,6 +229,17 @@ def _run_one_job(
 
     feats = {k: v.to(dev) for k, v in feats.items()}
 
+    guidance_terms = None
+    if guidance_specs:
+        from deepfold3.io.mmcif import resolve_chain_name as _resolve
+        from deepfold3.model.guidance import build_guidance_terms
+
+        chain_index = {_resolve(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
+        try:
+            guidance_terms = build_guidance_terms(guidance_specs, feats["asym_id"], chain_index, original_n)
+        except ValueError as e:
+            raise click.ClickException(f"--guidance on {json_input.name}: {e}") from e
+
     json_seeds = list(job.model_seeds) if job.model_seeds else [42]
     # CLI seeds (when provided) are authoritative — replace the JSON's own
     # seeds so a benchmark sweep folds exactly the requested set. Dedup while
@@ -227,19 +247,46 @@ def _run_one_job(
     seed_list = list(dict.fromkeys(seeds)) if seeds else json_seeds
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    # One manifest per job: a sweep's outputs then say for themselves which
+    # weights, code and flags produced them.
+    manifest_path = output_dir / "run_manifest.json"
+    manifest = new_manifest(
+        json_input=str(json_input),
+        seeds=[int(x) for x in seed_list],
+        num_tokens=original_n,
+        padded_tokens=feats["res_type"].shape[0],
+        msa_rows=S,
+        guidance=[{**dataclasses.asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
+        precision=precision,
+        **(manifest_fields or {}),
+    )
+    write_manifest(manifest_path, manifest)
+
     summaries: list[dict] = []
 
     for current_seed in seed_list:
+        # Judge a seed on every file it owes, not just model.cif: a run killed
+        # between the structure and its confidences would otherwise be "done"
+        # with the rest missing for good.
         if skip_existing and all(
-            (output_dir / f"seed-{int(current_seed)}_sample-{int(s)}" / "model.cif").exists()
-            for s in range(num_samples)
+            p.exists() for p in _seed_outputs(output_dir, current_seed, num_samples, save_distogram)
         ):
-            click.echo(f"[batch]   seed {current_seed}: all {num_samples} samples present — skip")
+            click.echo(f"[batch]   seed {current_seed}: complete — skip")
+            summaries += _existing_summaries(output_dir, current_seed, num_samples)
             continue
         click.echo(f"[batch] {json_input.name}  seed={current_seed} samples={num_samples} recycles={num_recycles}")
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            model_output = model(feats, seed=current_seed, num_recycles=num_recycles, num_samples=num_samples)
+        with (
+            torch.inference_mode(),
+            torch.autocast(feats["res_type"].device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+        ):
+            model_output = model(
+                feats,
+                seed=current_seed,
+                num_recycles=num_recycles,
+                num_samples=num_samples,
+                guidance_terms=guidance_terms,
+            )
 
         iter_feats = feats
         if use_bucket and original_n < feats["res_type"].shape[0]:
@@ -288,6 +335,41 @@ def _run_one_job(
         save_ranking_scores_csv(output_dir / "ranking_scores.csv", summaries)
         summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
         save_summary_confidences_json(output_dir / summary_name, summaries, job_name=job_name)
+    manifest["status"] = "ok"
+    write_manifest(manifest_path, manifest)
+
+
+def _seed_outputs(output_dir: Path, seed: int, num_samples: int, save_distogram: bool) -> list[Path]:
+    """Every file one seed of a job must leave behind, in write order."""
+    out: list[Path] = []
+    if save_distogram:
+        out.append(output_dir / f"seed-{int(seed)}_distogram.npz")
+    for s in range(num_samples):
+        d = output_dir / f"seed-{int(seed)}_sample-{int(s)}"
+        out += [d / "model.cif", d / "confidences.json"]
+    return out
+
+
+def _existing_summaries(output_dir: Path, seed: int, num_samples: int) -> list[dict]:
+    """The per-sample summaries of a seed already on disk.
+
+    ``ranking_scores.csv`` and ``summary_confidences.json`` cover the whole job,
+    so a resumed run has to re-read the seeds it skips or it would publish only
+    the seeds of this run.
+
+    Raises:
+        click.ClickException: A ``confidences.json`` is unreadable or has no
+            summary, which means the skip decision was wrong.
+    """
+    out = []
+    for s in range(num_samples):
+        path = output_dir / f"seed-{int(seed)}_sample-{int(s)}" / "confidences.json"
+        try:
+            summary = json.loads(path.read_text())["summary"]
+        except (OSError, ValueError, KeyError) as e:
+            raise click.ClickException(f"{path} is present but unusable ({e}); delete the seed and re-run") from e
+        out.append({**summary, "seed": int(seed), "sample": int(s)})
+    return out
 
 
 def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[tuple[Path, Path]]:
@@ -414,6 +496,33 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     "Recommended for multi-target sweeps; auto-on when torch.compile is used.",
 )
 @click.option(
+    "--precision",
+    default="fp32",
+    type=click.Choice(["fp32", "bf16"]),
+    show_default=True,
+    help="Compute dtype of the trunk, as ``inference --precision``.",
+)
+@click.option(
+    "--hoist-sampler/--no-hoist-sampler",
+    default=True,
+    show_default=True,
+    help="Hoist the diffusion sampler's step-invariant conditioning, as ``inference --hoist-sampler``.",
+)
+@click.option(
+    "--guidance",
+    "guidance_specs",
+    multiple=True,
+    metavar="W[@TARGET[@LO..HI]]",
+    callback=_parse_guidance,
+    help="Classifier-free guidance term, as ``inference --guidance``; applied to every job.",
+)
+@click.option(
+    "--det",
+    is_flag=True,
+    default=False,
+    help="Deterministic inference, as ``inference --det``.",
+)
+@click.option(
     "--allow-missing-keys",
     is_flag=True,
     default=False,
@@ -434,6 +543,10 @@ def inference_batch(
     pdb_mmcif_dir: Path | None,
     optim: str,
     matmul_precision: str,
+    precision: str,
+    hoist_sampler: bool,
+    guidance_specs: tuple,
+    det: bool,
     plot_confidences: bool,
     save_distogram: bool,
     logits_scheme: str,
@@ -461,6 +574,11 @@ def inference_batch(
 
     click.echo(f"[batch] {len(jobs)} jobs queued")
 
+    if det:
+        apply_det_recipe()
+        if optim in ("recommended", "all"):
+            raise click.UsageError(f"--det cannot fix torch.compile's kernels; --optim {optim} enables it")
+
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     # MSA depth varies by input even with --bucket: see ``set_nearest_shape_lookup``.
@@ -472,6 +590,30 @@ def inference_batch(
     model, model_cfg = _load_model_once(
         params, snapshot, dev, optim, msa_crop_size, matmul_precision, allow_missing_keys=allow_missing_keys
     )
+    model_cfg.diffusion.hoist_sampler = hoist_sampler
+    if guidance_specs:
+        try:
+            check_guidance_training(guidance_specs, model_cfg.diffusion)
+        except ValueError as e:
+            raise click.UsageError(f"--guidance: {e}") from e
+        click.echo(f"[batch] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+
+    checkpoint = checkpoint_record(params)
+    checkpoint["sha256"] = sha256_file(params)
+    manifest_fields = {
+        "device": str(dev),
+        "gpu": gpu_name(dev),
+        "checkpoint": checkpoint,
+        "num_samples": num_samples,
+        "num_recycles": num_recycles,
+        "msa_crop_size": model_cfg.msa_crop_size,
+        "bucket": bucket or model_cfg.optim.use_torch_compile,
+        "hoist_sampler": hoist_sampler,
+        "optim": optim,
+        "matmul_precision": torch.get_float32_matmul_precision(),
+        "logits_scheme": logits_scheme,
+        "det": det,
+    }
 
     seed_list = list(dict.fromkeys(seeds))
 
@@ -484,11 +626,7 @@ def inference_batch(
         if not od.exists():
             return False
         if seed_list:
-            return all(
-                (od / f"seed-{int(s)}_sample-{int(k)}" / "model.cif").exists()
-                for s in seed_list
-                for k in range(num_samples)
-            )
+            return all(p.exists() for s in seed_list for p in _seed_outputs(od, s, num_samples, save_distogram))
         return any(p.name.startswith("seed-") for p in od.iterdir() if p.is_dir())
 
     n_done = 0
@@ -519,6 +657,9 @@ def inference_batch(
             logits_scheme=logits_scheme,
             skip_existing=skip_existing,
             bucket=bucket,
+            precision=precision,
+            guidance_specs=guidance_specs,
+            manifest_fields=manifest_fields,
         )
         n_done += 1
         # Release this job's cached blocks back to the driver before the next
