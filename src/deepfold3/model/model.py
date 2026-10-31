@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 from contextlib import nullcontext
 from functools import partial as _partial
 
@@ -23,7 +24,7 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from deepfold3.model.atom_cross_attn import EvoformerConditioningEncoder
 from deepfold3.model.confidence import ConfidenceHead
 from deepfold3.model.config import DistogramConfig, ModelConfig, OptimConfig
-from deepfold3.model.diffusion import DiffusionHead
+from deepfold3.model.diffusion import DiffusionHead, GuidanceTerm
 from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_encoding
 from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.masked_msa import MaskedMSAHead, apply_bert_mask
@@ -931,6 +932,7 @@ class DeepFold3(nn.Module):
         seed: int = 0,
         num_recycles: int | None = None,
         num_samples: int | None = None,
+        guidance_terms: Sequence[GuidanceTerm] | None = None,
     ) -> DeepFold3Output:
         """Run full forward pass.
 
@@ -943,6 +945,8 @@ class DeepFold3(nn.Module):
             seed: random seed for diffusion sampling
             num_recycles: override default number of recycles
             num_samples: override default number of diffusion samples
+            guidance_terms: classifier-free guidance terms, replacing the
+                ``cfg.diffusion.guidance_*`` settings
         """
         if num_recycles is None:
             num_recycles = self.cfg.num_recycles
@@ -963,7 +967,7 @@ class DeepFold3(nn.Module):
 
             diff_cfg = self.diffusion_head.cfg
             guidance_pair_keep = None
-            if diff_cfg.guidance_scale != 1.0 and diff_cfg.guidance_drop == "interface":
+            if guidance_terms is None and diff_cfg.guidance_scale != 1.0 and diff_cfg.guidance_drop == "interface":
                 from deepfold3.model.diffusion import interface_pair_keep
 
                 guidance_pair_keep = interface_pair_keep(features["asym_id"].to(device))
@@ -973,6 +977,7 @@ class DeepFold3(nn.Module):
                 rel_feat=rel_feat,
                 generator=generator,
                 guidance_pair_keep=guidance_pair_keep,
+                guidance_terms=guidance_terms,
                 **self._ref_kwargs(features),
             )
 

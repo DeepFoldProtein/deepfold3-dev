@@ -489,7 +489,8 @@ class DiffusionConfig:
     # single stay conditioned), i.e. guidance on the trunk's interface signal
     # only. Needs ``cond_drop_interface_frac > 0`` at training. Callers of
     # ``DiffusionHead.sample`` can instead pass ``guidance_pair_keep`` to
-    # drop any chosen subset of chain pairs.
+    # drop any chosen subset of chain pairs, or ``guidance_terms`` for a linear
+    # combination of such terms (``deepfold3 inference --guidance``).
     guidance_drop: Literal["full", "interface"] = "full"
     # --- Masked / partial diffusion (motif scaffolding) -----------------------
     # NOT an OF3 feature — OF3 noises every atom unconditionally

@@ -8,6 +8,7 @@ import torch
 from deepfold3.model.config import DiffusionConfig, OptimConfig
 from deepfold3.model.diffusion import (
     DiffusionHead,
+    GuidanceTerm,
     cond_drop_stats,
     draw_interface_pair_keep,
     interface_pair_keep,
@@ -429,3 +430,154 @@ def test_training_step_logs_cond_drop_under_its_own_prefix(monkeypatch):
         "cond_drop/interface": 1.0,
     }
     assert all(counts[k] == 1 for k in loss_dict if k.startswith("cond_drop/"))
+
+
+def _parse(text: str):
+    from deepfold3.model.guidance import parse_guidance_spec
+
+    return parse_guidance_spec(text)
+
+
+def test_guidance_spec_syntax():
+    assert _parse("2").target == "full"
+    assert _parse("1.5@all").target == "all"
+    pairs = _parse("2@A:B,AA:B")
+    assert (pairs.target, pairs.pairs) == ("pairs", (("A", "B"), ("AA", "B")))
+    assert _parse("2@full@1e-4..160").sigma_range == (1e-4, 160.0)
+
+
+@pytest.mark.parametrize(
+    "text", ["", "x", "nan", "2@A", "2@A:A", "2@A:B:C", "2@A:", "2@A:B,", "2@all@5..1", "2@all@1", "2@all@1..2@x"]
+)
+def test_guidance_spec_rejects_malformed(text):
+    with pytest.raises(ValueError):
+        _parse(text)
+
+
+def test_pair_term_drops_exactly_the_named_chain_pairs():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym, _ = _asym(2, 2, 1)
+    index = {"A": 0, "B": 1, "AA": 2}
+    keep = build_guidance_terms([_parse("2@AA:A")], asym[0], index)[0].pair_keep
+    dropped = {(int(asym[0, i]), int(asym[0, j])) for i, j in (~keep).nonzero().tolist()}
+    assert dropped == {(0, 2), (2, 0)}
+    assert torch.equal(keep, keep.T)
+
+
+def test_pair_term_never_drops_bucket_padding():
+    from deepfold3.model.guidance import build_guidance_terms
+
+    asym = torch.tensor([0, 0, 1, 0, 0])  # the last two are padding, asym_id 0
+    keep = build_guidance_terms([_parse("2@A:B")], asym, {"A": 0, "B": 1}, n_tokens=3)[0].pair_keep
+    assert (~keep).sum() == 4  # (0,2), (1,2) and their mirrors
+    assert bool(keep[2, 3:].all())
+
+
+@pytest.mark.parametrize("text", ["2@A:Z", "2@Z:A"])
+def test_unknown_chain_is_an_error(text):
+    from deepfold3.model.guidance import build_guidance_terms
+
+    with pytest.raises(ValueError, match="unknown chain"):
+        build_guidance_terms([_parse(text)], torch.tensor([0, 1]), {"A": 0, "B": 1})
+
+
+@pytest.mark.parametrize("text", ["2@all", "2@A:B"])
+def test_interface_term_needs_two_chains(text):
+    from deepfold3.model.guidance import build_guidance_terms
+
+    with pytest.raises(ValueError, match="two chains"):
+        build_guidance_terms([_parse(text)], torch.zeros(3, dtype=torch.int64), {"A": 0})
+
+
+def test_checkpoint_must_have_trained_the_drop():
+    from deepfold3.model.guidance import check_guidance_training
+
+    with pytest.raises(ValueError, match="use_conditioning_prob"):
+        check_guidance_training([_parse("2")], DiffusionConfig())
+    with pytest.raises(ValueError, match="cond_drop_interface_frac"):
+        check_guidance_training([_parse("2@all")], DiffusionConfig(use_conditioning_prob=0.8))
+    check_guidance_training([_parse("1")], DiffusionConfig())  # w = 1 is inert
+    check_guidance_training([_parse("2")], DiffusionConfig(use_conditioning_prob=0.8))
+    check_guidance_training([_parse("2@all")], DiffusionConfig(use_conditioning_prob=0.8, cond_drop_interface_frac=0.5))
+
+
+def _sample_terms(head: DiffusionHead, inputs: dict, terms) -> torch.Tensor:
+    return head.sample(**inputs, generator=torch.Generator().manual_seed(2), guidance_terms=terms)["atom_positions"]
+
+
+def test_one_term_equals_the_config_path():
+    x = _inputs()
+    by_cfg = _sample(_head(guidance_scale=2.0, guidance_sigma_range=(1.0, 160.0)), x)
+    by_term = _sample_terms(_head(), x, [GuidanceTerm(2.0, sigma_range=(1.0, 160.0))])
+    assert torch.allclose(by_cfg, by_term, atol=1e-5)
+
+
+def test_terms_override_the_config_and_scale_one_is_inert():
+    x = _inputs()
+    base = _sample(_head(), x)
+    assert torch.equal(base, _sample_terms(_head(guidance_scale=3.0), x, []))
+    assert torch.equal(base, _sample_terms(_head(), x, [GuidanceTerm(1.0)]))
+
+
+def test_two_terms_are_the_linear_combination(monkeypatch):
+    """Every step adds both terms' ``(w − 1)·(D_c − D_u)`` to the same ``D_c``."""
+    asym, _ = _asym(2, 1)
+    keep = interface_pair_keep(asym)
+    head, x = _head(), _inputs()
+    head.cfg.steps = 1
+    orig = head._denoise_samples
+    denoised: list[torch.Tensor] = []
+
+    def spy(*a, **kw):
+        denoised.append(orig(*a, **kw))
+        return denoised[-1]
+
+    monkeypatch.setattr(head, "_denoise_samples", spy)
+    captured = []
+    step = head._sample_impl
+
+    def spy_impl(*a, **kw):
+        captured.append(kw["guidance_terms"])
+        return step(*a, **kw)
+
+    monkeypatch.setattr(head, "_sample_impl", spy_impl)
+    guided = _sample_terms(head, x, [GuidanceTerm(1.5), GuidanceTerm(3.0, keep)])
+    assert len(denoised) == 3 and len(captured[0]) == 2  # conditional + one per term
+
+    den_c, den_u1, den_u2 = denoised
+    combined = den_c + 0.5 * (den_c - den_u1) + 2.0 * (den_c - den_u2)
+    denoised.clear()
+    head._denoise_samples = lambda *a, **kw: combined
+    ref = _sample_terms(head, x, [])
+    assert torch.allclose(guided, ref, atol=1e-4)
+
+
+def test_sigma_range_limits_only_its_own_term(monkeypatch):
+    head, x = _head(), _inputs()
+    calls = []
+    orig = head._denoise_samples
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(head, "_denoise_samples", spy)
+    _sample_terms(head, x, [GuidanceTerm(2.0, sigma_range=(1e6, 1e7)), GuidanceTerm(2.0)])
+    assert len(calls) == 2 * head.cfg.steps
+
+
+def test_forward_passes_terms_to_the_sampler():
+    model = _tiny_model().eval()
+    batch = _tiny_batch()
+    terms = (GuidanceTerm(2.0),)
+    seen = {}
+    sample = model.diffusion_head.sample
+
+    def spy(*a, **kw):
+        seen["terms"] = kw["guidance_terms"]
+        return sample(*a, **kw)
+
+    model.diffusion_head.sample = spy
+    model(batch, num_recycles=0, num_samples=1, guidance_terms=terms)
+    assert seen["terms"] is terms

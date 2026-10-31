@@ -43,6 +43,8 @@ deepfold3 inference --msa query.a3m --output out.cif --params weights.safetensor
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --template-cache /tmp/cache
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --pdb-mmcif-dir /data/pdb/mmcif/
 deepfold3 inference --json input.json --output output_dir/ --params weights.safetensors --msa-crop-size 4096
+deepfold3 inference --json input.json --output output_dir/ --params stage2.safetensors --guidance 2.0@H:A,L:A
+deepfold3 inference --json input.json --output output_dir/ --params stage2.safetensors --guidance 1.5@all@1..160 --guidance 2.0@H:A
 deepfold3 convert   --params af3.bin.zst --af3-ref references/alphafold3 --output weights.safetensors
 deepfold3 export    --checkpoint runs/exp1/checkpoint_final.pt --output weights.safetensors --snapshot average
 deepfold3 plot      --input out_confidences.json --output confidences.png
@@ -160,6 +162,7 @@ src/deepfold3/
 │   ├── template_embedding.py  # TemplateEmbedding, SingleTemplateEmbedding, TemplatePairFormerBlock
 │   ├── atom_cross_attn.py # AtomCrossAttEncoder/Decoder, EvoformerConditioningEncoder
 │   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training noise/denoise)
+│   ├── guidance.py       # `--guidance` terms: syntax, checkpoint check, chain names → GuidanceTerm
 │   ├── confidence.py     # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
 │   ├── bucket.py         # Bucket-based sequence length padding for training
 │   ├── model.py          # DeepFold3 (top-level, forward + forward_training), DeepFold3Output, DistogramHead

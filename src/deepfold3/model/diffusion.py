@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 from contextlib import nullcontext
 from functools import partial as _partial
 
@@ -192,6 +193,26 @@ def build_diffusion_clean_mask(
                 start = int(torch.randint(0, n_valid - ln + 1, (), device=dev))
                 mask[b, s, valid_idx[start : start + ln]] = True
     return mask
+
+
+@dataclasses.dataclass(frozen=True)
+class GuidanceTerm:
+    """One term of the classifier-free guidance sum in :meth:`DiffusionHead.sample`.
+
+    The guided denoiser is ``D_c + Σ_k (w_k − 1)·(D_c − D_u,k)``, so one term is
+    the usual ``D_u + w·(D_c − D_u)``, ``w = 1`` adds nothing, and each term
+    costs one more denoiser pass per step inside its σ̂ range.
+
+    Attributes:
+        scale: The term's guidance weight ``w_k``.
+        pair_keep: ``[B?, N, N]`` bool, False where this term's unconditional
+            branch zeroes the trunk pair; ``None`` is the ``cond_drop`` drop.
+        sigma_range: ``(lo, hi)``: apply where lo ≤ σ̂ ≤ hi, ``None`` everywhere.
+    """
+
+    scale: float
+    pair_keep: torch.Tensor | None = None
+    sigma_range: tuple[float, float] | None = None
 
 
 def interface_pair_keep(asym_id: torch.Tensor) -> torch.Tensor:
@@ -1122,6 +1143,7 @@ class DiffusionHead(nn.Module):
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
         guidance: bool = True,
         guidance_pair_keep: torch.Tensor | None = None,  # [B?, N, N] bool
+        guidance_terms: Sequence[GuidanceTerm] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Draw samples from the diffusion model (Euler-Maruyama sampler).
 
@@ -1135,13 +1157,19 @@ class DiffusionHead(nn.Module):
         ``guidance_pair_keep`` is False — any subset of chain pairs — and
         falls back to the ``cond_drop`` drop when it is ``None``.
         ``cfg.guidance_drop == "interface"`` requires it (see
-        :func:`interface_pair_keep`).
+        :func:`interface_pair_keep`). ``guidance_terms``, when given, replaces
+        all of that with a linear combination of terms (:class:`GuidanceTerm`).
         """
         cfg = self.cfg
-        if not guidance or cfg.guidance_scale == 1.0:
-            guidance_pair_keep, guidance = None, False
-        elif cfg.guidance_drop == "interface" and guidance_pair_keep is None:
-            raise ValueError("guidance_drop='interface' needs guidance_pair_keep (interface_pair_keep(asym_id))")
+        terms: tuple[GuidanceTerm, ...] = ()
+        if not guidance:
+            pass
+        elif guidance_terms is not None:
+            terms = tuple(t for t in guidance_terms if t.scale != 1.0)
+        elif cfg.guidance_scale != 1.0:
+            if cfg.guidance_drop == "interface" and guidance_pair_keep is None:
+                raise ValueError("guidance_drop='interface' needs guidance_pair_keep (interface_pair_keep(asym_id))")
+            terms = (GuidanceTerm(cfg.guidance_scale, guidance_pair_keep, cfg.guidance_sigma_range),)
         if cfg.skip_amp_sample:
             # Protenix-style ``skip_amp.sample_diffusion``: upcast float
             # inputs and run the full sampler with autocast disabled.
@@ -1165,8 +1193,7 @@ class DiffusionHead(nn.Module):
                 rel_feat,
                 generator,
                 ref_space_uid=ref_space_uid,
-                guidance=guidance,
-                guidance_pair_keep=guidance_pair_keep,
+                guidance_terms=terms,
             )
 
     def _sample_impl(
@@ -1181,8 +1208,7 @@ class DiffusionHead(nn.Module):
         rel_feat: torch.Tensor,
         generator: torch.Generator | None,
         ref_space_uid: torch.Tensor | None = None,  # [B?, N, M] int64
-        guidance: bool = True,
-        guidance_pair_keep: torch.Tensor | None = None,
+        guidance_terms: tuple[GuidanceTerm, ...] = (),
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         N, M = ref_mask.shape[-2:]
@@ -1232,23 +1258,23 @@ class DiffusionHead(nn.Module):
         # fresh expanded copy each step.
         static_bs = static.expand_for_samples(cfg.num_samples)
 
-        # Classifier-free guidance: a second static for the unconditional
-        # branch, built only when guidance is on so w == 1 costs nothing.
-        w = cfg.guidance_scale
-        static_u_bs = None
-        if guidance and w != 1.0:
-            if guidance_pair_keep is not None:
+        # Classifier-free guidance: one static per unconditional branch, built
+        # only for active terms so the unguided path costs nothing.
+        uncond: list[tuple[float, object, float, float]] = []
+        for term in guidance_terms:
+            if term.pair_keep is not None:
                 u_inputs = {
                     **static_inputs,
-                    "embeddings": mask_trunk_pair(static_inputs["embeddings"], _ensure_b(guidance_pair_keep)),
+                    "embeddings": mask_trunk_pair(static_inputs["embeddings"], _ensure_b(term.pair_keep)),
                 }
                 static_u = self.compute_static(**u_inputs)
             else:
                 static_u = self.compute_static(**static_inputs, use_conditioning=False)
-            static_u_bs = static_u.expand_for_samples(cfg.num_samples)
+            lo, hi = term.sigma_range or (float("-inf"), float("inf"))
+            uncond.append((term.scale, static_u.expand_for_samples(cfg.num_samples), lo, hi))
+        if uncond:
             # Host-side interval test per step: noise_levels is tiny, one sync here.
             sig_hat_host = (noise_levels[:-1] * (1 + gammas)).tolist()
-            lo, hi = cfg.guidance_sigma_range or (float("-inf"), float("inf"))
 
         for step in range(cfg.steps):
             sigma_prev = noise_levels[step]
@@ -1265,11 +1291,13 @@ class DiffusionHead(nn.Module):
             noise_scale = cfg.noise_scale * (sigma_hat**2 - sigma_prev**2).sqrt()
             positions_hat = positions + noise_scale * torch.randn_like(positions, generator=generator)
 
-            denoised = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_bs)
-            if static_u_bs is not None and lo <= sig_hat_host[step] <= hi:
-                # Same positions_hat → both predictions share the augmented frame.
-                den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
-                denoised = den_u + w * (denoised - den_u)
+            den_c = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_bs)
+            denoised = den_c
+            for w, static_u_bs, lo, hi in uncond:
+                if lo <= sig_hat_host[step] <= hi:
+                    # Same positions_hat → all predictions share the augmented frame.
+                    den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
+                    denoised = denoised + (w - 1.0) * (den_c - den_u)
             d_t = sigma_next - sigma_hat
             positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
 

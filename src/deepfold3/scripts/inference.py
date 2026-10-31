@@ -31,6 +31,15 @@ that seed's samples) and top-level ``ranking_scores.csv`` /
 matrices are no longer inlined into JSON — recover them with
 ``deepfold3.io.confidences.load_logit_maps`` (or ``logit_codec.load_logits``).
 
+Classifier-free guidance needs a checkpoint trained with the conditioning drop
+(``configs/stage2.yaml``). ``--guidance`` is repeatable and the terms add up
+(syntax in ``deepfold3.model.guidance``):
+
+    --guidance 2.0                      # full drop, D_u + 2·(D_c − D_u)
+    --guidance 2.0@H:A,L:A              # only these interfaces
+    --guidance 1.5@all@1..160 \\
+    --guidance 2.0@H:A                  # D_c + 0.5·(D_c − D_u1) + 1·(D_c − D_u2)
+
 For ``--msa`` / ``--sequence`` input, a single mmCIF file with all
 samples stacked as MODEL blocks is written to ``--output``, with
 ``{stem}[_sample{s}]_logits.npz`` per sample and ``{stem}_distogram.npz``
@@ -45,8 +54,27 @@ from pathlib import Path
 import click
 import torch
 
+from deepfold3.model.guidance import (
+    GuidanceSpec,
+    build_guidance_terms,
+    check_guidance_training,
+    parse_guidance_spec,
+)
 from deepfold3.scripts import cli
 from deepfold3.scripts._common import load_pt_snapshot, pin_cuda_device
+
+
+def _parse_guidance(_ctx, _param, values: tuple[str, ...]) -> tuple[GuidanceSpec, ...]:
+    try:
+        return tuple(parse_guidance_spec(v) for v in values)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+
+def _describe_guidance(spec: GuidanceSpec) -> str:
+    target = ",".join(":".join(p) for p in spec.pairs) or spec.target
+    sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
+    return f"w={spec.scale:g} {target}{sigma}"
 
 
 @cli.command("inference")
@@ -173,6 +201,20 @@ from deepfold3.scripts._common import load_pt_snapshot, pin_cuda_device
         "int8_softmax preserves softmax(logits) within ~1e-4 at ~1 byte/value."
     ),
 )
+@click.option(
+    "--guidance",
+    "guidance_specs",
+    multiple=True,
+    metavar="W[@TARGET[@LO..HI]]",
+    callback=_parse_guidance,
+    help=(
+        "Classifier-free guidance term; repeat for a linear combination "
+        "D_c + Σ (W−1)·(D_c − D_u). TARGET is what the term's unconditional branch "
+        "drops: full (default), all (every interface) or chain pairs A:B,AA:B. "
+        "LO..HI limits the term to that σ̂ range (absolute, 0.0077..4608 is the "
+        "whole schedule). Each active term adds one denoiser pass per step."
+    ),
+)
 def inference(
     msa: Path | None,
     json_input: Path | None,
@@ -192,6 +234,7 @@ def inference(
     matmul_precision: str,
     plot_confidences: bool,
     logits_scheme: str,
+    guidance_specs: tuple[GuidanceSpec, ...],
 ) -> None:
     """Run structure prediction from an A3M MSA file or JSON input."""
     # Validate input: exactly one of --msa or --json
@@ -281,6 +324,15 @@ def inference(
     elif optim == "triton":
         model_cfg.optim = OptimConfig.triton_only()
     # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
+
+    if guidance_specs:
+        if ckpt_model_cfg is None:
+            click.echo("  [WARN] no embedded model_cfg: cannot check that --guidance matches the training drop")
+        else:
+            try:
+                check_guidance_training(guidance_specs, ckpt_model_cfg.diffusion)
+            except ValueError as e:
+                raise click.UsageError(f"--guidance: {e}") from e
 
     # Default to the MSA pool cap, NOT the checkpoint's training crop: the crop
     # is a training-throughput choice and the random-k mask makes the model
@@ -404,6 +456,17 @@ def inference(
     # Move to device
     feats = {k: v.to(dev) for k, v in feats.items()}
 
+    guidance_terms = None
+    if guidance_specs:
+        from deepfold3.io.mmcif import resolve_chain_name
+
+        chain_index = {resolve_chain_name(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
+        try:
+            guidance_terms = build_guidance_terms(guidance_specs, feats["asym_id"], chain_index, original_n)
+        except ValueError as e:
+            raise click.UsageError(f"--guidance: {e}") from e
+        click.echo(f"[inference] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+
     # ------------------------------------------------------------------
     # Determine seed list. JSON inputs honour the JSON's modelSeeds
     # (with --seed prepended if explicitly passed); MSA/sequence inputs
@@ -447,6 +510,7 @@ def inference(
                 seed=current_seed,
                 num_recycles=num_recycles,
                 num_samples=num_samples,
+                guidance_terms=guidance_terms,
             )
 
         iter_feats = feats
