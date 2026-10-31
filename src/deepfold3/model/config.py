@@ -701,6 +701,10 @@ class OptimConfig:
     use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
+    # Evoformer MSA transition as one in-place forward-only kernel (no [..., 2*hidden]
+    # tensor; see model/triton/msa_transition.py). Served only with grad disabled, so
+    # keep it off in training presets. A call it cannot serve logs why and goes stock.
+    use_fused_msa_transition_inference: bool = False
     # dropout_add fuses per-batch row/column-wise dropout with a residual add and
     # samples the mask on the fly via tl.rand (see model/triton/dropout_add.py).
     # Default True preserves current behavior (Triton always active on CUDA);
@@ -792,6 +796,7 @@ class OptimConfig:
             use_fused_triangle_mul=True,
             use_fused_transition_pair=True,
             use_fused_ln_transpose=True,
+            use_fused_msa_transition_inference=True,
             use_tiled_linear=True,
             tiled_linear_inference=True,
             tiled_opm_chunk=128,

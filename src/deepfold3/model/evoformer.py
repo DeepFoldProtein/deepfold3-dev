@@ -49,6 +49,7 @@ from deepfold3.model.primitives import (
 )
 from deepfold3.model.template_embedding import TemplateEmbedding
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
+from deepfold3.model.triton.msa_transition import msa_transition_residual_
 
 _checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -131,6 +132,7 @@ class EvoformerBlock(nn.Module):
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
         self.msa_transition = make_transition_block(c_msa, config=optim)
+        self.use_fused_msa_transition = optim.use_fused_msa_transition_inference if optim is not None else False
         self.msa_dropout = msa_dropout
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
@@ -149,7 +151,9 @@ class EvoformerBlock(nn.Module):
         s = self.residual_out_scale
         pair = pair + s * self.outer_product(msa, msa_mask)
         msa = dropout_add_rowwise(msa, s * self.row_attn(msa, msa_mask, pair), p_msa, training, use_fused)
-        msa = msa + s * self.msa_transition(msa)
+        # ``msa`` is the fresh sum above, so the in-place kernel cannot clobber a caller's tensor.
+        fused_msa = msa_transition_residual_(self.msa_transition, msa, s) if self.use_fused_msa_transition else None
+        msa = fused_msa if fused_msa is not None else msa + s * self.msa_transition(msa)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_out(pair, pair_mask), p_pair, training, use_fused)
         pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p_pair, training, use_fused)
         if self.use_triangle_attention:

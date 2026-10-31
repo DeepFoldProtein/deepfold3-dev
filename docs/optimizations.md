@@ -130,6 +130,7 @@ the 5D kernel overhead dominate). Use torch.compile for SingleAttention instead.
 | Triton FusedPairBias           | `FusedPairBias`           | LN + Linear + permute for pair bias (tl.dot GEMM)         | `triton/fused_pair_bias.py`       |
 | Triton FusedGatedDualGEMM      | `FusedGatedDualGEMM`      | Dual GEMM + sigmoid gate (TWO_INPUTS, mask, bias)         | `triton/fused_gated_dual_gemm.py` |
 | Triton FusedTransitionBlock    | `FusedTransitionBlock`    | `TransitionBlock` (LN + Linear + SwiGLU + Linear)         | `triton/fused_transition.py`      |
+| Triton fused MSA transition    | `fused_msa_transition`    | Evoformer `msa + s * msa_transition(msa)`, inference only | `triton/msa_transition.py`        |
 | Triton FusedLayerNormLinear    | `FusedLayerNormLinear`    | Fused LayerNorm + Linear                                  | `triton/layernorm_linear.py`      |
 | Triton FusedLayerNormTranspose | `FusedLayerNormTranspose` | LN + dim transpose (col attention)                        | `triton/layernorm_transpose.py`   |
 | Triton FusedTriangleMulGate    | `FusedTriangleMulGate`    | LN + packed 3-projection GEMM + sigmoid                   | `triton/triangle_mul_gate.py`     |
@@ -150,6 +151,7 @@ class OptimConfig:
     use_fused_transition_pair: bool = False # Triton fused transition for pair (M=N², C=128)
     use_fused_triangle_mul: bool = False    # Triton dual GEMM + gate fusion for TriangleMul
     use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
+    use_fused_msa_transition_inference: bool = False  # in-place forward-only MSA transition (inference preset only)
     use_torch_compile: bool = False         # torch.compile for attention + TriangleMul
 ```
 
