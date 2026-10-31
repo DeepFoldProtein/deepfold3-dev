@@ -213,6 +213,7 @@ src/deepfold3/
 ├── convert/         # Weight conversion
 │   └── af3.py            # Haiku → PyTorch state_dict converter
 ├── io/              # Output serialization
+│   ├── background_writer.py # Bounded background thread for logit writes; a failed write fails the run
 │   ├── mmcif.py          # save_mmcif() (gemmi-based, pLDDT in B-factors)
 │   └── confidences.py    # Confidence metric computation + save_confidences_json()
 ├── training/        # Training pipeline

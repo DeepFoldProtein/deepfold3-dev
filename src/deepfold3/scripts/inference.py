@@ -77,6 +77,12 @@ def _describe_guidance(spec: GuidanceSpec) -> str:
     return f"w={spec.scale:g} {target}{sigma}"
 
 
+def _save_logits(save, path: Path, *args, **kwargs) -> None:
+    """Run a logit saver on the writer thread and log the file it wrote."""
+    if save(path, *args, **kwargs):
+        click.echo(f"  saved  {path.resolve()}")
+
+
 @cli.command("inference")
 @click.option(
     "--msa",
@@ -499,6 +505,7 @@ def inference(
     else:
         seed_list = [seed if seed is not None else 42]
 
+    from deepfold3.io.background_writer import BackgroundWriter, logits_to_host
     from deepfold3.io.confidences import (
         save_confidences_json,
         save_distogram_logits,
@@ -517,107 +524,128 @@ def inference(
 
     summaries: list[dict] = []  # one entry per (seed, sample), augmented with seed/sample
 
-    for current_seed in seed_list:
-        click.echo(
-            f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
-        )
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            model_output = model(
-                feats,
-                seed=current_seed,
-                num_recycles=num_recycles,
-                num_samples=num_samples,
-                guidance_terms=guidance_terms,
+    # Logit compression is the bulk of the write time and does not depend on the
+    # device, so it runs behind the next seed's forward. One seed's worth may
+    # queue; everything is on disk, or the run has failed, past this block.
+    with BackgroundWriter(max_pending=num_samples + 1) as writer:
+        for current_seed in seed_list:
+            click.echo(
+                f"[inference] running model  (seed={current_seed}, recycles={num_recycles}, samples={num_samples}) …"
             )
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                model_output = model(
+                    feats,
+                    seed=current_seed,
+                    num_recycles=num_recycles,
+                    num_samples=num_samples,
+                    guidance_terms=guidance_terms,
+                )
 
-        iter_feats = feats
-        if use_bucket and original_n < feats["res_type"].shape[0]:
-            from deepfold3.model.bucket import unpad_features, unpad_output
+            iter_feats = feats
+            if use_bucket and original_n < feats["res_type"].shape[0]:
+                from deepfold3.model.bucket import unpad_features, unpad_output
 
-            model_output = unpad_output(model_output, original_n)
-            iter_feats = unpad_features(feats, original_n)
+                model_output = unpad_output(model_output, original_n)
+                iter_feats = unpad_features(feats, original_n)
 
-        elapsed = time.perf_counter() - t0
-        click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
+            elapsed = time.perf_counter() - t0
+            click.echo(f"  done in {elapsed:.1f}s  —  positions: {tuple(model_output.atom_positions.shape)}")
 
-        # Trunk distogram logits are shared across all samples of this seed, so
-        # they are written once per seed (not duplicated per sample).
-        if json_input is not None:
-            distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
-        else:
-            distogram_npz = output_dir / f"{cif_path.stem}_distogram.npz"
-        if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(current_seed)):
-            click.echo(f"  saved  {distogram_npz.resolve()}")
-
-        # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
-        # per-sample directories.  Either way, save_confidences_json
-        # returns the per-sample summary used for ranking.
-        if json_input is None:
-            click.echo(f"[inference] writing {cif_path} …")
-            save_mmcif(
-                cif_path,
-                model_output,
-                iter_feats,
-                entity_descriptions=entity_descriptions,
-                title=job_title,
-                chain_names=chain_names,
-            )
-            click.echo(f"  saved  {cif_path.resolve()}")
-
-        for s in range(num_samples):
+            # Trunk distogram logits are shared across all samples of this seed, so
+            # they are written once per seed (not duplicated per sample).
             if json_input is not None:
-                sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
-                sample_dir.mkdir(parents=True, exist_ok=True)
+                distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
+            else:
+                distogram_npz = output_dir / f"{cif_path.stem}_distogram.npz"
+            host_logits = logits_to_host(model_output)
+            writer.submit(
+                distogram_npz.name,
+                _save_logits,
+                save_distogram_logits,
+                distogram_npz,
+                host_logits,
+                scheme=logits_scheme,
+                seed=int(current_seed),
+            )
+
+            # Non-JSON path writes one multi-MODEL mmCIF; JSON path writes
+            # per-sample directories.  Either way, save_confidences_json
+            # returns the per-sample summary used for ranking.
+            if json_input is None:
+                click.echo(f"[inference] writing {cif_path} …")
                 save_mmcif(
-                    sample_dir / "model.cif",
+                    cif_path,
                     model_output,
                     iter_feats,
                     entity_descriptions=entity_descriptions,
                     title=job_title,
-                    sample_idx=s,
                     chain_names=chain_names,
                 )
-                conf_path = sample_dir / "confidences.json"
-                logits_npz = sample_dir / "logits.npz"
-            else:
-                stem = cif_path.stem
-                suffix = "" if num_samples == 1 else f"_sample{s}"
-                conf_path = output_dir / f"{stem}{suffix}_confidences.json"
-                logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
+                click.echo(f"  saved  {cif_path.resolve()}")
 
-            summary = save_confidences_json(
-                conf_path,
-                model_output,
-                iter_feats,
-                sample_idx=s,
-                seed=int(current_seed),
-                chain_names=chain_names,
-            )
-            summary = {**summary, "seed": int(current_seed), "sample": int(s)}
-            summaries.append(summary)
+            for s in range(num_samples):
+                if json_input is not None:
+                    sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    save_mmcif(
+                        sample_dir / "model.cif",
+                        model_output,
+                        iter_feats,
+                        entity_descriptions=entity_descriptions,
+                        title=job_title,
+                        sample_idx=s,
+                        chain_names=chain_names,
+                    )
+                    conf_path = sample_dir / "confidences.json"
+                    logits_npz = sample_dir / "logits.npz"
+                else:
+                    stem = cif_path.stem
+                    suffix = "" if num_samples == 1 else f"_sample{s}"
+                    conf_path = output_dir / f"{stem}{suffix}_confidences.json"
+                    logits_npz = output_dir / f"{stem}{suffix}_logits.npz"
 
-            # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
-            # float matrices that used to live in confidences.json.
-            if save_sample_logits(logits_npz, model_output, sample_idx=s, scheme=logits_scheme, seed=int(current_seed)):
-                click.echo(f"  saved  {logits_npz.resolve()}")
+                summary = save_confidences_json(
+                    conf_path,
+                    model_output,
+                    iter_feats,
+                    sample_idx=s,
+                    seed=int(current_seed),
+                    chain_names=chain_names,
+                )
+                summary = {**summary, "seed": int(current_seed), "sample": int(s)}
+                summaries.append(summary)
 
-            iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
-            clash_str = ", CLASH" if summary["has_clash"] else ""
-            click.echo(
-                f"  seed {current_seed} sample {s}: "
-                f"pLDDT={summary['mean_plddt']:.1f}, pTM={summary['ptm']:.3f}{iptm_str}, "
-                f"gPDE={summary['average_pde']:.2f}, disorder={summary['fraction_disordered']:.3f}"
-                f"{clash_str}, ranking={summary['ranking_score']:.3f}"
-            )
-            click.echo(f"  saved  {conf_path.resolve()}")
+                # Raw per-sample PAE/PDE logits (compressed) — replaces the dense
+                # float matrices that used to live in confidences.json.
+                writer.submit(
+                    str(logits_npz),
+                    _save_logits,
+                    save_sample_logits,
+                    logits_npz,
+                    host_logits,
+                    sample_idx=s,
+                    scheme=logits_scheme,
+                    seed=int(current_seed),
+                )
 
-            if plot_confidences:
-                from deepfold3.scripts.plot_confidences import plot_confidences_file
+                iptm_str = f", ipTM={summary['iptm']:.3f}" if summary.get("iptm") is not None else ""
+                clash_str = ", CLASH" if summary["has_clash"] else ""
+                click.echo(
+                    f"  seed {current_seed} sample {s}: "
+                    f"pLDDT={summary['mean_plddt']:.1f}, pTM={summary['ptm']:.3f}{iptm_str}, "
+                    f"gPDE={summary['average_pde']:.2f}, disorder={summary['fraction_disordered']:.3f}"
+                    f"{clash_str}, ranking={summary['ranking_score']:.3f}"
+                )
+                click.echo(f"  saved  {conf_path.resolve()}")
 
-                plot_path = conf_path.with_suffix(".png")
-                if plot_confidences_file(conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz):
-                    click.echo(f"  saved  {plot_path.resolve()}")
+                if plot_confidences:
+                    from deepfold3.scripts.plot_confidences import plot_confidences_file
+
+                    writer.drain()  # the plot reads the logit files just queued
+                    plot_path = conf_path.with_suffix(".png")
+                    if plot_confidences_file(conf_path, plot_path, logits_npz=logits_npz, distogram_npz=distogram_npz):
+                        click.echo(f"  saved  {plot_path.resolve()}")
 
     # ------------------------------------------------------------------
     # Aggregate ranking outputs (JSON input only)
