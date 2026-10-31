@@ -313,3 +313,19 @@ def test_odd_shapes(shape, rowwise):
     out = fn(residual, x, p_drop=0.25, training=True)
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(torch.cuda.get_device_properties(0).total_memory < 20 * 2**30, reason="needs 14 GiB of GPU memory")
+def test_offsets_past_int32():
+    """Past 2^31 elements the tail must be written where it belongs. A wrapped
+    int32 offset leaves it at the buffer's sentinel, or faults."""
+    shape = (1, 1024, 2048, 1100)  # 2.36e9 elements
+    x = torch.ones(shape, dtype=torch.bfloat16, device="cuda")
+    res = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    torch.manual_seed(0)
+    out = dropout_add_rowwise(res, x, 0.25, True, True)
+    tail = out[0, -1, -1]
+    kept, dropped = torch.isclose(tail.float(), torch.tensor(4 / 3, device="cuda"), atol=1e-2), tail == 0
+    assert bool((kept | dropped).all())
+    assert kept.any() and dropped.any()
+    assert torch.equal(out[0, -1, -1], out[0, 0, -1])  # the mask is shared along rows

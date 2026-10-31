@@ -69,7 +69,10 @@ if _HAS_TRITON:
         seed,
         BLOCK: tl.constexpr,
     ):
-        pid = tl.program_id(0)
+        # int64 before scaling: ``offsets`` indexes the flattened tensor, which
+        # can pass 2^31 elements (a wrapped offset would load and store rows of
+        # another allocation without any error).
+        pid = tl.program_id(0).to(tl.int64)
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
         valid = offsets < N_total
 
@@ -88,7 +91,7 @@ if _HAS_TRITON:
         r = tl.load(RES_ptr + offsets, mask=valid, other=0.0)
         x = tl.load(X_ptr + offsets, mask=valid, other=0.0)
 
-        rand_vals = tl.rand(seed, mask_idx)
+        rand_vals = tl.rand(seed, mask_idx.to(tl.int32))
         keep = rand_vals >= p_drop
         scale = 1.0 / (1.0 - p_drop)
         out = r + tl.where(keep, x * scale, tl.zeros_like(x))
@@ -108,7 +111,10 @@ if _HAS_TRITON:
         seed,
         BLOCK: tl.constexpr,
     ):
-        pid = tl.program_id(0)
+        # int64 before scaling: ``offsets`` indexes the flattened tensor, which
+        # can pass 2^31 elements (a wrapped offset would load and store rows of
+        # another allocation without any error).
+        pid = tl.program_id(0).to(tl.int64)
         offsets = pid * BLOCK + tl.arange(0, BLOCK)
         valid = offsets < N_total
 
@@ -123,7 +129,7 @@ if _HAS_TRITON:
             mask_idx = batch_idx * SHARED_STRIDE + r_idx * D + d_idx
 
         grad_out = tl.load(GRAD_OUT_ptr + offsets, mask=valid, other=0.0)
-        rand_vals = tl.rand(seed, mask_idx)
+        rand_vals = tl.rand(seed, mask_idx.to(tl.int32))
         keep = rand_vals >= p_drop
         scale = 1.0 / (1.0 - p_drop)
         grad_x = tl.where(keep, grad_out * scale, tl.zeros_like(grad_out))

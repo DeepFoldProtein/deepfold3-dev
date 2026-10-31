@@ -39,8 +39,8 @@ if HAS_TRITON:
         ROWS_PER_BLOCK: tl.constexpr,  # rows processed per thread block
     ):
         """Forward: y = silu(a) * b where x = [a | b] concatenated."""
-        pid = tl.program_id(0)
-        row_start = (pid * ROWS_PER_BLOCK).to(tl.int64)
+        pid = tl.program_id(0).to(tl.int64)
+        row_start = pid * ROWS_PER_BLOCK
 
         cols = tl.arange(0, BLOCK_D)
         col_mask = cols < D
@@ -69,8 +69,8 @@ if HAS_TRITON:
         ROWS_PER_BLOCK: tl.constexpr,
     ):
         """Backward: compute da, db in-place into x buffer."""
-        pid = tl.program_id(0)
-        row_start = (pid * ROWS_PER_BLOCK).to(tl.int64)
+        pid = tl.program_id(0).to(tl.int64)
+        row_start = pid * ROWS_PER_BLOCK
 
         cols = tl.arange(0, BLOCK_D)
         col_mask = cols < D
