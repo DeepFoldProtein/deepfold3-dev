@@ -193,6 +193,14 @@ bench/cache/
 # Large optional Triton test fixtures (checkpoints; tests skip when absent)
 tests/triton/_fixtures/*.pt
 
+# Triton kernel-accuracy diagnostics. Write-only output: the suite dumps these
+# on an assertion failure (and from a few always-log paths), and no test reads
+# one back. They record one GPU architecture's result at one moment, so a
+# committed copy reads as the current state of a kernel on every machine when
+# it is neither — and two concurrent test runs in the same checkout interleave
+# their writes. Keep them local.
+tests/triton/_failures/
+
 # Weights & Biases
 wandb/
 
