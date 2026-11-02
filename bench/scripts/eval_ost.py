@@ -39,8 +39,10 @@ import argparse
 import csv
 import json
 import os
+import re
 import shlex
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -106,12 +108,113 @@ INTERFACE_CATEGORIES = {
 DOCKQ_SUCCESS = 0.23
 
 
+# OST derives its chem groups from the *reference* mmCIF's SEQRES and then
+# enforces that each structure residue's one-letter code matches the SEQRES
+# character at that position. A ground truth containing a residue OST's
+# compound library does not know breaks that check outright:
+#
+#   RuntimeError: Sequence mismatch of residue "D.7WC11" with olc "?" and
+#   residue number "11". Character at that location in seqres: "X".
+#
+# 7yv1-assembly1 is such a target: its chain I is an 11-mer of non-standard
+# residues ((MLE)I(MAA)(02A)(7VU)(SAR)(7W2)P(AC5)(7VN)(7WC)) whose SEQRES
+# spells the unknown ones "X" while OST reads 7WC as "?". The chain mapper
+# raises before any score is computed, so the WHOLE target is lost -- for
+# 7yv1 that is both scored interfaces (A:B, A:C), neither of which involves
+# the peptide at all.
+#
+# The fallback drops exactly the offending chain from a cached copy of the
+# reference and retries, so the chem groups are inferred from the SEQRES of
+# the chains that remain. Nothing else about the invocation changes: raising
+# --min-pep-length past the peptide's length would also work, but it is a
+# global flag and would silently re-score every other target.
+#
+# The residue token is name+number glued together ("7WC11") and residue names
+# may themselves end in a digit, so the split is taken from the explicit
+# `residue number "11"` field rather than guessed from the token.
+_SEQRES_MISMATCH = re.compile(r'Sequence mismatch of residue "([^".]+)\.(\S+?)"')
+_SEQRES_RESNUM = re.compile(r'residue number "(-?\d+)"')
+_rescue_lock = threading.Lock()
+
+
+def _offending_residue(text: str) -> tuple[str, int] | None:
+    """(residue name, seq number) from OST's SEQRES-mismatch RuntimeError."""
+    m, n = _SEQRES_MISMATCH.search(text), _SEQRES_RESNUM.search(text)
+    if not m or not n:
+        return None
+    token, num = m.group(2), n.group(1)
+    if not token.endswith(num):
+        return None
+    return token[: -len(num)], int(num)
+
+
+def _reference_without_chain(ref: Path, res_name: str, seq_num: int) -> Path | None:
+    """A copy of ``ref`` with the chain holding ``res_name``/``seq_num`` removed.
+
+    Cached next to the detail JSONs under ``_ost_rescue`` so the 20 structures
+    of one target rebuild it once. Returns None if the chain cannot be found
+    or gemmi is unavailable, in which case the caller keeps the failure.
+    """
+    cache = ref.parent / "_ost_rescue" / f"{ref.stem}__no_{res_name}{seq_num}.cif"
+    with _rescue_lock:
+        if cache.exists():
+            return cache
+        try:
+            import gemmi
+        except ImportError:
+            return None
+        try:
+            st = gemmi.read_structure(str(ref))
+            st.setup_entities()
+            victim = next(
+                (ch.name for ch in st[0] for r in ch if r.name == res_name and r.seqid.num == seq_num),
+                None,
+            )
+            if victim is None:
+                return None
+            for mdl in st:
+                mdl.remove_chain(victim)
+            st.setup_entities()
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".cif.tmp")
+            st.make_mmcif_document().write_file(str(tmp))
+            tmp.replace(cache)
+        except Exception:  # noqa: BLE001 - a rescue that fails must not kill the eval
+            return None
+    return cache
+
+
 def run_ost(model: Path, ref: Path, out_json: Path, force: bool = False) -> None:
     if out_json.exists() and not force:
         return
     out_json.parent.mkdir(parents=True, exist_ok=True)
     cmd = [*_ost_cmd(), "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS]
     subprocess.run(cmd, capture_output=True, check=False)
+
+    try:
+        d = json.load(open(out_json))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    if d.get("status") == "SUCCESS":
+        return
+    hit = _offending_residue(str(d.get("exception") or d.get("traceback") or ""))
+    if hit is None:
+        return
+    res_name, seq_num = hit
+    fixed = _reference_without_chain(ref, res_name, seq_num)
+    if fixed is None:
+        return
+    cmd = [*_ost_cmd(), "-m", str(model), "-r", str(fixed), "-o", str(out_json), *STRUCT_FLAGS]
+    subprocess.run(cmd, capture_output=True, check=False)
+    try:
+        d = json.load(open(out_json))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    if d.get("status") == "SUCCESS":
+        # Leave a trace in the cached JSON: these scores came from a reference
+        # that is one chain short of the one on disk.
+        d["ost_rescue"] = {"dropped_residue": f"{res_name}{seq_num}", "reference": str(fixed)}
+        json.dump(d, open(out_json, "w"))
 
 
 def parse_monomer(d: dict) -> dict:
