@@ -371,6 +371,24 @@ The `precision_dot(a, b, acc, PRECISION)` JIT helper dispatches `tl.dot` with th
 requested precision mode. The pair bias kernel defaults to `TF32x3` for best
 accuracy/speed tradeoff.
 
+### Attention Precision Contract
+
+`evo_attention.py` keeps **operands in the input dtype and everything derived from
+the scores in fp32**: the `tl.dot` accumulator, the online-softmax running max
+`m_i` and sum `l_i`, the `exp2`, the output accumulator `O_block`, the stored LSE
+`M`, and the `dQ`/`dK`/`dV`/`d_pair_bias` accumulators. Only the `tl.dot` operands
+themselves (`Q`, `K`, `V`, and the `P` / `dS` tiles fed back into a dot) are bf16.
+
+`softmax_scale` is applied **after** the QK dot, on the fp32 accumulator, in all
+four kernels. Folding it into Q (or K) before the dot re-rounds the operand to
+bf16, and that ~2^-9 relative perturbation becomes an absolute logit error
+proportional to the logit's magnitude — which the softmax exponentiates. At
+`|QK^T/sqrt(D)| ~ 1e2` (activations with stddev ≳ 3) it cost ~5% of forward
+elements their bf16 tolerance, and because the backward `dk_dv` kernel pre-scaled
+`K` while the forward pre-scaled `Q`, its recomputed `P` also stopped matching the
+saved LSE — the dominant `dK` / `dV` error. See
+`tests/triton/test_evo_attn_robustness.py::test_row_norm_heterogeneity`.
+
 ### Persistent Autotuning Cache
 
 Triton kernel autotuning results are persisted to `~/.cache/deepfold3-triton/` (or

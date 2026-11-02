@@ -60,7 +60,6 @@ if HAS_TRITON:
         SEQ_LEN: tl.constexpr,
     ):
         lo, hi = 0, SEQ_LEN
-        Q_block = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
 
         for start_kv in range(lo, hi, BLOCK_SIZE_KV):
             start_kv = tl.multiple_of(start_kv, BLOCK_SIZE_KV)
@@ -98,7 +97,16 @@ if HAS_TRITON:
                         other=0.0,
                     )
 
-            QK_block = tl.dot(Q_block, K_block) + pair_bias_block + res_mask_block
+            # ``softmax_scale`` is applied to the fp32 ``tl.dot`` accumulator, NOT
+            # pre-multiplied into Q. Pre-scaling re-rounds every Q element to the
+            # input dtype: in bf16 that is a ~2^-9 relative perturbation whose
+            # effect on a logit grows with the logit's magnitude, so rows with a
+            # large norm (|QK^T/sqrt(D)| ~ 1e2) pick up absolute logit errors of
+            # ~3e-2, which the softmax exponentiates into a few-percent weight
+            # error. Post-scaling in fp32 is exact and costs one fp32 multiply per
+            # score tile. See tests/triton/test_evo_attn_robustness.py::
+            # test_row_norm_heterogeneity.
+            QK_block = tl.dot(Q_block, K_block) * softmax_scale + pair_bias_block + res_mask_block
 
             if not EVEN_KV:
                 QK_block += tl.where((start_kv + offs_kv)[None, :] < SEQ_LEN, 0, float("-inf"))
@@ -477,8 +485,6 @@ if HAS_TRITON:
         kT_ptrs = K + offs_kv[None, :] * stride_seq + offs_dim[:, None]
         vT_ptrs = V + offs_kv[None, :] * stride_seq + offs_dim[:, None]
 
-        Q_block = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
-
         num_steps = (SEQ_LEN + BLOCK_SIZE_KV - 1) // BLOCK_SIZE_KV
         for blk_idx in range(num_steps):
             if EVEN_Q & EVEN_KV:
@@ -514,7 +520,10 @@ if HAS_TRITON:
                         other=0.0,
                     )
 
-            QK_block = tl.dot(Q_block, K_T_block) + pb + rm
+            # fp32 post-scale, matching the forward kernel (see the note there).
+            # The recomputed logits must agree with the forward's to fp32
+            # rounding, or P no longer matches the saved LSE in ``M``.
+            QK_block = tl.dot(Q_block, K_T_block) * softmax_scale + pb + rm
             if not EVEN_KV:
                 QK_block += tl.where((blk_idx * BLOCK_SIZE_KV + offs_kv)[None, :] < SEQ_LEN, 0, float("-inf"))
 
@@ -698,8 +707,8 @@ if HAS_TRITON:
                         other=0.0,
                     )
 
-            Q_scaled = Q_block * tl.full((1,), softmax_scale, dtype=Q_block.dtype)
-            QK_block = tl.dot(Q_scaled, tl.trans(K_block)) + pb + rm
+            # fp32 post-scale, matching the forward kernel (see the note there).
+            QK_block = tl.dot(Q_block, tl.trans(K_block)) * softmax_scale + pb + rm
             if not EVEN_KV:
                 QK_block += tl.where(mask_kv, 0, float("-inf"))
             if not EVEN_Q:
@@ -838,8 +847,6 @@ if HAS_TRITON:
         qT_ptrs = Q + offs_q[None, :] * stride_seq + offs_dim[:, None]
         dO_ptrs = dO + offs_q[:, None] * stride_seq + offs_dim[None, :]
 
-        K_block = K_block * tl.full((1,), softmax_scale, dtype=K_block.dtype)
-
         num_steps = (SEQ_LEN + BLOCK_SIZE_Q - 1) // BLOCK_SIZE_Q
         curr_q = 0
         for _blk_idx in range(num_steps):
@@ -870,7 +877,11 @@ if HAS_TRITON:
                     qT_block = tl.load(qT_ptrs, mask=(offs_q[None, :] < SEQ_LEN) & (offs_dim[:, None] < DIM), other=0.0)
                     dO_block = tl.load(dO_ptrs, mask=(offs_q[:, None] < SEQ_LEN) & (offs_dim[None, :] < DIM), other=0.0)
 
-            QK_T_block = tl.dot(K_block, qT_block) + pb_T + res_mask_T_block
+            # fp32 post-scale. This kernel used to pre-scale K in the input dtype
+            # while the forward pre-scaled Q, so the recomputed logits disagreed
+            # with the forward's by ~3e-2 in bf16 for high-norm rows and P no
+            # longer matched the saved LSE — the dominant dK / dV error.
+            QK_T_block = tl.dot(K_block, qT_block) * softmax_scale + pb_T + res_mask_T_block
             if not (EVEN_Q & EVEN_KV):
                 QK_T_block += tl.where((offs_kv[:, None] < SEQ_LEN) & (offs_q[None, :] < SEQ_LEN), 0, float("-inf"))
 
