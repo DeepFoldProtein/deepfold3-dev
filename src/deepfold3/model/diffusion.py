@@ -1325,8 +1325,27 @@ class DiffusionHead(nn.Module):
         # Pre-compute per-step gamma to avoid GPU→CPU sync inside the loop
         gammas = torch.where(noise_levels[1:] > cfg.gamma_min, cfg.gamma_0, 0.0)  # [steps]
 
+        # Bucket padding (``model.bucket.pad_features``) appends dead tokens to
+        # the end of the N axis, and every mask is padded False so they cannot
+        # reach the output. The sampler's noise is the one thing the masks do
+        # not cover: drawing ``randn`` at the padded N consumes a different
+        # slice of the generator's stream than the same input unpadded, so
+        # ``--bucket`` and ``--no-bucket`` return different samples from one
+        # seed -- not a leak, but a silent dependence of the result on a flag
+        # that is supposed to buy speed only. Draw at the real token count and
+        # pad the noise, so the real atoms see the same noise either way.
+        # ``n_real == N`` without padding, where this is a no-op.
+        mask_any = seq_mask.reshape(-1, N).any(dim=0)
+        nz = torch.nonzero(mask_any)
+        n_real = int(nz[-1].item()) + 1 if nz.numel() > 0 else N
+
+        def _randn_tokens(*lead: int) -> torch.Tensor:
+            """``randn`` over ``[*lead, N, M, 3]``, drawn at the unpadded N."""
+            t = torch.randn(*lead, n_real, M, 3, device=device, generator=generator)
+            return t if n_real == N else F.pad(t, (0, 0, 0, 0, 0, N - n_real))
+
         # Initialize from pure noise: [B?, S, N, M, 3]
-        positions = torch.randn(*batch_shape, cfg.num_samples, N, M, 3, device=device, generator=generator)
+        positions = _randn_tokens(*batch_shape, cfg.num_samples)
         positions = positions * noise_levels[0]
         aug_mask = ref_mask.bool()
 
@@ -1395,7 +1414,7 @@ class DiffusionHead(nn.Module):
 
             # Add noise
             noise_scale = cfg.noise_scale * (sigma_hat**2 - sigma_prev**2).sqrt()
-            positions_hat = positions + noise_scale * torch.randn_like(positions, generator=generator)
+            positions_hat = positions + noise_scale * _randn_tokens(*batch_shape, cfg.num_samples)
 
             den_c = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_bs)
             denoised = den_c
